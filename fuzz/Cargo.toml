@@ -1,0 +1,66 @@
+[package]
+name = "dravity-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1.7"
+libfuzzer-sys = "0.4"
+serde = "1.0.200"
+dravity-bencode = { path = "../crates/dravity-bencode" }
+dravity-core = { path = "../crates/dravity-core" }
+dravity-wire = { path = "../crates/dravity-wire" }
+
+# Standalone workspace: fuzzing needs nightly and is not part of the main build.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "bencode_decode"
+path = "fuzz_targets/bencode_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bencode_roundtrip"
+path = "fuzz_targets/bencode_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metainfo_parse"
+path = "fuzz_targets/metainfo_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "magnet_parse"
+path = "fuzz_targets/magnet_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_roundtrip"
+path = "fuzz_targets/wire_roundtrip.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,59 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Just-Replicant/Dravity"
+authors = ["Dravity contributors"]
+keywords = ["bittorrent", "torrent", "p2p"]
+categories = ["network-programming"]
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+dravity-bencode = { path = "crates/dravity-bencode", version = "0.1.0" }
+dravity-core = { path = "crates/dravity-core", version = "0.1.0" }
+dravity-wire = { path = "crates/dravity-wire", version = "0.1.0" }
+
+# External crates
+bytes = "1.7"
+serde = { version = "1.0.200", features = ["derive"] }
+sha1 = "0.10.6"
+thiserror = "2.0"
+
+# Dev-only
+proptest = "1.5"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_possible_wrap = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "warn"
+
+[profile.release]
+debug = "line-tables-only"

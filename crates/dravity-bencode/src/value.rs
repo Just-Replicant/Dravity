@@ -52,6 +52,25 @@ impl<'a> Value<'a> {
         Ok(v)
     }
 
+    /// Decodes one value from the start of `input` and returns it with the
+    /// number of bytes it used. Trailing bytes are allowed, e.g. the raw
+    /// piece data after a BEP 9 `ut_metadata` dictionary.
+    ///
+    /// ```
+    /// use dravity_bencode::Value;
+    ///
+    /// let (v, used) = Value::decode_prefix(b"i42eRAW").unwrap();
+    /// assert_eq!((v, used), (Value::Int(42), 4));
+    /// ```
+    ///
+    /// # Errors
+    /// Returns an [`Error`] for malformed input.
+    pub fn decode_prefix(input: &'a [u8]) -> Result<(Self, usize)> {
+        let mut p = Parser::new(input, DecodeOptions::default());
+        let v = Self::parse(&mut p)?;
+        Ok((v, p.pos()))
+    }
+
     pub(crate) fn parse(p: &mut Parser<'a>) -> Result<Self> {
         match p.peek()? {
             b'i' => p.int_i64().map(Value::Int),

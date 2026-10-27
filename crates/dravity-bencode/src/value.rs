@@ -448,6 +448,31 @@ mod tests {
     }
 
     #[test]
+    fn item_limit_bounds_lists_and_dicts() {
+        let list = b"li1ei2ei3ee";
+        let tight = DecodeOptions::new().max_items(2);
+        assert!(matches!(
+            Value::decode_with(list, tight),
+            Err(Error::TooManyItems { max: 2, .. })
+        ));
+        assert!(Value::decode_with(list, DecodeOptions::new().max_items(3)).is_ok());
+        assert!(matches!(
+            crate::from_bytes_with::<Value<'_>>(list, tight),
+            Err(Error::TooManyItems { max: 2, .. })
+        ));
+        assert!(matches!(
+            crate::from_bytes_with::<serde::de::IgnoredAny>(list, tight),
+            Err(Error::TooManyItems { max: 2, .. })
+        ));
+        let dict = b"d1:ai1e1:bi2e1:ci3ee";
+        assert!(matches!(
+            Value::decode_with(dict, tight),
+            Err(Error::TooManyItems { max: 2, .. })
+        ));
+        assert!(Value::decode(list).is_ok());
+    }
+
+    #[test]
     fn into_owned_outlives_input() {
         let owned = {
             let input = b"d1:kl1:vee".to_vec();

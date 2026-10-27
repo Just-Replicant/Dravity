@@ -6,24 +6,29 @@ dispatch effects. CLI and HTTP send commands and read alerts. Tokio is the
 default runtime. See [`docs/rust-torrent-plan.md`](docs/rust-torrent-plan.md)
 for the full architecture, comparison with existing clients, and roadmap.
 
-> **Status: Phase 1 (MVP downloader) complete.** Dravity downloads v1
-> `.torrent` files from HTTP/UDP trackers and TCP peers with rarest-first,
-> pipelined requests and SHA-1 verification. It does not seed or accept
-> incoming connections yet (Phase 3). See [`docs/phase-1.md`](docs/phase-1.md).
+> **Status: Phase 2 (magnets and swarm) complete.** Dravity downloads v1
+> `.torrent` files and magnet links (metadata over BEP 9/10), finding peers
+> through HTTP/UDP trackers (BEP 12 tiers), the mainline DHT and PEX. The
+> engine pipelines requests with an AIMD window, uses endgame and block
+> stealing, can rate-limit downloads, and fastresume skips the hash check
+> on restart. It does not seed or accept incoming connections yet
+> (Phase 3). See [`docs/phase-1.md`](docs/phase-1.md) and
+> [`docs/phase-2.md`](docs/phase-2.md).
 
 ## Workspace
 
 | Crate | Status | What it does |
 |---|---|---|
 | [`dravity-bencode`](crates/dravity-bencode) | ✅ Phase 0 | Zero-copy bencode `Value`, serde `Deserializer`/`Serializer`, `RawValue` for exact byte capture, depth and item caps |
-| [`dravity-core`](crates/dravity-core) | ✅ Phase 0 | `InfoHash` (v1, v2 type), `PeerId`, `.torrent` parsing (`Metainfo`), magnet links, piece/block/file math, path-safety checks |
-| [`dravity-wire`](crates/dravity-wire) | ✅ Phase 0 | Handshake + reserved bits, BEP 3/5/6 messages, BEP 10 extended handshake, streaming zero-copy decoder |
-| [`dravity-engine`](crates/dravity-engine) | ✅ Phase 1 | Sans-IO `TorrentState::update(now, Event) -> Vec<Effect>`: rarest-first picker, peer table, pipelining, timeouts, data check, tracker scheduling |
-| [`dravity-storage`](crates/dravity-storage) | ✅ Phase 1 | `Storage` trait; filesystem backend (LRU FD cache, positional I/O, symlink refusal) and memory backend; piece verification |
-| [`dravity-tracker`](crates/dravity-tracker) | ✅ Phase 1 | HTTP (BEP 3/7/23) and UDP (BEP 15) announce: sans-IO codecs + async client (rustls) |
-| [`dravity-session`](crates/dravity-session) | ✅ Phase 1 | The only I/O driver: per-torrent owner task on Tokio, peer tasks, disk/hash offload, alerts |
-| [`dravity-cli`](crates/dravity-cli) | ✅ Phase 1 | `dravity download` / `dravity info`; renders alerts, never drives I/O |
-| `dravity-dht`, `-utp`, `-http`, … | ⏳ Phase 2+ | See the roadmap |
+| [`dravity-core`](crates/dravity-core) | ✅ Phase 2 | `InfoHash` (v1, v2 type), `PeerId`, `.torrent` parsing (`Metainfo`, also from fetched `info` bytes), magnet links, compact peers, piece/block/file math, path-safety checks |
+| [`dravity-wire`](crates/dravity-wire) | ✅ Phase 2 | Handshake + reserved bits, BEP 3/5/6 messages, BEP 10 extended handshake, BEP 9 `ut_metadata`, BEP 11 `ut_pex`, streaming zero-copy decoder |
+| [`dravity-engine`](crates/dravity-engine) | ✅ Phase 2 | Sans-IO `TorrentState::update(now, Event) -> Vec<Effect>`: rarest-first picker, AIMD request window, endgame + block stealing, rate limit, PEX, metadata serving, data check, tracker/DHT scheduling; `MetadataState` for magnets |
+| [`dravity-storage`](crates/dravity-storage) | ✅ Phase 2 | `Storage` trait; filesystem backend (LRU FD cache, positional I/O, symlink refusal) and memory backend; piece verification; fastresume data with file stamps |
+| [`dravity-tracker`](crates/dravity-tracker) | ✅ Phase 2 | HTTP (BEP 3/7/23) and UDP (BEP 15, cached connection ids) announce: sans-IO codecs + async client (rustls) |
+| [`dravity-dht`](crates/dravity-dht) | ✅ Phase 2 | Mainline DHT (BEP 5) peer lookups and announces, wrapping [`mainline`](https://crates.io/crates/mainline) |
+| [`dravity-session`](crates/dravity-session) | ✅ Phase 2 | The only I/O driver: per-torrent owner task on Tokio, peer tasks, disk/hash offload, magnets, DHT, fastresume, BEP 12 tiers, alerts |
+| [`dravity-cli`](crates/dravity-cli) | ✅ Phase 2 | `dravity download` / `dravity info` for files and magnet links; renders alerts, never drives I/O |
+| `dravity-utp`, `-http`, … | ⏳ Phase 3+ | See the roadmap |
 
 ## Phase 0 checklist
 
@@ -46,14 +51,33 @@ for the full architecture, comparison with existing clients, and roadmap.
 - [x] `dravity-session` ships the driver; `dravity-cli` shows progress through alerts only
 - [x] Tests: scripted engine sequences + proptest, storage, tracker mocks, loopback swarm end-to-end, CLI; fuzz targets for tracker responses; criterion benches
 
+## Phase 2 checklist
+
+- [x] Magnet links: BEP 10 extension handshake and BEP 9 metadata download, verified against the info-hash, then handed over to the download without reconnecting
+- [x] Serving metadata to other peers (`ut_metadata` data/reject)
+- [x] Mainline DHT (BEP 5) peer lookups via `dravity-dht` (wrapping `mainline`)
+- [x] PEX (BEP 11): learn peers and send add/drop diffs; off for private torrents (BEP 27), as is the DHT
+- [x] Endgame duplicate requests with `cancel`, and block stealing from slow peers
+- [x] AIMD per-peer request window capped by the peer's `reqq`; download rate limit (token bucket)
+- [x] Fastresume: verified pieces + file length/mtime stamps, atomic save, full check when anything changed
+- [x] UDP tracker connection-id cache; BEP 12 tier ordering
+- [x] Tests: engine scripts + proptest, metadata state machine, codecs (proptest + fuzz), resume fuzz target, loopback DHT testnet, loopback swarm (magnet via tracker and DHT, PEX, resume, tier fallback), CLI
+
 ## Command line
 
 ```sh
 cargo run --release -p dravity-cli -- info example.torrent
 cargo run --release -p dravity-cli -- download example.torrent --output downloads
+# magnet links (quote them: `&` is special in shells)
+cargo run --release -p dravity-cli -- download 'magnet:?xt=urn:btih:…&tr=…' --output downloads
 # extra peers, e.g. for a LAN seeder
 cargo run --release -p dravity-cli -- download example.torrent --peer 192.168.1.20:6881
+# no DHT, at most 2 MiB/s
+cargo run --release -p dravity-cli -- download example.torrent --no-dht --download-limit 2M
 ```
+
+Fastresume data goes to `<output>/.dravity` (`--resume-dir DIR` to move it,
+`--no-resume` to always check existing files).
 
 `DRAVITY_LOG=dravity_session=debug` enables logging (tracing `EnvFilter` syntax).
 
@@ -81,6 +105,7 @@ use dravity_session::{AddTorrentOptions, Session, SessionConfig};
 let session = Session::new(SessionConfig::default())?;
 let mut alerts = session.subscribe();
 let torrent = session.add_torrent(torrent, AddTorrentOptions::new("downloads"))?;
+// or: session.add_magnet(&magnet, AddTorrentOptions::new("downloads"))?
 while let Ok(a) = alerts.recv().await {
     if a.info_hash == torrent.info_hash() && a.alert == Alert::Finished {
         break;

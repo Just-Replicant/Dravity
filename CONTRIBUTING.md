@@ -11,6 +11,9 @@ Thanks for helping! A few rules keep the codebase consistent with the
    `dravity-session` owns the only production loop: poll I/O →
    `update(Event)` → dispatch `Effect`s. Binaries send session commands and
    read alerts; they never write that loop.
+   I/O crates such as `dravity-dht` and the tracker client are called by
+   the session only, and keep third-party types (e.g. `mainline`) out of
+   their public API.
 2. **Bounded queues.** Every channel is bounded. The torrent owner task must
    never `await` a send that its own loop has to drain; use `try_send` or a
    spawned task.
@@ -35,6 +38,7 @@ cargo deny check                   # if you touched dependencies
 - Public items need rustdoc (`missing_docs` is on).
 - Keep the MSRV (`rust-version` in `Cargo.toml`) unless the PR says why.
 - Add workspace dependencies in the root `Cargo.toml` `[workspace.dependencies]`.
+- Note user-visible changes in [CHANGELOG.md](CHANGELOG.md).
 - Use [Conventional Commits](https://www.conventionalcommits.org/) style
   messages (`feat(wire): …`, `fix(core): …`).
 

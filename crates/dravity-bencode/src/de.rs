@@ -199,6 +199,7 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
         self.p.enter(b'l')?;
         let mut access = ListAccess {
             de: self,
+            seen: 0,
             done: false,
         };
         let value = visitor.visit_seq(&mut access)?;
@@ -221,6 +222,7 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
         let mut access = DictAccess {
             de: self,
             prev: None,
+            seen: 0,
             done: false,
         };
         let value = visitor.visit_map(&mut access)?;
@@ -289,6 +291,7 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
 
 struct ListAccess<'a, 'de> {
     de: &'a mut Deserializer<'de>,
+    seen: usize,
     done: bool,
 }
 
@@ -300,6 +303,8 @@ impl<'de> SeqAccess<'de> for ListAccess<'_, 'de> {
             self.done = true;
             return Ok(None);
         }
+        self.de.p.check_items(self.seen)?;
+        self.seen += 1;
         seed.deserialize(&mut *self.de).map(Some)
     }
 }
@@ -307,6 +312,7 @@ impl<'de> SeqAccess<'de> for ListAccess<'_, 'de> {
 struct DictAccess<'a, 'de> {
     de: &'a mut Deserializer<'de>,
     prev: Option<&'de [u8]>,
+    seen: usize,
     done: bool,
 }
 
@@ -318,6 +324,8 @@ impl<'de> MapAccess<'de> for DictAccess<'_, 'de> {
             self.done = true;
             return Ok(None);
         }
+        self.de.p.check_items(self.seen)?;
+        self.seen += 1;
         let (key, offset) = self.de.p.dict_key()?;
         self.de.p.check_key(self.prev, key, offset)?;
         self.prev = Some(key);

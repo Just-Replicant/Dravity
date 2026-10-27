@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use dravity_core::Metainfo;
-use dravity_engine::Alert;
+use dravity_engine::{Alert, TorrentStatus};
 use dravity_session::{AddTorrentOptions, Session, SessionConfig};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -167,16 +167,23 @@ async fn download(
             Err(RecvError::Closed) => bail!("session closed unexpectedly"),
         };
         match alert {
-            Alert::Stats(stats) if !quiet => {
-                let rate = stats.downloaded.saturating_sub(last_downloaded);
-                last_downloaded = stats.downloaded;
-                ticks += 1;
-                let line = format::progress_line(&stats, rate);
-                let mut err = std::io::stderr().lock();
-                if tty {
-                    let _ = write!(err, "\r{line}\x1b[K");
-                } else if ticks % 10 == 0 {
-                    let _ = writeln!(err, "{line}");
+            Alert::Stats(stats) => {
+                if !quiet {
+                    let rate = stats.downloaded.saturating_sub(last_downloaded);
+                    last_downloaded = stats.downloaded;
+                    ticks += 1;
+                    let line = format::progress_line(&stats, rate);
+                    let mut err = std::io::stderr().lock();
+                    if tty {
+                        let _ = write!(err, "\r{line}\x1b[K");
+                    } else if ticks % 10 == 0 {
+                        let _ = writeln!(err, "{line}");
+                    }
+                }
+                // `Finished` can be dropped if a slow subscriber lags the
+                // broadcast. The next stats snapshot still carries the state.
+                if stats.status == TorrentStatus::Finished {
+                    break Ok(());
                 }
             }
             Alert::TrackerError { message } => {

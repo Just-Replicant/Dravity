@@ -16,9 +16,9 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::WireError;
 
-/// Default maximum frame length: a 16 KiB block plus generous room for
-/// bitfields of very large torrents (2 MiB covers 16M pieces).
-pub const DEFAULT_MAX_FRAME_LEN: u32 = 2 * 1024 * 1024;
+/// Default maximum frame length: a 16 KiB block plus room for a bitfield of
+/// a very large torrent (16 MiB covers 2^27 pieces).
+pub const DEFAULT_MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
 /// Known message ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

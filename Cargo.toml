@@ -20,6 +20,7 @@ dravity-bencode = { path = "crates/dravity-bencode", version = "0.1.0" }
 dravity-core = { path = "crates/dravity-core", version = "0.1.0" }
 dravity-wire = { path = "crates/dravity-wire", version = "0.1.0" }
 dravity-engine = { path = "crates/dravity-engine", version = "0.1.0" }
+dravity-storage = { path = "crates/dravity-storage", version = "0.1.0" }
 
 # External crates
 bytes = "1"
@@ -29,6 +30,7 @@ thiserror = "2"
 
 # Dev-only
 proptest = "1"
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

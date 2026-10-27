@@ -111,6 +111,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dravity-storage"
+version = "0.1.0"
+dependencies = [
+ "dravity-bencode",
+ "dravity-core",
+ "sha1",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "dravity-wire"
 version = "0.1.0"
 dependencies = [

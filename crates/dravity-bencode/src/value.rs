@@ -60,6 +60,7 @@ impl<'a> Value<'a> {
                 p.enter(b'l')?;
                 let mut items = Vec::new();
                 while !p.eat_end()? {
+                    p.check_items(items.len())?;
                     items.push(Self::parse(p)?);
                 }
                 p.leave();
@@ -69,7 +70,10 @@ impl<'a> Value<'a> {
                 p.enter(b'd')?;
                 let mut dict = Dict::new();
                 let mut prev: Option<&[u8]> = None;
+                let mut seen = 0usize;
                 while !p.eat_end()? {
+                    p.check_items(seen)?;
+                    seen += 1;
                     let (key, offset) = p.dict_key()?;
                     p.check_key(prev, key, offset)?;
                     prev = Some(key);

@@ -39,7 +39,7 @@ wildcards = "deny"
 allow-wildcard-paths = true
 deny = [
     # Libraries use thiserror; anyhow is reserved for binaries (see docs/).
-    { crate = "anyhow", wrappers = [] },
+    { crate = "anyhow", wrappers = ["dravity-cli"] },
     # OpenSSL is avoided in favour of rustls (see plan, section 5).
     { crate = "openssl-sys" },
 ]

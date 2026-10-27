@@ -1,0 +1,35 @@
+[package]
+name = "dravity-cli"
+description = "Command-line BitTorrent client built on the Dravity session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories = ["command-line-utilities", "network-programming"]
+publish.workspace = true
+
+[[bin]]
+name = "dravity"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dravity-core.workspace = true
+dravity-engine.workspace = true
+dravity-session.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+dravity-bencode.workspace = true
+dravity-wire.workspace = true
+sha1.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

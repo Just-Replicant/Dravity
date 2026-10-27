@@ -5,17 +5,17 @@ Thanks for helping! A few rules keep the codebase consistent with the
 
 ## Ground rules
 
-1. **No GPL code.** Superseedr (GPL-3.0) may inspire ideas, but never copy or
-   closely translate its source. Dravity is `MIT OR Apache-2.0`; `cargo deny`
-   enforces a permissive-only dependency tree.
-2. **Sans-IO libraries.** Protocol and parsing crates never perform I/O or
-   spawn tasks. Runtime glue lives in `dravity-session` (Phase 1+).
-3. **Errors:** `thiserror` enums in libraries; `anyhow` only in binaries.
-4. **No `unsafe`.** The workspace forbids it. If a future backend (e.g.
+1. **Sans-IO libraries.** `dravity-bencode`, `dravity-core`, `dravity-wire`,
+   and later `dravity-engine` never perform I/O or spawn tasks.
+   `dravity-session` (Phase 1+) owns the only production loop: poll I/O →
+   `update(Event)` → dispatch `Effect`s. Binaries send session commands and
+   read alerts; they never write that loop.
+2. **Errors:** `thiserror` enums in libraries; `anyhow` only in binaries.
+3. **No `unsafe`.** The workspace forbids it. If a future backend (e.g.
    io_uring) truly needs it, isolate it in its own crate with a justification.
-5. **Untrusted input never panics.** Every parser gets a cargo-fuzz target and
+4. **Untrusted input never panics.** Every parser gets a cargo-fuzz target and
    property tests from day one. Use `get()`/checked arithmetic, not indexing.
-6. **Paths from metainfo are hostile.** Go through `dravity_core::path`.
+5. **Paths from metainfo are hostile.** Go through `dravity_core::path`.
 
 ## Before opening a PR
 
@@ -43,3 +43,8 @@ cargo +nightly fuzz run bencode_decode -- -max_total_time=300
 
 Crashes land in `fuzz/artifacts/<target>/`; turn each into a regression unit
 test before fixing it.
+
+## License
+
+Contributions are licensed under the GNU Affero General Public License,
+version 3.0 or later, the same terms as the rest of Dravity. See [LICENSE](LICENSE).

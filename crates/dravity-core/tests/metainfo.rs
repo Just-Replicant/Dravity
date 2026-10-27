@@ -369,12 +369,12 @@ fn rejects_structural_problems() {
             MetainfoError::UnsupportedV2Only,
         ),
         (
-            with(
-                with(base.clone(), "length", Some(int(0))),
-                "pieces",
-                Some(pieces(0)),
-            ),
-            MetainfoError::Layout(dravity_core::layout::LayoutError::Empty),
+            with(base.clone(), "private", Some(int(2))),
+            MetainfoError::InvalidPrivate(2),
+        ),
+        (
+            with(base.clone(), "private", Some(int(-1))),
+            MetainfoError::InvalidPrivate(-1),
         ),
     ];
     for (info, expected) in cases {
@@ -403,6 +403,17 @@ fn rejects_structural_problems() {
         Metainfo::from_bytes(&trailing),
         Err(MetainfoError::Bencode(_))
     ));
+}
+
+#[test]
+fn zero_length_torrent_has_no_pieces() {
+    let m = parse(single_info("empty", 0, 16_384)).unwrap();
+    assert_eq!(m.info().total_length(), 0);
+    assert_eq!(m.info().piece_count(), 0);
+    assert_eq!(m.info().piece_hash(0), None);
+    assert_eq!(m.info().files()[0].length(), 0);
+    let public = parse(with(single_info("a.txt", 1, 1), "private", Some(int(0)))).unwrap();
+    assert!(!public.info().is_private());
 }
 
 #[test]

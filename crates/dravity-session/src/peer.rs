@@ -7,7 +7,7 @@ use std::time::Duration;
 use bytes::BytesMut;
 use dravity_core::{InfoHash, PeerId};
 use dravity_engine::PeerKey;
-use dravity_wire::{Handshake, Message};
+use dravity_wire::{Handshake, Message, Reserved};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -58,6 +58,11 @@ impl HandshakeError {
     }
 }
 
+/// Extensions we advertise: BEP 10 (metadata exchange, PEX).
+pub(crate) fn our_reserved() -> Reserved {
+    Reserved::new().with_extension_protocol(true)
+}
+
 /// Writes our handshake and reads the peer's. Returns the peer's handshake
 /// and any bytes that arrived after it.
 pub(crate) async fn handshake<S>(
@@ -69,7 +74,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     stream
-        .write_all(&Handshake::new(info_hash, our_id).to_bytes())
+        .write_all(
+            &Handshake::new(info_hash, our_id)
+                .with_reserved(our_reserved())
+                .to_bytes(),
+        )
         .await?;
     let mut buf = BytesMut::with_capacity(1024);
     let theirs = loop {
@@ -105,10 +114,10 @@ pub(crate) async fn run(
     let setup = async {
         let mut stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
-        let (_, leftover) = handshake(&mut stream, info_hash, our_id).await?;
-        Ok::<_, HandshakeError>((stream, leftover))
+        let (theirs, leftover) = handshake(&mut stream, info_hash, our_id).await?;
+        Ok::<_, HandshakeError>((stream, theirs.reserved, leftover))
     };
-    let (stream, leftover) = match tokio::time::timeout(connect_timeout, setup).await {
+    let (stream, reserved, leftover) = match tokio::time::timeout(connect_timeout, setup).await {
         Ok(Ok(ok)) => ok,
         Ok(Err(e)) => {
             tracing::debug!(%addr, error = %e, "peer connection failed");
@@ -133,7 +142,15 @@ pub(crate) async fn run(
             return;
         }
     };
-    if events.send(Input::Connected { key, addr }).await.is_err() {
+    if events
+        .send(Input::Connected {
+            key,
+            addr,
+            reserved,
+        })
+        .await
+        .is_err()
+    {
         return;
     }
     // Bytes that arrived with the handshake must be decoded before the

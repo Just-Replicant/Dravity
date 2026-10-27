@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use dravity_core::BlockRef;
-use dravity_wire::Message;
+use dravity_wire::{Message, Reserved};
 
 /// Opaque handle for a connected peer, allocated by the driver.
 ///
@@ -50,8 +50,34 @@ pub enum TorrentStatus {
 pub struct Config {
     /// Maximum simultaneously connected (or connecting) peers.
     pub max_peers: usize,
-    /// Outstanding block requests per unchoked peer (request pipeline depth).
+    /// Upper bound of a peer's AIMD request window (outstanding block
+    /// requests). A smaller `reqq` from the peer's extension handshake wins.
     pub max_requests_per_peer: usize,
+    /// Request window a new peer starts with; it grows while blocks arrive
+    /// in time and halves when a request times out.
+    pub initial_requests_per_peer: usize,
+    /// Request a block from a second peer when the first has not delivered
+    /// it after this long and the second has nothing else to do (piece
+    /// stealing from slow peers).
+    pub steal_after: Duration,
+    /// Once every remaining block is requested, request blocks from more
+    /// than one peer and cancel the duplicates as copies arrive (endgame).
+    pub endgame: bool,
+    /// Download rate limit in bytes per second (`None`: unlimited). Enforced
+    /// by pacing block requests with a token bucket.
+    pub download_rate_limit: Option<u64>,
+    /// Exchange peers with other peers (BEP 11). Disable for private torrents.
+    pub pex: bool,
+    /// Minimum time between two PEX messages to the same peer (BEP 11: one
+    /// minute).
+    pub pex_interval: Duration,
+    /// Ask the driver to look up peers in the DHT ([`Effect::DhtLookup`]).
+    /// Disable for private torrents or when the driver runs no DHT.
+    pub dht: bool,
+    /// Time between DHT lookups for one torrent.
+    pub dht_interval: Duration,
+    /// Largest `info` dictionary accepted from peers for a magnet link.
+    pub max_metadata_size: u64,
     /// A request without an answer after this long is given to other peers.
     pub request_timeout: Duration,
     /// Drop a peer that sent nothing for this long.
@@ -81,7 +107,16 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             max_peers: 50,
-            max_requests_per_peer: 16,
+            max_requests_per_peer: 128,
+            initial_requests_per_peer: 4,
+            steal_after: Duration::from_secs(10),
+            endgame: true,
+            download_rate_limit: None,
+            pex: true,
+            pex_interval: Duration::from_secs(60),
+            dht: false,
+            dht_interval: Duration::from_secs(5 * 60),
+            max_metadata_size: 8 * 1024 * 1024,
             request_timeout: Duration::from_secs(30),
             peer_timeout: Duration::from_secs(180),
             peer_retry: Duration::from_secs(30),
@@ -113,6 +148,8 @@ pub enum Event {
         peer: PeerKey,
         /// Remote address.
         addr: SocketAddr,
+        /// Reserved bytes from the peer's handshake (extension flags).
+        reserved: Reserved,
     },
     /// An [`Effect::Connect`] attempt failed (refused, timeout, bad handshake).
     PeerConnectFailed {
@@ -180,6 +217,11 @@ pub enum Event {
         /// Human-readable cause.
         error: String,
     },
+    /// An [`Effect::DhtLookup`] finished (possibly with no peers).
+    DhtPeers {
+        /// Peers found in the DHT.
+        peers: Vec<SocketAddr>,
+    },
 }
 
 /// Something the driver must do. Effects never block the engine; their
@@ -228,6 +270,8 @@ pub enum Effect {
         /// Bytes still missing.
         left: u64,
     },
+    /// Look the torrent up in the DHT, then report [`Event::DhtPeers`].
+    DhtLookup,
     /// Notify the application.
     Alert(Alert),
 }

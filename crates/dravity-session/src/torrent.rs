@@ -37,6 +37,7 @@ pub(crate) enum Input {
     Connected {
         key: PeerKey,
         addr: SocketAddr,
+        reserved: dravity_wire::Reserved,
     },
     ConnectFailed {
         key: PeerKey,
@@ -168,11 +169,19 @@ impl TorrentTask {
     /// Maps peer-task inputs to engine events, keeping the peer map in sync.
     fn translate(&mut self, input: Input) -> Option<Event> {
         Some(match input {
-            Input::Connected { key, addr } => {
+            Input::Connected {
+                key,
+                addr,
+                reserved,
+            } => {
                 if !self.peers.contains_key(&key) {
                     return None;
                 }
-                Event::PeerConnected { peer: key, addr }
+                Event::PeerConnected {
+                    peer: key,
+                    addr,
+                    reserved,
+                }
             }
             Input::ConnectFailed { key, addr, retry } => {
                 self.peers.remove(&key);

@@ -1,6 +1,6 @@
 //! Scripted event sequences against `TorrentState::update`.
 
-#![allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
+#![allow(clippy::unwrap_used, clippy::cast_possible_truncation, clippy::panic)]
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -10,7 +10,7 @@ use dravity_core::{BLOCK_SIZE, BlockRef, PieceLayout};
 use dravity_engine::{
     Alert, AnnounceEvent, Bitfield, Config, Effect, Event, PeerKey, TorrentState, TorrentStatus,
 };
-use dravity_wire::{BlockRequest, Message};
+use dravity_wire::{BlockRequest, Message, MetadataMessage, PexMessage, PexPeer, Reserved};
 use proptest::prelude::*;
 
 fn addr(n: u16) -> SocketAddr {
@@ -69,6 +69,7 @@ impl Harness {
         h.ev(Event::PeerConnected {
             peer: PeerKey(1),
             addr: addr(1),
+            reserved: Reserved::new(),
         });
         h
     }
@@ -410,6 +411,8 @@ fn protocol_violations_disconnect() {
 fn choke_releases_requests_to_other_peers() {
     let mut c = config();
     c.max_requests_per_peer = 100;
+    c.initial_requests_per_peer = 100;
+    c.endgame = false;
     let mut h = Harness::started_with_peer(c);
     h.ev(Event::Announced {
         peers: vec![addr(2)],
@@ -418,6 +421,7 @@ fn choke_releases_requests_to_other_peers() {
     h.ev(Event::PeerConnected {
         peer: PeerKey(2),
         addr: addr(2),
+        reserved: Reserved::new(),
     });
     h.msg(1, Message::HaveAll);
     h.msg(2, Message::HaveAll);
@@ -437,6 +441,7 @@ fn disconnect_releases_requests() {
     h.ev(Event::PeerConnected {
         peer: PeerKey(2),
         addr: addr(2),
+        reserved: Reserved::new(),
     });
     h.msg(2, Message::HaveAll);
     assert_eq!(requests(&h.msg(2, Message::Unchoke), 2), first);
@@ -447,9 +452,10 @@ fn timeouts_and_keepalives() {
     let mut h = Harness::started_with_peer(config());
     h.msg(1, Message::HaveAll);
     let first = requests(&h.msg(1, Message::Unchoke), 1);
-    // After the request timeout the same blocks are requested again.
+    // After the request timeout the same blocks are requested again, with
+    // the AIMD window halved.
     let fx = h.advance(h.t.config().request_timeout);
-    assert_eq!(requests(&fx, 1), first);
+    assert_eq!(requests(&fx, 1), first[..first.len() / 2]);
     let fx = h.advance(h.t.config().keepalive_interval);
     assert!(fx.contains(&Effect::Send {
         peer: PeerKey(1),
@@ -538,6 +544,7 @@ fn check_existing_resumes_partial_download() {
     let fx = h.ev(Event::PeerConnected {
         peer: PeerKey(1),
         addr: addr(1),
+        reserved: Reserved::new(),
     });
     assert_eq!(
         fx,
@@ -681,6 +688,331 @@ fn peers_added_while_checking_connect_afterwards() {
     assert!(fx.contains(&Effect::Connect { addr: addr(5) }));
 }
 
+fn ext_handshake(entries: &str) -> Message {
+    Message::Extended {
+        id: 0,
+        payload: Bytes::from(format!("d1:md{entries}ee").into_bytes()),
+    }
+}
+
+fn extended() -> Reserved {
+    Reserved::new().with_extension_protocol(true)
+}
+
+fn sent(effects: &[Effect], peer: u64) -> Vec<Message> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Send { peer: p, message } if *p == PeerKey(peer) => Some(message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The single extended message sent to `peer`.
+fn only_extended(effects: &[Effect], peer: u64) -> (u8, Bytes) {
+    let mut messages = sent(effects, peer);
+    messages.retain(|m| *m != Message::KeepAlive);
+    match messages.as_slice() {
+        [Message::Extended { id, payload }] => (*id, payload.clone()),
+        other => panic!("expected one extended message, got {other:?}"),
+    }
+}
+
+fn connect(h: &mut Harness, peer: u64, reserved: Reserved) -> Vec<Effect> {
+    h.ev(Event::PeerConnected {
+        peer: PeerKey(peer),
+        addr: addr(peer as u16),
+        reserved,
+    })
+}
+
+#[test]
+fn extension_handshake_and_metadata_serving() {
+    let info = Bytes::from(vec![b'x'; 20_000]);
+    let mut h = Harness::new(config());
+    h.t = TorrentState::new(layout(), config()).with_info_bytes(info.clone());
+    h.ev(Event::Start);
+    // Plain peers get no extended messages.
+    assert!(sent(&connect(&mut h, 1, Reserved::new()), 1).is_empty());
+    let fx = connect(&mut h, 2, extended());
+    let (_id, payload) = only_extended(&fx, 2);
+    assert_eq!(_id, 0);
+    let ours = dravity_wire::ExtendedHandshake::decode(&payload).unwrap();
+    assert_eq!(ours.metadata_size, Some(20_000));
+    let our_metadata_id = ours.extension_id("ut_metadata").unwrap();
+    assert!(ours.extension_id("ut_pex").is_some());
+
+    // The peer registers ut_metadata as id 3 and asks for both pieces.
+    h.msg(2, ext_handshake("11:ut_metadatai3e"));
+    let request = |piece| Message::Extended {
+        id: our_metadata_id,
+        payload: MetadataMessage::Request { piece }.encode().unwrap(),
+    };
+    let reply = |fx: &[Effect]| match sent(fx, 2).as_slice() {
+        [Message::Extended { id: 3, payload }] => MetadataMessage::decode(payload).unwrap(),
+        other => panic!("unexpected reply {other:?}"),
+    };
+    assert_eq!(
+        reply(&h.msg(2, request(1))),
+        MetadataMessage::Data {
+            piece: 1,
+            total_size: 20_000,
+            data: info.slice(16_384..),
+        }
+    );
+    assert_eq!(
+        reply(&h.msg(2, request(2))),
+        MetadataMessage::Reject { piece: 2 }
+    );
+    // Without info bytes every request is rejected.
+    let mut bare = Harness::started_with_peer(config());
+    bare.ev(Event::PeerConnected {
+        peer: PeerKey(2),
+        addr: addr(2),
+        reserved: extended(),
+    });
+    bare.msg(2, ext_handshake("11:ut_metadatai3e"));
+    let fx = bare.msg(2, request(0));
+    assert!(matches!(
+        sent(&fx, 2).as_slice(),
+        [Message::Extended { id: 3, .. }]
+    ));
+}
+
+#[test]
+fn pex_adds_peers_and_reports_connections() {
+    let mut c = config();
+    c.max_peers = 10;
+    let mut h = Harness::new(c);
+    h.ev(Event::Start);
+    h.ev(Event::AddPeers {
+        peers: vec![addr(1), addr(2)],
+    });
+    connect(&mut h, 1, extended());
+    connect(&mut h, 2, Reserved::new());
+    h.msg(1, ext_handshake("6:ut_pexi7e"));
+    // Peer 1 tells us about peer 3 (and an already connected peer).
+    let pex = PexMessage {
+        added: vec![
+            PexPeer {
+                addr: addr(3),
+                flags: 0,
+            },
+            PexPeer {
+                addr: addr(2),
+                flags: 0,
+            },
+        ],
+        dropped: vec![],
+    };
+    let fx = h.msg(
+        1,
+        Message::Extended {
+            id: 2,
+            payload: Bytes::from(pex.encode()),
+        },
+    );
+    assert!(fx.contains(&Effect::Connect { addr: addr(3) }));
+    assert!(!fx.contains(&Effect::Connect { addr: addr(2) }));
+
+    // After the PEX interval peer 1 hears about peer 2 (not itself).
+    let fx = h.advance(h.t.config().pex_interval);
+    let (_id, payload) = only_extended(&fx, 1);
+    assert_eq!(_id, 7);
+    let msg = PexMessage::decode(&payload).unwrap();
+    assert_eq!(
+        msg.added.iter().map(|p| p.addr).collect::<Vec<_>>(),
+        [addr(2)]
+    );
+    assert!(msg.dropped.is_empty());
+    // Nothing changed: no message. Then peer 2 drops and is reported.
+    assert!(sent(&h.advance(h.t.config().pex_interval), 1).is_empty());
+    h.ev(Event::PeerDisconnected { peer: PeerKey(2) });
+    h.msg(1, Message::KeepAlive); // stay clear of the peer timeout
+    let fx = h.advance(h.t.config().pex_interval);
+    let (_id, payload) = only_extended(&fx, 1);
+    assert_eq!(PexMessage::decode(&payload).unwrap().dropped, [addr(2)]);
+}
+
+#[test]
+fn pex_disabled_for_private_torrents() {
+    let mut c = config();
+    c.pex = false;
+    let mut h = Harness::new(c);
+    h.ev(Event::Start);
+    let fx = connect(&mut h, 1, extended());
+    let (_id, payload) = only_extended(&fx, 1);
+    let ours = dravity_wire::ExtendedHandshake::decode(&payload).unwrap();
+    assert_eq!(ours.extension_id("ut_pex"), None);
+    h.msg(1, ext_handshake("6:ut_pexi7e"));
+    let pex = PexMessage {
+        added: vec![PexPeer {
+            addr: addr(3),
+            flags: 0,
+        }],
+        dropped: vec![],
+    };
+    let fx = h.msg(
+        1,
+        Message::Extended {
+            id: 2,
+            payload: Bytes::from(pex.encode()),
+        },
+    );
+    assert!(!fx.contains(&Effect::Connect { addr: addr(3) }));
+    let later = sent(&h.advance(Duration::from_secs(120)), 1);
+    assert!(
+        !later.iter().any(|m| matches!(m, Message::Extended { .. })),
+        "{later:?}"
+    );
+}
+
+#[test]
+fn request_window_grows_and_respects_reqq() {
+    // One big piece so the window, not the torrent, limits requests.
+    let big = PieceLayout::new(64 * BLOCK_SIZE, u64::from(64 * BLOCK_SIZE)).unwrap();
+    let mut c = config();
+    c.max_requests_per_peer = 32;
+    c.initial_requests_per_peer = 2;
+    let mut h = Harness::new(c.clone());
+    h.t = TorrentState::new(big, c);
+    h.ev(Event::Start);
+    connect(&mut h, 1, extended());
+    h.msg(1, Message::HaveAll);
+    let first = requests(&h.msg(1, Message::Unchoke), 1);
+    assert_eq!(first.len(), 2);
+    // Slow start: each answered block opens two more slots.
+    let fx = h.msg(1, data_for(first[0]));
+    assert_eq!(requests(&fx, 1).len(), 2);
+    // A peer that accepts only 3 outstanding requests gets no more than that.
+    h.msg(1, ext_handshake("e4:reqqi3"));
+    let fx = h.msg(1, data_for(first[1]));
+    assert_eq!(requests(&fx, 1).len(), 1);
+    assert_eq!(h.t.stats().peers, 1);
+}
+
+#[test]
+fn endgame_requests_twice_and_cancels_the_loser() {
+    let mut c = config();
+    c.max_requests_per_peer = 100;
+    c.initial_requests_per_peer = 100;
+    let mut h = Harness::started_with_peer(c);
+    connect(&mut h, 2, Reserved::new());
+    h.msg(1, Message::HaveAll);
+    h.msg(2, Message::HaveAll);
+    let all = requests(&h.msg(1, Message::Unchoke), 1);
+    assert_eq!(all.len(), 6);
+    // Everything is requested: peer 2 duplicates the in-flight blocks.
+    let dup = requests(&h.msg(2, Message::Unchoke), 2);
+    assert_eq!(dup, all);
+    // Peer 2 wins the first block: peer 1 gets a cancel for it.
+    let fx = h.msg(2, data_for(all[0]));
+    assert!(fx.iter().any(|e| matches!(e, Effect::WriteBlock { .. })));
+    assert!(sent(&fx, 1).contains(&Message::Cancel(all[0])));
+    // The late copy from peer 1 is not written again.
+    let fx = h.msg(1, data_for(all[0]));
+    assert!(!fx.iter().any(|e| matches!(e, Effect::WriteBlock { .. })));
+    // Peer 1 choking us leaves the blocks with peer 2: nothing new is asked.
+    let fx = h.msg(1, Message::Choke);
+    assert!(requests(&fx, 2).is_empty());
+}
+
+#[test]
+fn idle_peers_steal_blocks_from_slow_peers() {
+    let mut c = config();
+    c.max_requests_per_peer = 100;
+    c.initial_requests_per_peer = 100;
+    c.endgame = false;
+    c.steal_after = Duration::from_secs(5);
+    let mut h = Harness::started_with_peer(c);
+    connect(&mut h, 2, Reserved::new());
+    h.msg(1, Message::HaveAll);
+    h.msg(2, Message::HaveAll);
+    let slow = requests(&h.msg(1, Message::Unchoke), 1);
+    assert!(requests(&h.msg(2, Message::Unchoke), 2).is_empty());
+    let stolen = requests(&h.advance(Duration::from_secs(5)), 2);
+    assert_eq!(stolen, slow);
+    assert!(requests(&h.advance(Duration::from_secs(1)), 2).is_empty());
+}
+
+#[test]
+fn download_rate_limit_paces_requests() {
+    let mut c = config();
+    c.download_rate_limit = Some(u64::from(BLOCK_SIZE));
+    let mut h = Harness::started_with_peer(c);
+    h.msg(1, Message::HaveAll);
+    let first = requests(&h.msg(1, Message::Unchoke), 1);
+    assert_eq!(first.len(), 1, "one block per second");
+    assert!(requests(&h.msg(1, data_for(first[0])), 1).is_empty());
+    assert!(requests(&h.advance(Duration::from_millis(500)), 1).is_empty());
+    assert_eq!(requests(&h.advance(Duration::from_millis(500)), 1).len(), 1);
+}
+
+#[test]
+fn dht_lookups_are_scheduled() {
+    let mut c = config();
+    c.dht = true;
+    let mut h = Harness::new(c);
+    let fx = h.ev(Event::Start);
+    assert!(fx.contains(&Effect::DhtLookup));
+    // Only one lookup in flight.
+    assert!(
+        !h.advance(Duration::from_secs(1))
+            .contains(&Effect::DhtLookup)
+    );
+    let fx = h.ev(Event::DhtPeers {
+        peers: vec![addr(9)],
+    });
+    assert!(fx.contains(&Effect::Connect { addr: addr(9) }));
+    let interval = h.t.config().dht_interval;
+    assert!(!h.advance(interval / 2).contains(&Effect::DhtLookup));
+    assert!(h.advance(interval / 2).contains(&Effect::DhtLookup));
+    // Disabled by default.
+    let mut h = Harness::new(config());
+    assert!(!h.ev(Event::Start).contains(&Effect::DhtLookup));
+}
+
+#[test]
+fn peers_handed_over_while_checking_start_after_the_check() {
+    let mut c = config();
+    c.check_existing = true;
+    c.check_concurrency = 3;
+    let mut h = Harness::new(c);
+    h.t = TorrentState::new(layout(), h.t.config().clone()).with_started_announced(true);
+    h.ev(Event::Start);
+    assert_eq!(h.t.status(), TorrentStatus::Checking);
+    let fx = connect(&mut h, 1, Reserved::new());
+    assert!(!disconnects(&fx, 1));
+    assert!(
+        h.msg(1, Message::HaveAll).is_empty(),
+        "no interest while checking"
+    );
+    h.ev(Event::PieceHashed { piece: 0, ok: true });
+    h.ev(Event::PieceHashed {
+        piece: 1,
+        ok: false,
+    });
+    let fx = h.ev(Event::PieceHashed {
+        piece: 2,
+        ok: false,
+    });
+    let to_peer = sent(&fx, 1);
+    assert!(
+        matches!(to_peer.first(), Some(Message::Bitfield(_))),
+        "{to_peer:?}"
+    );
+    assert!(to_peer.contains(&Message::Interested));
+    // `started` was sent by the metadata fetch.
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        Effect::Announce {
+            event: AnnounceEvent::None,
+            ..
+        }
+    )));
+}
+
 fn arb_message() -> impl Strategy<Value = Message> {
     prop_oneof![
         Just(Message::KeepAlive),
@@ -696,6 +1028,17 @@ fn arb_message() -> impl Strategy<Value = Message> {
             piece,
             offset: block * BLOCK_SIZE,
             data: Bytes::from(vec![0; (BLOCK_SIZE - extra) as usize]),
+        }),
+        Just(ext_handshake("11:ut_metadatai3e6:ut_pexi4ee4:reqqi2")),
+        (0u8..4, proptest::collection::vec(any::<u8>(), 0..40)).prop_map(|(id, b)| {
+            Message::Extended {
+                id,
+                payload: Bytes::from(b),
+            }
+        }),
+        (0u32..2).prop_map(|piece| Message::Extended {
+            id: 1,
+            payload: MetadataMessage::Request { piece }.encode().unwrap(),
         }),
     ]
 }
@@ -724,12 +1067,20 @@ fn arb_step() -> impl Strategy<Value = Step> {
 proptest! {
     #[test]
     fn arbitrary_event_sequences_keep_invariants(steps in proptest::collection::vec(arb_step(), 0..200)) {
-        let mut h = Harness::new(config());
+        let mut c = config();
+        c.steal_after = Duration::from_secs(3);
+        let mut h = Harness::new(c);
+        h.t = TorrentState::new(layout(), h.t.config().clone())
+            .with_info_bytes(Bytes::from(vec![1u8; 20_000]));
         h.ev(Event::Start);
         for step in steps {
             let fx = match step {
                 Step::Msg(p, m) => h.msg(p, m),
-                Step::Connect(p) => h.ev(Event::PeerConnected { peer: PeerKey(p), addr: addr(p as u16) }),
+                Step::Connect(p) => h.ev(Event::PeerConnected {
+                    peer: PeerKey(p),
+                    addr: addr(p as u16),
+                    reserved: Reserved::new().with_extension_protocol(p % 2 == 1),
+                }),
                 Step::Disconnect(p) => h.ev(Event::PeerDisconnected { peer: PeerKey(p) }),
                 Step::Tick(s) => h.advance(Duration::from_secs(s)),
                 Step::Written(piece, b) => {
@@ -738,10 +1089,12 @@ proptest! {
                 }
                 Step::Hashed(piece, ok) => h.ev(Event::PieceHashed { piece, ok }),
             };
+            let mut asked = std::collections::HashSet::new();
             for e in &fx {
                 if let Effect::Send { peer, message: Message::Request(r) } = e {
                     prop_assert!(layout().is_valid_request(block(*r)));
                     prop_assert!((1..4).contains(&peer.0));
+                    prop_assert!(asked.insert((*peer, *r)), "block requested twice from one peer");
                 }
             }
             let s = h.t.stats();

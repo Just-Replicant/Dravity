@@ -11,6 +11,10 @@
 //! Partially downloaded pieces are always finished before new pieces are
 //! started, which keeps the number of partial pieces (and wasted memory and
 //! re-requests) low.
+//!
+//! Once every wanted block is requested, [`Picker::requested_blocks`] lists
+//! blocks that are in flight so the engine can request them from a second
+//! peer (endgame mode and stealing from slow peers).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,14 +36,18 @@ enum BlockState {
 struct Partial {
     blocks: Vec<BlockState>,
     written: usize,
+    /// Blocks in [`BlockState::Missing`].
+    missing: usize,
     hashing: bool,
 }
 
 impl Partial {
     fn new(blocks: u32) -> Self {
+        let n = usize::try_from(blocks).unwrap_or(0);
         Self {
-            blocks: vec![BlockState::Missing; usize::try_from(blocks).unwrap_or(0)],
+            blocks: vec![BlockState::Missing; n],
             written: 0,
+            missing: n,
             hashing: false,
         }
     }
@@ -47,7 +55,25 @@ impl Partial {
     fn reset(&mut self) {
         self.blocks.fill(BlockState::Missing);
         self.written = 0;
+        self.missing = self.blocks.len();
         self.hashing = false;
+    }
+
+    /// Moves block `idx` from `from` to `to`; returns whether it was in `from`.
+    fn transition(&mut self, idx: usize, from: BlockState, to: BlockState) -> bool {
+        match self.blocks.get_mut(idx) {
+            Some(s) if *s == from => {
+                *s = to;
+                if from == BlockState::Missing {
+                    self.missing -= 1;
+                }
+                if to == BlockState::Missing {
+                    self.missing += 1;
+                }
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -177,6 +203,32 @@ impl Picker {
         pieces.has_any_missing_from(&self.have)
     }
 
+    /// Whether some wanted block is neither requested nor received: a new
+    /// piece can be started or a partial piece has a missing block. When
+    /// this is `false` the download is in its endgame.
+    #[must_use]
+    pub fn has_unrequested(&self) -> bool {
+        !self.queue.is_empty() || self.partial.values().any(|p| !p.hashing && p.missing > 0)
+    }
+
+    /// Blocks that are requested but not yet received, in pieces the peer
+    /// with `pieces` has. Used to request them again from another peer.
+    pub fn requested_blocks<'a>(
+        &'a self,
+        pieces: &'a Bitfield,
+    ) -> impl Iterator<Item = BlockRef> + 'a {
+        self.partial
+            .iter()
+            .filter(|(index, p)| !p.hashing && pieces.get(**index))
+            .flat_map(move |(&index, p)| {
+                p.blocks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| **s == BlockState::Requested)
+                    .filter_map(move |(b, _)| self.layout.block(index, u32::try_from(b).ok()?))
+            })
+    }
+
     /// Picks the next block to request from a peer with `pieces`, marking it
     /// requested. Unfinished pieces come first, then the rarest new piece the
     /// peer has (ties broken by lowest index).
@@ -194,17 +246,16 @@ impl Picker {
 
     fn pick_from_partial(&mut self, pieces: &Bitfield) -> Option<BlockRef> {
         for (&index, partial) in &mut self.partial {
-            if partial.hashing || !pieces.get(index) {
+            if partial.hashing || partial.missing == 0 || !pieces.get(index) {
                 continue;
             }
-            if let Some((b, state)) = partial
+            if let Some(b) = partial
                 .blocks
-                .iter_mut()
-                .enumerate()
-                .find(|(_, s)| **s == BlockState::Missing)
+                .iter()
+                .position(|s| *s == BlockState::Missing)
             {
                 let block = self.layout.block(index, u32::try_from(b).ok()?)?;
-                *state = BlockState::Requested;
+                partial.transition(b, BlockState::Missing, BlockState::Requested);
                 return Some(block);
             }
         }
@@ -230,11 +281,7 @@ impl Picker {
     /// the request timed out). No-op if the block was already received.
     pub fn release(&mut self, block: BlockRef) {
         if let Some((partial, idx)) = self.block_state(block) {
-            if let Some(s) = partial.blocks.get_mut(idx) {
-                if *s == BlockState::Requested {
-                    *s = BlockState::Missing;
-                }
-            }
+            partial.transition(idx, BlockState::Requested, BlockState::Missing);
         }
     }
 
@@ -244,12 +291,12 @@ impl Picker {
         let Some((partial, idx)) = self.block_state(block) else {
             return Received::Ignored;
         };
-        match partial.blocks.get_mut(idx) {
-            Some(s @ (BlockState::Missing | BlockState::Requested)) => {
-                *s = BlockState::Received;
-                Received::Accepted
-            }
-            _ => Received::Ignored,
+        if partial.transition(idx, BlockState::Requested, BlockState::Received)
+            || partial.transition(idx, BlockState::Missing, BlockState::Received)
+        {
+            Received::Accepted
+        } else {
+            Received::Ignored
         }
     }
 
@@ -257,11 +304,9 @@ impl Picker {
     /// the piece is now complete and should be hashed.
     pub fn block_written(&mut self, block: BlockRef) -> Option<u32> {
         let (partial, idx) = self.block_state(block)?;
-        let s = partial.blocks.get_mut(idx)?;
-        if *s != BlockState::Received {
+        if !partial.transition(idx, BlockState::Received, BlockState::Written) {
             return None;
         }
-        *s = BlockState::Written;
         partial.written += 1;
         if partial.written == partial.blocks.len() && !partial.hashing {
             partial.hashing = true;
@@ -273,11 +318,7 @@ impl Picker {
     /// Records that writing `block` failed; it will be downloaded again.
     pub fn block_write_failed(&mut self, block: BlockRef) {
         if let Some((partial, idx)) = self.block_state(block) {
-            if let Some(s) = partial.blocks.get_mut(idx) {
-                if *s == BlockState::Received {
-                    *s = BlockState::Missing;
-                }
-            }
+            partial.transition(idx, BlockState::Received, BlockState::Missing);
         }
     }
 
@@ -393,6 +434,25 @@ mod tests {
         p.block_received(a);
         p.block_write_failed(a);
         assert_eq!(p.pick(&all), Some(a));
+    }
+
+    #[test]
+    fn endgame_lists_requested_blocks() {
+        let mut p = Picker::new(layout(2, 2 * BLOCK_SIZE), Bitfield::new(2));
+        let all = Bitfield::full(2);
+        let mut only_1 = Bitfield::new(2);
+        only_1.set(1);
+        p.add_peer_pieces(&all);
+        let picked: Vec<BlockRef> = std::iter::from_fn(|| p.pick(&all)).collect();
+        assert_eq!(picked.len(), 4);
+        assert!(!p.has_unrequested());
+        assert_eq!(p.requested_blocks(&all).collect::<Vec<_>>(), picked);
+        assert_eq!(p.requested_blocks(&only_1).count(), 2);
+        p.block_received(picked[0]);
+        assert_eq!(p.requested_blocks(&all).count(), 3);
+        p.release(picked[1]);
+        assert!(p.has_unrequested());
+        assert_eq!(p.pick(&all), Some(picked[1]));
     }
 
     #[test]

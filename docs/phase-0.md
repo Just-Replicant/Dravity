@@ -43,6 +43,7 @@ clippy and tests.
 | Symlink-safe file opening (`O_NOFOLLOW`, dir fds), Windows reserved names (`CON`, `NUL`…) and case-collision handling | 1 (storage) / 3 (path hardening) |
 | Applying `check_bitfield` when the engine learns the piece count | 1 (engine) |
 | `tokio_util::codec` adapter for the wire decoder | 1 (session) |
+| Session driver: one owner task per torrent polls I/O, calls `update`, dispatches effects. Apps never write that loop | 1 (session) |
 | BEP 9/10 `ut_metadata` exchange (the extended handshake itself is parsed) | 2 |
 | BEP 6 fast-extension *behavior* (suggest, allowed-fast, reject); the messages are already decoded | 3 |
 | BEP 19 `url-list` web seeds in metainfo | 5 |

@@ -93,6 +93,12 @@ session.shutdown().await;
 
 Requires Rust **1.85+** (edition 2024). `rust-toolchain.toml` selects stable.
 
+Point `origin` at this repository over SSH:
+
+```sh
+git remote set-url origin git@github.com:Just-Replicant/Dravity.git
+```
+
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings

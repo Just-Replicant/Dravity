@@ -381,6 +381,39 @@ impl Message {
         })
     }
 }
+
+/// Reads one bit. Bit 0 is the high bit of the first byte.
+#[must_use]
+pub fn bitfield_bit(bitfield: &[u8], index: u32) -> Option<bool> {
+    let index = usize::try_from(index).ok()?;
+    let byte = *bitfield.get(index / 8)?;
+    let shift = 7 - (index % 8);
+    Some((byte >> shift) & 1 == 1)
+}
+
+/// Checks that `bitfield` is `ceil(piece_count / 8)` bytes and that spare bits are clear.
+///
+/// # Errors
+/// [`WireError::BadBitfield`] when the length or the unused low bits are wrong.
+/// A torrent with no pieces requires an empty bitfield.
+pub fn check_bitfield(bitfield: &[u8], piece_count: u32) -> Result<(), WireError> {
+    let need = usize::try_from(piece_count.div_ceil(8)).unwrap_or(usize::MAX);
+    if bitfield.len() != need {
+        return Err(WireError::BadBitfield);
+    }
+    let spare = piece_count % 8;
+    if spare != 0 {
+        let mask = (1_u8 << (8 - spare)).wrapping_sub(1);
+        let Some(last) = bitfield.last().copied() else {
+            return Err(WireError::BadBitfield);
+        };
+        if last & mask != 0 {
+            return Err(WireError::BadBitfield);
+        }
+    }
+    Ok(())
+}
+
 /// Streaming decoder for length-prefixed messages.
 ///
 /// Feed received bytes into a [`BytesMut`] and call [`decode`](Self::decode)
@@ -608,6 +641,23 @@ mod tests {
     }
 
     #[test]
+    fn bitfield_matches_piece_count() {
+        assert!(check_bitfield(&[], 0).is_ok());
+        assert_eq!(check_bitfield(&[0], 0), Err(WireError::BadBitfield));
+        assert!(check_bitfield(&[0x80], 1).is_ok());
+        assert_eq!(check_bitfield(&[0x81], 1), Err(WireError::BadBitfield));
+        assert!(check_bitfield(&[0xff], 8).is_ok());
+        assert!(check_bitfield(&[0xff, 0x80], 9).is_ok());
+        assert_eq!(
+            check_bitfield(&[0xff, 0x40], 9),
+            Err(WireError::BadBitfield)
+        );
+        assert_eq!(bitfield_bit(&[0x80], 0), Some(true));
+        assert_eq!(bitfield_bit(&[0x80], 1), Some(false));
+        assert_eq!(bitfield_bit(&[0x80], 8), None);
+    }
+
+    #[test]
     fn message_id_roundtrip() {
         for id in 0u8..=255 {
             if let Ok(known) = MessageId::try_from(id) {
@@ -616,4 +666,3 @@ mod tests {
         }
     }
 }
-

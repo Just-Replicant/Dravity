@@ -296,8 +296,12 @@ async fn recovers_from_corrupt_piece_with_explicit_peer() {
     ));
     let seen = until_finished(&mut alerts, handle.info_hash()).await;
     assert!(seen.contains(&Alert::HashFailed { piece: 0 }), "{seen:?}");
-    // Without trackers the announce fails but the download still works.
-    assert!(seen.iter().any(|a| matches!(a, Alert::TrackerError { .. })));
+    // A torrent with no trackers still downloads from the explicit peer,
+    // and does not report a tracker error.
+    assert!(
+        !seen.iter().any(|a| matches!(a, Alert::TrackerError { .. })),
+        "{seen:?}"
+    );
     handle.stop().await;
     assert_files(dir.path(), &content, len_a);
 }

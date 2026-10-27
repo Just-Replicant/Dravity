@@ -6,16 +6,20 @@ Thanks for helping! A few rules keep the codebase consistent with the
 ## Ground rules
 
 1. **Sans-IO libraries.** `dravity-bencode`, `dravity-core`, `dravity-wire`,
-   and later `dravity-engine` never perform I/O or spawn tasks.
-   `dravity-session` (Phase 1+) owns the only production loop: poll I/O →
+   `dravity-engine` and the `dravity-tracker` codecs never perform I/O, spawn
+   tasks, or read the clock (the engine takes `now` as an argument).
+   `dravity-session` owns the only production loop: poll I/O →
    `update(Event)` → dispatch `Effect`s. Binaries send session commands and
    read alerts; they never write that loop.
-2. **Errors:** `thiserror` enums in libraries; `anyhow` only in binaries.
-3. **No `unsafe`.** The workspace forbids it. If a future backend (e.g.
+2. **Bounded queues.** Every channel is bounded. The torrent owner task must
+   never `await` a send that its own loop has to drain; use `try_send` or a
+   spawned task.
+3. **Errors:** `thiserror` enums in libraries; `anyhow` only in binaries.
+4. **No `unsafe`.** The workspace forbids it. If a future backend (e.g.
    io_uring) truly needs it, isolate it in its own crate with a justification.
-4. **Untrusted input never panics.** Every parser gets a cargo-fuzz target and
+5. **Untrusted input never panics.** Every parser gets a cargo-fuzz target and
    property tests from day one. Use `get()`/checked arithmetic, not indexing.
-5. **Paths from metainfo are hostile.** Go through `dravity_core::path`.
+6. **Paths from metainfo are hostile.** Go through `dravity_core::path`.
 
 ## Before opening a PR
 

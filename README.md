@@ -12,17 +12,17 @@ for the full architecture, comparison with existing clients, and roadmap.
 
 | Crate | Status | What it does |
 |---|---|---|
-| [`dravity-bencode`](crates/dravity-bencode) | ✅ Phase 0 | Zero-copy bencode `Value`, serde `Deserializer`/`Serializer`, `RawValue` for exact byte capture |
+| [`dravity-bencode`](crates/dravity-bencode) | ✅ Phase 0 | Zero-copy bencode `Value`, serde `Deserializer`/`Serializer`, `RawValue` for exact byte capture, depth and item caps |
 | [`dravity-core`](crates/dravity-core) | ✅ Phase 0 | `InfoHash` (v1, v2 type), `PeerId`, `.torrent` parsing (`Metainfo`), magnet links, piece/block/file math, path-safety checks |
-| [`dravity-wire`](crates/dravity-wire) | ✅ Phase 0 | Handshake + reserved bits, BEP 3 messages (+ BEP 5 `port`), streaming zero-copy decoder |
+| [`dravity-wire`](crates/dravity-wire) | ✅ Phase 0 | Handshake + reserved bits, BEP 3/5/6 messages, BEP 10 extended handshake, streaming zero-copy decoder |
 | `dravity-engine`, `-storage`, `-tracker`, `-session`, `-cli`, … | ⏳ Phase 1+ | See the roadmap |
 
 ## Phase 0 checklist
 
 - [x] Cargo workspace with shared package metadata, dependencies and lints (`unsafe_code = "forbid"`)
-- [x] `dravity-bencode`: canonical, depth-limited, zero-copy decoding; canonical (sorted) encoding; serde both ways
+- [x] `dravity-bencode`: canonical, depth- and item-limited, zero-copy decoding; canonical (sorted) encoding; serde both ways
 - [x] `dravity-core`: v1 info-hash over the *original* `info` bytes; metainfo validation; magnets (`btih` hex/base32, `btmh`); piece math; rejection of `..`, absolute, drive-prefixed and separator-containing paths
-- [x] `dravity-wire`: handshake and BEP 3 codec, structured for BEP 6/10
+- [x] `dravity-wire`: handshake, BEP 3/5/6 messages, BEP 10 extended handshake, bitfield check
 - [x] Unit tests, proptest roundtrips, generated metainfo fixtures
 - [x] cargo-fuzz targets for every parser plus roundtrips (`fuzz/`)
 - [x] CI: fmt, clippy `-D warnings`, tests on Linux/macOS/Windows, MSRV, docs, cargo-deny, fuzz build + smoke run

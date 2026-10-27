@@ -1,6 +1,6 @@
 [package]
 name = "dravity-wire"
-description = "Sans-IO BitTorrent peer wire protocol (handshake and BEP 3 messages) for Dravity"
+description = "Sans-IO BitTorrent peer wire protocol (handshake, BEP 3, BEP 6, and BEP 10) for Dravity"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,7 @@ publish.workspace = true
 
 [dependencies]
 bytes.workspace = true
+dravity-bencode.workspace = true
 dravity-core.workspace = true
 thiserror.workspace = true
 

@@ -6,8 +6,9 @@
 //! * [`RawValue`] — captures the exact bytes of a sub-value (used for info-hashes).
 //!
 //! Decoding is hardened for untrusted input: integers and length prefixes must
-//! be canonical, nesting depth is bounded, duplicate keys and trailing data are
-//! rejected, and no input can cause a panic (this is continuously fuzzed).
+//! be canonical, nesting depth and container size are bounded, duplicate keys
+//! and trailing data are rejected, and no input can cause a panic (this is
+//! continuously fuzzed).
 //! Encoding is always canonical (sorted dictionary keys).
 //!
 //! ```
@@ -39,7 +40,7 @@ mod value;
 
 pub use de::{Deserializer, from_bytes, from_bytes_with};
 pub use error::{Error, Result};
-pub use parser::{DEFAULT_MAX_DEPTH, DecodeOptions};
+pub use parser::{DEFAULT_MAX_DEPTH, DEFAULT_MAX_ITEMS, DecodeOptions};
 pub use raw::RawValue;
 pub use ser::{Serializer, to_vec};
 pub use value::{Dict, Value};

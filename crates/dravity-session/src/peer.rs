@@ -50,6 +50,14 @@ pub(crate) enum HandshakeError {
     Io(#[from] std::io::Error),
 }
 
+impl HandshakeError {
+    /// Transient failures are dialed again. A peer that is the wrong torrent,
+    /// ourselves, or speaking garbage is not.
+    pub(crate) fn retryable(&self) -> bool {
+        matches!(self, Self::Timeout | Self::Eof | Self::Io(_))
+    }
+}
+
 /// Writes our handshake and reads the peer's. Returns the peer's handshake
 /// and any bytes that arrived after it.
 pub(crate) async fn handshake<S>(
@@ -104,12 +112,24 @@ pub(crate) async fn run(
         Ok(Ok(ok)) => ok,
         Ok(Err(e)) => {
             tracing::debug!(%addr, error = %e, "peer connection failed");
-            let _ = events.send(Input::ConnectFailed { key, addr }).await;
+            let _ = events
+                .send(Input::ConnectFailed {
+                    key,
+                    addr,
+                    retry: e.retryable(),
+                })
+                .await;
             return;
         }
         Err(_) => {
             tracing::debug!(%addr, error = %HandshakeError::Timeout, "peer connection failed");
-            let _ = events.send(Input::ConnectFailed { key, addr }).await;
+            let _ = events
+                .send(Input::ConnectFailed {
+                    key,
+                    addr,
+                    retry: true,
+                })
+                .await;
             return;
         }
     };
@@ -195,6 +215,16 @@ mod tests {
         let (mut a, b) = tokio::io::duplex(1024);
         drop(b);
         assert!(handshake(&mut a, hash, ours).await.is_err());
+    }
+
+    #[test]
+    fn only_transient_handshake_errors_are_retried() {
+        assert!(HandshakeError::Timeout.retryable());
+        assert!(HandshakeError::Eof.retryable());
+        assert!(HandshakeError::Io(std::io::Error::other("reset")).retryable());
+        assert!(!HandshakeError::WrongInfoHash.retryable());
+        assert!(!HandshakeError::SelfConnection.retryable());
+        assert!(!HandshakeError::Wire(dravity_wire::WireError::InvalidProtocol).retryable());
     }
 
     /// Regression: a message sent in the same segment as the handshake must

@@ -23,12 +23,14 @@ dravity-engine = { path = "crates/dravity-engine", version = "0.1.0" }
 dravity-storage = { path = "crates/dravity-storage", version = "0.1.0" }
 dravity-tracker = { path = "crates/dravity-tracker", version = "0.1.0" }
 dravity-session = { path = "crates/dravity-session", version = "0.1.0" }
+dravity-dht = { path = "crates/dravity-dht", version = "0.1.0" }
 
 # External crates
 anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 fastrand = "2"
+mainline = { version = "8", default-features = false, features = ["async"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

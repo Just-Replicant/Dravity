@@ -19,6 +19,7 @@ publish = false
 dravity-bencode = { path = "crates/dravity-bencode", version = "0.1.0" }
 dravity-core = { path = "crates/dravity-core", version = "0.1.0" }
 dravity-wire = { path = "crates/dravity-wire", version = "0.1.0" }
+dravity-engine = { path = "crates/dravity-engine", version = "0.1.0" }
 
 # External crates
 bytes = "1"

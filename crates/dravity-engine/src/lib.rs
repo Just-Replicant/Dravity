@@ -11,7 +11,10 @@
 //! directly.
 //!
 //! Phase 1 scope: downloading only. Peers are never unchoked, so the engine
-//! does not serve uploads yet (seeding and tit-for-tat are Phase 3).
+//! does not serve uploads yet (seeding and tit-for-tat are Phase 3). A peer
+//! that drops is dialed again after [`Config::peer_retry`]; a `bitfield` is
+//! still accepted when it follows a keep-alive, DHT `port`, or BEP 10
+//! extended handshake.
 
 mod bitfield;
 pub mod picker;

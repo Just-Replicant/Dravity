@@ -43,6 +43,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 url = "2"
 
 # Dev-only
+# 0.8 needs Rust 1.86; keep within the MSRV.
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 proptest = "1"
 tempfile = "3"
 

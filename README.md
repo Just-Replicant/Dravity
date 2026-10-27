@@ -1,7 +1,9 @@
 # Dravity
 
-A portable BitTorrent engine in Rust, built around a **sans-IO core** with a
-Tokio runtime at the edge. See [`docs/rust-torrent-plan.md`](docs/rust-torrent-plan.md)
+A portable BitTorrent engine in Rust, built around a **sans-IO core**.
+`dravity-session` (Phase 1) is the only I/O driver: poll → `update` →
+dispatch effects. CLI and HTTP send commands and read alerts. Tokio is the
+default runtime. See [`docs/rust-torrent-plan.md`](docs/rust-torrent-plan.md)
 for the full architecture, comparison with existing clients, and roadmap.
 
 > **Status: Phase 0 (Foundations) complete.** The parsing and protocol crates
@@ -61,13 +63,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions.
 
 ## License
 
-Licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
-dual licensed as above, without any additional terms or conditions.
+Licensed under the GNU Affero General Public License, version 3.0 or later.
+See [LICENSE](LICENSE).

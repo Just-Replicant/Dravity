@@ -152,6 +152,65 @@ async fn udp_retries_then_times_out() {
     assert_eq!(attempts, 2);
 }
 
+/// A UDP tracker that answers every packet, counting connects; announces
+/// with a connection id other than the latest one get an error response.
+async fn counting_udp_tracker() -> (
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicU32>,
+    tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("udp://{}", server.local_addr().unwrap());
+    let connects = Arc::new(AtomicU32::new(0));
+    let counter = Arc::clone(&connects);
+    let (rotate, mut rotations) = tokio::sync::mpsc::unbounded_channel::<()>();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        let mut current = 1000u64;
+        loop {
+            let (n, from) = server.recv_from(&mut buf).await.unwrap();
+            while rotations.try_recv().is_ok() {
+                current += 1;
+            }
+            let tid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+            let reply = if n == 16 {
+                counter.fetch_add(1, Ordering::SeqCst);
+                udp::encode_connect_response(tid, current).to_vec()
+            } else if u64::from_be_bytes(buf[..8].try_into().unwrap()) == current {
+                udp::encode_announce_response(tid, 600, 1, 1, &[])
+            } else {
+                let mut err = 3u32.to_be_bytes().to_vec();
+                err.extend_from_slice(&tid.to_be_bytes());
+                err.extend_from_slice(b"bad connection id");
+                err
+            };
+            server.send_to(&reply, from).await.unwrap();
+        }
+    });
+    (url, connects, rotate)
+}
+
+#[tokio::test]
+async fn udp_connection_ids_are_cached_and_refreshed() {
+    use std::sync::atomic::Ordering;
+    let (url, connects, rotate) = counting_udp_tracker().await;
+    let c = client();
+    c.announce(&url, &request()).await.unwrap();
+    c.clone().announce(&url, &request()).await.unwrap();
+    assert_eq!(connects.load(Ordering::SeqCst), 1, "id reused by clones");
+    // The tracker forgets the id: one failed announce, one reconnect.
+    rotate.send(()).unwrap();
+    c.announce(&url, &request()).await.unwrap();
+    assert_eq!(connects.load(Ordering::SeqCst), 2);
+    c.announce(&url, &request()).await.unwrap();
+    assert_eq!(connects.load(Ordering::SeqCst), 2);
+    // A different client has its own cache.
+    client().announce(&url, &request()).await.unwrap();
+    assert_eq!(connects.load(Ordering::SeqCst), 3);
+}
+
 #[tokio::test]
 async fn rejects_bad_urls() {
     let c = client();

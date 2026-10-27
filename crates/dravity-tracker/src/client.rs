@@ -1,7 +1,9 @@
 //! Async announce over HTTP(S) and UDP.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use rustls_platform_verifier::BuilderVerifierExt;
 use tokio::net::UdpSocket;
@@ -36,15 +38,25 @@ impl Default for ClientConfig {
     }
 }
 
+/// How long a UDP connection id may be reused (BEP 15: one minute).
+pub const UDP_CONNECTION_TTL: Duration = Duration::from_secs(60);
+
+/// Most cached UDP connection ids; the oldest are dropped beyond this.
+const MAX_CACHED_CONNECTIONS: usize = 256;
+
 /// Announces to HTTP, HTTPS and UDP trackers.
 ///
 /// HTTPS uses rustls with the `ring` provider and the operating system's
-/// certificate verifier. A UDP announce performs a fresh `connect` each
-/// time (connection ids are not cached yet).
+/// certificate verifier. UDP connection ids are cached per tracker address
+/// for [`UDP_CONNECTION_TTL`]; clones of a client share the cache. If an
+/// announce with a cached id fails (stale id, error response or no answer
+/// to a single attempt) the id is dropped and the announce is retried once
+/// with a fresh `connect`.
 #[derive(Debug, Clone)]
 pub struct TrackerClient {
     http: reqwest::Client,
     config: ClientConfig,
+    connections: Arc<Mutex<HashMap<SocketAddr, (u64, Instant)>>>,
 }
 
 impl TrackerClient {
@@ -65,7 +77,11 @@ impl TrackerClient {
             .timeout(config.http_timeout)
             .user_agent(config.user_agent.clone())
             .build()?;
-        Ok(Self { http, config })
+        Ok(Self {
+            http,
+            config,
+            connections: Arc::default(),
+        })
     }
 
     /// The client configuration.
@@ -135,17 +151,77 @@ impl TrackerClient {
         let socket = UdpSocket::bind(bind).await?;
         socket.connect(addr).await?;
 
+        if let Some(connection_id) = self.cached_connection(addr) {
+            match self
+                .udp_announce_with(&socket, addr, connection_id, req, 0)
+                .await
+            {
+                Err(TrackerError::Io(e)) => return Err(TrackerError::Io(e)),
+                Err(_) => self.forget_connection(addr),
+                ok => return ok,
+            }
+        }
+
         let tid = fastrand::u32(..);
         let packet = udp::connect_request(tid);
         let connection_id = self
-            .exchange(&socket, &packet, |p| udp::parse_connect_response(p, tid))
+            .exchange(&socket, &packet, self.config.udp_retries, |p| {
+                udp::parse_connect_response(p, tid)
+            })
             .await?;
+        self.remember_connection(addr, connection_id);
+        self.udp_announce_with(&socket, addr, connection_id, req, self.config.udp_retries)
+            .await
+    }
+
+    async fn udp_announce_with(
+        &self,
+        socket: &UdpSocket,
+        addr: SocketAddr,
+        connection_id: u64,
+        req: &AnnounceRequest,
+        retries: u32,
+    ) -> Result<AnnounceResponse, TrackerError> {
         let tid = fastrand::u32(..);
         let packet = udp::announce_request(connection_id, tid, req);
-        self.exchange(&socket, &packet, |p| {
+        self.exchange(socket, &packet, retries, |p| {
             udp::parse_announce_response(p, tid, addr.is_ipv6())
         })
         .await
+    }
+
+    fn lock_connections(&self) -> std::sync::MutexGuard<'_, HashMap<SocketAddr, (u64, Instant)>> {
+        self.connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn cached_connection(&self, addr: SocketAddr) -> Option<u64> {
+        let mut cache = self.lock_connections();
+        match cache.get(&addr) {
+            Some(&(id, at)) if at.elapsed() < UDP_CONNECTION_TTL => Some(id),
+            Some(_) => {
+                cache.remove(&addr);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn remember_connection(&self, addr: SocketAddr, id: u64) {
+        let mut cache = self.lock_connections();
+        cache.retain(|_, (_, at)| at.elapsed() < UDP_CONNECTION_TTL);
+        while cache.len() >= MAX_CACHED_CONNECTIONS {
+            let Some(oldest) = cache.iter().min_by_key(|(_, (_, at))| *at).map(|(a, _)| *a) else {
+                break;
+            };
+            cache.remove(&oldest);
+        }
+        cache.insert(addr, (id, Instant::now()));
+    }
+
+    fn forget_connection(&self, addr: SocketAddr) {
+        self.lock_connections().remove(&addr);
     }
 
     /// Sends `packet` and waits for a response `parse` accepts, retrying with
@@ -155,11 +231,12 @@ impl TrackerClient {
         &self,
         socket: &UdpSocket,
         packet: &[u8],
+        retries: u32,
         parse: impl Fn(&[u8]) -> Result<T, TrackerError>,
     ) -> Result<T, TrackerError> {
         let mut buf = vec![0u8; udp::MAX_PACKET_LEN];
         let mut timeout = self.config.udp_timeout;
-        for _ in 0..=self.config.udp_retries {
+        for _ in 0..=retries {
             socket.send(packet).await?;
             let deadline = tokio::time::Instant::now() + timeout;
             loop {

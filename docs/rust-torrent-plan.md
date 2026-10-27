@@ -31,7 +31,7 @@ Source-level comparison of **rqbit**, **Superseedr**, **cratetorrent**, and **Vo
 | Vortex | Performance-focused I/O path and choking |
 | cratetorrent | Smallest readable design (stale) |
 
-License stance: **Apache-2.0 or MIT/Apache dual** for Dravity. Superseedr is GPL-3.0 — take *ideas* only, never copy code.
+License stance: **AGPL-3.0-or-later** for Dravity. Superseedr is GPL-3.0 — take *ideas* only, never copy code.
 
 ---
 
@@ -107,35 +107,60 @@ License stance: **Apache-2.0 or MIT/Apache dual** for Dravity. Superseedr is GPL
 ## 4. Recommended architecture
 
 ```text
-                    ┌─────────────────────────────────────────┐
-  Session API       │              dravity-session              │
-  (lib / HTTP / TUI)│  limits · resume · metrics · torrent map │
-                    └─────────────┬───────────────▲────────────┘
-                                  │ cmds          │ alerts
-                                  ▼               │
-Net I/O (Tokio TCP + uTP) ──events──► dravity-engine (sans-IO)
-                                      │  picker · choker · peer table
-                                      │
-                         effects: send / write / hash / announce
-                                      │
-              ┌───────────────────────┼───────────────────────┐
-              ▼                       ▼                       ▼
-        Peer writer            dravity-storage          Hash pool
-        (batched flush)        (FD cache, pwritev)      (rayon /
-                                                        spawn_blocking)
+CLI / HTTP / TUI ──commands──► dravity-session ──alerts──► CLI / HTTP / TUI
+                                    │
+                     only production loop, per torrent:
+                     poll → update(Event) → dispatch Effects
+                                    │
+                                    ▼
+                          dravity-engine (sans-IO)
+                          picker · choker · peer table
+                                    │
+                     effects dispatched, never inlined:
+                                    │
+           ┌────────────────────────┼────────────────────────┐
+           ▼                        ▼                        ▼
+     peer read/write          dravity-storage           hash pool
+     (wire feed/encode,       (FD cache, pwritev)       (rayon /
+      batched flush)                                    spawn_blocking)
+           │                        │                        │
+           └──────── completion events back to the owner ────┘
 ```
+
+Library, CLI, HTTP, and TUI never poll sockets or call `update`. They send commands and read alerts.
 
 ### Design rules
 
-1. **Sans-IO core** — `TorrentState::update(Event) -> Vec<Effect>` (Superseedr pattern). Swap Tokio for io_uring later without forking protocol logic.
-2. **Single owner per torrent** — one Tokio task owns state; peers use **bounded** mpsc (backpressure). No shared torrent `RwLock`.
-3. **Peer I/O** — reader + writer tasks per peer; batch writes into one buffer per flush.
-4. **Disk actor** — FD cache, positional/`pwritev` writes; never open+seek per block.
-5. **Hash off the I/O path** — piece SHA-1 (and v2 Merkle per 16 KiB) on blocking/rayon pool; results return as events.
-6. **`Storage` trait** — rqbit-style: filesystem first; mmap and memory backends; middleware for write-through cache, timing, fault injection.
-7. **`Runtime` trait at the edge** — Tokio default; optional Linux io_uring backend (Vortex-style) as a feature, same effects.
-8. **Path safety** — reject `..`, absolute paths, symlinks; prefer dir-fd + `O_NOFOLLOW` where available.
-9. **Errors** — `thiserror` in libraries; `anyhow` only in binaries (`dravity-cli`, `dravity-http`).
+1. **Sans-IO core** — `TorrentState::update(Event) -> Vec<Effect>` (Superseedr pattern). The engine does no I/O and spawns no tasks. Swapping Tokio for io_uring does not fork protocol logic.
+2. **One driver** — `dravity-session` owns the only production loop: poll I/O, timers, disk, and hash → `update(Event)` → dispatch `Effect`s. App code never writes a read/feed/write loop.
+3. **Single owner per torrent** — one task owns that torrent and is the only caller of `update`. Peer, disk, and hash tasks use **bounded** mpsc (backpressure). No shared torrent `RwLock`.
+4. **Dispatch, don't inline** — the owner queues `Send`, `WriteBlock`, `HashPiece`, and `Announce`. It does not write the socket, the disk, or the hash. Completions return as events (`BlockStored`, `PieceHashed`).
+5. **Two sans-IO layers** — `dravity-wire` feeds bytes and yields frames inside the session peer tasks. The engine sees `Event::Message`, not sockets. Peer tasks batch writes into one buffer per flush.
+6. **Disk actor** — FD cache, positional/`pwritev` writes; never open+seek per block.
+7. **Hash off the I/O path** — piece SHA-1 (and v2 Merkle per 16 KiB) on a blocking/rayon pool.
+8. **`Storage` trait** — rqbit-style: filesystem first; mmap and memory backends; middleware for write-through cache, timing, fault injection.
+9. **`Runtime` trait at the edge** — Tokio is the default *poll* implementation. The effect match stays in `dravity-session`, so an optional Linux io_uring backend (Vortex-style) replaces polling only.
+10. **Path safety** — reject `..`, absolute paths, symlinks; prefer dir-fd + `O_NOFOLLOW` where available.
+11. **Errors** — `thiserror` in libraries; `anyhow` only in binaries (`dravity-cli`, `dravity-http`).
+
+### Driver (session)
+
+```text
+// one task per torrent, inside dravity-session
+loop {
+    let event = poll_sources().await;   // peers, disk, hash, timers, commands
+    let effects = state.update(event);  // dravity-engine, pure
+    for effect in effects {
+        dispatch(effect);               // queue I/O; do not run it here
+    }
+}
+
+// peer task, same crate
+read bytes → wire.feed → Event::Message
+Effect::Send → wire.encode → batched write
+```
+
+`update` stays public for scripted engine tests and a future runtime. It is not the integration API.
 
 ### Core types (sketch)
 
@@ -159,14 +184,14 @@ Peers addressed by arena handles (`slotmap`), not `String` ids. Picker keeps rar
 | `dravity-bencode` | Zero-copy bencode + serde |
 | `dravity-core` | Info-hash v1/v2, metainfo, magnet, piece/file length math |
 | `dravity-wire` | Handshake, messages, BEP 6 Fast, BEP 10 extension protocol |
-| `dravity-engine` | Sans-IO torrent state, picker, choker |
+| `dravity-engine` | Sans-IO torrent state, picker, choker. `update` only; no driver |
 | `dravity-storage` | `Storage` trait, filesystem/mmap/memory backends, middleware |
 | `dravity-tracker` | HTTP and UDP announce/scrape |
 | `dravity-dht` | Thin wrapper over `mainline` (own KRPC later if needed) |
 | `dravity-utp` | uTP transport (own impl or wrap a permissive crate; not GPL) |
-| `dravity-session` | Tokio (or Runtime) glue: peers, limits, persistence, metrics |
-| `dravity-cli` | clap CLI + optional ratatui TUI |
-| `dravity-http` | axum session API + optional Web UI statics |
+| `dravity-session` | The only driver: poll → `update` → dispatch effects. Limits, resume, metrics, torrent map |
+| `dravity-cli` | clap CLI + optional ratatui TUI. Session commands and alerts only |
+| `dravity-http` | axum session API + optional Web UI statics. Session commands and alerts only |
 
 Workspace root: `dravity` (meta) documenting the library entry via `dravity-session`.
 
@@ -238,7 +263,7 @@ Workspace root: `dravity` (meta) documenting the library entry via `dravity-sess
    `dravity-bencode`, `dravity-core` (v1 metainfo), `dravity-wire` codec with fuzz targets from day one; CI: `fmt`, `clippy`, tests.
 
 2. **Phase 1 — MVP downloader**  
-   Load `.torrent`; HTTP + UDP trackers; TCP peers; rarest-first + pipelined requests; `dravity-storage` filesystem backend; piece hash verify; `dravity-cli` progress.
+   Load `.torrent`; HTTP + UDP trackers; TCP peers; rarest-first + pipelined requests; `dravity-storage` filesystem backend; piece hash verify. `dravity-session` ships the driver; `dravity-cli` shows progress through alerts and never polls I/O itself.
 
 3. **Phase 2 — Magnets and swarm**  
    BEP 9/10 metadata; DHT via `dravity-dht`/`mainline`; PEX; endgame; piece stealing; fastresume; AIMD window + rate limits.
@@ -258,7 +283,7 @@ Each phase ships a usable artifact; later phases do not rewrite the sans-IO core
 
 ## 9. Testing and benchmarking
 
-1. **Unit** — scripted event sequences against `dravity-engine`; proptest state machines for picker/choker invariants.
+1. **Unit** — scripted event sequences call `dravity-engine::update` directly; proptest state machines for picker/choker invariants. CLI and HTTP tests talk to the session API and do not reimplement the driver.
 2. **Fuzz** — every parser: wire, bencode, torrent files, KRPC, UDP tracker, uTP; encode/decode roundtrips.
 3. **In-process swarm** — loopback seed↔leech (see rqbit `tests/e2e.rs`, Vortex `tests/chained_seeding.rs`).
 4. **Interop** — Docker against qBittorrent and Transmission for v1, v2, and hybrid.
@@ -281,6 +306,7 @@ Each phase ships a usable artifact; later phases do not rewrite the sans-IO core
 | Trust metainfo paths | common | Reject `..`, absolutes, symlinks |
 | Mandatory io_uring | Vortex | Optional feature only |
 | Copying Superseedr sources | — | GPL; reimplement from behavior |
+| Read/feed/write loop in each app | common sans-IO wrappers | One driver in `dravity-session`; binaries use commands and alerts |
 
 ---
 

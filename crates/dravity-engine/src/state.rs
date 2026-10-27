@@ -15,13 +15,27 @@ use crate::types::{Alert, AnnounceEvent, Config, Effect, Event, PeerKey, Stats, 
 /// Upper bound on queued, not yet tried peer addresses.
 const MAX_POOL: usize = 2_000;
 
+/// Messages that may arrive before `bitfield` / `have all` / `have none`.
+///
+/// BEP 3 says the bitfield is the first message, but libtorrent-family clients
+/// send a BEP 10 extended handshake (and sometimes a keep-alive or DHT `port`)
+/// first. Treating those as "already spoke" would drop the peer.
+fn message_defers_bitfield(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::KeepAlive | Message::Port(_) | Message::Extended { .. } | Message::Unknown { .. }
+    )
+}
+
 /// What the engine knows about one connected peer.
 #[derive(Debug, Clone)]
 struct Peer {
     addr: SocketAddr,
     has: Bitfield,
-    /// Whether any message arrived yet (`bitfield` is only legal first).
-    seen_message: bool,
+    /// `bitfield`, `have all`, and `have none` are still legal. Keep-alives,
+    /// DHT `port`, and BEP 10 extended messages do not clear this: common
+    /// clients send the extended handshake before the bitfield.
+    bitfield_ok: bool,
     am_interested: bool,
     peer_choking: bool,
     peer_interested: bool,
@@ -35,7 +49,7 @@ impl Peer {
         Self {
             addr,
             has: Bitfield::new(piece_count),
-            seen_message: false,
+            bitfield_ok: true,
             am_interested: false,
             peer_choking: true,
             peer_interested: false,
@@ -83,6 +97,8 @@ pub struct TorrentState {
     peers: HashMap<PeerKey, Peer>,
     connecting: HashSet<SocketAddr>,
     pool: VecDeque<SocketAddr>,
+    /// `(not_before, addr)` for peers to dial again after a drop or failure.
+    retry: VecDeque<(Instant, SocketAddr)>,
     check: Option<Check>,
     next_announce: Option<Instant>,
     announce_in_flight: bool,
@@ -117,6 +133,7 @@ impl TorrentState {
             peers: HashMap::new(),
             connecting: HashSet::new(),
             pool: VecDeque::new(),
+            retry: VecDeque::new(),
             check: None,
             next_announce: None,
             announce_in_flight: false,
@@ -160,7 +177,7 @@ impl TorrentState {
             uploaded: self.uploaded,
             peers: self.peers.len(),
             connecting: self.connecting.len(),
-            known_peers: self.pool.len(),
+            known_peers: self.pool.len() + self.retry.len(),
             pending_writes: self.pending_writes,
         }
     }
@@ -184,12 +201,17 @@ impl TorrentState {
             Event::Stop => self.stop(&mut out),
             Event::Tick => self.on_tick(now, &mut out),
             Event::PeerConnected { peer, addr } => self.on_connected(now, peer, addr, &mut out),
-            Event::PeerConnectFailed { addr } => {
+            Event::PeerConnectFailed { addr, retry } => {
                 self.connecting.remove(&addr);
+                if retry {
+                    self.schedule_retry(now, addr);
+                }
                 self.fill_connections(&mut out);
             }
             Event::PeerDisconnected { peer } => {
-                self.remove_peer(peer);
+                if let Some(addr) = self.remove_peer(peer) {
+                    self.schedule_retry(now, addr);
+                }
                 self.fill_connections(&mut out);
             }
             Event::Message { peer, message } => self.on_message(now, peer, message, &mut out),
@@ -211,6 +233,7 @@ impl TorrentState {
                 self.fail(format!("storage write failed: {error}"), &mut out);
             }
             Event::PieceHashed { piece, ok } => self.on_hashed(now, piece, ok, &mut out),
+            Event::StorageFailed { error } => self.fail(error, &mut out),
             Event::Announced { peers, interval } => {
                 self.on_announced(now, peers, interval, &mut out);
             }
@@ -282,6 +305,7 @@ impl TorrentState {
         self.set_status(TorrentStatus::Finished, out);
         out.push(Effect::Alert(Alert::Finished));
         self.pool.clear();
+        self.retry.clear();
         if self.started_announced {
             self.push_announce(AnnounceEvent::Completed, out);
         }
@@ -300,6 +324,7 @@ impl TorrentState {
         }
         self.connecting.clear();
         self.pool.clear();
+        self.retry.clear();
         self.set_status(TorrentStatus::Stopped, out);
     }
 
@@ -359,6 +384,9 @@ impl TorrentState {
             if self.pool.len() >= MAX_POOL {
                 break;
             }
+            // An explicit add should dial now, not after the retry delay.
+            // Only drop the retry entry once we have room to queue it.
+            self.retry.retain(|(_, queued_addr)| *queued_addr != addr);
             if addr.port() == 0
                 || connected.contains(&addr)
                 || self.connecting.contains(&addr)
@@ -367,6 +395,45 @@ impl TorrentState {
                 continue;
             }
             self.pool.push_back(addr);
+        }
+    }
+
+    /// Remembers `addr` so a later tick can dial it again. Ignored when the
+    /// address is already connected, connecting, queued, or waiting.
+    fn schedule_retry(&mut self, now: Instant, addr: SocketAddr) {
+        if self.status != TorrentStatus::Downloading || addr.port() == 0 {
+            return;
+        }
+        if self.peers.values().any(|p| p.addr == addr)
+            || self.connecting.contains(&addr)
+            || self.pool.contains(&addr)
+            || self.retry.iter().any(|(_, queued)| *queued == addr)
+        {
+            return;
+        }
+        if self.pool.len() + self.retry.len() >= MAX_POOL {
+            return;
+        }
+        self.retry.push_back((now + self.config.peer_retry, addr));
+    }
+
+    /// Moves due retries onto the dial queue.
+    fn promote_retries(&mut self, now: Instant) {
+        if self.status != TorrentStatus::Downloading || self.pool.len() >= MAX_POOL {
+            return;
+        }
+        let mut due = Vec::new();
+        let room = MAX_POOL - self.pool.len();
+        self.retry.retain(|(when, addr)| {
+            if *when <= now && due.len() < room {
+                due.push(*addr);
+                false
+            } else {
+                true
+            }
+        });
+        if !due.is_empty() {
+            self.add_to_pool(due);
         }
     }
 
@@ -412,13 +479,14 @@ impl TorrentState {
         self.peers.insert(key, peer);
     }
 
-    fn remove_peer(&mut self, key: PeerKey) {
-        if let Some(peer) = self.peers.remove(&key) {
-            for (block, _) in peer.inflight {
-                self.picker.release(block);
-            }
-            self.picker.remove_peer_pieces(&peer.has);
+    /// Forgets a connected peer and returns its address.
+    fn remove_peer(&mut self, key: PeerKey) -> Option<SocketAddr> {
+        let peer = self.peers.remove(&key)?;
+        for (block, _) in peer.inflight {
+            self.picker.release(block);
         }
+        self.picker.remove_peer_pieces(&peer.has);
+        Some(peer.addr)
     }
 
     fn disconnect(&mut self, key: PeerKey, out: &mut Vec<Effect>) {
@@ -433,11 +501,14 @@ impl TorrentState {
             return;
         };
         peer.last_recv = now;
-        let first = !peer.seen_message;
-        peer.seen_message = true;
+        // Captured before this message consumes the window.
+        let bitfield_ok = peer.bitfield_ok;
+        if !message_defers_bitfield(&message) {
+            peer.bitfield_ok = false;
+        }
         match message {
             Message::Bitfield(bits) => {
-                if !first {
+                if !bitfield_ok {
                     return self.disconnect(key, out);
                 }
                 match Bitfield::from_wire(&bits, piece_count) {
@@ -445,12 +516,15 @@ impl TorrentState {
                     Err(_) => return self.disconnect(key, out),
                 }
             }
-            Message::HaveAll | Message::HaveNone => {
-                if !first {
+            Message::HaveAll => {
+                if !bitfield_ok {
                     return self.disconnect(key, out);
                 }
-                if message == Message::HaveAll {
-                    self.set_peer_pieces(key, Bitfield::full(piece_count));
+                self.set_peer_pieces(key, Bitfield::full(piece_count));
+            }
+            Message::HaveNone => {
+                if !bitfield_ok {
+                    return self.disconnect(key, out);
                 }
             }
             Message::Have { piece } => {
@@ -605,6 +679,7 @@ impl TorrentState {
     }
 
     fn on_tick(&mut self, now: Instant, out: &mut Vec<Effect>) {
+        self.promote_retries(now);
         let mut dead = Vec::new();
         for key in self.sorted_keys() {
             let Some(peer) = self.peers.get_mut(&key) else {

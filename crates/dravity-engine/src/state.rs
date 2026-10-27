@@ -90,6 +90,7 @@ pub struct TorrentState {
     downloaded: u64,
     uploaded: u64,
     bytes_have: u64,
+    pending_writes: usize,
 }
 
 impl TorrentState {
@@ -123,6 +124,7 @@ impl TorrentState {
             downloaded: 0,
             uploaded: 0,
             bytes_have,
+            pending_writes: 0,
         }
     }
 
@@ -159,6 +161,7 @@ impl TorrentState {
             peers: self.peers.len(),
             connecting: self.connecting.len(),
             known_peers: self.pool.len(),
+            pending_writes: self.pending_writes,
         }
     }
 
@@ -191,17 +194,29 @@ impl TorrentState {
             }
             Event::Message { peer, message } => self.on_message(now, peer, message, &mut out),
             Event::BlockWritten { block } => {
+                self.pending_writes = self.pending_writes.saturating_sub(1);
                 if let Some(piece) = self.picker.block_written(block) {
                     out.push(Effect::HashPiece { piece });
                 }
+                if self.pending_writes + 1 == self.config.max_pending_writes {
+                    // Backpressure released: resume requesting.
+                    for key in self.sorted_keys() {
+                        self.fill_requests(now, key, &mut out);
+                    }
+                }
             }
             Event::WriteFailed { block, error } => {
+                self.pending_writes = self.pending_writes.saturating_sub(1);
                 self.picker.block_write_failed(block);
                 self.fail(format!("storage write failed: {error}"), &mut out);
             }
             Event::PieceHashed { piece, ok } => self.on_hashed(now, piece, ok, &mut out),
             Event::Announced { peers, interval } => {
-                self.on_announced(now, peers, interval, &mut out)
+                self.on_announced(now, peers, interval, &mut out);
+            }
+            Event::AddPeers { peers } => {
+                self.add_to_pool(peers);
+                self.fill_connections(&mut out);
             }
             Event::AnnounceFailed { error } => {
                 self.announce_in_flight = false;
@@ -325,6 +340,11 @@ impl TorrentState {
             .unwrap_or(self.config.default_announce_interval)
             .max(self.config.min_announce_interval);
         self.next_announce = Some(now + interval);
+        self.add_to_pool(peers);
+        self.fill_connections(out);
+    }
+
+    fn add_to_pool(&mut self, peers: Vec<SocketAddr>) {
         if self.status != TorrentStatus::Downloading {
             return;
         }
@@ -343,7 +363,6 @@ impl TorrentState {
             }
             self.pool.push_back(addr);
         }
-        self.fill_connections(out);
     }
 
     fn fill_connections(&mut self, out: &mut Vec<Effect>) {
@@ -489,6 +508,7 @@ impl TorrentState {
         }
         self.downloaded = self.downloaded.saturating_add(u64::from(length));
         if self.picker.block_received(block) == Received::Accepted {
+            self.pending_writes += 1;
             out.push(Effect::WriteBlock { block, data });
         }
     }
@@ -524,7 +544,9 @@ impl TorrentState {
         if peer.peer_choking || !peer.am_interested {
             return;
         }
-        while peer.inflight.len() < self.config.max_requests_per_peer {
+        while peer.inflight.len() < self.config.max_requests_per_peer
+            && self.pending_writes < self.config.max_pending_writes
+        {
             let Some(block) = self.picker.pick(&peer.has) else {
                 break;
             };

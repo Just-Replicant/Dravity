@@ -64,6 +64,9 @@ pub struct Config {
     pub min_announce_interval: Duration,
     /// Delay before retrying a failed announce.
     pub announce_retry: Duration,
+    /// Blocks handed to storage but not yet written; no new requests are
+    /// sent while this many writes are pending (disk backpressure).
+    pub max_pending_writes: usize,
     /// Hash existing data on start to resume a partial download.
     pub check_existing: bool,
     /// Maximum concurrent hash jobs while checking.
@@ -81,6 +84,7 @@ impl Default for Config {
             default_announce_interval: Duration::from_secs(30 * 60),
             min_announce_interval: Duration::from_secs(60),
             announce_retry: Duration::from_secs(60),
+            max_pending_writes: 512,
             check_existing: true,
             check_concurrency: 4,
         }
@@ -148,6 +152,12 @@ pub enum Event {
         peers: Vec<SocketAddr>,
         /// Tracker-requested re-announce interval.
         interval: Option<Duration>,
+    },
+    /// Peers learned from elsewhere (user input, PEX, DHT). Unlike
+    /// [`Event::Announced`] this does not affect announce scheduling.
+    AddPeers {
+        /// Peer addresses.
+        peers: Vec<SocketAddr>,
     },
     /// Every tracker failed for an announce.
     AnnounceFailed {
@@ -262,4 +272,6 @@ pub struct Stats {
     pub connecting: usize,
     /// Known, not yet tried peer addresses.
     pub known_peers: usize,
+    /// Blocks waiting to be written to storage.
+    pub pending_writes: usize,
 }

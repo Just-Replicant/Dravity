@@ -492,6 +492,34 @@ fn unrequested_and_duplicate_blocks_are_not_written_twice() {
     assert_eq!(writes(&h.msg(1, bogus)), 0);
 }
 
+#[test]
+fn pending_writes_throttle_requests() {
+    let mut c = config();
+    c.max_pending_writes = 2;
+    let mut h = Harness::started_with_peer(c);
+    h.msg(1, Message::HaveAll);
+    let first = requests(&h.msg(1, Message::Unchoke), 1);
+    assert_eq!(first.len(), 4);
+    assert_eq!(requests(&h.msg(1, data_for(first[0])), 1).len(), 1);
+    // Second unwritten block reaches the limit: no new request.
+    assert!(requests(&h.msg(1, data_for(first[1])), 1).is_empty());
+    assert_eq!(h.t.stats().pending_writes, 2);
+    let fx = h.ev(Event::BlockWritten {
+        block: block(first[0]),
+    });
+    assert_eq!(requests(&fx, 1).len(), 1, "resumes once a write completes");
+}
+
+#[test]
+fn add_peers_connects_without_announcing() {
+    let mut h = Harness::new(config());
+    h.ev(Event::Start);
+    let fx = h.ev(Event::AddPeers {
+        peers: vec![addr(5)],
+    });
+    assert_eq!(fx, vec![Effect::Connect { addr: addr(5) }]);
+}
+
 fn arb_message() -> impl Strategy<Value = Message> {
     prop_oneof![
         Just(Message::KeepAlive),

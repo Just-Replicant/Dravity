@@ -461,3 +461,38 @@ proptest! {
         let _ = Metainfo::from_bytes(&t);
     }
 }
+
+#[test]
+fn from_info_bytes_matches_full_torrent() {
+    let info = multi_info(
+        "dir",
+        vec![file(&["a"], 10), file(&["sub", "b"], 70_000)],
+        70_010,
+        32_768,
+    );
+    let full = parse(info.clone()).unwrap();
+    let bare = Metainfo::from_info_bytes(
+        full.info_bytes(),
+        vec![vec!["udp://a:1".into(), String::new()], vec![]],
+    )
+    .unwrap();
+    assert_eq!(bare.info_hash(), full.info_hash());
+    assert_eq!(bare.info(), full.info());
+    assert_eq!(bare.trackers(), [["udp://a:1"]]);
+    assert_eq!(bare.announce(), None);
+
+    let mut trailing = info.to_vec();
+    trailing.push(b'x');
+    assert!(Metainfo::from_info_bytes(&trailing, Vec::new()).is_err());
+    assert_eq!(
+        Metainfo::from_info_bytes(b"le", Vec::new()),
+        Err(MetainfoError::InfoNotDict)
+    );
+    assert!(matches!(
+        Metainfo::from_info_bytes(
+            &with(info, "piece length", Some(int(0))).to_vec(),
+            Vec::new()
+        ),
+        Err(MetainfoError::InvalidPieceLength(0))
+    ));
+}

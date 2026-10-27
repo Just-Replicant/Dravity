@@ -145,6 +145,53 @@ impl Metainfo {
         })
     }
 
+    /// Builds metainfo from a bare `info` dictionary, e.g. one fetched from
+    /// peers with BEP 9 for a magnet link. `trackers` become the
+    /// `announce-list` tiers (empty tiers and URLs are dropped).
+    ///
+    /// The info-hash is computed from `info`; callers fetching metadata for a
+    /// known hash must compare it.
+    ///
+    /// ```
+    /// use dravity_core::{InfoHash, Metainfo};
+    ///
+    /// let info = b"d6:lengthi3e4:name5:a.txt12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaae";
+    /// let m = Metainfo::from_info_bytes(info, vec![vec!["udp://t:1".into()]]).unwrap();
+    /// assert_eq!(m.info_hash(), InfoHash::from_info_bytes(info));
+    /// assert_eq!(m.trackers(), [["udp://t:1"]]);
+    /// assert!(Metainfo::from_info_bytes(b"i1e", Vec::new()).is_err());
+    /// ```
+    ///
+    /// # Errors
+    /// The same validation errors as [`Metainfo::from_bytes`] for `info`;
+    /// trailing bytes after the dictionary are rejected.
+    pub fn from_info_bytes(info: &[u8], trackers: Vec<Vec<String>>) -> Result<Self, MetainfoError> {
+        if info.first() != Some(&b'd') {
+            return Err(MetainfoError::InfoNotDict);
+        }
+        let raw: RawInfo<'_> = dravity_bencode::from_bytes(info)?;
+        let parsed = Info::from_raw(raw)?;
+        let announce_list: Vec<Vec<String>> = trackers
+            .into_iter()
+            .map(|tier| {
+                tier.into_iter()
+                    .filter(|u| !u.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|tier| !tier.is_empty())
+            .collect();
+        Ok(Self {
+            info_hash: InfoHash::from_info_bytes(info),
+            info_bytes: info.to_vec(),
+            info: parsed,
+            announce: None,
+            announce_list,
+            comment: None,
+            created_by: None,
+            creation_date: None,
+        })
+    }
+
     /// The v1 info-hash.
     #[must_use]
     pub const fn info_hash(&self) -> InfoHash {

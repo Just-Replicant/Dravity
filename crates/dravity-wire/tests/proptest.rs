@@ -4,7 +4,8 @@
 use bytes::{Bytes, BytesMut};
 use dravity_core::{InfoHash, PeerId};
 use dravity_wire::{
-    BlockRequest, Handshake, Message, MessageDecoder, MessageId, Reserved, WireError,
+    BlockRequest, Handshake, Message, MessageDecoder, MessageId, MetadataMessage, PexMessage,
+    PexPeer, Reserved, WireError,
 };
 use proptest::prelude::*;
 
@@ -108,5 +109,45 @@ proptest! {
         }
         let mut buf = BytesMut::from(&input[..]);
         let _ = Handshake::decode(&mut buf);
+    }
+}
+
+fn arb_addr() -> impl Strategy<Value = std::net::SocketAddr> {
+    prop_oneof![
+        (any::<[u8; 4]>(), any::<u16>()).prop_map(|(ip, p)| std::net::SocketAddr::from((ip, p))),
+        (any::<[u8; 16]>(), any::<u16>()).prop_map(|(ip, p)| std::net::SocketAddr::from((ip, p))),
+    ]
+}
+
+proptest! {
+    #[test]
+    fn metadata_roundtrip(kind in 0u8..3, piece in any::<u32>(), size in 0u64..i64::MAX as u64, data in arb_bytes(512)) {
+        let msg = match kind {
+            0 => MetadataMessage::Request { piece },
+            1 => MetadataMessage::Data { piece, total_size: size, data },
+            _ => MetadataMessage::Reject { piece },
+        };
+        prop_assert_eq!(MetadataMessage::decode(&msg.encode().unwrap()).unwrap(), msg);
+    }
+
+    #[test]
+    fn pex_roundtrip(
+        added in proptest::collection::vec((arb_addr(), any::<u8>()), 0..60),
+        dropped in proptest::collection::vec(arb_addr(), 0..60),
+    ) {
+        // Decoding yields IPv4 entries before IPv6 ones.
+        let order = |a: &std::net::SocketAddr| a.is_ipv6();
+        let mut added: Vec<PexPeer> = added.into_iter().map(|(addr, flags)| PexPeer { addr, flags }).collect();
+        added.sort_by_key(|p| order(&p.addr));
+        let mut dropped = dropped;
+        dropped.sort_by_key(order);
+        let msg = PexMessage { added, dropped };
+        prop_assert_eq!(PexMessage::decode(&msg.encode()).unwrap(), msg);
+    }
+
+    #[test]
+    fn extension_payloads_never_panic(input in proptest::collection::vec(any::<u8>(), 0..512)) {
+        let _ = PexMessage::decode(&input);
+        let _ = MetadataMessage::decode(&Bytes::from(input));
     }
 }

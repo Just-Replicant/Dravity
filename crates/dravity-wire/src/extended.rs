@@ -37,6 +37,9 @@ pub enum ExtendedError {
         /// Field name.
         field: &'static str,
     },
+    /// A `ut_metadata` message has an unknown `msg_type`.
+    #[error("unknown ut_metadata msg_type {0}")]
+    UnknownMessageType(i64),
     /// An entry in `m` is not a single byte.
     #[error("extension id for {name:?} does not fit in a byte")]
     BadExtensionId {

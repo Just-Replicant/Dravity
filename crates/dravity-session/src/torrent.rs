@@ -22,7 +22,7 @@ use dravity_engine::{
     Alert, AnnounceEvent, Effect, Event, PeerKey, Stats, TorrentState, TorrentStatus,
 };
 use dravity_storage::{Storage, verify_piece, write_block};
-use dravity_tracker::{AnnounceRequest, TrackerClient};
+use dravity_tracker::{AnnounceRequest, AnnounceResponse, TrackerClient};
 use dravity_wire::Message;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -34,10 +34,22 @@ use crate::peer::{self, PeerCommand, PeerParams};
 /// Everything that can wake the owner task besides commands and the timer.
 #[derive(Debug)]
 pub(crate) enum Input {
-    Connected { key: PeerKey, addr: SocketAddr },
-    ConnectFailed { key: PeerKey, addr: SocketAddr },
-    Disconnected { key: PeerKey },
-    Message { key: PeerKey, message: Message },
+    Connected {
+        key: PeerKey,
+        addr: SocketAddr,
+    },
+    ConnectFailed {
+        key: PeerKey,
+        addr: SocketAddr,
+        retry: bool,
+    },
+    Disconnected {
+        key: PeerKey,
+    },
+    Message {
+        key: PeerKey,
+        message: Message,
+    },
     Engine(Event),
 }
 
@@ -162,9 +174,9 @@ impl TorrentTask {
                 }
                 Event::PeerConnected { peer: key, addr }
             }
-            Input::ConnectFailed { key, addr } => {
+            Input::ConnectFailed { key, addr, retry } => {
                 self.peers.remove(&key);
-                Event::PeerConnectFailed { addr }
+                Event::PeerConnectFailed { addr, retry }
             }
             Input::Disconnected { key } => {
                 self.peers.remove(&key)?;
@@ -291,20 +303,25 @@ impl TorrentTask {
                 verify_piece(storage.as_ref(), meta.info(), piece)
             })
             .await;
-            let ok = match result {
-                Ok(Ok(ok)) => ok,
+            // A mismatch or a short file is "we don't have it". Any other I/O
+            // error would otherwise reset the piece and download it forever.
+            let event = match result {
+                Ok(Ok(ok)) => Event::PieceHashed { piece, ok },
+                Ok(Err(e)) if e.is_missing_data() => Event::PieceHashed { piece, ok: false },
                 Ok(Err(e)) => {
-                    tracing::warn!(piece, error = %e, "piece hash read failed");
-                    false
+                    tracing::warn!(piece, error = %e, "piece hash failed");
+                    Event::StorageFailed {
+                        error: format!("hashing piece {piece}: {e}"),
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(piece, error = %e, "piece hash task failed");
-                    false
+                    Event::StorageFailed {
+                        error: format!("hashing piece {piece}: {e}"),
+                    }
                 }
             };
-            let _ = tx
-                .send(Input::Engine(Event::PieceHashed { piece, ok }))
-                .await;
+            let _ = tx.send(Input::Engine(event)).await;
         });
     }
 
@@ -339,8 +356,11 @@ impl TorrentTask {
 async fn announce_all(ctx: TorrentContext, req: AnnounceRequest) -> Event {
     let urls: Vec<String> = ctx.metainfo.trackers().into_iter().flatten().collect();
     if urls.is_empty() {
-        return Event::AnnounceFailed {
-            error: "torrent has no trackers".into(),
+        // Explicit peers can still download. Reporting a failure would retry
+        // forever and surface a tracker error for a trackerless torrent.
+        return Event::Announced {
+            peers: Vec::new(),
+            interval: None,
         };
     }
     let mut set = JoinSet::new();
@@ -352,8 +372,7 @@ async fn announce_all(ctx: TorrentContext, req: AnnounceRequest) -> Event {
             (url, result)
         });
     }
-    let mut peers = Vec::new();
-    let mut interval = None;
+    let mut merge = AnnounceMerge::default();
     let mut errors = Vec::new();
     let mut any_ok = false;
     while let Some(joined) = set.join_next().await {
@@ -364,11 +383,7 @@ async fn announce_all(ctx: TorrentContext, req: AnnounceRequest) -> Event {
             Ok(response) => {
                 tracing::debug!(%url, peers = response.peers.len(), "announce ok");
                 any_ok = true;
-                peers.extend(response.peers);
-                interval = match (interval, response.interval) {
-                    (Some(a), Some(b)) => Some(std::cmp::min(a, b)),
-                    (a, b) => a.or(b),
-                };
+                merge.observe(&url, response);
             }
             Err(e) => {
                 let e = error_chain(&e);
@@ -378,11 +393,69 @@ async fn announce_all(ctx: TorrentContext, req: AnnounceRequest) -> Event {
         }
     }
     if any_ok {
-        Event::Announced { peers, interval }
+        for warning in &merge.warnings {
+            tracing::warn!(%warning, "tracker warning");
+        }
+        let interval = merge.interval();
+        Event::Announced {
+            peers: merge.peers,
+            interval,
+        }
     } else {
         Event::AnnounceFailed {
             error: errors.join("; "),
         }
+    }
+}
+
+/// Peers and re-announce timing merged from every tracker that answered.
+#[derive(Debug, Default)]
+struct AnnounceMerge {
+    peers: Vec<SocketAddr>,
+    /// Smallest requested interval.
+    interval: Option<std::time::Duration>,
+    /// Largest `min interval`. BEP 3 forbids announcing more often than this.
+    min_interval: Option<std::time::Duration>,
+    warnings: Vec<String>,
+}
+
+impl AnnounceMerge {
+    fn observe(&mut self, url: &str, response: AnnounceResponse) {
+        if let Some(warning) = response.warning.as_deref().filter(|w| !w.is_empty()) {
+            self.warnings.push(format!("{url}: {warning}"));
+        }
+        self.peers.extend(response.peers);
+        self.interval = min_duration(self.interval, response.interval);
+        self.min_interval = max_duration(self.min_interval, response.min_interval);
+    }
+
+    /// Interval to report to the engine: not sooner than any tracker's minimum,
+    /// otherwise the soonest requested interval.
+    fn interval(&self) -> Option<std::time::Duration> {
+        match (self.interval, self.min_interval) {
+            (Some(interval), Some(min)) => Some(interval.max(min)),
+            (interval, min) => interval.or(min),
+        }
+    }
+}
+
+fn min_duration(
+    a: Option<std::time::Duration>,
+    b: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn max_duration(
+    a: Option<std::time::Duration>,
+    b: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
     }
 }
 
@@ -403,12 +476,54 @@ fn error_chain(e: &dyn std::error::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::error_chain;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use dravity_tracker::AnnounceResponse;
+
+    use super::{AnnounceMerge, error_chain};
 
     #[test]
     fn error_chain_includes_sources() {
         let inner = std::io::Error::other("connection refused");
         let outer = dravity_tracker::TrackerError::Io(inner);
         assert_eq!(error_chain(&outer), "I/O error: connection refused");
+    }
+
+    #[test]
+    fn merge_honors_tracker_min_interval() {
+        let mut merge = AnnounceMerge::default();
+        merge.observe(
+            "http://a",
+            AnnounceResponse {
+                interval: Some(Duration::from_secs(30)),
+                min_interval: Some(Duration::from_secs(120)),
+                warning: Some("slow".into()),
+                ..AnnounceResponse::default()
+            },
+        );
+        merge.observe(
+            "http://b",
+            AnnounceResponse {
+                interval: Some(Duration::from_secs(1800)),
+                min_interval: Some(Duration::from_secs(60)),
+                peers: vec![SocketAddr::from(([1, 2, 3, 4], 1))],
+                ..AnnounceResponse::default()
+            },
+        );
+        // Soonest interval is 30s, strictest minimum is 120s.
+        assert_eq!(merge.interval(), Some(Duration::from_secs(120)));
+        assert_eq!(merge.peers.len(), 1);
+        assert_eq!(merge.warnings, ["http://a: slow"]);
+
+        let mut only_min = AnnounceMerge::default();
+        only_min.observe(
+            "http://c",
+            AnnounceResponse {
+                min_interval: Some(Duration::from_secs(90)),
+                ..AnnounceResponse::default()
+            },
+        );
+        assert_eq!(only_min.interval(), Some(Duration::from_secs(90)));
     }
 }

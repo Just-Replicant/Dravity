@@ -56,6 +56,10 @@ pub struct Config {
     pub request_timeout: Duration,
     /// Drop a peer that sent nothing for this long.
     pub peer_timeout: Duration,
+    /// Wait this long before connecting again to a peer that failed or dropped.
+    /// Protocol rejects (wrong torrent, our own peer id, a malformed handshake)
+    /// are not retried on this timer.
+    pub peer_retry: Duration,
     /// Send a keep-alive after this long without sending anything.
     pub keepalive_interval: Duration,
     /// Re-announce interval when the tracker does not give one.
@@ -80,6 +84,7 @@ impl Default for Config {
             max_requests_per_peer: 16,
             request_timeout: Duration::from_secs(30),
             peer_timeout: Duration::from_secs(180),
+            peer_retry: Duration::from_secs(30),
             keepalive_interval: Duration::from_secs(90),
             default_announce_interval: Duration::from_secs(30 * 60),
             min_announce_interval: Duration::from_secs(60),
@@ -113,6 +118,10 @@ pub enum Event {
     PeerConnectFailed {
         /// Address that failed.
         addr: SocketAddr,
+        /// When `true`, try the address again after
+        /// [`Config::peer_retry`](crate::Config::peer_retry). Protocol rejects
+        /// pass `false` so a bad peer is not dialed in a loop.
+        retry: bool,
     },
     /// A connected peer went away (EOF, I/O error, protocol error).
     PeerDisconnected {
@@ -139,12 +148,19 @@ pub enum Event {
         error: String,
     },
     /// Result of an [`Effect::HashPiece`]. `ok` is `false` when the data does
-    /// not match or could not be read.
+    /// not match or was never written. A real storage failure is
+    /// [`Event::StorageFailed`], not `ok: false`.
     PieceHashed {
         /// Piece index.
         piece: u32,
         /// Whether the SHA-1 matched.
         ok: bool,
+    },
+    /// Reading or hashing a piece failed for a reason other than missing data.
+    /// Fatal: the torrent stops.
+    StorageFailed {
+        /// Human-readable cause.
+        error: String,
     },
     /// An announce succeeded.
     Announced {
@@ -270,7 +286,7 @@ pub struct Stats {
     pub peers: usize,
     /// Connection attempts in flight.
     pub connecting: usize,
-    /// Known, not yet tried peer addresses.
+    /// Peer addresses waiting to be dialed (queued, or scheduled for retry).
     pub known_peers: usize,
     /// Blocks waiting to be written to storage.
     pub pending_writes: usize,

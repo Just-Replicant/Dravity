@@ -95,9 +95,19 @@ dependencies = [
  "bytes",
  "dravity-bencode",
  "dravity-core",
+ "dravity-tracker",
  "dravity-wire",
  "libfuzzer-sys",
  "serde",
+]
+
+[[package]]
+name = "dravity-tracker"
+version = "0.1.0"
+dependencies = [
+ "dravity-bencode",
+ "dravity-core",
+ "thiserror",
 ]
 
 [[package]]
@@ -105,6 +115,7 @@ name = "dravity-wire"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "dravity-bencode",
  "dravity-core",
  "thiserror",
 ]

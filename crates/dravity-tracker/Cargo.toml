@@ -11,20 +11,37 @@ keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
 
+[features]
+default = ["client"]
+# The async `TrackerClient`. Without it only the sans-IO codecs are built
+# (used by the fuzz targets).
+client = [
+    "dep:fastrand",
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:rustls-platform-verifier",
+    "dep:tokio",
+    "dep:url",
+]
+
 [dependencies]
 dravity-bencode.workspace = true
 dravity-core.workspace = true
-fastrand.workspace = true
-reqwest.workspace = true
-rustls.workspace = true
-rustls-platform-verifier.workspace = true
+fastrand = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-platform-verifier = { workspace = true, optional = true }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "time"] }
-url.workspace = true
+tokio = { workspace = true, features = ["net", "time"], optional = true }
+url = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util"] }
+
+[[test]]
+name = "client"
+required-features = ["client"]
 
 [lints]
 workspace = true

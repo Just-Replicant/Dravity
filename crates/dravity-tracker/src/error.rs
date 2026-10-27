@@ -26,9 +26,11 @@ pub enum TrackerError {
     #[error("tracker returned HTTP status {0}")]
     HttpStatus(u16),
     /// HTTP transport error.
+    #[cfg(feature = "client")]
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     /// TLS configuration error.
+    #[cfg(feature = "client")]
     #[error("TLS setup failed: {0}")]
     Tls(#[from] rustls::Error),
     /// Socket error.

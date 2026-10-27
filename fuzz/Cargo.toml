@@ -15,6 +15,7 @@ serde = "1.0.200"
 dravity-bencode = { path = "../crates/dravity-bencode" }
 dravity-core = { path = "../crates/dravity-core" }
 dravity-wire = { path = "../crates/dravity-wire" }
+dravity-tracker = { path = "../crates/dravity-tracker", default-features = false }
 
 # Standalone workspace: fuzzing needs nightly and is not part of the main build.
 [workspace]
@@ -61,6 +62,20 @@ bench = false
 [[bin]]
 name = "wire_roundtrip"
 path = "fuzz_targets/wire_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tracker_http_response"
+path = "fuzz_targets/tracker_http_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tracker_udp_response"
+path = "fuzz_targets/tracker_udp_response.rs"
 test = false
 doc = false
 bench = false

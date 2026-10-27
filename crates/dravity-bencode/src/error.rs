@@ -70,6 +70,14 @@ pub enum Error {
         /// Offset at which the limit was exceeded.
         offset: usize,
     },
+    /// A list or dictionary contains more entries than the configured limit.
+    #[error("more than {max} entries in a container at offset {offset}")]
+    TooManyItems {
+        /// The configured limit.
+        max: usize,
+        /// Offset of the entry that exceeded the limit.
+        offset: usize,
+    },
     /// Bytes remain after the top-level value.
     #[error("trailing data at offset {offset}")]
     TrailingData {

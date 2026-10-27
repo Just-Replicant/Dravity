@@ -57,6 +57,9 @@ pub enum MetainfoError {
     /// `files` is an empty list.
     #[error("`files` is empty")]
     NoFiles,
+    /// `private` is present and is not `0` or `1`.
+    #[error("`private` flag must be 0 or 1, found {0}")]
+    InvalidPrivate(i64),
     /// A file name or path component is unsafe.
     #[error("unsafe path {path:?}: {source}")]
     UnsafePath {
@@ -318,7 +321,11 @@ impl Info {
             pieces,
             files,
             multi_file,
-            private: raw.private == Some(1),
+            private: match raw.private {
+                None | Some(0) => false,
+                Some(1) => true,
+                Some(other) => return Err(MetainfoError::InvalidPrivate(other)),
+            },
             source: raw.source.map(|t| t.0),
             layout,
             file_layout,

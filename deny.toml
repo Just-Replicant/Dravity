@@ -13,8 +13,9 @@ version = 2
 confidence-threshold = 0.9
 # The allow-list anticipates later phases (tokio, rustls, ...).
 unused-allowed-license = "allow"
-# Permissive licenses only. GPL-family licenses are deliberately absent:
-# Dravity is MIT OR Apache-2.0 and must never depend on copyleft code.
+# Permissive dependency licenses only. GPL-family licenses are deliberately
+# absent: Dravity itself is AGPL-3.0-or-later, and copyleft crates still need an
+# explicit allow-list change.
 allow = [
     "MIT",
     "Apache-2.0",

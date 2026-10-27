@@ -21,13 +21,13 @@ dravity-core = { path = "crates/dravity-core", version = "0.1.0" }
 dravity-wire = { path = "crates/dravity-wire", version = "0.1.0" }
 
 # External crates
-bytes = "1.7"
-serde = { version = "1.0.200", features = ["derive"] }
-sha1 = "0.10.6"
-thiserror = "2.0"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+sha1 = "0.10"
+thiserror = "2"
 
 # Dev-only
-proptest = "1.5"
+proptest = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

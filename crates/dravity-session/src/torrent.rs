@@ -371,6 +371,7 @@ async fn announce_all(ctx: TorrentContext, req: AnnounceRequest) -> Event {
                 };
             }
             Err(e) => {
+                let e = error_chain(&e);
                 tracing::debug!(%url, error = %e, "announce failed");
                 errors.push(format!("{url}: {e}"));
             }
@@ -382,5 +383,32 @@ async fn announce_all(ctx: TorrentContext, req: AnnounceRequest) -> Event {
         Event::AnnounceFailed {
             error: errors.join("; "),
         }
+    }
+}
+
+/// Formats an error with its `source()` chain (`outer: inner: root`).
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut text = e.to_string();
+    let mut source = e.source();
+    while let Some(inner) = source {
+        let part = inner.to_string();
+        if !text.contains(&part) {
+            text.push_str(": ");
+            text.push_str(&part);
+        }
+        source = inner.source();
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_chain;
+
+    #[test]
+    fn error_chain_includes_sources() {
+        let inner = std::io::Error::other("connection refused");
+        let outer = dravity_tracker::TrackerError::Io(inner);
+        assert_eq!(error_chain(&outer), "I/O error: connection refused");
     }
 }

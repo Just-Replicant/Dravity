@@ -520,6 +520,33 @@ fn add_peers_connects_without_announcing() {
     assert_eq!(fx, vec![Effect::Connect { addr: addr(5) }]);
 }
 
+#[test]
+fn peers_added_while_checking_connect_afterwards() {
+    let mut c = config();
+    c.check_existing = true;
+    let mut h = Harness::new(c);
+    h.ev(Event::Start);
+    assert!(
+        h.ev(Event::AddPeers {
+            peers: vec![addr(5)]
+        })
+        .is_empty()
+    );
+    h.ev(Event::PieceHashed {
+        piece: 0,
+        ok: false,
+    });
+    h.ev(Event::PieceHashed {
+        piece: 1,
+        ok: false,
+    });
+    let fx = h.ev(Event::PieceHashed {
+        piece: 2,
+        ok: false,
+    });
+    assert!(fx.contains(&Effect::Connect { addr: addr(5) }));
+}
+
 fn arb_message() -> impl Strategy<Value = Message> {
     prop_oneof![
         Just(Message::KeepAlive),

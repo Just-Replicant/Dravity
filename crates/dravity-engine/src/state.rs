@@ -275,6 +275,7 @@ impl TorrentState {
         }
         self.set_status(TorrentStatus::Downloading, out);
         self.announce(now, AnnounceEvent::Started, out);
+        self.fill_connections(out);
     }
 
     fn finish(&mut self, out: &mut Vec<Effect>) {
@@ -345,7 +346,11 @@ impl TorrentState {
     }
 
     fn add_to_pool(&mut self, peers: Vec<SocketAddr>) {
-        if self.status != TorrentStatus::Downloading {
+        // Peers given while checking are kept for when downloading starts.
+        if matches!(
+            self.status,
+            TorrentStatus::Finished | TorrentStatus::Stopped
+        ) {
             return;
         }
         let connected: HashSet<SocketAddr> = self.peers.values().map(|p| p.addr).collect();

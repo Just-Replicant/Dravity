@@ -149,7 +149,10 @@ fn start_announces_and_connects_tracker_peers() {
         .collect();
     assert_eq!(connects, vec![addr(1), addr(2)]);
     // A failed attempt frees a slot for the queued address.
-    let fx = h.ev(Event::PeerConnectFailed { addr: addr(1) });
+    let fx = h.ev(Event::PeerConnectFailed {
+        addr: addr(1),
+        retry: true,
+    });
     assert_eq!(fx, vec![Effect::Connect { addr: addr(3) }]);
     assert_eq!(h.t.stats().connecting, 2);
 }
@@ -243,6 +246,137 @@ fn hash_failure_redownloads_piece() {
         again.extend(requests(&h.msg(1, data_for(r)), 1));
     }
     assert_eq!(again, piece0);
+}
+
+#[test]
+fn preamble_does_not_block_bitfield() {
+    let mut h = Harness::started_with_peer(config());
+    for message in [
+        Message::KeepAlive,
+        Message::Port(6881),
+        Message::Extended {
+            id: 0,
+            payload: Bytes::new(),
+        },
+        Message::Unknown {
+            id: 21,
+            payload: Bytes::new(),
+        },
+    ] {
+        assert!(
+            !disconnects(&h.msg(1, message), 1),
+            "preamble must not drop the peer"
+        );
+    }
+    let fx = h.msg(1, Message::Bitfield(Bitfield::full(3).to_bytes()));
+    assert!(!disconnects(&fx, 1));
+    assert!(fx.contains(&Effect::Send {
+        peer: PeerKey(1),
+        message: Message::Interested
+    }));
+    // A second bitfield, or one after a real BEP 3 message, is still illegal.
+    assert!(disconnects(
+        &h.msg(1, Message::Bitfield(Bitfield::full(3).to_bytes())),
+        1
+    ));
+
+    let mut h = Harness::started_with_peer(config());
+    h.msg(1, Message::Unchoke);
+    assert!(disconnects(&h.msg(1, Message::HaveAll), 1));
+}
+
+#[test]
+fn failed_and_dropped_peers_are_retried() {
+    let mut c = config();
+    c.peer_retry = Duration::from_secs(15);
+    let mut h = Harness::new(c);
+    h.ev(Event::Start);
+    h.ev(Event::AddPeers {
+        peers: vec![addr(1)],
+    });
+    let fx = h.ev(Event::PeerConnectFailed {
+        addr: addr(1),
+        retry: true,
+    });
+    assert!(
+        !fx.iter().any(|e| matches!(e, Effect::Connect { .. })),
+        "a failure is not redialed in the same turn"
+    );
+    assert_eq!(h.t.stats().known_peers, 1);
+    assert!(
+        !h.advance(Duration::from_secs(14))
+            .iter()
+            .any(|e| matches!(e, Effect::Connect { addr: peer } if *peer == addr(1)))
+    );
+    assert!(
+        h.advance(Duration::from_secs(1))
+            .contains(&Effect::Connect { addr: addr(1) })
+    );
+
+    // A live peer that drops is dialed again; a protocol reject is not.
+    let mut h = Harness::started_with_peer(config());
+    h.ev(Event::PeerDisconnected { peer: PeerKey(1) });
+    assert_eq!(h.t.stats().peers, 0);
+    assert!(
+        h.advance(h.t.config().peer_retry)
+            .contains(&Effect::Connect { addr: addr(1) })
+    );
+
+    let mut h = Harness::started_with_peer(config());
+    assert!(disconnects(&h.msg(1, Message::Have { piece: 99 }), 1));
+    assert_eq!(h.t.stats().known_peers, 0);
+    assert!(
+        !h.advance(h.t.config().peer_retry)
+            .iter()
+            .any(|e| matches!(e, Effect::Connect { .. }))
+    );
+
+    // Adding the same address again dials immediately, ahead of the timer.
+    let mut h = Harness::new(config());
+    h.ev(Event::Start);
+    h.ev(Event::AddPeers {
+        peers: vec![addr(4)],
+    });
+    h.ev(Event::PeerConnectFailed {
+        addr: addr(4),
+        retry: true,
+    });
+    assert!(
+        h.ev(Event::AddPeers {
+            peers: vec![addr(4)],
+        })
+        .contains(&Effect::Connect { addr: addr(4) })
+    );
+
+    // A handshake reject is not retried.
+    let mut h = Harness::new(config());
+    h.ev(Event::Start);
+    h.ev(Event::AddPeers {
+        peers: vec![addr(2)],
+    });
+    h.ev(Event::PeerConnectFailed {
+        addr: addr(2),
+        retry: false,
+    });
+    assert_eq!(h.t.stats().known_peers, 0);
+    assert!(
+        !h.advance(h.t.config().peer_retry)
+            .iter()
+            .any(|e| matches!(e, Effect::Connect { .. }))
+    );
+}
+
+#[test]
+fn storage_failure_stops_the_torrent() {
+    let mut h = Harness::started_with_peer(config());
+    let fx = h.ev(Event::StorageFailed {
+        error: "disk read failed".into(),
+    });
+    assert!(has_alert(
+        &fx,
+        |a| matches!(a, Alert::Error { message } if message.contains("disk read failed"))
+    ));
+    assert_eq!(h.t.status(), TorrentStatus::Stopped);
 }
 
 #[test]

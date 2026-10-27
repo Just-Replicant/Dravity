@@ -9,12 +9,15 @@
 //! * [`MemoryStorage`] — a byte buffer, for tests and small torrents.
 //!
 //! [`write_block`] and [`verify_piece`] adapt piece/block addresses to stream
-//! offsets. All calls block; the session runs them on a blocking thread pool.
+//! offsets. [`resume`] stores verified pieces plus file stamps so a restart
+//! can skip the hash check. All calls block; the session runs them on a
+//! blocking thread pool.
 
 mod error;
 mod file;
 mod memory;
 mod pos;
+pub mod resume;
 
 use dravity_core::{BlockRef, Info, PieceLayout};
 use sha1::{Digest, Sha1};
@@ -22,6 +25,7 @@ use sha1::{Digest, Sha1};
 pub use error::StorageError;
 pub use file::{DEFAULT_MAX_OPEN_FILES, FileStorage};
 pub use memory::MemoryStorage;
+pub use resume::{FileStamp, ResumeData, ResumeError, load_resume, remove_resume, save_resume};
 
 /// Byte-range access to a torrent's content stream.
 ///
@@ -55,6 +59,15 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     /// # Errors
     /// I/O errors from the backend.
     fn flush(&self) -> Result<(), StorageError>;
+
+    /// A [`FileStamp`] per file for fastresume, or `None` if the backend
+    /// cannot vouch for its data across restarts (the default).
+    ///
+    /// # Errors
+    /// I/O errors from the backend.
+    fn stamps(&self) -> Result<Option<Vec<FileStamp>>, StorageError> {
+        Ok(None)
+    }
 }
 
 /// Checks that `offset..offset + len` lies within `total`.

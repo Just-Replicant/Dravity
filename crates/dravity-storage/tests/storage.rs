@@ -12,7 +12,8 @@ use std::borrow::Cow;
 use dravity_bencode::{Dict, Value};
 use dravity_core::{BLOCK_SIZE, BlockRef, Metainfo};
 use dravity_storage::{
-    FileStorage, MemoryStorage, Storage, StorageError, verify_piece, write_block,
+    FileStamp, FileStorage, MemoryStorage, ResumeData, Storage, StorageError, load_resume,
+    remove_resume, save_resume, verify_piece, write_block,
 };
 use sha1::{Digest, Sha1};
 
@@ -228,4 +229,66 @@ fn memory_storage_verifies() {
     for piece in 0..m.info().piece_count() {
         assert!(verify_piece(&s, m.info(), piece).unwrap());
     }
+}
+
+#[test]
+fn stamps_vouch_for_resume_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, data) = torrent(
+        &[
+            (&["a.bin"], content(20_000, 1), false),
+            (&["pad"], vec![0; 100], true),
+            (&["b.bin"], content(5_000, 2), false),
+        ],
+        2 * BLOCK_SIZE as usize,
+    );
+    let s = FileStorage::new(dir.path(), m.info()).unwrap();
+    assert_eq!(
+        s.stamps().unwrap(),
+        Some(vec![FileStamp::Missing; 3]),
+        "nothing written yet"
+    );
+    write_all_blocks(&s, &m, &data);
+    s.flush().unwrap();
+    let stamps = s.stamps().unwrap().unwrap();
+    assert!(matches!(stamps[0], FileStamp::Present { len: 20_000, .. }));
+    assert_eq!(stamps[1], FileStamp::Missing, "padding is never created");
+
+    let path = dir.path().join("state/x.resume");
+    assert_eq!(load_resume(&path).unwrap(), None);
+    let resume = ResumeData {
+        info_hash: m.info_hash(),
+        piece_count: m.info().piece_count(),
+        have: vec![0b1000_0000],
+        files: stamps.clone(),
+    };
+    save_resume(&path, &resume).unwrap();
+    let loaded = load_resume(&path).unwrap().unwrap();
+    assert_eq!(loaded, resume);
+    assert!(!dir.path().join("state/x.resume.tmp").exists());
+    assert!(loaded.is_valid_for(
+        &m.info_hash(),
+        m.info().piece_count(),
+        &s.stamps().unwrap().unwrap()
+    ));
+
+    // Touching a file invalidates the stamps.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("root/b.bin"))
+        .unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+        .unwrap();
+    assert!(!loaded.is_valid_for(
+        &m.info_hash(),
+        m.info().piece_count(),
+        &s.stamps().unwrap().unwrap()
+    ));
+
+    std::fs::write(&path, b"garbage").unwrap();
+    assert!(load_resume(&path).is_err());
+    remove_resume(&path).unwrap();
+    remove_resume(&path).unwrap();
+    assert_eq!(load_resume(&path).unwrap(), None);
+    assert_eq!(MemoryStorage::new(1).stamps().unwrap(), None);
 }

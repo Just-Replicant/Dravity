@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use dravity_core::Info;
 use dravity_core::layout::FileLayout;
 
-use crate::{Storage, StorageError, check_range, pos};
+use crate::{FileStamp, Storage, StorageError, check_range, pos};
 
 /// Default cap on simultaneously open files.
 pub const DEFAULT_MAX_OPEN_FILES: usize = 128;
@@ -166,7 +166,48 @@ impl FileStorage {
     }
 }
 
+/// Length and modification time of the file at `path`, if it exists.
+fn stamp(path: &Path) -> Result<Option<FileStamp>, StorageError> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Some(FileStamp::Missing)),
+        Err(e) => return Err(StorageError::io(path, e)),
+    };
+    if !meta.is_file() {
+        // A symlink or directory in place of a file: never trust it.
+        return Ok(None);
+    }
+    let Ok(modified) = meta.modified() else {
+        return Ok(None);
+    };
+    let mtime_ns = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_nanos()).ok());
+    Ok(mtime_ns.map(|mtime_ns| FileStamp::Present {
+        len: meta.len(),
+        mtime_ns,
+    }))
+}
+
 impl Storage for FileStorage {
+    /// Stamps every non-padding file; `None` if a file has no usable
+    /// modification time or is not a regular file.
+    fn stamps(&self) -> Result<Option<Vec<FileStamp>>, StorageError> {
+        let mut out = Vec::with_capacity(self.files.len());
+        for spec in &self.files {
+            if spec.padding {
+                out.push(FileStamp::Missing);
+                continue;
+            }
+            match stamp(&spec.path)? {
+                Some(s) => out.push(s),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(out))
+    }
+
     fn len(&self) -> u64 {
         self.layout.total_length()
     }

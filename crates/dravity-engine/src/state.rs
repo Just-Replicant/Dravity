@@ -210,8 +210,8 @@ impl TorrentState {
     }
 
     /// Records that a `started` announce was already sent for this torrent
-    /// (for example while fetching its metadata), so the first announce is a
-    /// regular one.
+    /// (by the [`MetadataState`](crate::MetadataState) that fetched its
+    /// metadata), so the first announce is a regular one.
     #[must_use]
     pub const fn with_started_announced(mut self, started: bool) -> Self {
         self.started_announced = started;

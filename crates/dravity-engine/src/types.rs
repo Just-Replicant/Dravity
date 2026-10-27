@@ -34,6 +34,8 @@ pub enum AnnounceEvent {
 pub enum TorrentStatus {
     /// Created but [`Event::Start`] not yet processed.
     Idle,
+    /// Fetching the `info` dictionary from peers (magnet link, BEP 9).
+    FetchingMetadata,
     /// Hashing existing data to find pieces that are already present.
     Checking,
     /// Fetching pieces from peers.
@@ -272,6 +274,12 @@ pub enum Effect {
     },
     /// Look the torrent up in the DHT, then report [`Event::DhtPeers`].
     DhtLookup,
+    /// The `info` dictionary of a magnet link was downloaded and matches the
+    /// info-hash. Only produced by [`MetadataState`](crate::MetadataState).
+    MetadataReceived {
+        /// The bencoded `info` dictionary.
+        info: Bytes,
+    },
     /// Notify the application.
     Alert(Alert),
 }
@@ -301,6 +309,8 @@ pub enum Alert {
     },
     /// Every piece is present and verified.
     Finished,
+    /// The `info` dictionary of a magnet link was received and verified.
+    MetadataReceived,
     /// A fatal error stopped the torrent.
     Error {
         /// Cause.

@@ -1,7 +1,8 @@
 //! Peer addresses waiting to be dialed: a FIFO queue, a retry list with
 //! not-before times, and the set of dials in flight.
 //!
-//! Used by [`TorrentState`](crate::TorrentState); the owner decides *when* each
+//! Shared by [`TorrentState`](crate::TorrentState) and
+//! [`MetadataState`](crate::MetadataState); the owner decides *when* each
 //! operation is allowed (e.g. no retries once a torrent is finished).
 
 use std::collections::{HashSet, VecDeque};
@@ -124,6 +125,13 @@ impl PeerPool {
         self.clear_known();
         self.connecting.clear();
     }
+
+    /// Every queued or waiting address, for handing over to another state.
+    pub(crate) fn drain_known(&mut self) -> Vec<SocketAddr> {
+        let mut out: Vec<SocketAddr> = self.queue.drain(..).collect();
+        out.extend(self.retry.drain(..).map(|(_, addr)| addr));
+        out
+    }
 }
 
 #[cfg(test)]
@@ -157,11 +165,8 @@ mod tests {
         pool.dial_done(addr(1));
         pool.schedule_retry(now + Duration::from_secs(60), addr(1), |_| false);
         pool.add([addr(1)], |_| false);
-        assert_eq!(
-            pool.next_dial(|_| false),
-            Some(addr(1)),
-            "explicit add dials now"
-        );
+        assert_eq!(pool.drain_known(), [addr(1)], "explicit add dials now");
+        assert_eq!(pool.known(), 0, "drained");
     }
 
     #[test]

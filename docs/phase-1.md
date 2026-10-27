@@ -62,6 +62,20 @@ Also picks up the items Phase 0 deferred to Phase 1 (see below).
 - **Download-only:** we never unchoke peers, so `request`/`cancel` are
   ignored; the announced port is informational because Phase 1 does not
   listen. `anyhow` is allowed only for `dravity-cli` (cargo-deny wrapper).
+- **Peer retry.** A dial that fails or a connection that drops is tried again
+  after `peer_retry` (default 30s), so one refused connection does not forget
+  a `--peer` or a tracker address until the next announce. Wrong info-hash,
+  our own peer id, and a malformed handshake are not retried on that timer.
+- **Bitfield window.** `bitfield` / `have all` / `have none` stay legal after
+  keep-alives, DHT `port`, and BEP 10 extended messages. libtorrent-family
+  clients send the extended handshake before the bitfield; dropping them
+  there would refuse the common seeders. A bitfield after any other message
+  still disconnects.
+- **Tracker timing.** The re-announce period is at least every answering
+  tracker's `min interval`. A torrent with no trackers does not raise a
+  tracker error; explicit peers are still used.
+- **Hash I/O.** A hash mismatch or missing data is downloaded again. Any
+  other storage error while hashing stops the torrent.
 - **MSRV 1.85 is kept.** `criterion` is pinned to 0.7 (0.8 needs 1.86).
 
 ## Phase 0 deferrals handled here

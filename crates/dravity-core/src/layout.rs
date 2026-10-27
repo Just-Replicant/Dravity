@@ -16,9 +16,6 @@ pub enum LayoutError {
     /// Piece length was zero.
     #[error("piece length must be greater than zero")]
     ZeroPieceLength,
-    /// Total length was zero.
-    #[error("torrent has no content (total length is zero)")]
-    Empty,
     /// More pieces than fit in a `u32` piece index.
     #[error("too many pieces for a u32 index")]
     TooManyPieces,
@@ -59,13 +56,11 @@ impl PieceLayout {
     /// Creates a layout.
     ///
     /// # Errors
-    /// Fails for a zero piece length, zero total length, or more than `u32::MAX` pieces.
+    /// Fails for a zero piece length or more than `u32::MAX` pieces.
+    /// A total length of zero is an empty torrent and has [`piece_count`](Self::piece_count) 0.
     pub fn new(piece_length: u32, total_length: u64) -> Result<Self, LayoutError> {
         if piece_length == 0 {
             return Err(LayoutError::ZeroPieceLength);
-        }
-        if total_length == 0 {
-            return Err(LayoutError::Empty);
         }
         let count = total_length.div_ceil(u64::from(piece_length));
         let piece_count = u32::try_from(count).map_err(|_| LayoutError::TooManyPieces)?;
@@ -240,7 +235,6 @@ mod tests {
     #[test]
     fn rejects_bad_geometry() {
         assert_eq!(PieceLayout::new(0, 10), Err(LayoutError::ZeroPieceLength));
-        assert_eq!(PieceLayout::new(10, 0), Err(LayoutError::Empty));
         assert_eq!(
             PieceLayout::new(1, u64::MAX),
             Err(LayoutError::TooManyPieces)

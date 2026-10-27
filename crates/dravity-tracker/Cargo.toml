@@ -1,0 +1,30 @@
+[package]
+name = "dravity-tracker"
+description = "HTTP (BEP 3/23) and UDP (BEP 15) tracker announce for the Dravity BitTorrent engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+dravity-bencode.workspace = true
+dravity-core.workspace = true
+fastrand.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "time"] }
+url.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util"] }
+
+[lints]
+workspace = true

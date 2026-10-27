@@ -79,3 +79,17 @@ path = "fuzz_targets/tracker_udp_response.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "wire_metadata"
+path = "fuzz_targets/wire_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_pex"
+path = "fuzz_targets/wire_pex.rs"
+test = false
+doc = false
+bench = false

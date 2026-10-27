@@ -8,14 +8,19 @@ use crate::error::{Error, Result};
 /// Default maximum nesting depth of lists and dictionaries.
 pub const DEFAULT_MAX_DEPTH: usize = 256;
 
+/// Default maximum number of entries in one list or dictionary.
+pub const DEFAULT_MAX_ITEMS: usize = 1_048_576;
+
 /// Options controlling how strictly input is decoded.
 ///
 /// The default is *lenient about key order* (many real-world `.torrent` files
 /// have unsorted dictionaries) but always rejects non-canonical integers,
-/// duplicate adjacent keys, trailing data and excessive nesting.
+/// duplicate adjacent keys, trailing data, excessive nesting, and containers
+/// with more than [`DEFAULT_MAX_ITEMS`] entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeOptions {
     max_depth: usize,
+    max_items: usize,
     require_sorted_keys: bool,
 }
 
@@ -31,6 +36,7 @@ impl DecodeOptions {
     pub const fn new() -> Self {
         Self {
             max_depth: DEFAULT_MAX_DEPTH,
+            max_items: DEFAULT_MAX_ITEMS,
             require_sorted_keys: false,
         }
     }
@@ -40,6 +46,7 @@ impl DecodeOptions {
     pub const fn strict() -> Self {
         Self {
             max_depth: DEFAULT_MAX_DEPTH,
+            max_items: DEFAULT_MAX_ITEMS,
             require_sorted_keys: true,
         }
     }
@@ -48,6 +55,13 @@ impl DecodeOptions {
     #[must_use]
     pub const fn max_depth(mut self, depth: usize) -> Self {
         self.max_depth = depth;
+        self
+    }
+
+    /// Sets the maximum number of entries in a single list or dictionary.
+    #[must_use]
+    pub const fn max_items(mut self, items: usize) -> Self {
+        self.max_items = items;
         self
     }
 
@@ -62,6 +76,12 @@ impl DecodeOptions {
     #[must_use]
     pub const fn depth_limit(&self) -> usize {
         self.max_depth
+    }
+
+    /// Returns the configured maximum number of entries per container.
+    #[must_use]
+    pub const fn item_limit(&self) -> usize {
+        self.max_items
     }
 
     /// Returns whether sorted dictionary keys are required.
@@ -149,6 +169,18 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn leave(&mut self) {
         self.depth = self.depth.saturating_sub(1);
+    }
+
+    /// Rejects the next entry when `seen` has already reached the item cap.
+    pub(crate) fn check_items(&self, seen: usize) -> Result<()> {
+        if seen >= self.opts.max_items {
+            Err(Error::TooManyItems {
+                max: self.opts.max_items,
+                offset: self.pos,
+            })
+        } else {
+            Ok(())
+        }
     }
 
     /// Parses `i<digits>e`, validating canonical form. Returns the digit slice
@@ -251,7 +283,10 @@ impl<'a> Parser<'a> {
             }
             b'l' => {
                 self.enter(b'l')?;
+                let mut seen = 0usize;
                 while !self.eat_end()? {
+                    self.check_items(seen)?;
+                    seen += 1;
                     self.skip_value()?;
                 }
                 self.leave();
@@ -259,7 +294,10 @@ impl<'a> Parser<'a> {
             b'd' => {
                 self.enter(b'd')?;
                 let mut prev: Option<&[u8]> = None;
+                let mut seen = 0usize;
                 while !self.eat_end()? {
+                    self.check_items(seen)?;
+                    seen += 1;
                     let key = self.dict_key()?;
                     self.check_key(prev, key.0, key.1)?;
                     prev = Some(key.0);

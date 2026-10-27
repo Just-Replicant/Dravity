@@ -1,7 +1,9 @@
 //! Session configuration.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
+use dravity_dht::DhtConfig;
 use dravity_tracker::ClientConfig;
 
 /// Session-wide settings. [`SessionConfig::default`] is a reasonable start.
@@ -10,8 +12,8 @@ use dravity_tracker::ClientConfig;
 pub struct SessionConfig {
     /// Peer id prefix in Azureus style (`-DV0001-`); the rest is random.
     pub peer_id_prefix: Vec<u8>,
-    /// Port reported to trackers. Phase 1 does not accept incoming
-    /// connections, so this is informational.
+    /// Port reported to trackers. Incoming connections are not accepted
+    /// yet (Phase 3), so this is informational.
     pub announce_port: u16,
     /// Per-torrent engine tunables.
     pub engine: dravity_engine::Config,
@@ -33,6 +35,15 @@ pub struct SessionConfig {
     pub stop_announce_timeout: Duration,
     /// Broadcast buffer for alerts; slow subscribers miss older alerts.
     pub alert_buffer: usize,
+    /// Run a DHT node (BEP 5) for peer discovery; `None` disables the DHT.
+    /// Private torrents never use it.
+    pub dht: Option<DhtConfig>,
+    /// Time allowed for one DHT lookup.
+    pub dht_lookup_timeout: Duration,
+    /// Directory for fastresume files (`<info-hash>.resume`). When set, a
+    /// torrent saves its verified pieces on stop and, on the next start,
+    /// skips the full check if no file changed since. `None` disables it.
+    pub resume_dir: Option<PathBuf>,
 }
 
 impl Default for SessionConfig {
@@ -50,6 +61,9 @@ impl Default for SessionConfig {
             hash_workers: std::thread::available_parallelism().map_or(2, usize::from),
             stop_announce_timeout: Duration::from_secs(5),
             alert_buffer: 1024,
+            dht: Some(DhtConfig::default()),
+            dht_lookup_timeout: Duration::from_secs(30),
+            resume_dir: None,
         }
     }
 }

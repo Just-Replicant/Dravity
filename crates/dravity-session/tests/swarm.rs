@@ -18,10 +18,14 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use dravity_bencode::{Dict, Value};
-use dravity_core::{InfoHash, Metainfo, PeerId};
+use dravity_core::{InfoHash, Magnet, Metainfo, PeerId};
+use dravity_dht::{Dht, Testnet};
 use dravity_engine::{Alert, Bitfield, TorrentStatus};
 use dravity_session::{AddTorrentOptions, PeerCodec, Session, SessionAlert, SessionConfig};
-use dravity_wire::{Handshake, Message};
+use dravity_wire::{
+    ExtendedHandshake, Handshake, METADATA_PIECE_LEN, Message, MetadataMessage, PexMessage,
+    PexPeer, Reserved,
+};
 use futures_util::{SinkExt, StreamExt};
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -75,12 +79,38 @@ fn make_torrent(announce: Option<&str>, len_a: usize, len_b: usize) -> (Metainfo
     (Metainfo::from_bytes(&encoded).unwrap(), content)
 }
 
+/// What a scripted remote peer does.
+#[derive(Clone, Default)]
+struct PeerScript {
+    /// Content to serve; `None` advertises no pieces.
+    content: Option<Arc<Vec<u8>>>,
+    /// Bencoded `info` dictionary to serve over `ut_metadata` (BEP 9).
+    info: Option<Bytes>,
+    /// Addresses to announce over `ut_pex` (BEP 11).
+    pex: Vec<SocketAddr>,
+    /// Garble the first block of piece 0 once.
+    corrupt_once: bool,
+}
+
 /// A seeder that serves `content` to every connection. If `corrupt_once` is
 /// set, the first block of piece 0 it serves is garbage.
 async fn seeder(content: Arc<Vec<u8>>, info_hash: InfoHash, corrupt_once: bool) -> SocketAddr {
+    spawn_peer(
+        info_hash,
+        PeerScript {
+            content: Some(content),
+            corrupt_once,
+            ..PeerScript::default()
+        },
+    )
+    .await
+}
+
+/// Listens on loopback and runs `script` for every connection.
+async fn spawn_peer(info_hash: InfoHash, script: PeerScript) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let corrupted = Arc::new(AtomicBool::new(!corrupt_once));
+    let corrupted = Arc::new(AtomicBool::new(!script.corrupt_once));
     tokio::spawn(async move {
         loop {
             let Ok((sock, _)) = listener.accept().await else {
@@ -88,7 +118,7 @@ async fn seeder(content: Arc<Vec<u8>>, info_hash: InfoHash, corrupt_once: bool) 
             };
             tokio::spawn(serve(
                 sock,
-                Arc::clone(&content),
+                script.clone(),
                 info_hash,
                 Arc::clone(&corrupted),
             ));
@@ -97,9 +127,13 @@ async fn seeder(content: Arc<Vec<u8>>, info_hash: InfoHash, corrupt_once: bool) 
     addr
 }
 
+/// Our extension ids, as announced to the client.
+const SEED_UT_METADATA: u8 = 3;
+const SEED_UT_PEX: u8 = 4;
+
 async fn serve(
     mut sock: TcpStream,
-    content: Arc<Vec<u8>>,
+    script: PeerScript,
     info_hash: InfoHash,
     corrupted: Arc<AtomicBool>,
 ) {
@@ -111,21 +145,55 @@ async fn serve(
         .unwrap()
         .unwrap();
     assert_eq!(theirs.info_hash, info_hash);
-    let ours = Handshake::new(info_hash, PeerId::new(*b"-TS0001-seedseedseed"));
+    let extended = theirs.reserved.extension_protocol();
+    let ours = Handshake::new(info_hash, PeerId::new(*b"-TS0001-seedseedseed"))
+        .with_reserved(Reserved::new().with_extension_protocol(true));
     sock.write_all(&ours.to_bytes()).await.unwrap();
-    let pieces = content.len().div_ceil(PIECE_LEN) as u32;
     let mut framed = Framed::new(sock, PeerCodec::default());
-    if framed
-        .send(Message::Bitfield(Bitfield::full(pieces).to_bytes()))
-        .await
-        .is_err()
-    {
+    if extended {
+        let mut extensions = vec![("ut_metadata".to_owned(), SEED_UT_METADATA)];
+        if !script.pex.is_empty() {
+            extensions.push(("ut_pex".to_owned(), SEED_UT_PEX));
+        }
+        let hs = ExtendedHandshake {
+            extensions,
+            listen_port: None,
+            client: Some(b"test seeder".to_vec()),
+            your_ip: None,
+            request_queue: Some(250),
+            metadata_size: script.info.as_ref().map(|i| i.len() as u64),
+            ipv4: None,
+            ipv6: None,
+        };
+        let payload = Bytes::from(hs.encode().unwrap());
+        if framed
+            .send(Message::Extended { id: 0, payload })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    let availability = match &script.content {
+        Some(content) => {
+            let pieces = content.len().div_ceil(PIECE_LEN) as u32;
+            Message::Bitfield(Bitfield::full(pieces).to_bytes())
+        }
+        None => Message::KeepAlive,
+    };
+    if framed.send(availability).await.is_err() {
         return;
     }
+    // Extension ids the client wants us to use.
+    let mut their_metadata = None;
+    let mut their_pex = None;
     while let Some(Ok(message)) = framed.next().await {
         let reply = match message {
             Message::Interested => Message::Unchoke,
             Message::Request(r) => {
+                let Some(content) = &script.content else {
+                    continue;
+                };
                 let start = r.piece as usize * PIECE_LEN + r.offset as usize;
                 let mut data = content[start..start + r.length as usize].to_vec();
                 if r.piece == 0 && r.offset == 0 && !corrupted.swap(true, Ordering::SeqCst) {
@@ -135,6 +203,59 @@ async fn serve(
                     piece: r.piece,
                     offset: r.offset,
                     data: Bytes::from(data),
+                }
+            }
+            Message::Extended { id: 0, payload } => {
+                let hs = ExtendedHandshake::decode(&payload).unwrap();
+                for (name, id) in hs.extensions {
+                    match name.as_str() {
+                        "ut_metadata" => their_metadata = Some(id),
+                        "ut_pex" => their_pex = Some(id),
+                        _ => {}
+                    }
+                }
+                match their_pex.filter(|_| !script.pex.is_empty()) {
+                    Some(id) => {
+                        let pex = PexMessage {
+                            added: script
+                                .pex
+                                .iter()
+                                .map(|&addr| PexPeer { addr, flags: 0 })
+                                .collect(),
+                            dropped: Vec::new(),
+                        };
+                        Message::Extended {
+                            id,
+                            payload: Bytes::from(pex.encode()),
+                        }
+                    }
+                    None => continue,
+                }
+            }
+            Message::Extended {
+                id: SEED_UT_METADATA,
+                payload,
+            } => {
+                let (Some(id), Ok(MetadataMessage::Request { piece })) =
+                    (their_metadata, MetadataMessage::decode(&payload))
+                else {
+                    continue;
+                };
+                let answer = match &script.info {
+                    Some(info) => {
+                        let start = (piece * METADATA_PIECE_LEN) as usize;
+                        let end = (start + METADATA_PIECE_LEN as usize).min(info.len());
+                        MetadataMessage::Data {
+                            piece,
+                            total_size: info.len() as u64,
+                            data: info.slice(start..end),
+                        }
+                    }
+                    None => MetadataMessage::Reject { piece },
+                };
+                Message::Extended {
+                    id,
+                    payload: answer.encode().unwrap(),
                 }
             }
             _ => continue,
@@ -193,6 +314,8 @@ fn config() -> SessionConfig {
     let mut c = SessionConfig::default();
     c.tick_interval = Duration::from_millis(50);
     c.stop_announce_timeout = Duration::from_secs(1);
+    // Hermetic: no public DHT bootstrap.
+    c.dht = None;
     c
 }
 
@@ -301,6 +424,225 @@ async fn recovers_from_corrupt_piece_with_explicit_peer() {
     assert!(
         !seen.iter().any(|a| matches!(a, Alert::TrackerError { .. })),
         "{seen:?}"
+    );
+    handle.stop().await;
+    assert_files(dir.path(), &content, len_a);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn magnet_fetches_metadata_then_downloads() {
+    let (len_a, len_b) = (70_000, 20_000);
+    let (metainfo, content) = make_torrent(None, len_a, len_b);
+    let hash = metainfo.info_hash();
+    let seed = spawn_peer(
+        hash,
+        PeerScript {
+            content: Some(Arc::new(content.clone())),
+            info: Some(Bytes::copy_from_slice(metainfo.info_bytes())),
+            ..PeerScript::default()
+        },
+    )
+    .await;
+    let url = tracker(vec![seed]).await;
+    let mut magnet = Magnet::new(hash);
+    magnet.trackers.push(url);
+
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(config()).unwrap();
+    let mut alerts = session.subscribe();
+    let handle = session
+        .add_magnet(&magnet, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    let seen = until_finished(&mut alerts, hash).await;
+    assert!(
+        seen.contains(&Alert::StateChanged(TorrentStatus::FetchingMetadata)),
+        "{seen:?}"
+    );
+    let received = seen
+        .iter()
+        .position(|a| *a == Alert::MetadataReceived)
+        .expect("metadata alert");
+    let downloading = seen
+        .iter()
+        .position(|a| *a == Alert::StateChanged(TorrentStatus::Downloading))
+        .expect("downloading");
+    assert!(received < downloading);
+    assert_eq!(
+        handle.stats().await.unwrap().bytes_have,
+        (len_a + len_b) as u64
+    );
+    handle.stop().await;
+    assert_files(dir.path(), &content, len_a);
+
+    // Unsupported inputs are rejected up front.
+    let v2_only = Magnet::parse(&format!("magnet:?xt=urn:btmh:1220{}", "ab".repeat(32))).unwrap();
+    assert!(matches!(
+        session.add_magnet(&v2_only, AddTorrentOptions::new(dir.path())),
+        Err(dravity_session::SessionError::MagnetWithoutV1Hash)
+    ));
+    let storage = Arc::new(dravity_storage::MemoryStorage::new(1));
+    assert!(matches!(
+        session.add_magnet(
+            &magnet,
+            AddTorrentOptions::new(dir.path()).with_storage(storage)
+        ),
+        Err(dravity_session::SessionError::StorageForMagnet)
+    ));
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn magnet_finds_peers_in_the_dht() {
+    let (len_a, len_b) = (33_000, 1);
+    let (metainfo, content) = make_torrent(None, len_a, len_b);
+    let hash = metainfo.info_hash();
+    let seed = spawn_peer(
+        hash,
+        PeerScript {
+            content: Some(Arc::new(content.clone())),
+            info: Some(Bytes::copy_from_slice(metainfo.info_bytes())),
+            ..PeerScript::default()
+        },
+    )
+    .await;
+    let net = Testnet::new(8).unwrap();
+    let announcer = Dht::new(&net.config()).unwrap();
+    announcer.announce(hash, Some(seed.port())).await.unwrap();
+
+    let mut c = config();
+    c.dht = Some(net.config());
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(c).unwrap();
+    assert!(session.dht().is_some());
+    let mut alerts = session.subscribe();
+    let handle = session
+        .add_magnet(&Magnet::new(hash), AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    until_finished(&mut alerts, hash).await;
+    handle.stop().await;
+    assert_files(dir.path(), &content, len_a);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peers_learned_through_pex() {
+    let (len_a, len_b) = (50_000, 10_000);
+    let (metainfo, content) = make_torrent(None, len_a, len_b);
+    let hash = metainfo.info_hash();
+    let seed = seeder(Arc::new(content.clone()), hash, false).await;
+    // The only peer we are told about has nothing but knows the seeder.
+    let gossip = spawn_peer(
+        hash,
+        PeerScript {
+            pex: vec![seed],
+            ..PeerScript::default()
+        },
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(config()).unwrap();
+    let mut alerts = session.subscribe();
+    let handle = session
+        .add_torrent(
+            metainfo,
+            AddTorrentOptions::new(dir.path()).with_peers([gossip]),
+        )
+        .unwrap();
+    until_finished(&mut alerts, hash).await;
+    handle.stop().await;
+    assert_files(dir.path(), &content, len_a);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fastresume_skips_the_check_until_files_change() {
+    let (len_a, len_b) = (64_000, 32_000);
+    let (metainfo, content) = make_torrent(None, len_a, len_b);
+    let hash = metainfo.info_hash();
+    let seed = seeder(Arc::new(content.clone()), hash, false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = config();
+    c.resume_dir = Some(dir.path().join(".resume"));
+    let session = Session::new(c).unwrap();
+    let mut alerts = session.subscribe();
+    let add = |session: &Session| {
+        session
+            .add_torrent(
+                make_torrent(None, len_a, len_b).0,
+                AddTorrentOptions::new(dir.path()).with_peers([seed]),
+            )
+            .unwrap()
+    };
+
+    let handle = add(&session);
+    let seen = until_finished(&mut alerts, hash).await;
+    assert!(seen.contains(&Alert::StateChanged(TorrentStatus::Checking)));
+    handle.stop().await;
+    let resume = dir.path().join(format!(".resume/{}.resume", hash.to_hex()));
+    assert!(resume.exists());
+
+    // Nothing changed: trusted without hashing.
+    let handle = add(&session);
+    let seen = until_finished(&mut alerts, hash).await;
+    assert!(
+        !seen.contains(&Alert::StateChanged(TorrentStatus::Checking)),
+        "{seen:?}"
+    );
+    assert_eq!(handle.stats().await.unwrap().downloaded, 0);
+    handle.stop().await;
+
+    // A touched file invalidates the resume data: full check again.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("payload/b.bin"))
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1))
+        .unwrap();
+    let handle = add(&session);
+    let seen = until_finished(&mut alerts, hash).await;
+    assert!(seen.contains(&Alert::StateChanged(TorrentStatus::Checking)));
+    assert_eq!(handle.stats().await.unwrap().downloaded, 0);
+    handle.stop().await;
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tier_falls_back_to_the_next_tracker() {
+    let (len_a, len_b) = (20_000, 20_000);
+    let (probe, content) = make_torrent(None, len_a, len_b);
+    let seed = seeder(Arc::new(content.clone()), probe.info_hash(), false).await;
+    let good = tracker(vec![seed]).await;
+    // A port nobody listens on.
+    let dead = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("http://{}/announce", l.local_addr().unwrap())
+    };
+    let mut magnet = Magnet::new(probe.info_hash());
+    magnet.trackers = vec![dead, good];
+    // Same tier: build a torrent with announce-list [[dead, good]].
+    let info = Value::decode(probe.info_bytes()).unwrap().into_owned();
+    let tier = Value::List(
+        magnet
+            .trackers
+            .iter()
+            .map(|u| bytes(u.as_bytes()))
+            .collect(),
+    );
+    let encoded = dict(vec![
+        ("info", info),
+        ("announce-list", Value::List(vec![tier])),
+    ])
+    .to_vec();
+    let metainfo = Metainfo::from_bytes(&encoded).unwrap();
+    assert_eq!(metainfo.trackers().len(), 1);
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(config()).unwrap();
+    let mut alerts = session.subscribe();
+    let handle = session
+        .add_torrent(metainfo, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    let seen = until_finished(&mut alerts, handle.info_hash()).await;
+    assert!(
+        !seen.iter().any(|a| matches!(a, Alert::TrackerError { .. })),
+        "one tracker of the tier answered: {seen:?}"
     );
     handle.stop().await;
     assert_files(dir.path(), &content, len_a);

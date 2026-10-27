@@ -486,6 +486,7 @@ dependencies = [
  "bytes",
  "dravity-bencode",
  "dravity-core",
+ "dravity-dht",
  "dravity-engine",
  "dravity-storage",
  "dravity-tracker",

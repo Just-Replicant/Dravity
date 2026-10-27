@@ -26,8 +26,14 @@
 //! # Ok(()) }
 //! ```
 //!
-//! Phase 1 downloads only: it connects to peers from trackers (and any
-//! given explicitly) but does not listen for incoming connections or upload.
+//! Torrents come from `.torrent` files ([`Session::add_torrent`]) or magnet
+//! links ([`Session::add_magnet`], metadata fetched from peers with BEP 9).
+//! Peers are found through trackers (BEP 12 tiers), the DHT (BEP 5), peer
+//! exchange (BEP 11) and explicit addresses. With
+//! [`SessionConfig::resume_dir`] set, restarts skip the full hash check.
+//!
+//! The session downloads only: it does not yet listen for incoming
+//! connections or upload (Phase 3).
 
 mod codec;
 mod config;
@@ -40,7 +46,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use dravity_core::{InfoHash, Metainfo, PeerId};
+use dravity_core::{InfoHash, Magnet, Metainfo, PeerId};
+use dravity_dht::Dht;
 use dravity_engine::{Alert, Stats};
 use dravity_storage::{FileStorage, Storage};
 use dravity_tracker::TrackerClient;
@@ -50,7 +57,7 @@ pub use codec::{CodecError, PeerCodec};
 pub use config::SessionConfig;
 pub use error::SessionError;
 
-use crate::torrent::{Command, TorrentContext, TorrentTask};
+use crate::torrent::{Command, Source, TorrentContext, TorrentTask, prepare_tiers};
 
 /// An engine [`Alert`] tagged with the torrent it concerns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +77,8 @@ pub struct AddTorrentOptions {
     pub download_dir: PathBuf,
     /// Peers to try in addition to those from trackers.
     pub peers: Vec<SocketAddr>,
-    /// Custom storage backend; overrides `download_dir`.
+    /// Custom storage backend; overrides `download_dir`. Not supported for
+    /// magnet links.
     pub storage: Option<Arc<dyn Storage>>,
 }
 
@@ -104,6 +112,7 @@ struct Inner {
     config: Arc<SessionConfig>,
     peer_id: PeerId,
     tracker: TrackerClient,
+    dht: Option<Dht>,
     alerts: broadcast::Sender<SessionAlert>,
     torrents: Mutex<HashMap<InfoHash, mpsc::Sender<Command>>>,
 }
@@ -117,8 +126,11 @@ pub struct Session {
 impl Session {
     /// Creates a session with a random peer id.
     ///
+    /// Starts the DHT node when [`SessionConfig::dht`] is set.
+    ///
     /// # Errors
-    /// [`SessionError::Tracker`] if the tracker HTTP/TLS client cannot be built.
+    /// [`SessionError::Tracker`] if the tracker HTTP/TLS client cannot be
+    /// built; [`SessionError::Dht`] if the DHT socket cannot be bound.
     pub fn new(config: SessionConfig) -> Result<Self, SessionError> {
         let suffix: Vec<u8> = std::iter::repeat_with(fastrand::alphanumeric)
             .take(PeerId::LEN)
@@ -126,12 +138,14 @@ impl Session {
             .collect();
         let peer_id = PeerId::with_prefix(&config.peer_id_prefix, &suffix);
         let tracker = TrackerClient::new(config.tracker.clone())?;
+        let dht = config.dht.as_ref().map(Dht::new).transpose()?;
         let (alerts, _) = broadcast::channel(config.alert_buffer.max(1));
         Ok(Self {
             inner: Arc::new(Inner {
                 config: Arc::new(config),
                 peer_id,
                 tracker,
+                dht,
                 alerts,
                 torrents: Mutex::new(HashMap::new()),
             }),
@@ -151,8 +165,14 @@ impl Session {
         self.inner.alerts.subscribe()
     }
 
-    /// Adds a torrent and starts it: existing data is checked, then trackers
-    /// are announced to and pieces downloaded.
+    /// The session's DHT node, if it runs one.
+    #[must_use]
+    pub fn dht(&self) -> Option<&Dht> {
+        self.inner.dht.as_ref()
+    }
+
+    /// Adds a torrent and starts it: existing data is checked (or resume
+    /// data trusted), then trackers are announced to and pieces downloaded.
     ///
     /// Must be called from within a Tokio runtime.
     ///
@@ -165,6 +185,64 @@ impl Session {
         options: AddTorrentOptions,
     ) -> Result<TorrentHandle, SessionError> {
         let info_hash = metainfo.info_hash();
+        let trackers = metainfo.trackers();
+        self.spawn(info_hash, trackers, options.peers, || {
+            let storage: Arc<dyn Storage> = match options.storage {
+                Some(storage) => storage,
+                None => Arc::new(FileStorage::new(&options.download_dir, metainfo.info())?),
+            };
+            Ok(Source::Torrent {
+                metainfo: Arc::new(metainfo),
+                storage,
+            })
+        })
+    }
+
+    /// Adds a magnet link and starts it: the `info` dictionary is fetched
+    /// from peers (BEP 9) found through the magnet's trackers and peers and
+    /// the DHT, verified against the info-hash, and then the torrent
+    /// downloads like one added from a file.
+    ///
+    /// Must be called from within a Tokio runtime.
+    ///
+    /// # Errors
+    /// [`SessionError::MagnetWithoutV1Hash`] for a v2-only magnet,
+    /// [`SessionError::StorageForMagnet`] if `options` carries a custom
+    /// storage backend, [`SessionError::Duplicate`] if the torrent is
+    /// already running.
+    pub fn add_magnet(
+        &self,
+        magnet: &Magnet,
+        options: AddTorrentOptions,
+    ) -> Result<TorrentHandle, SessionError> {
+        let info_hash = magnet.info_hash.ok_or(SessionError::MagnetWithoutV1Hash)?;
+        if options.storage.is_some() {
+            return Err(SessionError::StorageForMagnet);
+        }
+        // Each `tr` is its own tier: all of them are asked concurrently.
+        let trackers = magnet.trackers.iter().map(|t| vec![t.clone()]).collect();
+        let mut peers = options.peers;
+        peers.extend(
+            magnet
+                .peers
+                .iter()
+                .filter_map(|p| p.parse::<SocketAddr>().ok()),
+        );
+        let download_dir = options.download_dir;
+        self.spawn(info_hash, trackers, peers, || {
+            Ok(Source::Magnet { download_dir })
+        })
+    }
+
+    /// Registers and spawns a torrent task; `source` runs under the torrent
+    /// map lock, after the duplicate check.
+    fn spawn(
+        &self,
+        info_hash: InfoHash,
+        trackers: Vec<Vec<String>>,
+        peers: Vec<SocketAddr>,
+        source: impl FnOnce() -> Result<Source, SessionError>,
+    ) -> Result<TorrentHandle, SessionError> {
         let mut torrents = self
             .inner
             .torrents
@@ -173,25 +251,23 @@ impl Session {
         if torrents.get(&info_hash).is_some_and(|tx| !tx.is_closed()) {
             return Err(SessionError::Duplicate(info_hash));
         }
-        let storage: Arc<dyn Storage> = match options.storage {
-            Some(storage) => storage,
-            None => Arc::new(FileStorage::new(&options.download_dir, metainfo.info())?),
-        };
+        let source = source()?;
         let ctx = TorrentContext {
-            metainfo: Arc::new(metainfo),
-            storage,
+            info_hash,
+            trackers: prepare_tiers(trackers),
             tracker: self.inner.tracker.clone(),
+            dht: self.inner.dht.clone(),
             peer_id: self.inner.peer_id,
             config: Arc::clone(&self.inner.config),
             alerts: self.inner.alerts.clone(),
             tracker_key: fastrand::u32(..),
         };
         let (tx, rx) = mpsc::channel(64);
-        if !options.peers.is_empty() {
+        if !peers.is_empty() {
             // Fresh channel with spare capacity: cannot fail.
-            let _ = tx.try_send(Command::AddPeers(options.peers));
+            let _ = tx.try_send(Command::AddPeers(peers));
         }
-        tokio::spawn(TorrentTask::new(ctx, rx).run());
+        tokio::spawn(TorrentTask::new(ctx, source, rx).run());
         torrents.insert(info_hash, tx.clone());
         Ok(TorrentHandle {
             info_hash,

@@ -18,4 +18,15 @@ pub enum SessionError {
     /// The tracker client could not be created.
     #[error(transparent)]
     Tracker(#[from] dravity_tracker::TrackerError),
+    /// The DHT node could not be started.
+    #[error(transparent)]
+    Dht(#[from] dravity_dht::DhtError),
+    /// The magnet link has no v1 info-hash (`urn:btih`); v2-only magnets
+    /// are not supported yet.
+    #[error("magnet link has no v1 (btih) info-hash")]
+    MagnetWithoutV1Hash,
+    /// A custom storage backend was given for a magnet link, whose size is
+    /// unknown until the metadata arrives.
+    #[error("custom storage is not supported for magnet links")]
+    StorageForMagnet,
 }

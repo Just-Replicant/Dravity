@@ -14,6 +14,7 @@ publish.workspace = true
 [dependencies]
 bytes.workspace = true
 dravity-core.workspace = true
+dravity-dht.workspace = true
 dravity-engine.workspace = true
 dravity-storage.workspace = true
 dravity-tracker.workspace = true

@@ -246,6 +246,21 @@ mod tests {
     }
 
     #[test]
+    fn empty_content_has_no_pieces() {
+        let l = PieceLayout::new(16 * 1024, 0).unwrap();
+        assert_eq!(l.piece_count(), 0);
+        assert_eq!(l.total_length(), 0);
+        assert_eq!(l.piece_size(0), None);
+        assert_eq!(l.piece_at(0), None);
+        assert_eq!(l.blocks(0).count(), 0);
+        assert!(!l.is_valid_request(BlockRef {
+            piece: 0,
+            offset: 0,
+            length: 1
+        }));
+    }
+
+    #[test]
     fn exact_multiple() {
         let l = PieceLayout::new(BLOCK_SIZE * 2, u64::from(BLOCK_SIZE) * 4).unwrap();
         assert_eq!(l.piece_count(), 2);

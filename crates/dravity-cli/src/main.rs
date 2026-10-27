@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use dravity_core::Metainfo;
+use dravity_core::{Magnet, Metainfo};
 use dravity_engine::{Alert, TorrentStatus};
 use dravity_session::{AddTorrentOptions, Session, SessionConfig};
 use tokio::sync::broadcast::error::RecvError;
@@ -29,8 +29,8 @@ struct Cli {
 enum Command {
     /// Download a torrent and exit when it is complete.
     Download {
-        /// Path to a `.torrent` file.
-        torrent: PathBuf,
+        /// Path to a `.torrent` file, or a `magnet:` link.
+        torrent: String,
         /// Download directory.
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
@@ -43,14 +43,27 @@ enum Command {
         /// Maximum connected peers.
         #[arg(long, default_value_t = 50)]
         max_peers: usize,
+        /// Download rate limit in bytes per second; accepts `K`/`M`/`G`
+        /// suffixes (binary), e.g. `500K` or `2M`.
+        #[arg(long, value_name = "RATE", value_parser = format::parse_rate)]
+        download_limit: Option<u64>,
+        /// Do not use the DHT for peer discovery.
+        #[arg(long)]
+        no_dht: bool,
+        /// Directory for fastresume data (defaults to OUTPUT/.dravity).
+        #[arg(long, value_name = "DIR", conflicts_with = "no_resume")]
+        resume_dir: Option<PathBuf>,
+        /// Neither read nor write fastresume data (always check existing files).
+        #[arg(long)]
+        no_resume: bool,
         /// Suppress the progress line.
         #[arg(short, long)]
         quiet: bool,
     },
-    /// Show what a `.torrent` file contains.
+    /// Show what a `.torrent` file or `magnet:` link contains.
     Info {
-        /// Path to a `.torrent` file.
-        torrent: PathBuf,
+        /// Path to a `.torrent` file, or a `magnet:` link.
+        torrent: String,
     },
 }
 
@@ -71,30 +84,98 @@ fn main() -> ExitCode {
     }
 }
 
+/// A torrent given on the command line.
+#[derive(Debug)]
+enum Input {
+    File(Box<Metainfo>),
+    Magnet(Magnet),
+}
+
+impl Input {
+    /// A display name: the torrent name, the magnet's `dn`, or the info-hash.
+    fn name(&self) -> String {
+        match self {
+            Self::File(m) => m.info().name().to_owned(),
+            Self::Magnet(m) => m
+                .display_name
+                .clone()
+                .or_else(|| m.info_hash.map(|h| h.to_hex()))
+                .unwrap_or_else(|| "magnet".to_owned()),
+        }
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Info { torrent } => info(&load(&torrent)?),
+        Command::Info { torrent } => match load(&torrent)? {
+            Input::File(m) => info(&m),
+            Input::Magnet(m) => magnet_info(&m),
+        },
         Command::Download {
             torrent,
             output,
             peers,
             port,
             max_peers,
+            download_limit,
+            no_dht,
+            resume_dir,
+            no_resume,
             quiet,
         } => {
-            let metainfo = load(&torrent)?;
+            let input = load(&torrent)?;
             let mut config = SessionConfig::default();
             config.announce_port = port;
             config.engine.max_peers = max_peers.max(1);
+            config.engine.download_rate_limit = download_limit.filter(|&r| r > 0);
+            if no_dht {
+                config.dht = None;
+            }
+            config.resume_dir = if no_resume {
+                None
+            } else {
+                Some(resume_dir.unwrap_or_else(|| output.join(".dravity")))
+            };
             let runtime = tokio::runtime::Runtime::new().context("starting the Tokio runtime")?;
-            runtime.block_on(download(metainfo, output, peers, config, quiet))
+            runtime.block_on(download(input, output, peers, config, quiet))
         }
     }
 }
 
-fn load(path: &Path) -> Result<Metainfo> {
+fn load(arg: &str) -> Result<Input> {
+    if arg.starts_with("magnet:") {
+        let magnet = Magnet::parse(arg).context("parsing the magnet link")?;
+        return Ok(Input::Magnet(magnet));
+    }
+    let path = Path::new(arg);
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    Metainfo::from_bytes(&bytes).with_context(|| format!("parsing {}", path.display()))
+    let metainfo =
+        Metainfo::from_bytes(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Input::File(Box::new(metainfo)))
+}
+
+fn magnet_info(m: &Magnet) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    if let Some(name) = &m.display_name {
+        writeln!(out, "name:       {name}")?;
+    }
+    if let Some(hash) = m.info_hash {
+        writeln!(out, "info-hash:  {hash}")?;
+    }
+    if let Some(hash) = &m.info_hash_v2 {
+        writeln!(out, "v2 hash:    {}", hash.to_hex())?;
+    }
+    if let Some(len) = m.exact_length {
+        writeln!(out, "size:       {} ({len} bytes)", format::bytes(len))?;
+    }
+    for url in &m.trackers {
+        writeln!(out, "tracker:    {url}")?;
+    }
+    for peer in &m.peers {
+        writeln!(out, "peer:       {peer}")?;
+    }
+    writeln!(out, "(files are known once the metadata is fetched)")?;
+    Ok(())
 }
 
 fn info(m: &Metainfo) -> Result<()> {
@@ -139,18 +220,21 @@ fn info(m: &Metainfo) -> Result<()> {
 }
 
 async fn download(
-    metainfo: Metainfo,
+    input: Input,
     output: PathBuf,
     peers: Vec<SocketAddr>,
     config: SessionConfig,
     quiet: bool,
 ) -> Result<()> {
-    let name = metainfo.info().name().to_owned();
+    let name = input.name();
     let session = Session::new(config).context("creating the session")?;
     let mut alerts = session.subscribe();
-    let torrent = session
-        .add_torrent(metainfo, AddTorrentOptions::new(&output).with_peers(peers))
-        .context("adding the torrent")?;
+    let options = AddTorrentOptions::new(&output).with_peers(peers);
+    let torrent = match input {
+        Input::File(metainfo) => session.add_torrent(*metainfo, options),
+        Input::Magnet(magnet) => session.add_magnet(&magnet, options),
+    }
+    .context("adding the torrent")?;
     let tty = std::io::stderr().is_terminal();
     let mut last_downloaded = 0u64;
     let mut ticks = 0u64;

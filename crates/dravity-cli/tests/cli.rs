@@ -145,7 +145,7 @@ fn download_from_explicit_peer() {
         .arg(&out_dir)
         .arg("--peer")
         .arg(peer.to_string())
-        .arg("--quiet")
+        .args(["--no-dht", "--download-limit", "4M", "--quiet"])
         .output()
         .unwrap();
     assert!(
@@ -155,6 +155,45 @@ fn download_from_explicit_peer() {
     );
     assert_eq!(std::fs::read(out_dir.join("hello.bin")).unwrap(), data);
     assert!(String::from_utf8_lossy(&out.stdout).contains("hello.bin: complete"));
+    // Fastresume data lands in <output>/.dravity by default.
+    let resume = out_dir.join(format!(".dravity/{}.resume", hash.to_hex()));
+    assert!(resume.exists());
+}
+
+#[test]
+fn info_describes_magnet() {
+    let uri = format!(
+        "magnet:?xt=urn:btih:{}&dn=hello.bin&tr=udp%3A%2F%2F127.0.0.1%3A9&x.pe=127.0.0.1:7000",
+        "ab".repeat(20)
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("info")
+        .arg(&uri)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("name:       hello.bin"), "{text}");
+    assert!(text.contains(&"ab".repeat(20)), "{text}");
+    assert!(text.contains("tracker:    udp://127.0.0.1:9"), "{text}");
+    assert!(text.contains("peer:       127.0.0.1:7000"), "{text}");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .args(["info", "magnet:?dn=nothing"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("error: parsing the magnet link"));
+}
+
+#[test]
+fn rejects_bad_rate() {
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .args(["download", "x.torrent", "--download-limit", "fast"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid rate"));
 }
 
 #[test]

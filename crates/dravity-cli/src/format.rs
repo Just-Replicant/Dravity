@@ -48,6 +48,7 @@ pub(crate) fn bar(permille: u64, width: usize) -> String {
 fn status(s: TorrentStatus) -> &'static str {
     match s {
         TorrentStatus::Idle => "idle",
+        TorrentStatus::FetchingMetadata => "fetching metadata",
         TorrentStatus::Checking => "checking",
         TorrentStatus::Downloading => "downloading",
         TorrentStatus::Finished => "finished",
@@ -59,6 +60,10 @@ fn status(s: TorrentStatus) -> &'static str {
 /// One progress line, given the download rate in bytes per second.
 #[must_use]
 pub(crate) fn progress_line(stats: &Stats, rate: u64) -> String {
+    if stats.status == TorrentStatus::FetchingMetadata {
+        // Sizes are unknown until the metadata arrives.
+        return format!("{} peers {}", status(stats.status), stats.peers);
+    }
     let p = permille(stats.bytes_have, stats.total_length);
     format!(
         "{} {:>3}.{}% {}/{} {}/s peers {} {}",
@@ -71,6 +76,40 @@ pub(crate) fn progress_line(stats: &Stats, rate: u64) -> String {
         stats.peers,
         status(stats.status),
     )
+}
+
+/// Parses a byte rate: a plain number, or one with a binary `K`, `M` or
+/// `G` suffix (`500K`, `1.5M`). A trailing `B`, `iB` or `/s` is accepted.
+pub(crate) fn parse_rate(s: &str) -> Result<u64, String> {
+    let lower = s.trim().to_ascii_lowercase();
+    let mut t = lower.as_str();
+    t = t.strip_suffix("/s").unwrap_or(t);
+    t = t
+        .strip_suffix("ib")
+        .or_else(|| t.strip_suffix('b'))
+        .unwrap_or(t);
+    let (number, scale) = match t.char_indices().last() {
+        Some((i, 'k')) => (t.get(..i), 1u64 << 10),
+        Some((i, 'm')) => (t.get(..i), 1 << 20),
+        Some((i, 'g')) => (t.get(..i), 1 << 30),
+        _ => (Some(t), 1),
+    };
+    let number = number.unwrap_or_default().trim();
+    let invalid = || format!("invalid rate `{s}` (examples: 65536, 500K, 2M)");
+    if let Ok(n) = number.parse::<u64>() {
+        return n.checked_mul(scale).ok_or_else(invalid);
+    }
+    // One decimal place at most: 1.5M.
+    let (whole, frac) = number.split_once('.').ok_or_else(invalid)?;
+    let whole: u64 = whole.parse().map_err(|_| invalid())?;
+    let tenths: u64 = match frac {
+        d if d.len() == 1 => d.parse().map_err(|_| invalid())?,
+        _ => return Err(invalid()),
+    };
+    whole
+        .checked_mul(scale)
+        .and_then(|w| w.checked_add(tenths * scale / 10))
+        .ok_or_else(invalid)
 }
 
 #[cfg(test)]
@@ -93,5 +132,34 @@ mod tests {
         assert_eq!(permille(u64::MAX, u64::MAX), 1000);
         assert_eq!(bar(500, 10), "[#####.....]");
         assert_eq!(bar(2000, 4), "[####]");
+    }
+
+    #[test]
+    fn rates() {
+        assert_eq!(parse_rate("65536"), Ok(65536));
+        assert_eq!(parse_rate("500K"), Ok(500 * 1024));
+        assert_eq!(parse_rate("2m"), Ok(2 * 1024 * 1024));
+        assert_eq!(parse_rate("1.5MiB/s"), Ok(1536 * 1024));
+        assert_eq!(parse_rate("1G"), Ok(1 << 30));
+        assert_eq!(parse_rate("10kb"), Ok(10 * 1024));
+        assert!(parse_rate("").is_err());
+        assert!(parse_rate("fast").is_err());
+        assert!(parse_rate("1.25M").is_err());
+        assert!(parse_rate("-1").is_err());
+        assert!(parse_rate("99999999999999999999G").is_err());
+    }
+
+    #[test]
+    fn metadata_progress_has_no_sizes() {
+        let mut config = dravity_engine::Config::default();
+        config.dht = false;
+        let mut state =
+            dravity_engine::MetadataState::new(dravity_core::InfoHash::new([1; 20]), config);
+        let _ = state.update(std::time::Instant::now(), dravity_engine::Event::Start);
+        assert_eq!(state.status(), TorrentStatus::FetchingMetadata);
+        assert_eq!(
+            progress_line(&state.stats(), 0),
+            "fetching metadata peers 0"
+        );
     }
 }

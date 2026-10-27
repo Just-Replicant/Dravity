@@ -39,6 +39,12 @@ fn arb_message() -> impl Strategy<Value = Message> {
             }
         }),
         any::<u16>().prop_map(Message::Port),
+        any::<u32>().prop_map(|piece| Message::Suggest { piece }),
+        Just(Message::HaveAll),
+        Just(Message::HaveNone),
+        arb_request().prop_map(Message::Reject),
+        any::<u32>().prop_map(|piece| Message::AllowedFast { piece }),
+        (any::<u8>(), arb_bytes(32)).prop_map(|(id, payload)| Message::Extended { id, payload }),
         (
             any::<u8>().prop_filter("unknown id", |id| MessageId::try_from(*id).is_err()),
             arb_bytes(32)
@@ -57,7 +63,7 @@ proptest! {
     ) {
         let mut wire = BytesMut::new();
         for m in &msgs {
-            m.encode(&mut wire);
+            m.encode(&mut wire).unwrap();
         }
         let expected_len: usize = msgs.iter().map(Message::encoded_len).sum();
         prop_assert_eq!(wire.len(), expected_len);
@@ -93,7 +99,7 @@ proptest! {
                 Ok(Some(m)) => {
                     // Anything decoded re-encodes to a decodable frame.
                     let mut re = BytesMut::new();
-                    m.encode(&mut re);
+                    m.encode(&mut re).unwrap();
                     prop_assert_eq!(MessageDecoder::new().decode(&mut re).unwrap(), Some(m));
                 }
                 Ok(None) | Err(WireError::FrameTooLarge { .. } | WireError::InvalidPayloadLength { .. }) => break,

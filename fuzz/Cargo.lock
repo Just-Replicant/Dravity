@@ -95,10 +95,21 @@ dependencies = [
  "bytes",
  "dravity-bencode",
  "dravity-core",
+ "dravity-storage",
  "dravity-tracker",
  "dravity-wire",
  "libfuzzer-sys",
  "serde",
+]
+
+[[package]]
+name = "dravity-storage"
+version = "0.1.0"
+dependencies = [
+ "dravity-bencode",
+ "dravity-core",
+ "sha1",
+ "thiserror",
 ]
 
 [[package]]

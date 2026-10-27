@@ -14,6 +14,7 @@ libfuzzer-sys = "0.4"
 serde = "1.0.200"
 dravity-bencode = { path = "../crates/dravity-bencode" }
 dravity-core = { path = "../crates/dravity-core" }
+dravity-storage = { path = "../crates/dravity-storage" }
 dravity-wire = { path = "../crates/dravity-wire" }
 dravity-tracker = { path = "../crates/dravity-tracker", default-features = false }
 
@@ -90,6 +91,13 @@ bench = false
 [[bin]]
 name = "wire_pex"
 path = "fuzz_targets/wire_pex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "storage_resume"
+path = "fuzz_targets/storage_resume.rs"
 test = false
 doc = false
 bench = false

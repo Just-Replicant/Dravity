@@ -6,11 +6,10 @@
 //!
 //! ## Extending
 //!
-//! The decoder dispatches on [`MessageId`]. BEP 6 (fast extension: ids
-//! 13–17) and BEP 10 (extended messages: id 20) will be added as new
-//! `MessageId` and [`Message`] variants (both are `#[non_exhaustive]`);
-//! until then those ids decode to [`Message::Unknown`], which callers can
-//! ignore, so adding them is non-breaking for the codec's structure.
+//! The decoder dispatches on [`MessageId`]. BEP 6 (ids 13–17) and BEP 10
+//! (id 20) are named variants. Any other id decodes to [`Message::Unknown`].
+//! Both enums are `#[non_exhaustive]`, so further messages can be added
+//! without breaking the codec's structure.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -45,6 +44,18 @@ pub enum MessageId {
     Cancel = 8,
     /// `port` (BEP 5)
     Port = 9,
+    /// `suggest` (BEP 6)
+    Suggest = 13,
+    /// `have all` (BEP 6)
+    HaveAll = 14,
+    /// `have none` (BEP 6)
+    HaveNone = 15,
+    /// `reject` (BEP 6)
+    Reject = 16,
+    /// `allowed fast` (BEP 6)
+    AllowedFast = 17,
+    /// `extended` (BEP 10)
+    Extended = 20,
 }
 
 impl TryFrom<u8> for MessageId {
@@ -62,6 +73,12 @@ impl TryFrom<u8> for MessageId {
             7 => Self::Piece,
             8 => Self::Cancel,
             9 => Self::Port,
+            13 => Self::Suggest,
+            14 => Self::HaveAll,
+            15 => Self::HaveNone,
+            16 => Self::Reject,
+            17 => Self::AllowedFast,
+            20 => Self::Extended,
             other => return Err(other),
         })
     }
@@ -125,6 +142,30 @@ pub enum Message {
     Cancel(BlockRequest),
     /// Sender's DHT port (BEP 5).
     Port(u16),
+    /// Suggest a piece (BEP 6).
+    Suggest {
+        /// Piece index.
+        piece: u32,
+    },
+    /// Sender has every piece (BEP 6).
+    HaveAll,
+    /// Sender has no pieces (BEP 6).
+    HaveNone,
+    /// Reject a request (BEP 6).
+    Reject(BlockRequest),
+    /// A piece the sender will serve while choked (BEP 6).
+    AllowedFast {
+        /// Piece index.
+        piece: u32,
+    },
+    /// BEP 10 extended message. Extended id 0 is the handshake; parse that
+    /// payload with [`crate::ExtendedHandshake`].
+    Extended {
+        /// Extended message id.
+        id: u8,
+        /// Payload after the extended id.
+        payload: Bytes,
+    },
     /// A message with an id this crate does not (yet) understand.
     /// Never produced for ids listed in [`MessageId`].
     Unknown {
@@ -151,6 +192,12 @@ impl Message {
             Self::Piece { .. } => MessageId::Piece,
             Self::Cancel(_) => MessageId::Cancel,
             Self::Port(_) => MessageId::Port,
+            Self::Suggest { .. } => MessageId::Suggest,
+            Self::HaveAll => MessageId::HaveAll,
+            Self::HaveNone => MessageId::HaveNone,
+            Self::Reject(_) => MessageId::Reject,
+            Self::AllowedFast { .. } => MessageId::AllowedFast,
+            Self::Extended { .. } => MessageId::Extended,
             Self::Unknown { id, .. } => return Some(*id),
         };
         Some(id as u8)
@@ -163,12 +210,15 @@ impl Message {
             | Self::Choke
             | Self::Unchoke
             | Self::Interested
-            | Self::NotInterested => 0,
-            Self::Have { .. } => 4,
+            | Self::NotInterested
+            | Self::HaveAll
+            | Self::HaveNone => 0,
+            Self::Have { .. } | Self::Suggest { .. } | Self::AllowedFast { .. } => 4,
             Self::Bitfield(b) | Self::Unknown { payload: b, .. } => b.len(),
-            Self::Request(_) | Self::Cancel(_) => 12,
+            Self::Request(_) | Self::Cancel(_) | Self::Reject(_) => 12,
             Self::Piece { data, .. } => 8 + data.len(),
             Self::Port(_) => 2,
+            Self::Extended { payload, .. } => 1 + payload.len(),
         }
     }
 
@@ -180,17 +230,21 @@ impl Message {
 
     /// Appends the framed encoding to `dst`.
     ///
-    /// # Panics
-    /// Never in practice: panics only if a payload exceeds 4 GiB, which cannot
-    /// be framed by the protocol.
-    pub fn encode(&self, dst: &mut BytesMut) {
-        dst.reserve(self.encoded_len());
+    /// # Errors
+    /// [`WireError::PayloadTooLarge`] when the body does not fit in a `u32`
+    /// length prefix.
+    pub fn encode(&self, dst: &mut BytesMut) -> Result<(), WireError> {
         let Some(id) = self.id() else {
+            dst.reserve(4);
             dst.put_u32(0);
-            return;
+            return Ok(());
         };
-        #[allow(clippy::expect_used)]
-        let len = u32::try_from(1 + self.payload_len()).expect("message payload exceeds u32");
+        let body = self
+            .payload_len()
+            .checked_add(1)
+            .ok_or(WireError::PayloadTooLarge)?;
+        let len = u32::try_from(body).map_err(|_| WireError::PayloadTooLarge)?;
+        dst.reserve(4 + body);
         dst.put_u32(len);
         dst.put_u8(id);
         match self {
@@ -216,7 +270,19 @@ impl Message {
                 dst.put_slice(data);
             }
             Self::Port(p) => dst.put_u16(*p),
+            Self::Suggest { piece } | Self::AllowedFast { piece } => dst.put_u32(*piece),
+            Self::HaveAll | Self::HaveNone => {}
+            Self::Reject(r) => {
+                dst.put_u32(r.piece);
+                dst.put_u32(r.offset);
+                dst.put_u32(r.length);
+            }
+            Self::Extended { id, payload } => {
+                dst.put_u8(*id);
+                dst.put_slice(payload);
+            }
         }
+        Ok(())
     }
 
     /// Decodes one frame body (id + payload, without the length prefix).
@@ -281,10 +347,40 @@ impl Message {
                 need(2)?;
                 Self::Port(frame.get_u16())
             }
+            MessageId::Suggest => {
+                need(4)?;
+                Self::Suggest {
+                    piece: frame.get_u32(),
+                }
+            }
+            MessageId::HaveAll => need(0).map(|()| Self::HaveAll)?,
+            MessageId::HaveNone => need(0).map(|()| Self::HaveNone)?,
+            MessageId::Reject => {
+                need(12)?;
+                Self::Reject(BlockRequest {
+                    piece: frame.get_u32(),
+                    offset: frame.get_u32(),
+                    length: frame.get_u32(),
+                })
+            }
+            MessageId::AllowedFast => {
+                need(4)?;
+                Self::AllowedFast {
+                    piece: frame.get_u32(),
+                }
+            }
+            MessageId::Extended => {
+                if len < 1 {
+                    return Err(WireError::InvalidPayloadLength { id, len });
+                }
+                Self::Extended {
+                    id: frame.get_u8(),
+                    payload: frame,
+                }
+            }
         })
     }
 }
-
 /// Streaming decoder for length-prefixed messages.
 ///
 /// Feed received bytes into a [`BytesMut`] and call [`decode`](Self::decode)
@@ -296,8 +392,8 @@ impl Message {
 /// use dravity_wire::{Message, MessageDecoder};
 ///
 /// let mut buf = BytesMut::new();
-/// Message::Have { piece: 7 }.encode(&mut buf);
-/// Message::KeepAlive.encode(&mut buf);
+/// Message::Have { piece: 7 }.encode(&mut buf).unwrap();
+/// Message::KeepAlive.encode(&mut buf).unwrap();
 /// let mut dec = MessageDecoder::new();
 /// assert_eq!(dec.decode(&mut buf).unwrap(), Some(Message::Have { piece: 7 }));
 /// assert_eq!(dec.decode(&mut buf).unwrap(), Some(Message::KeepAlive));
@@ -374,7 +470,7 @@ mod tests {
 
     fn enc(m: &Message) -> Vec<u8> {
         let mut b = BytesMut::new();
-        m.encode(&mut b);
+        m.encode(&mut b).unwrap();
         assert_eq!(b.len(), m.encoded_len());
         b.to_vec()
     }
@@ -405,12 +501,37 @@ mod tests {
             [0, 0, 0, 11, 7, 0, 0, 0, 2, 0, 0, 0, 3, b'x', b'y']
         );
         assert_eq!(enc(&Message::Port(6881)), [0, 0, 0, 3, 9, 0x1a, 0xe1]);
+        assert_eq!(enc(&Message::HaveAll), [0, 0, 0, 1, 14]);
+        assert_eq!(enc(&Message::HaveNone), [0, 0, 0, 1, 15]);
+        assert_eq!(
+            enc(&Message::Suggest { piece: 7 }),
+            [0, 0, 0, 5, 13, 0, 0, 0, 7]
+        );
+        assert_eq!(
+            enc(&Message::AllowedFast { piece: 4 }),
+            [0, 0, 0, 5, 17, 0, 0, 0, 4]
+        );
+        assert_eq!(
+            enc(&Message::Reject(BlockRequest {
+                piece: 1,
+                offset: 2,
+                length: 3
+            })),
+            [0, 0, 0, 13, 16, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3]
+        );
+        assert_eq!(
+            enc(&Message::Extended {
+                id: 0,
+                payload: Bytes::from_static(b"de")
+            }),
+            [0, 0, 0, 4, 20, 0, b'd', b'e']
+        );
         assert_eq!(
             enc(&Message::Unknown {
-                id: 20,
+                id: 21,
                 payload: Bytes::from_static(b"\x00d")
             }),
-            [0, 0, 0, 3, 20, 0, b'd']
+            [0, 0, 0, 3, 21, 0, b'd']
         );
     }
 
@@ -463,7 +584,8 @@ mod tests {
             offset: 0,
             data: Bytes::from(vec![7u8; 16384]),
         }
-        .encode(&mut buf);
+        .encode(&mut buf)
+        .unwrap();
         let base = buf.as_ptr();
         let Some(Message::Piece { data, .. }) = MessageDecoder::new().decode(&mut buf).unwrap()
         else {
@@ -494,3 +616,4 @@ mod tests {
         }
     }
 }
+

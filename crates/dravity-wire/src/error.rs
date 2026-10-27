@@ -24,4 +24,10 @@ pub enum WireError {
         /// Payload length (excluding the id byte).
         len: usize,
     },
+    /// The payload does not fit in a 32-bit length prefix.
+    #[error("message payload exceeds the 32-bit length prefix")]
+    PayloadTooLarge,
+    /// A bitfield's length or spare bits do not match the piece count.
+    #[error("bitfield does not match the piece count")]
+    BadBitfield,
 }

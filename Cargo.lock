@@ -498,6 +498,7 @@ dependencies = [
  "dravity-core",
  "dravity-dht",
  "dravity-engine",
+ "dravity-portmap",
  "dravity-storage",
  "dravity-tracker",
  "dravity-utp",

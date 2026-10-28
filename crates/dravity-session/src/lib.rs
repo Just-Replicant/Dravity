@@ -56,6 +56,7 @@ use std::time::Duration;
 use dravity_core::{InfoHash, Magnet, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{Alert, Stats};
+use dravity_portmap::{Mapping, PortMapper};
 use dravity_storage::{FileStorage, Storage};
 use dravity_tracker::TrackerClient;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
@@ -63,6 +64,10 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub use codec::{CodecError, PeerCodec};
 pub use config::SessionConfig;
+pub use dravity_portmap::{
+    Mapped as PortMapped, Method as PortMapMethod, PortMapConfig, Protocol as PortMapProtocol,
+    Status as PortMapStatus,
+};
 pub use error::SessionError;
 pub use listen::ListenConfig;
 
@@ -131,6 +136,8 @@ struct Inner {
     listen_port: Option<u16>,
     /// uTP sockets, once the listener started.
     utp: OnceLock<UtpSockets>,
+    /// Router port mapping, once the listener started.
+    port_mapper: Mutex<Option<PortMapper>>,
     /// Ends the accept tasks when the last session clone is dropped.
     _stop: DropGuard,
     stop: CancellationToken,
@@ -182,6 +189,7 @@ impl Session {
                 listener: Mutex::new(listener),
                 listen_port,
                 utp: OnceLock::new(),
+                port_mapper: Mutex::new(None),
                 _stop: stop.clone().drop_guard(),
                 stop,
             }),
@@ -220,8 +228,41 @@ impl Session {
             Ok(utp) => {
                 let _ = self.inner.utp.set(utp);
             }
-            Err(e) => tracing::warn!(error = %e, "cannot accept peers"),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot accept peers");
+                return;
+            }
         }
+        if let (Some(mapping), Some(port)) = (&config.port_mapping, self.inner.listen_port) {
+            let mut mappings = vec![Mapping {
+                protocol: dravity_portmap::Protocol::Tcp,
+                port,
+            }];
+            if config.listen.as_ref().is_some_and(|l| l.utp.is_some()) {
+                mappings.push(Mapping {
+                    protocol: dravity_portmap::Protocol::Udp,
+                    port,
+                });
+            }
+            *self
+                .inner
+                .port_mapper
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) =
+                Some(PortMapper::start(mapping.clone(), mappings));
+        }
+    }
+
+    /// What router port mapping achieved so far; `None` when it is off or
+    /// has not started (it starts with the first torrent).
+    #[must_use]
+    pub fn port_mapping(&self) -> Option<PortMapStatus> {
+        self.inner
+            .port_mapper
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(PortMapper::status)
     }
 
     /// Our peer id.
@@ -386,6 +427,16 @@ impl Session {
         };
         for handle in handles {
             handle.stop().await;
+        }
+        let mapper = self
+            .inner
+            .port_mapper
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(mapper) = mapper {
+            // Removing the mappings is a courtesy; never hang on a router.
+            let _ = tokio::time::timeout(Duration::from_secs(5), mapper.stop()).await;
         }
     }
 }

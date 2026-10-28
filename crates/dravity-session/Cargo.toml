@@ -16,6 +16,7 @@ bytes.workspace = true
 dravity-core.workspace = true
 dravity-dht.workspace = true
 dravity-engine.workspace = true
+dravity-portmap.workspace = true
 dravity-storage.workspace = true
 dravity-tracker.workspace = true
 dravity-utp.workspace = true

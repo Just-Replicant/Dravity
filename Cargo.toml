@@ -25,6 +25,7 @@ dravity-tracker = { path = "crates/dravity-tracker", version = "0.1.0" }
 dravity-session = { path = "crates/dravity-session", version = "0.1.0" }
 dravity-dht = { path = "crates/dravity-dht", version = "0.1.0" }
 dravity-utp = { path = "crates/dravity-utp", version = "0.1.0" }
+dravity-portmap = { path = "crates/dravity-portmap", version = "0.1.0" }
 
 # External crates
 anyhow = "1"

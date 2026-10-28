@@ -12,8 +12,8 @@
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -319,6 +319,7 @@ fn config() -> SessionConfig {
     // Hermetic: no public DHT bootstrap, loopback only, any free port.
     c.dht = None;
     c.listen = Some(ListenConfig::loopback(0));
+    c.port_mapping = None;
     c
 }
 
@@ -884,4 +885,72 @@ async fn a_session_seeds_over_utp() {
     assert_files(leech_dir.path(), &content, len_a);
     leecher.shutdown().await;
     seeder.shutdown().await;
+}
+
+/// A NAT-PMP gateway on loopback that grants every request as asked and
+/// records the requests.
+async fn fake_natpmp_gateway() -> (std::net::SocketAddrV4, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let socket = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let SocketAddr::V4(addr) = socket.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 64];
+        while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+            let req = buf[..n].to_vec();
+            log.lock().unwrap().push(req.clone());
+            let mut out = vec![0, 128 + req[1], 0, 0, 0, 0, 0, 1];
+            if req[1] == 0 {
+                out.extend_from_slice(&[203, 0, 113, 1]);
+            } else {
+                out.extend_from_slice(&req[4..12]);
+            }
+            let _ = socket.send_to(&out, from).await;
+        }
+    });
+    (addr, seen)
+}
+
+#[tokio::test]
+async fn the_listen_port_is_mapped_on_the_router_and_unmapped_on_shutdown() {
+    let (gateway, seen) = fake_natpmp_gateway().await;
+    let mut c = config();
+    let mut mapping = dravity_session::PortMapConfig::default();
+    mapping.upnp = false;
+    mapping.gateway = Some(gateway);
+    c.port_mapping = Some(mapping);
+    let session = Session::new(c).unwrap();
+    assert!(
+        session.port_mapping().is_none(),
+        "starts with the first torrent"
+    );
+    let port = session.listen_port().unwrap();
+    let (metainfo, _) = make_torrent(None, 10_000, 5_000);
+    let dir = tempfile::tempdir().unwrap();
+    let _torrent = session
+        .add_torrent(metainfo, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(s) = session.port_mapping().filter(|s| s.mapped.len() == 2) {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("ports mapped");
+    assert_eq!(status.method, Some(dravity_session::PortMapMethod::NatPmp));
+    assert!(status.mapped.iter().all(|m| m.external_port == port));
+    session.shutdown().await;
+    let seen = seen.lock().unwrap();
+    let deletes = seen
+        .iter()
+        .filter(|r| r.len() == 12 && r[8..12] == [0, 0, 0, 0])
+        .count();
+    assert_eq!(deletes, 2, "{seen:?}");
 }

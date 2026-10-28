@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use dravity_dht::DhtConfig;
+use dravity_portmap::PortMapConfig;
 use dravity_tracker::ClientConfig;
 
 use crate::listen::ListenConfig;
@@ -21,6 +22,11 @@ pub struct SessionConfig {
     /// tried first and uTP only when TCP fails (peers behind NATs that pass
     /// only UDP). Needs uTP sockets, so a listener with uTP.
     pub prefer_utp: bool,
+    /// Ask the router (NAT-PMP, then UPnP IGD) to forward the listening
+    /// port, TCP and (with uTP) UDP, so peers behind no NAT of their own
+    /// can reach us. Mappings are removed on [`crate::Session::shutdown`].
+    /// `None`, or no listener, disables it.
+    pub port_mapping: Option<PortMapConfig>,
     /// Port reported to trackers when the session does not listen (for
     /// example behind a proxy that forwards to us). With a listener its
     /// bound port is reported instead.
@@ -62,6 +68,7 @@ impl Default for SessionConfig {
             peer_id_prefix: b"-DV0001-".to_vec(),
             listen: Some(ListenConfig::default()),
             prefer_utp: false,
+            port_mapping: Some(PortMapConfig::default()),
             announce_port: 6881,
             engine: dravity_engine::Config::default(),
             tracker: ClientConfig::default(),

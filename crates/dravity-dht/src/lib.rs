@@ -127,9 +127,22 @@ impl Dht {
         SocketAddr::V4(self.inner.info().await.local_addr())
     }
 
-    /// Waits for the bootstrap query; `true` if any node answered.
+    /// Asks the network for nodes near our id. `true` if any node answered.
+    ///
+    /// This sends a `find_node` query. It is not a snapshot of whether
+    /// bootstrap has already filled the routing table; use [`Self::has_nodes`]
+    /// for that.
     pub async fn bootstrapped(&self) -> bool {
         self.inner.bootstrapped().await
+    }
+
+    /// Whether the routing table currently has a live neighbor.
+    ///
+    /// A local read. An empty table means bootstrap has not succeeded, so a
+    /// peer lookup that found nobody should be retried soon instead of being
+    /// treated as an empty swarm.
+    pub async fn has_nodes(&self) -> bool {
+        !self.to_bootstrap().await.is_empty()
     }
 
     /// The node's routing table as `host:port` bootstrap entries (useful to

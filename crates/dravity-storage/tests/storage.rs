@@ -173,6 +173,8 @@ fn fd_cache_is_bounded() {
         .with_max_open_files(3);
     write_all_blocks(&s, &m, &data);
     assert!(s.open_files() <= 3);
+    // Evicted files are synced too; flush must not skip them.
+    s.flush().unwrap();
     for piece in 0..m.info().piece_count() {
         assert!(verify_piece(&s, m.info(), piece).unwrap());
     }

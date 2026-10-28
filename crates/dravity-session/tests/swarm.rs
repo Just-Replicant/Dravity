@@ -954,3 +954,42 @@ async fn the_listen_port_is_mapped_on_the_router_and_unmapped_on_shutdown() {
         .count();
     assert_eq!(deletes, 2, "{seen:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peers_connect_over_ipv6_tcp_and_utp() {
+    for prefer_utp in [false, true] {
+        let (len_a, len_b) = (40_000, 30_000);
+        let (metainfo, content) = make_torrent(None, len_a, len_b);
+        let hash = metainfo.info_hash();
+        let seed_dir = tempfile::tempdir().unwrap();
+        write_files(seed_dir.path(), &content, len_a);
+        let mut c = config();
+        let mut listen = ListenConfig::loopback(0);
+        listen.ipv4 = None;
+        c.listen = Some(listen);
+        let seeder = Session::new(c).unwrap();
+        let port = seeder.listen_port().unwrap();
+        let mut seeder_alerts = seeder.subscribe();
+        let _seeding = seeder
+            .add_torrent(metainfo, AddTorrentOptions::new(seed_dir.path()))
+            .unwrap();
+        until_finished(&mut seeder_alerts, hash).await;
+
+        let leech_dir = tempfile::tempdir().unwrap();
+        let mut c = config();
+        c.prefer_utp = prefer_utp;
+        let leecher = Session::new(c).unwrap();
+        let mut alerts = leecher.subscribe();
+        let _leeching = leecher
+            .add_torrent(
+                make_torrent(None, len_a, len_b).0,
+                AddTorrentOptions::new(leech_dir.path())
+                    .with_peers([SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))]),
+            )
+            .unwrap();
+        until_finished(&mut alerts, hash).await;
+        assert_files(leech_dir.path(), &content, len_a);
+        leecher.shutdown().await;
+        seeder.shutdown().await;
+    }
+}

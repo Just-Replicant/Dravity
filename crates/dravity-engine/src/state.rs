@@ -45,6 +45,9 @@ struct Peer {
     peer_choking: bool,
     peer_interested: bool,
     inflight: Vec<(BlockRef, Instant)>,
+    /// Blocks this peer was asked for, including ones that timed out, so a
+    /// late `piece` is accepted and an unsolicited one is ignored.
+    asked: HashSet<(u32, u32)>,
     window: Window,
     /// The peer set the BEP 10 bit in its handshake.
     extended: bool,
@@ -66,6 +69,7 @@ impl Peer {
             peer_choking: true,
             peer_interested: false,
             inflight: Vec::new(),
+            asked: HashSet::new(),
             window: Window::new(
                 cap(config.initial_requests_per_peer),
                 cap(config.max_requests_per_peer),
@@ -109,10 +113,15 @@ impl DhtSchedule {
         }
     }
 
-    /// A lookup finished.
-    pub(crate) fn done(&mut self, now: Instant, config: &Config) {
+    /// A lookup finished. `failed` schedules the shorter [`Config::dht_retry`].
+    pub(crate) fn done(&mut self, now: Instant, config: &Config, failed: bool) {
         self.in_flight = false;
-        self.next = Some(now + config.dht_interval);
+        let wait = if failed {
+            config.dht_retry
+        } else {
+            config.dht_interval
+        };
+        self.next = Some(now + wait);
     }
 }
 
@@ -151,6 +160,10 @@ pub struct TorrentState {
     next_announce: Option<Instant>,
     announce_in_flight: bool,
     started_announced: bool,
+    /// The announce the driver is currently performing.
+    pending_announce: Option<AnnounceEvent>,
+    /// DHT and PEX addresses refused after a magnet turns out private.
+    swarm_ban: HashSet<SocketAddr>,
     dht: DhtSchedule,
     next_pex: Option<Instant>,
     rate: Option<TokenBucket>,
@@ -190,6 +203,8 @@ impl TorrentState {
             next_announce: None,
             announce_in_flight: false,
             started_announced: false,
+            pending_announce: None,
+            swarm_ban: HashSet::new(),
             dht: DhtSchedule::default(),
             next_pex: None,
             rate: None,
@@ -215,6 +230,32 @@ impl TorrentState {
     #[must_use]
     pub const fn with_started_announced(mut self, started: bool) -> Self {
         self.started_announced = started;
+        self
+    }
+
+    /// A `started` announce is still waiting for the tracker. No second one
+    /// is sent; [`Event::AnnounceFailed`] clears the flag so it is retried.
+    #[must_use]
+    pub fn with_started_pending(mut self, pending: bool) -> Self {
+        if pending {
+            self.started_announced = true;
+            self.announce_in_flight = true;
+            self.pending_announce = Some(AnnounceEvent::Started);
+        }
+        self
+    }
+
+    /// Addresses whose TCP handshake is already in progress.
+    #[must_use]
+    pub fn with_connecting(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        self.pool.adopt_connecting(addrs);
+        self
+    }
+
+    /// Addresses that must not be dialed (DHT/PEX peers of a private torrent).
+    #[must_use]
+    pub fn ban_peers(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        self.swarm_ban.extend(addrs);
         self
     }
 
@@ -320,14 +361,20 @@ impl TorrentState {
                 self.fill_connections(&mut out);
             }
             Event::AnnounceFailed { error } => {
+                if self.pending_announce == Some(AnnounceEvent::Started) {
+                    self.started_announced = false;
+                }
+                self.pending_announce = None;
                 self.announce_in_flight = false;
                 self.next_announce = Some(now + self.config.announce_retry);
                 out.push(Effect::Alert(Alert::TrackerError { message: error }));
             }
-            Event::DhtPeers { peers } => {
-                self.dht.done(now, &self.config);
-                self.add_to_pool(peers);
-                self.fill_connections(&mut out);
+            Event::DhtPeers { peers, failed } => {
+                self.dht.done(now, &self.config, failed);
+                if self.config.dht {
+                    self.add_to_pool(peers);
+                    self.fill_connections(&mut out);
+                }
             }
         }
         out
@@ -359,6 +406,15 @@ impl TorrentState {
             self.schedule_checks(now, out);
         } else {
             self.begin_download(now, out);
+        }
+        // Peer discovery runs during the hash check; addresses wait until
+        // downloading starts. A torrent that is already complete does not look
+        // anyone up.
+        if matches!(
+            self.status,
+            TorrentStatus::Downloading | TorrentStatus::Checking
+        ) {
+            self.dht.poll(now, &self.config, out);
         }
     }
 
@@ -435,6 +491,7 @@ impl TorrentState {
             return;
         }
         self.announce_in_flight = true;
+        self.pending_announce = Some(event);
         self.next_announce = Some(now + self.config.default_announce_interval);
         self.push_announce(event, out);
         if event == AnnounceEvent::Started {
@@ -458,6 +515,7 @@ impl TorrentState {
         interval: Option<Duration>,
         out: &mut Vec<Effect>,
     ) {
+        self.pending_announce = None;
         self.announce_in_flight = false;
         let interval = interval
             .unwrap_or(self.config.default_announce_interval)
@@ -480,12 +538,21 @@ impl TorrentState {
             return;
         }
         let connected: HashSet<SocketAddr> = self.peers.values().map(|p| p.addr).collect();
-        self.pool.add(peers, |a| connected.contains(&a));
+        let banned = &self.swarm_ban;
+        self.pool.add(
+            peers.into_iter().filter(|addr| !banned.contains(addr)),
+            |a| connected.contains(&a),
+        );
     }
 
     /// Remembers `addr` so a later tick can dial it again.
     fn schedule_retry(&mut self, now: Instant, addr: SocketAddr) {
-        if self.status != TorrentStatus::Downloading {
+        if self.swarm_ban.contains(&addr)
+            || !matches!(
+                self.status,
+                TorrentStatus::Downloading | TorrentStatus::Checking
+            )
+        {
             return;
         }
         let peers = &self.peers;
@@ -519,10 +586,12 @@ impl TorrentState {
         self.pool.dial_done(addr);
         // Peers may connect while checking: a magnet's metadata fetch hands
         // its connections over before the data check ends.
-        if !matches!(
-            self.status,
-            TorrentStatus::Downloading | TorrentStatus::Checking
-        ) || self.peers.len() >= self.config.max_peers
+        if self.swarm_ban.contains(&addr)
+            || !matches!(
+                self.status,
+                TorrentStatus::Downloading | TorrentStatus::Checking
+            )
+            || self.peers.len() >= self.config.max_peers
             || self.peers.contains_key(&key)
             || Self::is_connected(&self.peers, addr)
         {
@@ -547,6 +616,30 @@ impl TorrentState {
         self.peers.insert(key, peer);
         if self.status == TorrentStatus::Downloading {
             self.send_bitfield(now, key, out);
+        }
+    }
+
+    /// Cancels requests that no longer fit the window (after `reqq` shrinks
+    /// it, or a timeout halves it).
+    fn trim_inflight(&mut self, now: Instant, key: PeerKey, out: &mut Vec<Effect>) {
+        let Some(peer) = self.peers.get_mut(&key) else {
+            return;
+        };
+        let limit = peer.request_limit();
+        if peer.inflight.len() <= limit {
+            return;
+        }
+        let extra: Vec<BlockRef> = peer
+            .inflight
+            .split_off(limit)
+            .into_iter()
+            .map(|(block, _)| block)
+            .collect();
+        for block in extra {
+            if let Some(peer) = self.peers.get_mut(&key) {
+                Self::send(peer, key, Message::Cancel(block.into()), now, out);
+            }
+            self.release_owner(key, block);
         }
     }
 
@@ -658,6 +751,7 @@ impl TorrentState {
             _ => {}
         }
         self.update_interest(now, key, out);
+        self.trim_inflight(now, key, out);
         self.fill_requests(now, key, out);
     }
 
@@ -735,6 +829,15 @@ impl TorrentState {
             offset,
             length,
         };
+        // Only a peer we asked may deliver the block. Anyone else would
+        // cancel the honest download and get their bytes hashed.
+        let asked = self
+            .peers
+            .get(&key)
+            .is_some_and(|peer| peer.asked.contains(&(piece, offset)));
+        if !asked {
+            return;
+        }
         if let Some(peer) = self.peers.get_mut(&key) {
             let before = peer.inflight.len();
             peer.inflight.retain(|(b, _)| *b != block);
@@ -829,6 +932,7 @@ impl TorrentState {
             }
             self.owners.entry(block).or_default().push((key, now));
             peer.inflight.push((block, now));
+            peer.asked.insert((block.piece, block.offset));
             Self::send(peer, key, Message::Request(block.into()), now, out);
         }
     }
@@ -876,45 +980,66 @@ impl TorrentState {
     }
 
     fn on_tick(&mut self, now: Instant, out: &mut Vec<Effect>) {
-        if self.status == TorrentStatus::Downloading {
+        if matches!(
+            self.status,
+            TorrentStatus::Downloading | TorrentStatus::Checking
+        ) {
             let peers = &self.peers;
             self.pool.promote(now, |a| Self::is_connected(peers, a));
         }
         let mut dead = Vec::new();
         for key in self.sorted_keys() {
-            let Some(peer) = self.peers.get_mut(&key) else {
-                continue;
-            };
-            if now.saturating_duration_since(peer.last_recv) >= self.config.peer_timeout {
-                dead.push(key);
-                continue;
-            }
-            let timeout = self.config.request_timeout;
-            let mut expired = Vec::new();
-            peer.inflight.retain(|(block, since)| {
-                let late = now.saturating_duration_since(*since) >= timeout;
-                if late {
-                    expired.push(*block);
+            let expired = {
+                let Some(peer) = self.peers.get_mut(&key) else {
+                    continue;
+                };
+                if now.saturating_duration_since(peer.last_recv) >= self.config.peer_timeout {
+                    dead.push(key);
+                    continue;
                 }
-                !late
-            });
-            if !expired.is_empty() {
-                peer.window.on_timeout();
-            }
-            if now.saturating_duration_since(peer.last_sent) >= self.config.keepalive_interval {
-                Self::send(peer, key, Message::KeepAlive, now, out);
-            }
+                let timeout = self.config.request_timeout;
+                let mut expired = Vec::new();
+                peer.inflight.retain(|(block, since)| {
+                    let late = now.saturating_duration_since(*since) >= timeout;
+                    if late {
+                        expired.push(*block);
+                    }
+                    !late
+                });
+                if !expired.is_empty() {
+                    // Live limit is min(window, reqq). Halve that, so a window
+                    // that has grown to 128 with reqq 4 becomes 2.
+                    let reqq = peer.ext.reqq.unwrap_or(u32::MAX);
+                    peer.window.on_timeout(reqq);
+                }
+                if now.saturating_duration_since(peer.last_sent) >= self.config.keepalive_interval {
+                    Self::send(peer, key, Message::KeepAlive, now, out);
+                }
+                expired
+            };
             for block in expired {
                 self.release_owner(key, block);
+                // The timed-out request is outside the shrunk pipeline. Cancel
+                // it so the peer frees the queue slot; a refill may ask again.
+                if let Some(peer) = self.peers.get_mut(&key) {
+                    Self::send(peer, key, Message::Cancel(block.into()), now, out);
+                }
             }
+            // Still-in-flight requests past the new limit are cancelled here.
+            self.trim_inflight(now, key, out);
         }
         for key in dead {
             self.remove_peer(key);
             out.push(Effect::Disconnect { peer: key });
         }
+        if matches!(
+            self.status,
+            TorrentStatus::Downloading | TorrentStatus::Checking
+        ) {
+            self.dht.poll(now, &self.config, out);
+        }
         if self.status == TorrentStatus::Downloading {
             self.fill_all_requests(now, out);
-            self.dht.poll(now, &self.config, out);
             if self.next_pex.is_some_and(|t| now >= t) {
                 self.next_pex = Some(now + self.config.pex_interval);
                 self.send_pex(now, out);
@@ -925,7 +1050,12 @@ impl TorrentState {
             TorrentStatus::Downloading | TorrentStatus::Finished
         ) && self.next_announce.is_some_and(|t| now >= t)
         {
-            self.announce(now, AnnounceEvent::None, out);
+            let event = if self.started_announced {
+                AnnounceEvent::None
+            } else {
+                AnnounceEvent::Started
+            };
+            self.announce(now, event, out);
         }
         self.fill_connections(out);
         out.push(Effect::Alert(Alert::Stats(self.stats())));
@@ -951,7 +1081,7 @@ impl TorrentState {
                 .filter(|a| *a != peer.addr && !peer.pex_known.contains(a))
                 .collect();
             added.sort_unstable();
-            added.truncate(ext::PEX_MAX_PER_MESSAGE);
+            added.truncate(ext::PEX_MAX_SENT);
             let mut dropped: Vec<SocketAddr> = peer
                 .pex_known
                 .iter()
@@ -959,7 +1089,7 @@ impl TorrentState {
                 .filter(|a| !connected.contains(a))
                 .collect();
             dropped.sort_unstable();
-            dropped.truncate(ext::PEX_MAX_PER_MESSAGE);
+            dropped.truncate(ext::PEX_MAX_SENT);
             if added.is_empty() && dropped.is_empty() {
                 continue;
             }

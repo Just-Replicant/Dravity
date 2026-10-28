@@ -46,6 +46,12 @@ enum Command {
         /// to trackers.
         #[arg(long)]
         no_listen: bool,
+        /// Speak TCP only: no uTP (BEP 29) sockets.
+        #[arg(long, conflicts_with = "prefer_utp")]
+        no_utp: bool,
+        /// Dial peers over uTP first, falling back to TCP.
+        #[arg(long)]
+        prefer_utp: bool,
         /// Keep seeding after the download completes, until Ctrl-C.
         #[arg(long)]
         seed: bool,
@@ -132,6 +138,8 @@ fn run(cli: Cli) -> Result<()> {
             peers,
             port,
             no_listen,
+            no_utp,
+            prefer_utp,
             seed,
             upload_limit,
             upload_slots,
@@ -145,7 +153,14 @@ fn run(cli: Cli) -> Result<()> {
             let input = load(&torrent)?;
             let mut config = SessionConfig::default();
             config.announce_port = port;
-            config.listen = (!no_listen).then(|| ListenConfig::new(port));
+            config.listen = (!no_listen).then(|| {
+                let mut listen = ListenConfig::new(port);
+                if no_utp {
+                    listen.utp = None;
+                }
+                listen
+            });
+            config.prefer_utp = prefer_utp;
             config.engine.seed = seed;
             config.engine.upload_slots = upload_slots;
             config.engine.upload_rate_limit = upload_limit.filter(|&r| r > 0);

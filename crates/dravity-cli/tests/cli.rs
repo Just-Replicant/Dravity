@@ -286,6 +286,7 @@ fn listen_port(child: &mut std::process::Child) -> u16 {
         .expect("listen port line")
 }
 
+/// A `--seed` process serves a second download, which dials it over uTP.
 #[test]
 fn seed_serves_another_download() {
     let dir = tempfile::tempdir().unwrap();
@@ -314,7 +315,7 @@ fn seed_serves_another_download() {
         .arg(&out_dir)
         .arg("--peer")
         .arg(format!("127.0.0.1:{port}"))
-        .args(["--no-dht", "--no-listen", "--quiet"])
+        .args(["--no-dht", "--prefer-utp", "--port", "0", "--quiet"])
         .output()
         .unwrap();
     seeder.kill().unwrap();

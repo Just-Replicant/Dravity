@@ -14,6 +14,10 @@ async fn announce_then_lookup() {
     let leecher = Dht::new(&net.config()).unwrap();
     assert!(seeder.bootstrapped().await);
     assert!(leecher.bootstrapped().await);
+    assert!(
+        seeder.has_nodes().await,
+        "bootstrap left neighbors in the table"
+    );
     let hash = InfoHash::new([0x42; 20]);
     assert!(
         leecher.get_peers(hash).await.is_empty(),
@@ -33,6 +37,7 @@ async fn isolated_node() {
     let mut config = DhtConfig::with_bootstrap(Vec::new());
     config.bind_address = Some(std::net::Ipv4Addr::LOCALHOST);
     let dht = Dht::new(&config).unwrap();
+    assert!(!dht.has_nodes().await);
     assert!(!dht.bootstrapped().await);
     assert!(dht.get_peers(InfoHash::new([1; 20])).await.is_empty());
     assert!(dht.announce(InfoHash::new([1; 20]), None).await.is_err());

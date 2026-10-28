@@ -26,8 +26,14 @@ UDP tracker connection-id caching and BEP 12 tier ordering.
   trackers return peers), dials peers, exchanges BEP 10 handshakes and asks
   for 16 KiB metadata pieces (two in flight per peer). The assembled `info`
   dictionary is hashed against the info-hash; a mismatch disconnects every
-  peer that contributed and starts over, a `reject` or a timeout moves on to
-  other peers, and sizes above `max_metadata_size` (8 MiB) are refused.
+  peer that contributed, bans those addresses, and starts over. A `reject`
+  or a timeout moves that piece to another peer (the peer that failed it is
+  skipped until `request_timeout` elapses). The first in-range
+  `metadata_size` is kept only while it makes progress: if every request
+  for it has failed and another peer advertises a different size, that size
+  is abandoned. Sizes above `max_metadata_size` (8 MiB) are refused.
+  `Stop` is still handled after the metadata is verified, so a storage
+  failure during handover can finish the task.
   `into_handover()` then returns the open connections with the messages to
   replay (extension handshake, availability, `unchoke`), the known
   addresses, and whether `started` was announced. The session builds the
@@ -41,11 +47,15 @@ UDP tracker connection-id caching and BEP 12 tier ordering.
 - **PEX (BEP 11).** Peers from `ut_pex` are added to the pool (capped at
   200 per message on decode); every `pex_interval` (60 s) each peer gets
   the added/dropped diff since its last message (at most 50 entries each).
-  Private torrents (BEP 27) disable PEX and DHT.
+  Private torrents (BEP 27) disable PEX and DHT. A magnet does not know
+  that until the info-dict arrives; peers and addresses learned from DHT or
+  PEX during the fetch are then dropped, and a late lookup is ignored.
 - **AIMD request window.** Each peer starts at `initial_requests_per_peer`
   (4). Blocks that arrive in time grow it — doubling in slow start, then +1
   per window — up to `max_requests_per_peer` (128) or the peer's `reqq`,
-  whichever is smaller. A request timeout halves it.
+  whichever is smaller. A request timeout halves that effective limit (not
+  the uncapped window) and cancels requests that no longer fit. A `piece`
+  is accepted only from a peer that was asked for that block.
 - **Endgame and stealing share one mechanism.** A block may have at most two
   owners. Once every missing block is requested (endgame) an idle peer
   duplicates outstanding requests; before that, an idle peer may "steal" a
@@ -60,7 +70,11 @@ UDP tracker connection-id caching and BEP 12 tier ordering.
   MSRV 1.85), which runs the node on its own thread; its types stay out of
   the public API. The engine emits `Effect::DhtLookup` on start and every
   `dht_interval` (5 min); the session runs a lookup bounded by
-  `dht_lookup_timeout` (30 s) and returns `Event::DhtPeers`. The session's
+  `dht_lookup_timeout` (30 s) and returns `Event::DhtPeers`, including
+  peers found before the deadline. A timeout, or an empty result when the
+  routing table has no live neighbors (`Dht::has_nodes`, a local snapshot —
+  not `Dht::bootstrapped`, which sends `find_node`), is retried after
+  `dht_retry` (15 s) instead of `dht_interval`. The session's
   DHT is on by default (`SessionConfig::dht`) and off in tests unless they
   bring a loopback `Testnet`. `mainline` brings a second
   `sha1`/`digest` generation; cargo-deny reports the duplicates as
@@ -76,7 +90,9 @@ UDP tracker connection-id caching and BEP 12 tier ordering.
   `check_existing` is skipped — only if the info-hash, piece count and every
   stamp still match; anything else (a touched, truncated, created or deleted
   file) falls back to the full check. Saving is atomic (synced temporary file
-  + rename). Resume is off by default in the library
+  + rename). Before that, in-flight disk writes are drained and every file
+  is synced, including ones already evicted from the descriptor cache.
+  Resume is off by default in the library
   (`SessionConfig::resume_dir = None`); the CLI uses `<output>/.dravity`.
 - **BEP 12 tiers.** Tiers are shuffled once, announced concurrently, and the
   trackers within a tier are tried one after another until one answers; that
@@ -84,9 +100,14 @@ UDP tracker connection-id caching and BEP 12 tier ordering.
   some tracker load for faster peer discovery (libtorrent's
   `announce_to_all_tiers`). Magnet `tr` entries each form their own tier.
 - **UDP connection ids** are cached per tracker address for 60 s (BEP 15)
-  and shared between `TrackerClient` clones. A failure with a cached id (an
-  error response, or no answer to a single attempt) drops it and retries
-  once with a fresh `connect`.
+  and shared between `TrackerClient` clones, together with the UDP socket
+  that performed `connect` (the id is only valid from that source port).
+  Announces to one tracker take turns on that socket: responses are not
+  demultiplexed, and a second `connect` would replace the id. A failure
+  with a cached id (an error response, or no answer to a single attempt)
+  drops that id — not a newer id for the same address — and retries once
+  with a fresh `connect` on the same socket. An I/O error drops the socket
+  and the announce is tried once more from a new port.
 - **We advertise BEP 10** in the handshake reserved bits so peers send their
   extension handshakes.
 
@@ -113,8 +134,9 @@ UDP tracker connection-id caching and BEP 12 tier ordering.
   block twice.
 - Storage: resume roundtrip, bitfield validation, stamp invalidation, atomic
   save; fuzz target `storage_resume`.
-- Tracker: a counting UDP tracker shows ids are reused, shared by clones and
-  refreshed after the tracker forgets them.
+- Tracker: a counting UDP tracker shows ids are reused, shared by clones
+  (including overlapping announces) and refreshed after the tracker forgets
+  them.
 - DHT: announce + lookup on a loopback testnet; an isolated node.
 - Session (loopback): magnet via a tracker, magnet via a DHT testnet, peers
   learned only through PEX, fastresume (skip, then invalidation), tier

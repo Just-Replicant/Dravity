@@ -430,6 +430,46 @@ async fn recovers_from_corrupt_piece_with_explicit_peer() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_metadata_stops_instead_of_hanging() {
+    let garbage = Bytes::from(vec![b'x'; 64]);
+    let hash = InfoHash::from_info_bytes(&garbage);
+    let seed = spawn_peer(
+        hash,
+        PeerScript {
+            info: Some(garbage),
+            ..PeerScript::default()
+        },
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(config()).unwrap();
+    let mut alerts = session.subscribe();
+    let handle = session
+        .add_magnet(
+            &Magnet::new(hash),
+            AddTorrentOptions::new(dir.path()).with_peers([seed]),
+        )
+        .unwrap();
+    let message = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let alert = alerts.recv().await.expect("alerts closed");
+            if alert.info_hash == hash {
+                if let Alert::Error { message } = alert.alert {
+                    return message;
+                }
+            }
+        }
+    })
+    .await
+    .expect("invalid metadata left the torrent running");
+    assert!(message.contains("invalid metadata"), "{message}");
+    tokio::time::timeout(Duration::from_secs(5), handle.stop())
+        .await
+        .expect("stop hung after metadata failure");
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn magnet_fetches_metadata_then_downloads() {
     let (len_a, len_b) = (70_000, 20_000);
     let (metainfo, content) = make_torrent(None, len_a, len_b);

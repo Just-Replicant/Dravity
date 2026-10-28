@@ -167,6 +167,58 @@ fn download_from_explicit_peer() {
 }
 
 #[test]
+fn resume_dir_and_no_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = content();
+    let (torrent, hash) = write_torrent(dir.path(), &data);
+    let peer = seeder(data.clone(), hash);
+    let out_dir = dir.path().join("out");
+    let resume_dir = dir.path().join("resume");
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .arg("--output")
+        .arg(&out_dir)
+        .arg("--peer")
+        .arg(peer.to_string())
+        .arg("--resume-dir")
+        .arg(&resume_dir)
+        .args(["--no-dht", "--quiet"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        resume_dir
+            .join(format!("{}.resume", hash.to_hex()))
+            .exists()
+    );
+    assert!(!out_dir.join(".dravity").exists());
+
+    let peer = seeder(data, hash);
+    let out_dir = dir.path().join("out2");
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .arg("--output")
+        .arg(&out_dir)
+        .arg("--peer")
+        .arg(peer.to_string())
+        .args(["--no-dht", "--no-resume", "--quiet"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out_dir.join(".dravity").exists());
+}
+
+#[test]
 fn info_describes_magnet() {
     let uri = format!(
         "magnet:?xt=urn:btih:{}&dn=hello.bin&tr=udp%3A%2F%2F127.0.0.1%3A9&x.pe=127.0.0.1:7000",

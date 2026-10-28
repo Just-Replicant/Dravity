@@ -18,8 +18,8 @@
 //!   torrent's `info` bytes and `ut_pex` peers are exchanged (BEP 11).
 //! * **AIMD request window**: each peer's pipeline depth starts at
 //!   [`Config::initial_requests_per_peer`], grows while blocks arrive and
-//!   halves on a request timeout, capped by [`Config::max_requests_per_peer`]
-//!   and the peer's `reqq`.
+//!   halves `min(window, reqq)` on a request timeout, and is capped by
+//!   [`Config::max_requests_per_peer`].
 //! * **Piece stealing and endgame**: an idle peer re-requests a block that a
 //!   slow peer has held for [`Config::steal_after`]; once every block is
 //!   requested any in-flight block may be requested twice. The copy that

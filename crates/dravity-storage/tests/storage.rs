@@ -13,7 +13,7 @@ use dravity_bencode::{Dict, Value};
 use dravity_core::{BLOCK_SIZE, BlockRef, Metainfo};
 use dravity_storage::{
     FileStamp, FileStorage, MemoryStorage, ResumeData, Storage, StorageError, load_resume,
-    remove_resume, save_resume, verify_piece, write_block,
+    read_block, remove_resume, save_resume, verify_piece, write_block,
 };
 use sha1::{Digest, Sha1};
 
@@ -122,6 +122,52 @@ fn file_storage_spans_files_and_verifies() {
     let mut buf = vec![0; 100];
     s.read_at(19_950, &mut buf).unwrap();
     assert_eq!(buf, data[19_950..20_050]);
+}
+
+#[test]
+fn read_block_returns_written_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, data) = torrent(
+        &[
+            (&["a"], content(BLOCK_SIZE as usize + 100, 4), false),
+            (&["b"], content(BLOCK_SIZE as usize, 5), false),
+        ],
+        2 * BLOCK_SIZE as usize,
+    );
+    let s = FileStorage::new(dir.path(), m.info()).unwrap();
+    let layout = m.info().layout();
+    let block = BlockRef {
+        piece: 0,
+        offset: BLOCK_SIZE,
+        length: BLOCK_SIZE,
+    };
+    // Never written: missing data, not a hard error.
+    assert!(read_block(&s, layout, block).unwrap_err().is_missing_data());
+    write_all_blocks(&s, &m, &data);
+    // Spans the boundary between `a` and `b`.
+    let got = read_block(&s, layout, block).unwrap();
+    assert_eq!(got, data[BLOCK_SIZE as usize..2 * BLOCK_SIZE as usize]);
+    let last = layout.blocks(1).last().unwrap();
+    let got = read_block(&s, layout, last).unwrap();
+    assert_eq!(got.len(), last.length as usize);
+    // Unaligned or oversized requests are refused.
+    for bad in [
+        BlockRef {
+            piece: 0,
+            offset: 1,
+            length: BLOCK_SIZE + 1,
+        },
+        BlockRef {
+            piece: 9,
+            offset: 0,
+            length: 1,
+        },
+    ] {
+        assert!(matches!(
+            read_block(&s, layout, bad),
+            Err(StorageError::InvalidBlock(_))
+        ));
+    }
 }
 
 #[test]

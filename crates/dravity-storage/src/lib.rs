@@ -102,6 +102,28 @@ pub fn write_block(
     }
 }
 
+/// Reads one block, e.g. to upload it to a peer.
+///
+/// # Errors
+/// [`StorageError::InvalidBlock`] if `block` is not valid for `layout`;
+/// otherwise errors from the backend (including data never written).
+pub fn read_block(
+    storage: &dyn Storage,
+    layout: &PieceLayout,
+    block: BlockRef,
+) -> Result<Vec<u8>, StorageError> {
+    let start = layout.piece_offset(block.piece);
+    let len = usize::try_from(block.length);
+    match (start, len) {
+        (Some(start), Ok(len)) if layout.is_valid_request(block) => {
+            let mut buf = vec![0u8; len];
+            storage.read_at(start + u64::from(block.offset), &mut buf)?;
+            Ok(buf)
+        }
+        _ => Err(StorageError::InvalidBlock(block)),
+    }
+}
+
 /// Reads piece `piece` and compares its SHA-1 with the metainfo.
 ///
 /// Returns `Ok(false)` on a mismatch *or* when the data cannot be read

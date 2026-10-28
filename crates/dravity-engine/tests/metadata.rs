@@ -213,24 +213,109 @@ fn rejects_timeouts_and_bad_sizes() {
         payload: MetadataMessage::Reject { piece }.encode().unwrap(),
     };
     let fx = h.msg(3, reject(0));
-    assert!(
-        requests(&fx).is_empty(),
-        "a rejecting peer is not asked again"
+    assert_eq!(
+        requests(&fx),
+        [(3, 2)],
+        "a reject moves that piece on and leaves the peer's other pieces"
     );
-    // A fourth peer picks up what peer 3 rejected.
-    assert_eq!(requests(&h.peer(4, Some(40_000))), [(4, 0), (4, 2)]);
-    // Every request times out; only peer 4 is asked again.
+    // A fourth peer picks up the rejected piece.
+    assert_eq!(requests(&h.peer(4, Some(40_000))), [(4, 0)]);
+    // Every request times out. Each piece goes to the peer that did not fail it.
     h.now += Config::default().request_timeout;
     let fx = h.ev(Event::Tick);
-    assert_eq!(requests(&fx), [(4, 0), (4, 1)]);
+    let again = requests(&fx);
+    assert!(again.contains(&(3, 0)), "{again:?}");
+    assert!(
+        again.contains(&(4, 1)) && again.contains(&(4, 2)),
+        "{again:?}"
+    );
+    assert!(!again.contains(&(3, 1)), "peer 3 just timed out on piece 1");
+    assert!(!again.contains(&(4, 0)), "peer 4 just timed out on piece 0");
     assert!(
         fx.iter()
             .any(|e| matches!(e, Effect::Alert(Alert::Stats(_))))
     );
     let content = info();
-    assert_eq!(requests(&h.msg(4, data(0, &content))), [(4, 2)]);
+    h.msg(4, data(1, &content));
     h.msg(4, data(2, &content));
-    assert_eq!(received(&h.msg(4, data(1, &content))), Some(content));
+    assert_eq!(received(&h.msg(3, data(0, &content))), Some(content));
+}
+
+#[test]
+fn timeout_retries_the_only_peer_later() {
+    let mut h = Harness::new(Config::default());
+    assert_eq!(requests(&h.peer(1, Some(40_000))), [(1, 0), (1, 1)]);
+    let timeout = Config::default().request_timeout;
+    h.now += timeout;
+    // Pieces 0 and 1 just timed out, so only the untouched piece is asked.
+    assert_eq!(requests(&h.ev(Event::Tick)), [(1, 2)]);
+    h.now += timeout;
+    assert_eq!(requests(&h.ev(Event::Tick)), [(1, 0), (1, 1)]);
+}
+
+#[test]
+fn stalled_metadata_size_is_abandoned() {
+    let mut h = Harness::new(Config::default());
+    h.peer(1, Some(100));
+    h.now += Config::default().request_timeout;
+    // Peer 2's size is ignored while 100 is still the adopted size.
+    assert!(requests(&h.peer(2, Some(40_000))).is_empty());
+    let fx = h.ev(Event::Tick);
+    let asked = requests(&fx);
+    assert!(asked.iter().all(|(peer, _)| *peer == 2), "{asked:?}");
+    assert!(!asked.is_empty());
+}
+
+#[test]
+fn bad_metadata_is_not_dialed_again() {
+    let mut h = Harness::new(Config::default());
+    h.peer(1, Some(40_000));
+    let mut wrong = info().to_vec();
+    wrong[0] ^= 0xff;
+    h.msg(1, data(0, &wrong));
+    h.msg(1, data(1, &wrong));
+    h.msg(1, data(2, &wrong));
+    let fx = h.ev(Event::AddPeers {
+        peers: vec![addr(1)],
+    });
+    assert!(!fx.contains(&Effect::Connect { addr: addr(1) }), "{fx:?}");
+}
+
+#[test]
+fn stop_after_metadata_finishes_the_task() {
+    let mut h = Harness::new(Config::default());
+    h.peer(1, Some(40_000));
+    let content = info();
+    h.msg(1, data(0, &content));
+    h.msg(1, data(1, &content));
+    assert!(received(&h.msg(1, data(2, &content))).is_some());
+    let fx = h.ev(Event::Stop);
+    assert_eq!(h.m.status(), TorrentStatus::Stopped);
+    assert!(fx.contains(&Effect::Disconnect { peer: PeerKey(1) }));
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        Effect::Announce {
+            event: AnnounceEvent::Stopped,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn failed_started_announce_is_retried() {
+    let mut h = Harness::new(Config::default());
+    h.ev(Event::AnnounceFailed {
+        error: "down".into(),
+    });
+    h.now += Config::default().announce_retry;
+    let fx = h.ev(Event::Tick);
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        Effect::Announce {
+            event: AnnounceEvent::Started,
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -241,6 +326,7 @@ fn trackers_dht_and_stop() {
     // Start already announced and asked the DHT; peers from both connect.
     let fx = h.ev(Event::DhtPeers {
         peers: vec![addr(5)],
+        failed: false,
     });
     assert!(fx.contains(&Effect::Connect { addr: addr(5) }));
     let fx = h.ev(Event::Announced {
@@ -263,4 +349,50 @@ fn trackers_dht_and_stop() {
         }
     )));
     assert_eq!(h.m.status(), TorrentStatus::Stopped);
+    let handover = h.m.into_handover();
+    assert!(handover.swarm.is_empty(), "stopped state has no peers");
+}
+
+#[test]
+fn handover_keeps_dials_in_flight_and_a_failed_started() {
+    let mut h = Harness::new(Config::default());
+    h.ev(Event::AddPeers {
+        peers: vec![addr(4), addr(5)],
+    });
+    let handover = h.m.into_handover();
+    assert_eq!(handover.connecting, vec![addr(4), addr(5)]);
+    assert!(handover.known.is_empty(), "{handover:?}");
+    assert!(handover.started_announced);
+    assert!(handover.started_pending);
+
+    let mut failed = Harness::new(Config::default());
+    failed.ev(Event::AnnounceFailed {
+        error: "down".into(),
+    });
+    let handover = failed.m.into_handover();
+    assert!(!handover.started_announced);
+    assert!(!handover.started_pending);
+}
+
+#[test]
+fn dht_and_pex_addresses_are_marked_for_a_private_handover() {
+    let mut config = Config::default();
+    config.dht = true;
+    config.pex = true;
+    let mut h = Harness::new(config);
+    h.ev(Event::DhtPeers {
+        peers: vec![addr(5)],
+        failed: false,
+    });
+    h.ev(Event::Announced {
+        peers: vec![addr(6)],
+        interval: None,
+    });
+    let handover = h.m.into_handover();
+    assert_eq!(handover.swarm, vec![addr(5)]);
+    assert!(!handover.swarm.contains(&addr(6)));
+    assert!(
+        handover.known.contains(&addr(6)) || handover.connecting.contains(&addr(6)),
+        "{handover:?}"
+    );
 }

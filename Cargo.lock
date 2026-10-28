@@ -538,6 +538,7 @@ dependencies = [
  "dravity-bencode",
  "dravity-core",
  "proptest",
+ "sha1",
  "thiserror",
 ]
 

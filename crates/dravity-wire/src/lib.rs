@@ -7,6 +7,7 @@
 //! * [`ExtendedHandshake`] — the bencode payload of extended message 0.
 //! * [`MetadataMessage`] — BEP 9 `ut_metadata` (metadata for magnet links).
 //! * [`PexMessage`] — BEP 11 `ut_pex` peer exchange.
+//! * [`allowed_fast_set`] — the BEP 6 allowed fast set for a peer.
 //!
 //! The crate performs no I/O: feed it bytes from any transport (Tokio TCP,
 //! uTP, io_uring) and write out what it encodes. Further message ids stay
@@ -14,6 +15,7 @@
 
 mod error;
 mod extended;
+mod fast;
 mod handshake;
 pub mod message;
 mod metadata;
@@ -21,6 +23,7 @@ mod pex;
 
 pub use error::WireError;
 pub use extended::{ExtendedError, ExtendedHandshake};
+pub use fast::{DEFAULT_ALLOWED_FAST, allowed_fast_set};
 pub use handshake::{HANDSHAKE_LEN, Handshake, PROTOCOL, Reserved};
 pub use message::{
     BlockRequest, DEFAULT_MAX_FRAME_LEN, Message, MessageDecoder, MessageId, bitfield_bit,

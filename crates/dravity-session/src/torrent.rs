@@ -18,7 +18,7 @@
 //! [`TorrentState`], and replays the open connections into it as ordinary
 //! events, so no peer is reconnected.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -36,6 +36,7 @@ use dravity_storage::{
 };
 use dravity_tracker::{AnnounceRequest, AnnounceResponse, TrackerClient};
 use dravity_wire::Message;
+use futures_util::StreamExt;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 
@@ -175,7 +176,11 @@ pub(crate) struct TorrentTask {
     /// Events produced synchronously during dispatch, handled next.
     local: VecDeque<Event>,
     hash_slots: Arc<Semaphore>,
+    /// Announce and DHT tasks. Aborted on stop; they must not delay it.
     background: JoinSet<()>,
+    /// Block writes and piece hashes. Drained on stop, before resume data
+    /// is stamped, so a write cannot land after the stamp.
+    disk: JoinSet<()>,
 }
 
 impl std::fmt::Debug for TorrentTask {
@@ -224,6 +229,7 @@ impl TorrentTask {
             local: VecDeque::new(),
             hash_slots,
             background: JoinSet::new(),
+            disk: JoinSet::new(),
         }
     }
 
@@ -270,6 +276,9 @@ impl TorrentTask {
         }
         self.peers.clear();
         self.background.shutdown().await;
+        // Unblock disk tasks waiting to report, then let the writes finish.
+        self.events_rx.close();
+        while self.disk.join_next().await.is_some() {}
         self.finish_storage().await;
         // Mark the handle as not running before acknowledging the stop.
         self.commands.close();
@@ -413,7 +422,7 @@ impl TorrentTask {
             return;
         };
         let Some(dir) = self.download_dir.take() else {
-            return;
+            return self.fail("magnet is missing a download directory".to_owned());
         };
         let tiers = self
             .ctx
@@ -431,6 +440,7 @@ impl TorrentTask {
         };
         let content = Content { metainfo, storage };
         let info_meta = content.metainfo.info();
+        let private = info_meta.is_private();
         let state = match self.resumed_state(&content, Some(&info)).await {
             Some(state) => state,
             None => TorrentState::new(
@@ -448,10 +458,25 @@ impl TorrentTask {
             return;
         };
         let handover = metadata.into_handover();
-        let state = state.with_started_announced(handover.started_announced);
+        let swarm: HashSet<SocketAddr> = if private {
+            handover.swarm.iter().copied().collect()
+        } else {
+            HashSet::new()
+        };
+        let state = state
+            .with_started_announced(handover.started_announced)
+            .with_started_pending(handover.started_pending)
+            .with_connecting(handover.connecting.iter().copied())
+            .ban_peers(swarm.iter().copied());
         self.phase = Phase::Download(Box::new(state));
         self.local.push_back(Event::Start);
         for peer in handover.peers {
+            if swarm.contains(&peer.addr) {
+                // Dropping the command sender closes a DHT/PEX connection
+                // that a private torrent must not keep.
+                self.peers.remove(&peer.peer);
+                continue;
+            }
             self.local.push_back(Event::PeerConnected {
                 peer: peer.peer,
                 addr: peer.addr,
@@ -464,10 +489,13 @@ impl TorrentTask {
                 });
             }
         }
-        if !handover.known.is_empty() {
-            self.local.push_back(Event::AddPeers {
-                peers: handover.known,
-            });
+        let known: Vec<SocketAddr> = handover
+            .known
+            .into_iter()
+            .filter(|addr| !swarm.contains(addr))
+            .collect();
+        if !known.is_empty() {
+            self.local.push_back(Event::AddPeers { peers: known });
         }
     }
 
@@ -520,18 +548,21 @@ impl TorrentTask {
         let Some(dht) = self.ctx.dht.clone() else {
             // The engine only asks when DHT is enabled; answer anyway so it
             // does not wait for a lookup that never ends.
-            self.local.push_back(Event::DhtPeers { peers: Vec::new() });
+            self.local.push_back(Event::DhtPeers {
+                peers: Vec::new(),
+                failed: false,
+            });
             return;
         };
         let info_hash = self.ctx.info_hash;
         let timeout = self.ctx.config.dht_lookup_timeout;
         let tx = self.events_tx.clone();
         self.background.spawn(async move {
-            let peers = tokio::time::timeout(timeout, dht.get_peers(info_hash))
-                .await
-                .unwrap_or_default();
-            tracing::debug!(peers = peers.len(), "DHT lookup done");
-            let _ = tx.send(Input::Engine(Event::DhtPeers { peers })).await;
+            let (peers, failed) = lookup_peers(&dht, info_hash, timeout).await;
+            tracing::debug!(peers = peers.len(), failed, "DHT lookup done");
+            let _ = tx
+                .send(Input::Engine(Event::DhtPeers { peers, failed }))
+                .await;
         });
     }
 
@@ -558,7 +589,7 @@ impl TorrentTask {
             return;
         };
         let tx = self.events_tx.clone();
-        self.background.spawn(async move {
+        self.disk.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 write_block(
                     content.storage.as_ref(),
@@ -590,7 +621,7 @@ impl TorrentTask {
         };
         let slots = Arc::clone(&self.hash_slots);
         let tx = self.events_tx.clone();
-        self.background.spawn(async move {
+        self.disk.spawn(async move {
             let Ok(_permit) = slots.acquire_owned().await else {
                 return;
             };
@@ -644,6 +675,59 @@ impl TorrentTask {
             key: self.ctx.tracker_key,
         }
     }
+}
+
+/// Collects DHT peers until `timeout`. Peers that arrived before the
+/// deadline are kept. `failed` is set on timeout, and when the lookup ended
+/// with nobody because the routing table has no neighbors yet.
+///
+/// [`Dht::bootstrapped`](dravity_dht::Dht::bootstrapped) is not used here: it
+/// runs a `find_node` query, so a short timeout around it treats every empty
+/// swarm as a bootstrap failure and the engine retries every `dht_retry`.
+async fn lookup_peers(
+    dht: &Dht,
+    info_hash: InfoHash,
+    timeout: std::time::Duration,
+) -> (Vec<SocketAddr>, bool) {
+    let mut seen = HashSet::new();
+    let mut peers = Vec::new();
+    let mut stream = std::pin::pin!(dht.peer_batches(info_hash));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let timed_out = loop {
+        if peers.len() >= dravity_dht::DEFAULT_MAX_PEERS {
+            break false;
+        }
+        match tokio::time::timeout_at(deadline, stream.as_mut().next()).await {
+            Ok(Some(batch)) => {
+                for addr in batch {
+                    if seen.insert(addr) {
+                        peers.push(addr);
+                    }
+                }
+            }
+            Ok(None) => break false,
+            Err(_) => break true,
+        }
+    };
+    // Only an empty, finished lookup needs the routing-table snapshot.
+    // `has_nodes` is a local read; it does not start another DHT query.
+    let has_nodes = if !timed_out && peers.is_empty() {
+        dht.has_nodes().await
+    } else {
+        true
+    };
+    let failed = dht_lookup_failed(timed_out, peers.is_empty(), has_nodes);
+    (peers, failed)
+}
+
+/// Whether the engine should retry a DHT lookup after [`Config::dht_retry`]
+/// instead of waiting the full interval.
+///
+/// A timeout is retried soon (peers found before the deadline are still
+/// returned). So is an empty result when the node has no neighbors yet.
+/// An empty result from a node that does have neighbors is an empty swarm.
+fn dht_lookup_failed(timed_out: bool, peers_empty: bool, has_nodes: bool) -> bool {
+    timed_out || (peers_empty && !has_nodes)
 }
 
 /// Announces to the torrent's trackers following BEP 12: tiers are tried
@@ -830,7 +914,20 @@ mod tests {
 
     use dravity_tracker::AnnounceResponse;
 
-    use super::{AnnounceMerge, error_chain, prepare_tiers, promote};
+    use super::{
+        AnnounceMerge, announce_tier, dht_lookup_failed, error_chain, prepare_tiers, promote,
+    };
+
+    #[test]
+    fn dht_failure_is_a_timeout_or_a_node_with_no_neighbors() {
+        assert!(dht_lookup_failed(true, true, false));
+        // Peers collected before the deadline are kept; the lookup still
+        // retries soon because it did not finish.
+        assert!(dht_lookup_failed(true, false, true));
+        assert!(dht_lookup_failed(false, true, false), "not bootstrapped");
+        assert!(!dht_lookup_failed(false, true, true), "empty swarm");
+        assert!(!dht_lookup_failed(false, false, false));
+    }
 
     #[test]
     fn tiers_drop_empty_and_promote_answers() {
@@ -893,5 +990,50 @@ mod tests {
             },
         );
         assert_eq!(only_min.interval(), Some(Duration::from_secs(90)));
+    }
+
+    #[tokio::test]
+    async fn tier_tries_the_next_tracker_and_promotes_it() {
+        use std::sync::{Arc, Mutex};
+
+        use dravity_core::{InfoHash, PeerId};
+        use dravity_tracker::{AnnounceEvent, AnnounceRequest, ClientConfig, TrackerClient};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good = format!("http://{}/announce", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let body = b"d8:completei1e10:incompletei0e8:intervali60e5:peers0:e";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body).await;
+        });
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = format!("http://{}/announce", dead_listener.local_addr().unwrap());
+        drop(dead_listener);
+        let tiers = Arc::new(Mutex::new(vec![vec![dead.clone(), good.clone()]]));
+        let client = TrackerClient::new(ClientConfig::default()).unwrap();
+        let req = AnnounceRequest {
+            info_hash: InfoHash::new([9; 20]),
+            peer_id: PeerId::new(*b"-TS0001-testtesttest"),
+            port: 6881,
+            uploaded: 0,
+            downloaded: 0,
+            left: 1,
+            event: AnnounceEvent::Started,
+            num_want: Some(1),
+            key: 7,
+        };
+        let (answer, errors) =
+            announce_tier(client, Arc::clone(&tiers), vec![dead, good.clone()], req).await;
+        assert_eq!(answer.expect("fallback").0, good);
+        assert!(!errors.is_empty(), "the dead tracker was tried");
+        assert_eq!(tiers.lock().unwrap()[0][0], good);
     }
 }

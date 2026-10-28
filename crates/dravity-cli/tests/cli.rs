@@ -138,6 +138,7 @@ fn download_from_explicit_peer() {
     let (torrent, hash) = write_torrent(dir.path(), &data);
     let peer = seeder(data.clone(), hash);
     let out_dir = dir.path().join("out");
+    let started = std::time::Instant::now();
     let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
         .arg("download")
         .arg(&torrent)
@@ -145,9 +146,14 @@ fn download_from_explicit_peer() {
         .arg(&out_dir)
         .arg("--peer")
         .arg(peer.to_string())
-        .args(["--no-dht", "--download-limit", "4M", "--quiet"])
+        .args(["--no-dht", "--download-limit", "16K", "--quiet"])
         .output()
         .unwrap();
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(2),
+        "16 KiB/s should pace 50 KiB; finished in {:?}",
+        started.elapsed()
+    );
     assert!(
         out.status.success(),
         "stderr: {}",

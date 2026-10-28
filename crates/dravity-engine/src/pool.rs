@@ -132,6 +132,26 @@ impl PeerPool {
         out.extend(self.retry.drain(..).map(|(_, addr)| addr));
         out
     }
+
+    /// Queued and waiting addresses, plus dials already in flight.
+    ///
+    /// In-flight dials stay recorded so the next state can adopt them and
+    /// does not open a second connection to the same address.
+    pub(crate) fn drain_handover(&mut self) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+        let known = self.drain_known();
+        let mut connecting: Vec<SocketAddr> = self.connecting.iter().copied().collect();
+        connecting.sort_unstable();
+        (known, connecting)
+    }
+
+    /// Marks addresses whose TCP connect is already running.
+    pub(crate) fn adopt_connecting(&mut self, addrs: impl IntoIterator<Item = SocketAddr>) {
+        for addr in addrs {
+            if addr.port() != 0 {
+                self.connecting.insert(addr);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -167,6 +187,22 @@ mod tests {
         pool.add([addr(1)], |_| false);
         assert_eq!(pool.drain_known(), [addr(1)], "explicit add dials now");
         assert_eq!(pool.known(), 0, "drained");
+    }
+
+    #[test]
+    fn handover_keeps_dials_in_flight() {
+        let mut pool = PeerPool::default();
+        pool.add([addr(1), addr(2)], |_| false);
+        assert_eq!(pool.next_dial(|_| false), Some(addr(1)));
+        let (known, connecting) = pool.drain_handover();
+        assert_eq!(known, [addr(2)]);
+        assert_eq!(connecting, [addr(1)]);
+        let mut next = PeerPool::default();
+        next.adopt_connecting(connecting);
+        assert_eq!(next.connecting(), 1);
+        assert_eq!(next.next_dial(|_| false), None, "already connecting");
+        next.dial_done(addr(1));
+        assert_eq!(next.connecting(), 0);
     }
 
     #[test]

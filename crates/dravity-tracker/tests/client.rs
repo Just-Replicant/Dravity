@@ -158,6 +158,20 @@ async fn counting_udp_tracker() -> (
     String,
     std::sync::Arc<std::sync::atomic::AtomicU32>,
     tokio::sync::mpsc::UnboundedSender<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<u16>>>,
+) {
+    counting_udp_tracker_with(Duration::ZERO).await
+}
+
+/// Like [`counting_udp_tracker`], waiting `reply_delay` before each reply so
+/// overlapping clients both send before either receives.
+async fn counting_udp_tracker_with(
+    reply_delay: Duration,
+) -> (
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicU32>,
+    tokio::sync::mpsc::UnboundedSender<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<u16>>>,
 ) {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -165,12 +179,15 @@ async fn counting_udp_tracker() -> (
     let url = format!("udp://{}", server.local_addr().unwrap());
     let connects = Arc::new(AtomicU32::new(0));
     let counter = Arc::clone(&connects);
+    let ports = Arc::new(std::sync::Mutex::new(Vec::<u16>::new()));
+    let ports_task = Arc::clone(&ports);
     let (rotate, mut rotations) = tokio::sync::mpsc::unbounded_channel::<()>();
     tokio::spawn(async move {
         let mut buf = [0u8; 2048];
         let mut current = 1000u64;
         loop {
             let (n, from) = server.recv_from(&mut buf).await.unwrap();
+            ports_task.lock().unwrap().push(from.port());
             while rotations.try_recv().is_ok() {
                 current += 1;
             }
@@ -186,16 +203,19 @@ async fn counting_udp_tracker() -> (
                 err.extend_from_slice(b"bad connection id");
                 err
             };
+            if !reply_delay.is_zero() {
+                tokio::time::sleep(reply_delay).await;
+            }
             server.send_to(&reply, from).await.unwrap();
         }
     });
-    (url, connects, rotate)
+    (url, connects, rotate, ports)
 }
 
 #[tokio::test]
 async fn udp_connection_ids_are_cached_and_refreshed() {
     use std::sync::atomic::Ordering;
-    let (url, connects, rotate) = counting_udp_tracker().await;
+    let (url, connects, rotate, ports) = counting_udp_tracker().await;
     let c = client();
     c.announce(&url, &request()).await.unwrap();
     c.clone().announce(&url, &request()).await.unwrap();
@@ -209,6 +229,47 @@ async fn udp_connection_ids_are_cached_and_refreshed() {
     // A different client has its own cache.
     client().announce(&url, &request()).await.unwrap();
     assert_eq!(connects.load(Ordering::SeqCst), 3);
+    let ports = ports.lock().unwrap();
+    let distinct: std::collections::HashSet<u16> = ports.iter().copied().collect();
+    // The cached client reuses one socket; the other client binds its own.
+    assert_eq!(distinct.len(), 2, "source ports: {ports:?}");
+}
+
+#[tokio::test]
+async fn overlapping_udp_announces_share_one_socket() {
+    use std::collections::HashSet;
+    use std::sync::atomic::Ordering;
+    // Replies wait so both clones send before either finishes, which used to
+    // let them steal each other's datagrams or each open a connect.
+    let (url, connects, rotate, ports) = counting_udp_tracker_with(Duration::from_millis(30)).await;
+    let c = client();
+    let first = c.clone();
+    let second = c.clone();
+    let req = request();
+    let (left, right) = tokio::join!(first.announce(&url, &req), second.announce(&url, &req));
+    left.unwrap();
+    right.unwrap();
+    assert_eq!(
+        connects.load(Ordering::SeqCst),
+        1,
+        "second clone reused the id"
+    );
+    // The tracker forgets the id while two announces are in flight: one
+    // reconnect, then the waiter uses that new id.
+    rotate.send(()).unwrap();
+    let first = c.clone();
+    let second = c.clone();
+    let (left, right) = tokio::join!(first.announce(&url, &req), second.announce(&url, &req));
+    left.unwrap();
+    right.unwrap();
+    assert_eq!(
+        connects.load(Ordering::SeqCst),
+        2,
+        "one reconnect for both clones"
+    );
+    let ports = ports.lock().unwrap();
+    let distinct: HashSet<u16> = ports.iter().copied().collect();
+    assert_eq!(distinct.len(), 1, "one source port: {ports:?}");
 }
 
 #[tokio::test]

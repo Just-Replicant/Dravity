@@ -32,7 +32,7 @@ reqwest = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-platform-verifier = { workspace = true, optional = true }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "time"], optional = true }
+tokio = { workspace = true, features = ["net", "sync", "time"], optional = true }
 url = { workspace = true, optional = true }
 
 [dev-dependencies]

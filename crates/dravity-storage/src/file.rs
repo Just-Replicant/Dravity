@@ -1,6 +1,6 @@
 //! Filesystem backend.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -173,6 +173,15 @@ impl FileStorage {
         cache.order.push_back(index);
         Ok(file)
     }
+
+    fn sync_index(&self, index: usize, file: &File) -> Result<(), StorageError> {
+        let path = self
+            .files
+            .get(index)
+            .map(|spec| spec.path.clone())
+            .unwrap_or_default();
+        file.sync_data().map_err(|e| StorageError::io(path, e))
+    }
 }
 
 /// Length and modification time of the file at `path`, if it exists.
@@ -277,22 +286,36 @@ impl Storage for FileStorage {
     }
 
     fn flush(&self) -> Result<(), StorageError> {
-        let files: Vec<(usize, Arc<File>)> = self
+        let cached: Vec<(usize, Arc<File>)> = self
             .lock()
             .open
             .iter()
             .map(|(i, f)| (*i, Arc::clone(f)))
             .collect();
-        for (index, file) in files {
-            file.sync_data().map_err(|e| {
-                StorageError::io(
-                    self.files
-                        .get(index)
-                        .map(|f| f.path.clone())
-                        .unwrap_or_default(),
-                    e,
-                )
-            })?;
+        let mut synced = HashSet::new();
+        for (index, file) in cached {
+            self.sync_index(index, &file)?;
+            synced.insert(index);
+        }
+        // Files evicted from the LRU cache are not in `open`. Sync those too,
+        // so resume data is not written ahead of bytes still in the page cache.
+        for index in 0..self.files.len() {
+            if synced.contains(&index) {
+                continue;
+            }
+            let Some(spec) = self.files.get(index) else {
+                continue;
+            };
+            if spec.padding {
+                continue;
+            }
+            let file = match OpenOptions::new().read(true).write(true).open(&spec.path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(StorageError::io(&spec.path, e)),
+            };
+            file.sync_data()
+                .map_err(|e| StorageError::io(&spec.path, e))?;
         }
         Ok(())
     }

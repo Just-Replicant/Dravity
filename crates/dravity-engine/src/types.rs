@@ -225,8 +225,15 @@ pub enum Event {
     },
     /// An [`Effect::DhtLookup`] finished (possibly with no peers).
     DhtPeers {
-        /// Peers found in the DHT.
+        /// Peers found before the lookup ended. A timed-out lookup still
+        /// returns whatever had already arrived.
         peers: Vec<SocketAddr>,
+        /// The lookup timed out, or it finished with no peers because the
+        /// node still has no DHT neighbors. The engine asks again after
+        /// [`Config::dht_retry`] instead of waiting [`Config::dht_interval`].
+        /// An empty result from a node that does have neighbors is an empty
+        /// swarm and uses the longer interval.
+        failed: bool,
     },
 }
 

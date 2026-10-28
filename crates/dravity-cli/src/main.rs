@@ -52,6 +52,9 @@ enum Command {
         /// Dial peers over uTP first, falling back to TCP.
         #[arg(long)]
         prefer_utp: bool,
+        /// Do not ask the router (NAT-PMP, UPnP) to forward the port.
+        #[arg(long)]
+        no_port_mapping: bool,
         /// Keep seeding after the download completes, until Ctrl-C.
         #[arg(long)]
         seed: bool,
@@ -140,6 +143,7 @@ fn run(cli: Cli) -> Result<()> {
             no_listen,
             no_utp,
             prefer_utp,
+            no_port_mapping,
             seed,
             upload_limit,
             upload_slots,
@@ -161,6 +165,9 @@ fn run(cli: Cli) -> Result<()> {
                 listen
             });
             config.prefer_utp = prefer_utp;
+            if no_port_mapping {
+                config.port_mapping = None;
+            }
             config.engine.seed = seed;
             config.engine.upload_slots = upload_slots;
             config.engine.upload_rate_limit = upload_limit.filter(|&r| r > 0);

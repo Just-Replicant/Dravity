@@ -147,7 +147,13 @@ fn download_from_explicit_peer() {
         .arg(&out_dir)
         .arg("--peer")
         .arg(peer.to_string())
-        .args(["--no-dht", "--download-limit", "16K", "--quiet"])
+        .args([
+            "--no-dht",
+            "--no-port-mapping",
+            "--download-limit",
+            "16K",
+            "--quiet",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -184,7 +190,7 @@ fn resume_dir_and_no_resume() {
         .arg(peer.to_string())
         .arg("--resume-dir")
         .arg(&resume_dir)
-        .args(["--no-dht", "--quiet"])
+        .args(["--no-dht", "--no-port-mapping", "--quiet"])
         .output()
         .unwrap();
     assert!(
@@ -208,7 +214,7 @@ fn resume_dir_and_no_resume() {
         .arg(&out_dir)
         .arg("--peer")
         .arg(peer.to_string())
-        .args(["--no-dht", "--no-resume", "--quiet"])
+        .args(["--no-dht", "--no-port-mapping", "--no-resume", "--quiet"])
         .output()
         .unwrap();
     assert!(
@@ -300,7 +306,14 @@ fn seed_serves_another_download() {
         .arg(&torrent)
         .arg("--output")
         .arg(&seed_dir)
-        .args(["--seed", "--port", "0", "--no-dht", "--no-resume"])
+        .args([
+            "--seed",
+            "--port",
+            "0",
+            "--no-dht",
+            "--no-port-mapping",
+            "--no-resume",
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -315,7 +328,14 @@ fn seed_serves_another_download() {
         .arg(&out_dir)
         .arg("--peer")
         .arg(format!("127.0.0.1:{port}"))
-        .args(["--no-dht", "--prefer-utp", "--port", "0", "--quiet"])
+        .args([
+            "--no-dht",
+            "--no-port-mapping",
+            "--prefer-utp",
+            "--port",
+            "0",
+            "--quiet",
+        ])
         .output()
         .unwrap();
     seeder.kill().unwrap();

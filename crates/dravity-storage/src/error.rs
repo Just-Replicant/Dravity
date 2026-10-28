@@ -23,6 +23,11 @@ pub enum StorageError {
     /// A path on disk is (or goes through) a symbolic link.
     #[error("refusing to follow symbolic link at {0}")]
     Symlink(PathBuf),
+    /// A path below the download directory is not a plain relative path
+    /// (it has `..`, a root or a prefix). Metainfo paths never are; this
+    /// guards the filesystem against bugs upstream.
+    #[error("refusing unsafe path {0}")]
+    UnsafePath(PathBuf),
     /// An I/O error on a file.
     #[error("I/O error on {path}: {source}")]
     Io {

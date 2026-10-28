@@ -507,6 +507,7 @@ version = "0.1.0"
 dependencies = [
  "dravity-bencode",
  "dravity-core",
+ "rustix",
  "sha1",
  "tempfile",
  "thiserror",

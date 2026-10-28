@@ -17,6 +17,9 @@ dravity-core.workspace = true
 sha1.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 sha1.workspace = true
 tempfile.workspace = true

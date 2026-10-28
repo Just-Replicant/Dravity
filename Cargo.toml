@@ -32,6 +32,8 @@ clap = { version = "4", features = ["derive"] }
 fastrand = "2"
 mainline = { version = "8", default-features = false, features = ["async"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# Directory-relative `openat`/`O_NOFOLLOW` opens (storage path hardening).
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-platform-verifier = "0.7"

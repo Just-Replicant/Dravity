@@ -1,7 +1,7 @@
 //! Filesystem backend.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use dravity_core::Info;
 use dravity_core::layout::FileLayout;
 
+use crate::open::open_beneath;
 use crate::{FileStamp, Storage, StorageError, check_range, pos};
 
 /// Default cap on simultaneously open files.
@@ -18,6 +19,8 @@ pub const DEFAULT_MAX_OPEN_FILES: usize = 128;
 struct FileSpec {
     /// Absolute path (download directory joined with the safe relative path).
     path: PathBuf,
+    /// The safe relative path below the download directory.
+    rel: PathBuf,
     /// BEP 47 padding files are never created; they read as zeros.
     padding: bool,
 }
@@ -33,8 +36,10 @@ struct FdCache {
 ///
 /// * Paths come from [`Info::file_path`], which only yields components that
 ///   passed `dravity_core::path` validation, so nothing escapes the directory.
-/// * Existing symbolic links anywhere between the directory and a file are
-///   refused (a hostile torrent cannot be combined with a pre-planted link).
+/// * Symbolic links anywhere between the directory and a file are refused
+///   (a hostile torrent cannot be combined with a pre-planted link). On Unix
+///   every component is opened relative to its parent directory with
+///   `O_NOFOLLOW`, so a link swapped in concurrently is refused too.
 /// * Open files are kept in an LRU cache; reads and writes are positional,
 ///   so concurrent block writes never race on a shared cursor.
 /// * Files are created lazily on first write. Reading data that was never
@@ -61,9 +66,13 @@ impl FileStorage {
             .files()
             .iter()
             .enumerate()
-            .map(|(i, f)| FileSpec {
-                path: root.join(info.file_path(i).unwrap_or_default()),
-                padding: f.is_padding(),
+            .map(|(i, f)| {
+                let rel = info.file_path(i).unwrap_or_default();
+                FileSpec {
+                    path: root.join(&rel),
+                    rel,
+                    padding: f.is_padding(),
+                }
             })
             .collect();
         let layout = FileLayout::new(info.files().iter().map(dravity_core::FileEntry::length))
@@ -109,26 +118,6 @@ impl FileStorage {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Refuses symlinks on every existing component below the root.
-    fn check_no_symlinks(&self, path: &Path) -> Result<(), StorageError> {
-        let Ok(rel) = path.strip_prefix(&self.root) else {
-            return Err(StorageError::Symlink(path.to_path_buf()));
-        };
-        let mut current = self.root.clone();
-        for component in rel.components() {
-            current.push(component);
-            match fs::symlink_metadata(&current) {
-                Ok(meta) if meta.file_type().is_symlink() => {
-                    return Err(StorageError::Symlink(current));
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => break,
-                Err(e) => return Err(StorageError::io(current, e)),
-            }
-        }
-        Ok(())
-    }
-
     fn handle(&self, index: usize, create: bool) -> Result<Arc<File>, StorageError> {
         let mut cache = self.lock();
         if let Some(file) = cache.open.get(&index).cloned() {
@@ -140,20 +129,7 @@ impl FileStorage {
             .files
             .get(index)
             .ok_or(StorageError::OutOfBounds { offset: 0, len: 0 })?;
-        self.check_no_symlinks(&spec.path)?;
-        if create {
-            if let Some(parent) = spec.path.parent() {
-                fs::create_dir_all(parent).map_err(|e| StorageError::io(parent, e))?;
-            }
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(create)
-            .truncate(false)
-            .open(&spec.path)
-            .map_err(|e| StorageError::io(&spec.path, e))?;
-        let file = Arc::new(file);
+        let file = Arc::new(open_beneath(&self.root, &spec.rel, create)?);
         while cache.open.len() >= self.max_open {
             let Some(evict) = cache.order.pop_front() else {
                 break;
@@ -309,10 +285,10 @@ impl Storage for FileStorage {
             if spec.padding {
                 continue;
             }
-            let file = match OpenOptions::new().read(true).write(true).open(&spec.path) {
+            let file = match open_beneath(&self.root, &spec.rel, false) {
                 Ok(file) => file,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(StorageError::io(&spec.path, e)),
+                Err(e) if e.is_missing_data() => continue,
+                Err(e) => return Err(e),
             };
             file.sync_data()
                 .map_err(|e| StorageError::io(&spec.path, e))?;

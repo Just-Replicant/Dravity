@@ -4,8 +4,9 @@
 //! [`dravity_core::layout`]). A [`Storage`] reads and writes byte ranges of
 //! that stream; backends map the ranges onto files, memory, or anything else.
 //!
-//! * [`FileStorage`] — files below a download directory, an LRU cache of open
-//!   file descriptors, and positional reads/writes (no seek per block).
+//! * [`FileStorage`] — files below a download directory, opened without
+//!   following symbolic links, an LRU cache of open file descriptors, and
+//!   positional reads/writes (no seek per block).
 //! * [`MemoryStorage`] — a byte buffer, for tests and small torrents.
 //!
 //! [`write_block`] and [`verify_piece`] adapt piece/block addresses to stream
@@ -16,6 +17,7 @@
 mod error;
 mod file;
 mod memory;
+mod open;
 mod pos;
 pub mod resume;
 

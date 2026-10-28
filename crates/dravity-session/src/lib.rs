@@ -33,7 +33,9 @@
 //! [`SessionConfig::resume_dir`] set, restarts skip the full hash check.
 //!
 //! With [`SessionConfig::listen`] the session accepts incoming connections
-//! (IPv4 and IPv6) and routes them to torrents by info-hash; finished
+//! over TCP and uTP (BEP 29), IPv4 and IPv6, and routes them to torrents by
+//! info-hash; outgoing connections use TCP with uTP as a fallback (or
+//! first, with [`SessionConfig::prefer_utp`]); finished
 //! torrents keep seeding until stopped (see the engine's choker and
 //! [`dravity_engine::Config::seed`]).
 
@@ -42,12 +44,13 @@ mod config;
 mod error;
 mod listen;
 mod peer;
+mod stream;
 mod torrent;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use dravity_core::{InfoHash, Magnet, Metainfo, PeerId};
@@ -63,7 +66,7 @@ pub use config::SessionConfig;
 pub use error::SessionError;
 pub use listen::ListenConfig;
 
-use crate::listen::{Acceptor, Bound, Registry};
+use crate::listen::{Acceptor, Bound, Registry, UtpSockets};
 use crate::torrent::{Command, Source, TorrentContext, TorrentTask, prepare_tiers};
 
 /// An engine [`Alert`] tagged with the torrent it concerns.
@@ -126,6 +129,8 @@ struct Inner {
     /// (which need a Tokio runtime).
     listener: Mutex<Option<Bound>>,
     listen_port: Option<u16>,
+    /// uTP sockets, once the listener started.
+    utp: OnceLock<UtpSockets>,
     /// Ends the accept tasks when the last session clone is dropped.
     _stop: DropGuard,
     stop: CancellationToken,
@@ -176,6 +181,7 @@ impl Session {
                 torrents: Arc::new(Mutex::new(HashMap::new())),
                 listener: Mutex::new(listener),
                 listen_port,
+                utp: OnceLock::new(),
                 _stop: stop.clone().drop_guard(),
                 stop,
             }),
@@ -210,8 +216,11 @@ impl Session {
                 config.listen.as_ref().map_or(1, |l| l.max_pending.max(1)),
             )),
         };
-        if let Err(e) = listen::start(bound, &acceptor, &self.inner.stop) {
-            tracing::warn!(error = %e, "cannot accept peers");
+        match listen::start(bound, &acceptor, &self.inner.stop) {
+            Ok(utp) => {
+                let _ = self.inner.utp.set(utp);
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot accept peers"),
         }
     }
 
@@ -326,6 +335,7 @@ impl Session {
             alerts: self.inner.alerts.clone(),
             tracker_key: fastrand::u32(..),
             listen_port: self.inner.listen_port,
+            utp: self.inner.utp.get().cloned().unwrap_or_default(),
         };
         let (tx, rx) = mpsc::channel(64);
         if !peers.is_empty() {

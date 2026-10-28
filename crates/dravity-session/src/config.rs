@@ -14,8 +14,13 @@ use crate::listen::ListenConfig;
 pub struct SessionConfig {
     /// Peer id prefix in Azureus style (`-DV0001-`); the rest is random.
     pub peer_id_prefix: Vec<u8>,
-    /// Accept incoming peer connections; `None` only dials out.
+    /// Accept incoming peer connections (TCP, and uTP unless
+    /// [`ListenConfig::utp`] is `None`); `None` only dials out over TCP.
     pub listen: Option<ListenConfig>,
+    /// Dial peers over uTP first and fall back to TCP. By default TCP is
+    /// tried first and uTP only when TCP fails (peers behind NATs that pass
+    /// only UDP). Needs uTP sockets, so a listener with uTP.
+    pub prefer_utp: bool,
     /// Port reported to trackers when the session does not listen (for
     /// example behind a proxy that forwards to us). With a listener its
     /// bound port is reported instead.
@@ -56,6 +61,7 @@ impl Default for SessionConfig {
         Self {
             peer_id_prefix: b"-DV0001-".to_vec(),
             listen: Some(ListenConfig::default()),
+            prefer_utp: false,
             announce_port: 6881,
             engine: dravity_engine::Config::default(),
             tracker: ClientConfig::default(),

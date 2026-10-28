@@ -490,6 +490,7 @@ dependencies = [
  "dravity-engine",
  "dravity-storage",
  "dravity-tracker",
+ "dravity-utp",
  "dravity-wire",
  "fastrand",
  "futures-util",

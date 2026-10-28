@@ -44,13 +44,14 @@ use dravity_storage::{
 use dravity_tracker::{AnnounceRequest, AnnounceResponse, TrackerClient};
 use dravity_wire::{Message, Reserved};
 use futures_util::StreamExt;
-use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::SessionAlert;
 use crate::config::SessionConfig;
+use crate::listen::UtpSockets;
 use crate::peer::{self, PeerCommand, PeerParams};
+use crate::stream::PeerStream;
 
 /// Tracker tiers (BEP 12), shared with announce tasks so a tracker that
 /// answered moves to the front of its tier.
@@ -82,7 +83,7 @@ pub(crate) enum Input {
 /// A connection the listener accepted and handshook for this torrent.
 #[derive(Debug)]
 pub(crate) struct Accepted {
-    pub(crate) stream: TcpStream,
+    pub(crate) stream: PeerStream,
     pub(crate) addr: SocketAddr,
     /// The remote handshake's reserved bits.
     pub(crate) reserved: Reserved,
@@ -112,6 +113,8 @@ pub(crate) struct TorrentContext {
     pub(crate) tracker_key: u32,
     /// Port the session accepts peers on, if it listens.
     pub(crate) listen_port: Option<u16>,
+    /// uTP sockets for dialing (empty without a listener or uTP).
+    pub(crate) utp: UtpSockets,
 }
 
 impl TorrentContext {
@@ -665,6 +668,8 @@ impl TorrentTask {
             our_id: self.ctx.peer_id,
             reserved: self.ctx.reserved(),
             connect_timeout: self.ctx.config.connect_timeout,
+            utp: self.ctx.utp.for_addr(addr).cloned(),
+            prefer_utp: self.ctx.config.prefer_utp,
         };
         // Peer tasks are not in `background`: dropping their command sender
         // ends them, and they must not delay shutdown.

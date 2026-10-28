@@ -1,8 +1,9 @@
 //! Accepting incoming peer connections.
 //!
 //! The session binds one TCP socket per address family (IPv6 with
-//! `IPV6_V6ONLY`, so both families can share a port on every platform). One
-//! accept task per socket reads the remote handshake, routes the connection
+//! `IPV6_V6ONLY`, so both families can share a port on every platform),
+//! and with uTP enabled a UDP socket on the same port for each. One accept
+//! task per socket reads the remote handshake, routes the connection
 //! to the torrent named by its info-hash, answers with our handshake and
 //! hands the stream to that torrent's task, which runs it like a dialed
 //! peer. Unknown info-hashes, connections from ourselves and handshakes that
@@ -17,14 +18,16 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use dravity_core::{InfoHash, PeerId};
+use dravity_utp::UtpSocket;
 use dravity_wire::{Handshake, Reserved};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::peer::HandshakeError;
+use crate::stream::PeerStream;
 use crate::torrent::{Accepted, Command};
 
 /// Where to accept incoming peer connections.
@@ -42,6 +45,9 @@ pub struct ListenConfig {
     /// Incoming handshakes in progress at once; more connections are closed
     /// right away.
     pub max_pending: usize,
+    /// Also speak uTP (BEP 29) on UDP sockets bound to the same port;
+    /// `None` uses TCP only.
+    pub utp: Option<dravity_utp::Config>,
 }
 
 impl Default for ListenConfig {
@@ -51,6 +57,7 @@ impl Default for ListenConfig {
             ipv4: Some(Ipv4Addr::UNSPECIFIED),
             ipv6: Some(Ipv6Addr::UNSPECIFIED),
             max_pending: 32,
+            utp: Some(dravity_utp::Config::default()),
         }
     }
 }
@@ -81,6 +88,9 @@ impl ListenConfig {
 #[derive(Debug)]
 pub(crate) struct Bound {
     pub(crate) sockets: Vec<std::net::TcpListener>,
+    /// uTP sockets, on the TCP port of their family.
+    pub(crate) udp: Vec<std::net::UdpSocket>,
+    pub(crate) utp: dravity_utp::Config,
     /// The port every socket is bound to.
     pub(crate) port: u16,
 }
@@ -126,7 +136,51 @@ pub(crate) fn bind(config: &ListenConfig) -> io::Result<Bound> {
         return Err(first_error
             .unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address to bind")));
     }
-    Ok(Bound { sockets, port })
+    let mut udp = Vec::new();
+    if config.utp.is_some() {
+        for tcp in &sockets {
+            let addr = tcp.local_addr()?;
+            match bind_udp(addr) {
+                Ok(socket) => udp.push(socket),
+                // TCP still works; this family just has no uTP.
+                Err(e) => tracing::warn!(%addr, error = %e, "cannot bind uTP socket"),
+            }
+        }
+    }
+    Ok(Bound {
+        sockets,
+        udp,
+        utp: config.utp.clone().unwrap_or_default(),
+        port,
+    })
+}
+
+fn bind_udp(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
+/// The session's uTP sockets, one per address family.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UtpSockets {
+    v4: Option<Arc<UtpSocket>>,
+    v6: Option<Arc<UtpSocket>>,
+}
+
+impl UtpSockets {
+    /// The socket that can reach `addr`.
+    pub(crate) fn for_addr(&self, addr: SocketAddr) -> Option<&Arc<UtpSocket>> {
+        if addr.is_ipv4() {
+            self.v4.as_ref()
+        } else {
+            self.v6.as_ref()
+        }
+    }
 }
 
 fn bind_one(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
@@ -158,16 +212,67 @@ pub(crate) struct Acceptor {
 }
 
 /// Starts one accept task per socket; they end when `stop` is cancelled.
+/// Returns the uTP sockets for dialing.
 ///
 /// # Errors
 /// If a socket cannot be registered with the Tokio runtime.
-pub(crate) fn start(bound: Bound, acceptor: &Acceptor, stop: &CancellationToken) -> io::Result<()> {
+pub(crate) fn start(
+    bound: Bound,
+    acceptor: &Acceptor,
+    stop: &CancellationToken,
+) -> io::Result<UtpSockets> {
     for socket in bound.sockets {
         let listener = TcpListener::from_std(socket)?;
-        tracing::info!(addr = %listener.local_addr()?, "accepting peers");
+        tracing::info!(addr = %listener.local_addr()?, "accepting peers over TCP");
         tokio::spawn(accept_loop(listener, acceptor.clone(), stop.clone()));
     }
-    Ok(())
+    let mut utp = UtpSockets::default();
+    for socket in bound.udp {
+        let socket = Arc::new(UtpSocket::from_std(socket, bound.utp.clone())?);
+        let addr = socket.local_addr();
+        tracing::info!(%addr, "accepting peers over uTP");
+        tokio::spawn(accept_utp(
+            Arc::clone(&socket),
+            acceptor.clone(),
+            stop.clone(),
+        ));
+        if addr.is_ipv4() {
+            utp.v4 = Some(socket);
+        } else {
+            utp.v6 = Some(socket);
+        }
+    }
+    Ok(utp)
+}
+
+async fn accept_utp(socket: Arc<UtpSocket>, acceptor: Acceptor, stop: CancellationToken) {
+    loop {
+        let accepted = tokio::select! {
+            () = stop.cancelled() => return,
+            accepted = socket.accept() => accepted,
+        };
+        let Ok((stream, addr)) = accepted else {
+            return;
+        };
+        handle(PeerStream::Utp(stream), addr, &acceptor);
+    }
+}
+
+/// Handshakes and routes one accepted connection in its own task, within
+/// the pending-handshake budget.
+fn handle(stream: PeerStream, addr: SocketAddr, acceptor: &Acceptor) {
+    let Ok(permit) = Arc::clone(&acceptor.pending).try_acquire_owned() else {
+        tracing::debug!(%addr, "too many incoming handshakes; closing");
+        return;
+    };
+    let acceptor = acceptor.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let transport = stream.transport();
+        if let Err(e) = route(stream, addr, &acceptor).await {
+            tracing::debug!(%addr, transport, error = %e, "incoming connection dropped");
+        }
+    });
 }
 
 async fn accept_loop(listener: TcpListener, acceptor: Acceptor, stop: CancellationToken) {
@@ -186,27 +291,19 @@ async fn accept_loop(listener: TcpListener, acceptor: Acceptor, stop: Cancellati
                 continue;
             }
         };
-        let Ok(permit) = Arc::clone(&acceptor.pending).try_acquire_owned() else {
-            tracing::debug!(%addr, "too many incoming handshakes; closing");
-            continue;
-        };
-        let acceptor = acceptor.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(e) = route(stream, addr, &acceptor).await {
-                tracing::debug!(%addr, error = %e, "incoming connection dropped");
-            }
-        });
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::debug!(%addr, error = %e, "set_nodelay failed");
+        }
+        handle(PeerStream::Tcp(stream), addr, &acceptor);
     }
 }
 
 /// Handshakes an accepted connection and hands it to its torrent.
 async fn route(
-    mut stream: TcpStream,
+    mut stream: PeerStream,
     addr: SocketAddr,
     acceptor: &Acceptor,
 ) -> Result<(), HandshakeError> {
-    stream.set_nodelay(true)?;
     let lookup = |hash: &InfoHash| {
         acceptor
             .registry

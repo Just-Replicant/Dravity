@@ -782,3 +782,106 @@ async fn without_a_listener_nothing_is_accepted() {
     let session = Session::new(c).unwrap();
     assert_eq!(session.listen_port(), None);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_utp_connections_are_routed_like_tcp() {
+    let (metainfo, _) = make_torrent(None, 1000, 1000);
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(config()).unwrap();
+    let port = session.listen_port().unwrap();
+    let handle = session
+        .add_torrent(metainfo, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    let client = dravity_utp::UtpSocket::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        dravity_utp::Config::default(),
+    )
+    .await
+    .unwrap();
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.connect(SocketAddr::from(([127, 0, 0, 1], port))),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let hello = Handshake::new(handle.info_hash(), PeerId::new([4; 20]));
+    stream.write_all(&hello.to_bytes()).await.unwrap();
+    let mut buf = [0u8; 68];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let theirs = Handshake::decode(&mut BytesMut::from(&buf[..]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(theirs.peer_id, session.peer_id());
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dials_fall_back_to_utp_when_tcp_is_refused() {
+    let (metainfo, _) = make_torrent(None, 1000, 1000);
+    let hash = metainfo.info_hash();
+    // A uTP-only peer: nothing listens on its TCP port.
+    let peer = dravity_utp::UtpSocket::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        dravity_utp::Config::default(),
+    )
+    .await
+    .unwrap();
+    let addr = peer.local_addr();
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(config()).unwrap();
+    let _handle = session
+        .add_torrent(
+            metainfo,
+            AddTorrentOptions::new(dir.path()).with_peers([addr]),
+        )
+        .unwrap();
+    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), peer.accept())
+        .await
+        .expect("dialed over uTP")
+        .unwrap();
+    let mut buf = [0u8; 68];
+    stream.read_exact(&mut buf).await.unwrap();
+    let theirs = Handshake::decode(&mut BytesMut::from(&buf[..]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(theirs.info_hash, hash);
+    assert!(theirs.reserved.fast());
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_seeds_over_utp() {
+    let (len_a, len_b) = (120_000, 50_000);
+    let (metainfo, content) = make_torrent(None, len_a, len_b);
+    let hash = metainfo.info_hash();
+    let seed_dir = tempfile::tempdir().unwrap();
+    write_files(seed_dir.path(), &content, len_a);
+    let seeder = Session::new(config()).unwrap();
+    let port = seeder.listen_port().unwrap();
+    let mut seeder_alerts = seeder.subscribe();
+    let _seeding = seeder
+        .add_torrent(metainfo, AddTorrentOptions::new(seed_dir.path()))
+        .unwrap();
+    until_finished(&mut seeder_alerts, hash).await;
+
+    let mut c = config();
+    c.prefer_utp = true;
+    let leecher = Session::new(c).unwrap();
+    let mut alerts = leecher.subscribe();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let _leeching = leecher
+        .add_torrent(
+            make_torrent(None, len_a, len_b).0,
+            AddTorrentOptions::new(leech_dir.path())
+                .with_peers([SocketAddr::from(([127, 0, 0, 1], port))]),
+        )
+        .unwrap();
+    until_finished(&mut alerts, hash).await;
+    assert_files(leech_dir.path(), &content, len_a);
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}

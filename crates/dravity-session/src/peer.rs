@@ -5,11 +5,13 @@
 //! peers arrive already handshaken from the listener ([`run_accepted`]).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
 use dravity_core::{InfoHash, PeerId};
 use dravity_engine::PeerKey;
+use dravity_utp::UtpSocket;
 use dravity_wire::{Handshake, Message, Reserved};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -18,6 +20,7 @@ use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, FramedParts};
 
 use crate::codec::PeerCodec;
+use crate::stream::PeerStream;
 use crate::torrent::Input;
 
 /// Commands from the torrent owner to a peer task.
@@ -27,7 +30,7 @@ pub(crate) enum PeerCommand {
 }
 
 /// Static parameters of a peer connection.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct PeerParams {
     pub(crate) key: PeerKey,
     pub(crate) addr: SocketAddr,
@@ -35,6 +38,9 @@ pub(crate) struct PeerParams {
     pub(crate) our_id: PeerId,
     pub(crate) reserved: Reserved,
     pub(crate) connect_timeout: Duration,
+    /// The uTP socket for this address family, if uTP is available.
+    pub(crate) utp: Option<Arc<UtpSocket>>,
+    pub(crate) prefer_utp: bool,
 }
 
 /// Why a handshake failed.
@@ -108,46 +114,76 @@ where
     Ok((theirs, buf))
 }
 
+/// Opens a connection and handshakes over one transport.
+async fn open(
+    transport: Transport,
+    params: &PeerParams,
+) -> Result<(PeerStream, Handshake, BytesMut), HandshakeError> {
+    let mut stream = match (transport, &params.utp) {
+        (Transport::Utp, Some(utp)) => PeerStream::Utp(utp.connect(params.addr).await?),
+        _ => {
+            let tcp = TcpStream::connect(params.addr).await?;
+            tcp.set_nodelay(true)?;
+            PeerStream::Tcp(tcp)
+        }
+    };
+    let (theirs, leftover) = handshake(
+        &mut stream,
+        params.info_hash,
+        params.our_id,
+        params.reserved,
+    )
+    .await?;
+    Ok((stream, theirs, leftover))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Tcp,
+    Utp,
+}
+
+/// Tries the preferred transport, then the other one if the first could
+/// not connect at all (a peer that answered and refused is not retried).
+/// Each attempt gets the full connect timeout.
+async fn dial(params: &PeerParams) -> Result<(PeerStream, Handshake, BytesMut), HandshakeError> {
+    let order = match (params.utp.is_some(), params.prefer_utp) {
+        (false, _) => &[Transport::Tcp][..],
+        (true, false) => &[Transport::Tcp, Transport::Utp][..],
+        (true, true) => &[Transport::Utp, Transport::Tcp][..],
+    };
+    let mut last = HandshakeError::Timeout;
+    for &transport in order {
+        match tokio::time::timeout(params.connect_timeout, open(transport, params)).await {
+            Ok(Ok(ok)) => return Ok(ok),
+            Ok(Err(e)) if !e.retryable() => return Err(e),
+            Ok(Err(e)) => last = e,
+            Err(_) => last = HandshakeError::Timeout,
+        }
+        tracing::trace!(addr = %params.addr, ?transport, error = %last, "dial attempt failed");
+    }
+    Err(last)
+}
+
 /// Connects, handshakes and runs the connection until either side closes.
 pub(crate) async fn run(
     params: PeerParams,
     events: mpsc::Sender<Input>,
     commands: mpsc::Receiver<PeerCommand>,
 ) {
-    let PeerParams {
-        key,
-        addr,
-        info_hash,
-        our_id,
-        reserved: ours,
-        connect_timeout,
-    } = params;
-    let setup = async {
-        let mut stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
-        let (theirs, leftover) = handshake(&mut stream, info_hash, our_id, ours).await?;
-        Ok::<_, HandshakeError>((stream, theirs.reserved, leftover))
-    };
-    let (stream, reserved, leftover) = match tokio::time::timeout(connect_timeout, setup).await {
-        Ok(Ok(ok)) => ok,
-        Ok(Err(e)) => {
+    let (key, addr) = (params.key, params.addr);
+    let (stream, reserved, leftover) = match dial(&params).await {
+        Ok((stream, theirs, leftover)) => {
+            tracing::debug!(%addr, transport = stream.transport(), "peer connected");
+            (stream, theirs.reserved, leftover)
+        }
+        Err(e) => {
             tracing::debug!(%addr, error = %e, "peer connection failed");
             let _ = events
                 .send(Input::ConnectFailed {
                     key,
                     addr,
                     retry: e.retryable(),
-                })
-                .await;
-            return;
-        }
-        Err(_) => {
-            tracing::debug!(%addr, error = %HandshakeError::Timeout, "peer connection failed");
-            let _ = events
-                .send(Input::ConnectFailed {
-                    key,
-                    addr,
-                    retry: true,
                 })
                 .await;
             return;
@@ -172,7 +208,7 @@ pub(crate) async fn run(
 pub(crate) async fn run_accepted(
     key: PeerKey,
     addr: SocketAddr,
-    stream: TcpStream,
+    stream: PeerStream,
     leftover: BytesMut,
     events: mpsc::Sender<Input>,
     commands: mpsc::Receiver<PeerCommand>,
@@ -317,6 +353,8 @@ mod tests {
             our_id: PeerId::new([7; 20]),
             reserved: our_reserved(true),
             connect_timeout: Duration::from_secs(5),
+            utp: None,
+            prefer_utp: false,
         };
         tokio::spawn(run(params, events_tx, cmd_rx));
         assert!(matches!(events.recv().await, Some(Input::Connected { .. })));

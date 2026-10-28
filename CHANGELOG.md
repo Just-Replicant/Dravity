@@ -6,6 +6,46 @@ the roadmap phases until the first release.
 
 ## [Unreleased]
 
+### Phase 3 — Good citizen
+
+See [`docs/phase-3.md`](docs/phase-3.md) for design notes.
+
+#### Added
+
+- Seeding: the engine serves blocks (`Effect::ReadBlock`,
+  `Event::BlockRead`), keeps finished torrents in the swarm
+  (`Config::seed`) and paces uploads (`upload_rate_limit`,
+  `--upload-limit`).
+- Choker: tit-for-tat by rate, anti-snubbing and a rotating optimistic
+  unchoke (`upload_slots`, `--upload-slots`).
+- BEP 6 fast extension: `have all`/`have none`, `reject`, allowed fast set
+  (`dravity_wire::allowed_fast_set`).
+- Per-IP bans for peers whose pieces fail the hash check
+  (`hash_fail_ban`, `Alert::PeerBanned`).
+- Incoming connections: `SessionConfig::listen` (`ListenConfig`), TCP and
+  uTP on IPv4 and IPv6, routed by info-hash; `Session::listen_port`. CLI
+  `--port` is now the listen port; `--no-listen`, `--seed`.
+- `dravity-utp`: uTP (BEP 29) with LEDBAT. The session dials over uTP when
+  TCP fails (`SessionConfig::prefer_utp`, `--prefer-utp`, `--no-utp`).
+- `dravity-portmap`: NAT-PMP and UPnP IGD port mapping, on by default
+  (`SessionConfig::port_mapping`, `Session::port_mapping`,
+  `--no-port-mapping`); mappings are removed on shutdown.
+- DHT `announce_peer` with the listen port after each lookup.
+- `dravity_storage` `read_block`.
+- Fuzz targets `utp_packet`, `portmap_parse`.
+
+#### Changed
+
+- Paths from metainfo are refused when they are invalid on the running
+  platform (Windows device names, `<>:"|?*`, trailing dots or spaces) or
+  have components over 255 bytes (`dravity_core::path::Platform`).
+- On Unix, content files are opened beneath the download directory with
+  `O_NOFOLLOW` at every level (`StorageError::UnsafePath`).
+- The handshake advertises the fast extension; the extension handshake
+  sends `p`, `reqq` and `yourip`.
+- `SessionConfig::announce_port` is only used when the session does not
+  listen.
+
 ### Phase 2 — Magnets and swarm
 
 See [`docs/phase-2.md`](docs/phase-2.md) for design notes.

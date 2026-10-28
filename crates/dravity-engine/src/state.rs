@@ -1,14 +1,18 @@
 //! The per-torrent state machine.
 
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use dravity_core::{BLOCK_SIZE, BlockRef, PieceLayout};
-use dravity_wire::{ExtendedHandshake, METADATA_PIECE_LEN, Message, MetadataMessage, Reserved};
+use dravity_core::{BLOCK_SIZE, BlockRef, InfoHash, PieceLayout};
+use dravity_wire::{
+    BlockRequest, ExtendedHandshake, METADATA_PIECE_LEN, Message, MetadataMessage, Reserved,
+};
 
+use crate::ban::HashBans;
 use crate::bitfield::Bitfield;
+use crate::choker::{Candidate, Choker};
 use crate::ext::{self, PeerExtensions};
 use crate::picker::{Picker, Received};
 use crate::pool::PeerPool;
@@ -36,6 +40,12 @@ fn message_defers_bitfield(message: &Message) -> bool {
 #[derive(Debug, Clone)]
 struct Peer {
     addr: SocketAddr,
+    /// The peer connected to us (its source port is not its listen port).
+    incoming: bool,
+    /// Where other peers can reach this one (for PEX): the address we
+    /// dialed, or an incoming peer's IP with the `p` of its extension
+    /// handshake.
+    reachable: Option<SocketAddr>,
     has: Bitfield,
     /// `bitfield`, `have all`, and `have none` are still legal. Keep-alives,
     /// DHT `port`, and BEP 10 extended messages do not clear this: common
@@ -51,18 +61,49 @@ struct Peer {
     window: Window,
     /// The peer set the BEP 10 bit in its handshake.
     extended: bool,
+    /// Both sides speak the BEP 6 fast extension.
+    fast: bool,
     ext: PeerExtensions,
     /// Addresses we told this peer about with PEX.
     pex_known: HashSet<SocketAddr>,
     last_recv: Instant,
     last_sent: Instant,
+    /// We refuse to upload to the peer (initially true).
+    am_choking: bool,
+    /// Pieces the peer lets us request while it chokes us (BEP 6).
+    allowed_in: HashSet<u32>,
+    /// Pieces we let the peer request while we choke it (BEP 6).
+    allowed_out: HashSet<u32>,
+    /// Requests from the peer waiting for a disk read.
+    upload_queue: VecDeque<BlockRef>,
+    /// Requests whose read is in flight. A cancel or a choke removes the
+    /// block, and the data is dropped when it arrives.
+    reading: HashSet<BlockRef>,
+    /// Payload bytes received from the peer since the last choker round.
+    down_round: u64,
+    /// Payload bytes sent to the peer since the last choker round.
+    up_round: u64,
+    /// Since when the peer has held our requests without delivering a
+    /// block (snub detection). A request timeout does not reset it.
+    snub_since: Option<Instant>,
+    /// When the peer last held the optimistic unchoke (or connected).
+    last_optimistic: Instant,
 }
 
 impl Peer {
-    fn new(addr: SocketAddr, piece_count: u32, config: &Config, now: Instant) -> Self {
+    fn new(
+        addr: SocketAddr,
+        incoming: bool,
+        reserved: Reserved,
+        piece_count: u32,
+        config: &Config,
+        now: Instant,
+    ) -> Self {
         let cap = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
         Self {
             addr,
+            incoming,
+            reachable: (!incoming).then_some(addr),
             has: Bitfield::new(piece_count),
             bitfield_ok: true,
             am_interested: false,
@@ -74,12 +115,33 @@ impl Peer {
                 cap(config.initial_requests_per_peer),
                 cap(config.max_requests_per_peer),
             ),
-            extended: false,
+            extended: reserved.extension_protocol(),
+            fast: config.fast_extension && reserved.fast(),
             ext: PeerExtensions::default(),
             pex_known: HashSet::new(),
             last_recv: now,
             last_sent: now,
+            am_choking: true,
+            allowed_in: HashSet::new(),
+            allowed_out: HashSet::new(),
+            upload_queue: VecDeque::new(),
+            reading: HashSet::new(),
+            down_round: 0,
+            up_round: 0,
+            snub_since: None,
+            last_optimistic: now,
         }
+    }
+
+    /// The peer holds requests and delivered nothing for `timeout`.
+    fn is_snubbing(&self, now: Instant, timeout: Duration) -> bool {
+        self.snub_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= timeout)
+    }
+
+    /// Whether the peer may receive `piece` from us right now.
+    fn may_download(&self, piece: u32) -> bool {
+        !self.am_choking || self.allowed_out.contains(&piece)
     }
 
     /// Outstanding requests allowed now: the AIMD window, capped by the
@@ -169,6 +231,15 @@ pub struct TorrentState {
     rate: Option<TokenBucket>,
     /// The bencoded `info` dictionary, served to peers with BEP 9.
     info_bytes: Option<Bytes>,
+    /// Needed for the BEP 6 allowed fast set.
+    info_hash: Option<InfoHash>,
+    choker: Choker,
+    bans: HashBans,
+    upload_rate: Option<TokenBucket>,
+    /// Block reads for uploads in flight.
+    pending_reads: usize,
+    /// Last peer served by the upload round-robin.
+    upload_cursor: Option<PeerKey>,
     downloaded: u64,
     uploaded: u64,
     bytes_have: u64,
@@ -209,6 +280,12 @@ impl TorrentState {
             next_pex: None,
             rate: None,
             info_bytes: None,
+            info_hash: None,
+            choker: Choker::default(),
+            bans: HashBans::default(),
+            upload_rate: None,
+            pending_reads: 0,
+            upload_cursor: None,
             downloaded: 0,
             uploaded: 0,
             bytes_have,
@@ -221,6 +298,13 @@ impl TorrentState {
     #[must_use]
     pub fn with_info_bytes(mut self, info: Bytes) -> Self {
         self.info_bytes = Some(info);
+        self
+    }
+
+    /// The torrent's info-hash, used for the BEP 6 allowed fast set.
+    #[must_use]
+    pub const fn with_info_hash(mut self, info_hash: InfoHash) -> Self {
+        self.info_hash = Some(info_hash);
         self
     }
 
@@ -293,6 +377,10 @@ impl TorrentState {
             connecting: self.pool.connecting(),
             known_peers: self.pool.known(),
             pending_writes: self.pending_writes,
+            unchoked: self.peers.values().filter(|p| !p.am_choking).count(),
+            interested: self.peers.values().filter(|p| p.peer_interested).count(),
+            pending_reads: self.pending_reads,
+            banned: self.bans.count(),
         }
     }
 
@@ -313,6 +401,9 @@ impl TorrentState {
         if let Some(rate) = self.rate.as_mut() {
             rate.refill(now);
         }
+        if let Some(rate) = self.upload_rate.as_mut() {
+            rate.refill(now);
+        }
         match event {
             Event::Start => self.on_start(now, &mut out),
             Event::Stop => self.stop(&mut out),
@@ -321,7 +412,12 @@ impl TorrentState {
                 peer,
                 addr,
                 reserved,
-            } => self.on_connected(now, peer, addr, reserved, &mut out),
+            } => self.on_connected(now, peer, addr, reserved, false, &mut out),
+            Event::PeerAccepted {
+                peer,
+                addr,
+                reserved,
+            } => self.on_connected(now, peer, addr, reserved, true, &mut out),
             Event::PeerConnectFailed { addr, retry } => {
                 self.pool.dial_done(addr);
                 if retry {
@@ -334,6 +430,7 @@ impl TorrentState {
                     self.schedule_retry(now, addr);
                 }
                 self.fill_connections(&mut out);
+                self.fill_unchoke_slots(now, &mut out);
             }
             Event::Message { peer, message } => self.on_message(now, peer, message, &mut out),
             Event::BlockWritten { block } => {
@@ -352,6 +449,16 @@ impl TorrentState {
                 self.fail(format!("storage write failed: {error}"), &mut out);
             }
             Event::PieceHashed { piece, ok } => self.on_hashed(now, piece, ok, &mut out),
+            Event::BlockRead { peer, block, data } => {
+                self.on_block_read(now, peer, block, data, &mut out);
+            }
+            Event::ReadFailed { block, error, .. } => {
+                self.pending_reads = self.pending_reads.saturating_sub(1);
+                self.fail(
+                    format!("reading piece {} for upload failed: {error}", block.piece),
+                    &mut out,
+                );
+            }
             Event::StorageFailed { error } => self.fail(error, &mut out),
             Event::Announced { peers, interval } => {
                 self.on_announced(now, peers, interval, &mut out);
@@ -397,6 +504,11 @@ impl TorrentState {
             .filter(|&r| r > 0)
             // One second of burst, and at least one block.
             .map(|r| TokenBucket::new(r, r.max(u64::from(BLOCK_SIZE)), now));
+        self.upload_rate = self
+            .config
+            .upload_rate_limit
+            .filter(|&r| r > 0)
+            .map(|r| TokenBucket::new(r, r.max(u64::from(BLOCK_SIZE)), now));
         if self.config.check_existing && self.picker.layout().piece_count() > 0 {
             self.set_status(TorrentStatus::Checking, out);
             self.check = Some(Check {
@@ -438,7 +550,7 @@ impl TorrentState {
 
     fn begin_download(&mut self, now: Instant, out: &mut Vec<Effect>) {
         if self.picker.is_complete() {
-            self.finish(out);
+            self.finish(now, out);
             return;
         }
         self.set_status(TorrentStatus::Downloading, out);
@@ -459,13 +571,52 @@ impl TorrentState {
         self.fill_connections(out);
     }
 
-    fn finish(&mut self, out: &mut Vec<Effect>) {
+    /// Every piece is verified. A seeding torrent stays in the swarm: it
+    /// announces (`completed`, or `started` if it never announced, as when
+    /// it was complete on disk), drops peers that are seeds too and keeps
+    /// uploading. Otherwise it leaves the swarm.
+    fn finish(&mut self, now: Instant, out: &mut Vec<Effect>) {
         self.set_status(TorrentStatus::Finished, out);
         out.push(Effect::Alert(Alert::Finished));
-        self.pool.clear_known();
+        if !self.config.seed {
+            self.pool.clear_known();
+            if self.started_announced {
+                self.push_announce(AnnounceEvent::Completed, out);
+            }
+            self.next_announce = None;
+            for key in self.sorted_keys() {
+                self.remove_peer(key);
+                out.push(Effect::Disconnect { peer: key });
+            }
+            return;
+        }
         if self.started_announced {
             self.push_announce(AnnounceEvent::Completed, out);
+        } else {
+            self.announce(now, AnnounceEvent::Started, out);
         }
+        if self.next_pex.is_none() {
+            self.next_pex = Some(now + self.config.pex_interval);
+        }
+        self.dht.poll(now, &self.config, out);
+        let seeds: Vec<PeerKey> = self
+            .sorted_keys()
+            .into_iter()
+            .filter(|k| self.peers.get(k).is_some_and(|p| p.has.is_full()))
+            .collect();
+        for key in seeds {
+            self.remove_peer(key);
+            out.push(Effect::Disconnect { peer: key });
+        }
+        // Rankings switch from download to upload rates.
+        self.run_choker(now, out);
+        self.fill_connections(out);
+    }
+
+    /// Whether the torrent is in the swarm: downloading, or seeding.
+    fn is_active(&self) -> bool {
+        self.status == TorrentStatus::Downloading
+            || (self.status == TorrentStatus::Finished && self.config.seed)
     }
 
     fn stop(&mut self, out: &mut Vec<Effect>) {
@@ -531,16 +682,16 @@ impl TorrentState {
 
     fn add_to_pool(&mut self, peers: Vec<SocketAddr>) {
         // Peers given while checking are kept for when downloading starts.
-        if matches!(
-            self.status,
-            TorrentStatus::Finished | TorrentStatus::Stopped
-        ) {
+        if !(self.is_active() || self.status == TorrentStatus::Checking) {
             return;
         }
         let connected: HashSet<SocketAddr> = self.peers.values().map(|p| p.addr).collect();
         let banned = &self.swarm_ban;
+        let bans = &self.bans;
         self.pool.add(
-            peers.into_iter().filter(|addr| !banned.contains(addr)),
+            peers
+                .into_iter()
+                .filter(|addr| !banned.contains(addr) && !bans.is_banned(addr.ip())),
             |a| connected.contains(&a),
         );
     }
@@ -548,6 +699,7 @@ impl TorrentState {
     /// Remembers `addr` so a later tick can dial it again.
     fn schedule_retry(&mut self, now: Instant, addr: SocketAddr) {
         if self.swarm_ban.contains(&addr)
+            || self.bans.is_banned(addr.ip())
             || !matches!(
                 self.status,
                 TorrentStatus::Downloading | TorrentStatus::Checking
@@ -563,7 +715,7 @@ impl TorrentState {
     }
 
     fn fill_connections(&mut self, out: &mut Vec<Effect>) {
-        if self.status != TorrentStatus::Downloading {
+        if !self.is_active() {
             return;
         }
         while self.peers.len() + self.pool.connecting() < self.config.max_peers {
@@ -581,16 +733,17 @@ impl TorrentState {
         key: PeerKey,
         addr: SocketAddr,
         reserved: Reserved,
+        incoming: bool,
         out: &mut Vec<Effect>,
     ) {
-        self.pool.dial_done(addr);
+        if !incoming {
+            self.pool.dial_done(addr);
+        }
         // Peers may connect while checking: a magnet's metadata fetch hands
         // its connections over before the data check ends.
         if self.swarm_ban.contains(&addr)
-            || !matches!(
-                self.status,
-                TorrentStatus::Downloading | TorrentStatus::Checking
-            )
+            || self.bans.is_banned(addr.ip())
+            || !(self.is_active() || self.status == TorrentStatus::Checking)
             || self.peers.len() >= self.config.max_peers
             || self.peers.contains_key(&key)
             || Self::is_connected(&self.peers, addr)
@@ -598,23 +751,18 @@ impl TorrentState {
             out.push(Effect::Disconnect { peer: key });
             return;
         }
-        let mut peer = Peer::new(addr, self.picker.layout().piece_count(), &self.config, now);
-        peer.extended = reserved.extension_protocol();
+        let piece_count = self.picker.layout().piece_count();
+        let mut peer = Peer::new(addr, incoming, reserved, piece_count, &self.config, now);
         if peer.extended {
             let size = self
                 .info_bytes
                 .as_ref()
                 .and_then(|b| u64::try_from(b.len()).ok());
-            Self::send(
-                &mut peer,
-                key,
-                ext::our_handshake(size, self.config.pex),
-                now,
-                out,
-            );
+            let hs = ext::our_handshake(&self.config, size, addr);
+            Self::send(&mut peer, key, hs, now, out);
         }
         self.peers.insert(key, peer);
-        if self.status == TorrentStatus::Downloading {
+        if self.status != TorrentStatus::Checking {
             self.send_bitfield(now, key, out);
         }
     }
@@ -643,19 +791,59 @@ impl TorrentState {
         }
     }
 
+    /// Our availability: `have all`/`have none` to fast-extension peers
+    /// when that says it all, else a bitfield (none at all for a peer
+    /// without the fast extension when we have nothing). Then the allowed
+    /// fast set.
     fn send_bitfield(&mut self, now: Instant, key: PeerKey, out: &mut Vec<Effect>) {
-        if self.picker.have().count() == 0 {
+        let have = self.picker.have();
+        let Some(peer) = self.peers.get_mut(&key) else {
+            return;
+        };
+        let message = if peer.fast && have.is_full() {
+            Some(Message::HaveAll)
+        } else if have.count() == 0 {
+            peer.fast.then_some(Message::HaveNone)
+        } else {
+            Some(Message::Bitfield(have.to_bytes()))
+        };
+        if let Some(message) = message {
+            Self::send(peer, key, message, now, out);
+        }
+        self.send_allowed_fast(now, key, out);
+    }
+
+    /// Offers the BEP 6 allowed fast set (the pieces of it we have) to a
+    /// fast-extension peer on IPv4. BEP 6 defines the set for IPv4 only.
+    fn send_allowed_fast(&mut self, now: Instant, key: PeerKey, out: &mut Vec<Effect>) {
+        let (Some(info_hash), k) = (self.info_hash, self.config.allowed_fast) else {
+            return;
+        };
+        let have = self.picker.have();
+        let Some(peer) = self.peers.get_mut(&key) else {
+            return;
+        };
+        let ip = match peer.addr.ip() {
+            IpAddr::V4(ip) => ip,
+            IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+                Some(ip) => ip,
+                None => return,
+            },
+        };
+        if !peer.fast || k == 0 {
             return;
         }
-        let message = Message::Bitfield(self.picker.have().to_bytes());
-        if let Some(peer) = self.peers.get_mut(&key) {
-            Self::send(peer, key, message, now, out);
+        for piece in dravity_wire::allowed_fast_set(&info_hash, ip, have.len(), k) {
+            if have.get(piece) && peer.allowed_out.insert(piece) {
+                Self::send(peer, key, Message::AllowedFast { piece }, now, out);
+            }
         }
     }
 
     /// Forgets a connected peer and returns its address.
     fn remove_peer(&mut self, key: PeerKey) -> Option<SocketAddr> {
         let peer = self.peers.remove(&key)?;
+        self.choker.remove(key);
         for (block, _) in &peer.inflight {
             self.release_owner(key, *block);
         }
@@ -685,6 +873,17 @@ impl TorrentState {
         self.fill_connections(out);
     }
 
+    /// Two seeds have nothing to exchange: drop a peer that has every piece
+    /// once we have them too. Returns whether it was dropped.
+    fn drop_if_both_seeds(&mut self, key: PeerKey, out: &mut Vec<Effect>) -> bool {
+        let both =
+            self.picker.is_complete() && self.peers.get(&key).is_some_and(|p| p.has.is_full());
+        if both {
+            self.disconnect(key, out);
+        }
+        both
+    }
+
     fn on_message(&mut self, now: Instant, key: PeerKey, message: Message, out: &mut Vec<Effect>) {
         let piece_count = self.picker.layout().piece_count();
         let Some(peer) = self.peers.get_mut(&key) else {
@@ -705,12 +904,20 @@ impl TorrentState {
                     Ok(has) => self.set_peer_pieces(key, has),
                     Err(_) => return self.disconnect(key, out),
                 }
+                if self.drop_if_both_seeds(key, out) {
+                    return;
+                }
             }
+            // Accepted without the fast extension too: harmless, and some
+            // clients send it anyway.
             Message::HaveAll => {
                 if !bitfield_ok {
                     return self.disconnect(key, out);
                 }
                 self.set_peer_pieces(key, Bitfield::full(piece_count));
+                if self.drop_if_both_seeds(key, out) {
+                    return;
+                }
             }
             Message::HaveNone => {
                 if !bitfield_ok {
@@ -724,17 +931,43 @@ impl TorrentState {
                 if peer.has.set(piece) {
                     self.picker.add_peer_piece(piece);
                 }
+                if self.drop_if_both_seeds(key, out) {
+                    return;
+                }
             }
             Message::Choke => {
                 peer.peer_choking = true;
-                let blocks: Vec<BlockRef> = peer.inflight.drain(..).map(|(b, _)| b).collect();
-                for block in blocks {
-                    self.release_owner(key, block);
+                peer.snub_since = None;
+                // With the fast extension a choke keeps our requests: the
+                // peer rejects the ones it will not serve (BEP 6).
+                if !peer.fast {
+                    let blocks: Vec<BlockRef> = peer.inflight.drain(..).map(|(b, _)| b).collect();
+                    for block in blocks {
+                        self.release_owner(key, block);
+                    }
                 }
             }
             Message::Unchoke => peer.peer_choking = false,
-            Message::Interested => peer.peer_interested = true,
-            Message::NotInterested => peer.peer_interested = false,
+            Message::Interested => {
+                peer.peer_interested = true;
+                self.fill_unchoke_slots(now, out);
+            }
+            Message::NotInterested => {
+                peer.peer_interested = false;
+                if !peer.am_choking {
+                    // Give the slot to someone who wants it.
+                    self.choke_peer(now, key, out);
+                    self.fill_unchoke_slots(now, out);
+                }
+            }
+            Message::Request(request) => self.on_request(now, key, request, out),
+            Message::Cancel(request) => self.on_cancel(now, key, request, out),
+            Message::Reject(request) if peer.fast => self.on_reject(key, request),
+            Message::AllowedFast { piece } if peer.fast => {
+                if piece < piece_count {
+                    peer.allowed_in.insert(piece);
+                }
+            }
             Message::Piece {
                 piece,
                 offset,
@@ -746,8 +979,9 @@ impl TorrentState {
                     self.fill_connections(out);
                 }
             }
-            // Download-only: we never unchoke, so requests and cancels need
-            // no answer. Fast-extension behavior is Phase 3.
+            // `suggest` is only a hint; rarest-first already picks well.
+            // Fast-extension messages from a peer without the extension and
+            // DHT `port` are ignored.
             _ => {}
         }
         self.update_interest(now, key, out);
@@ -774,6 +1008,11 @@ impl TorrentState {
             ext::HANDSHAKE_ID => {
                 if let Ok(hs) = ExtendedHandshake::decode(payload) {
                     peer.ext.update(&hs);
+                    if peer.incoming {
+                        if let Some(port) = hs.listen_port.filter(|&p| p != 0) {
+                            peer.reachable = Some(SocketAddr::new(peer.addr.ip(), port));
+                        }
+                    }
                 }
                 false
             }
@@ -838,12 +1077,16 @@ impl TorrentState {
         if !asked {
             return;
         }
+        let mut from_ip = None;
         if let Some(peer) = self.peers.get_mut(&key) {
             let before = peer.inflight.len();
             peer.inflight.retain(|(b, _)| *b != block);
             if peer.inflight.len() < before {
                 peer.window.on_block();
             }
+            peer.down_round = peer.down_round.saturating_add(u64::from(length));
+            peer.snub_since = (!peer.inflight.is_empty()).then_some(now);
+            from_ip = Some(peer.addr.ip());
         }
         // Cancel copies of this block requested from other peers.
         for (other, _) in self.owners.remove(&block).unwrap_or_default() {
@@ -857,6 +1100,9 @@ impl TorrentState {
         }
         self.downloaded = self.downloaded.saturating_add(u64::from(length));
         if self.picker.block_received(block) == Received::Accepted {
+            if let Some(ip) = from_ip {
+                self.bans.record(piece, ip);
+            }
             self.pending_writes += 1;
             out.push(Effect::WriteBlock { block, data });
         }
@@ -898,12 +1144,29 @@ impl TorrentState {
         if self.status != TorrentStatus::Downloading {
             return;
         }
+        let piece_count = self.picker.layout().piece_count();
         let Some(peer) = self.peers.get_mut(&key) else {
             return;
         };
-        if peer.peer_choking || !peer.am_interested {
+        if !peer.am_interested {
             return;
         }
+        // A choking fast-extension peer still serves its allowed fast set.
+        let choked_mask = if peer.peer_choking {
+            if !peer.fast || peer.allowed_in.is_empty() {
+                return;
+            }
+            let mut mask = Bitfield::new(piece_count);
+            for &piece in &peer.allowed_in {
+                if peer.has.get(piece) {
+                    mask.set(piece);
+                }
+            }
+            Some(mask)
+        } else {
+            None
+        };
+        let has = choked_mask.as_ref().unwrap_or(&peer.has);
         let limit = peer.request_limit();
         while peer.inflight.len() < limit && self.pending_writes < self.config.max_pending_writes {
             if self
@@ -913,14 +1176,14 @@ impl TorrentState {
             {
                 break;
             }
-            let block = match self.picker.pick(&peer.has) {
+            let block = match self.picker.pick(has) {
                 Some(block) => block,
                 None => match duplicate_candidate(
                     &self.picker,
                     &self.owners,
                     &self.config,
                     key,
-                    &peer.has,
+                    has,
                     now,
                 ) {
                     Some(block) => block,
@@ -931,9 +1194,18 @@ impl TorrentState {
                 rate.try_take(u64::from(block.length));
             }
             self.owners.entry(block).or_default().push((key, now));
+            if peer.snub_since.is_none() {
+                // The snub timer runs from the first outstanding request.
+                peer.snub_since = Some(now);
+            }
             peer.inflight.push((block, now));
             peer.asked.insert((block.piece, block.offset));
-            Self::send(peer, key, Message::Request(block.into()), now, out);
+            // Not `Self::send`: `has` may borrow `peer.has`.
+            peer.last_sent = now;
+            out.push(Effect::Send {
+                peer: key,
+                message: Message::Request(block.into()),
+            });
         }
     }
 
@@ -957,7 +1229,11 @@ impl TorrentState {
         if !ok {
             self.picker.piece_hashed(piece, false);
             out.push(Effect::Alert(Alert::HashFailed { piece }));
+            for ip in self.bans.failed(piece, self.config.hash_fail_ban) {
+                self.ban(ip, out);
+            }
         } else if self.picker.piece_hashed(piece, true) {
+            self.bans.passed(piece);
             self.add_have_bytes(piece);
             out.push(Effect::Alert(Alert::PieceCompleted { piece }));
             for key in self.sorted_keys() {
@@ -967,7 +1243,7 @@ impl TorrentState {
                 self.update_interest(now, key, out);
             }
             if self.picker.is_complete() {
-                self.finish(out);
+                self.finish(now, out);
                 return;
             }
         }
@@ -1032,18 +1308,23 @@ impl TorrentState {
             self.remove_peer(key);
             out.push(Effect::Disconnect { peer: key });
         }
-        if matches!(
-            self.status,
-            TorrentStatus::Downloading | TorrentStatus::Checking
-        ) {
+        if self.is_active() || self.status == TorrentStatus::Checking {
             self.dht.poll(now, &self.config, out);
         }
         if self.status == TorrentStatus::Downloading {
             self.fill_all_requests(now, out);
+        }
+        if self.is_active() {
             if self.next_pex.is_some_and(|t| now >= t) {
                 self.next_pex = Some(now + self.config.pex_interval);
                 self.send_pex(now, out);
             }
+            if self.choker.due(now) {
+                self.run_choker(now, out);
+            } else {
+                self.fill_unchoke_slots(now, out);
+            }
+            self.pump_uploads(out);
         }
         if matches!(
             self.status,
@@ -1061,13 +1342,326 @@ impl TorrentState {
         out.push(Effect::Alert(Alert::Stats(self.stats())));
     }
 
+    /// A peer asked us for a block. Queued if we have the piece, the peer
+    /// may download it (unchoked, or in its allowed fast set) and its queue
+    /// has room; otherwise refused (`reject` with the fast extension,
+    /// silently without).
+    fn on_request(
+        &mut self,
+        now: Instant,
+        key: PeerKey,
+        request: BlockRequest,
+        out: &mut Vec<Effect>,
+    ) {
+        let block = BlockRef {
+            piece: request.piece,
+            offset: request.offset,
+            length: request.length,
+        };
+        let serving = self.is_active();
+        let valid =
+            self.picker.layout().is_valid_request(block) && self.picker.have().get(block.piece);
+        let max_queue = self.config.max_upload_queue;
+        let Some(peer) = self.peers.get_mut(&key) else {
+            return;
+        };
+        if peer.upload_queue.contains(&block) || peer.reading.contains(&block) {
+            return;
+        }
+        let room = peer.upload_queue.len() + peer.reading.len() < max_queue;
+        if !(serving && valid && room && peer.may_download(block.piece)) {
+            if peer.fast {
+                Self::send(peer, key, Message::Reject(request), now, out);
+            }
+            return;
+        }
+        peer.upload_queue.push_back(block);
+        self.pump_uploads(out);
+    }
+
+    /// A peer no longer wants a block. With the fast extension a cancelled
+    /// request that was still queued is answered with `reject` (BEP 6).
+    fn on_cancel(
+        &mut self,
+        now: Instant,
+        key: PeerKey,
+        request: BlockRequest,
+        out: &mut Vec<Effect>,
+    ) {
+        let block = BlockRef {
+            piece: request.piece,
+            offset: request.offset,
+            length: request.length,
+        };
+        let Some(peer) = self.peers.get_mut(&key) else {
+            return;
+        };
+        let before = peer.upload_queue.len();
+        peer.upload_queue.retain(|b| *b != block);
+        let queued = peer.upload_queue.len() < before;
+        let reading = peer.reading.remove(&block);
+        let found = queued || reading;
+        if found && peer.fast {
+            Self::send(peer, key, Message::Reject(request), now, out);
+        }
+    }
+
+    /// A fast-extension peer will not serve a request: hand the block back.
+    /// A rejected allowed fast piece is not asked for again while choked.
+    fn on_reject(&mut self, key: PeerKey, request: BlockRequest) {
+        let block = BlockRef {
+            piece: request.piece,
+            offset: request.offset,
+            length: request.length,
+        };
+        let Some(peer) = self.peers.get_mut(&key) else {
+            return;
+        };
+        let before = peer.inflight.len();
+        peer.inflight.retain(|(b, _)| *b != block);
+        if peer.inflight.len() == before {
+            return;
+        }
+        if peer.peer_choking {
+            peer.allowed_in.remove(&block.piece);
+        }
+        self.release_owner(key, block);
+    }
+
+    /// Issues block reads for queued requests, round-robin over peers, while
+    /// disk reads and the upload rate limit allow.
+    fn pump_uploads(&mut self, out: &mut Vec<Effect>) {
+        let keys: Vec<PeerKey> = self
+            .sorted_keys()
+            .into_iter()
+            .filter(|k| {
+                self.peers
+                    .get(k)
+                    .is_some_and(|p| !p.upload_queue.is_empty())
+            })
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        // Start after the peer served last.
+        let start = self
+            .upload_cursor
+            .and_then(|c| keys.iter().position(|k| *k > c))
+            .unwrap_or(0);
+        let mut order: VecDeque<PeerKey> = keys
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(keys.len())
+            .copied()
+            .collect();
+        while self.pending_reads < self.config.max_pending_reads.max(1) {
+            let Some(key) = order.pop_front() else {
+                break;
+            };
+            let Some(peer) = self.peers.get_mut(&key) else {
+                continue;
+            };
+            let Some(&block) = peer.upload_queue.front() else {
+                continue;
+            };
+            if let Some(rate) = self.upload_rate.as_mut() {
+                if !rate.try_take(u64::from(block.length)) {
+                    // Tokens refill on the next tick.
+                    break;
+                }
+            }
+            peer.upload_queue.pop_front();
+            peer.reading.insert(block);
+            self.pending_reads += 1;
+            self.upload_cursor = Some(key);
+            out.push(Effect::ReadBlock { peer: key, block });
+            if !peer.upload_queue.is_empty() {
+                order.push_back(key);
+            }
+        }
+    }
+
+    fn on_block_read(
+        &mut self,
+        now: Instant,
+        key: PeerKey,
+        block: BlockRef,
+        data: Bytes,
+        out: &mut Vec<Effect>,
+    ) {
+        self.pending_reads = self.pending_reads.saturating_sub(1);
+        if let Some(peer) = self.peers.get_mut(&key) {
+            // Gone from `reading`: cancelled, or rejected when we choked.
+            if peer.reading.remove(&block) && peer.may_download(block.piece) {
+                let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                peer.up_round = peer.up_round.saturating_add(len);
+                self.uploaded = self.uploaded.saturating_add(len);
+                let message = Message::Piece {
+                    piece: block.piece,
+                    offset: block.offset,
+                    data,
+                };
+                Self::send(peer, key, message, now, out);
+            }
+        }
+        self.pump_uploads(out);
+    }
+
+    fn unchoke_peer(&mut self, now: Instant, key: PeerKey, out: &mut Vec<Effect>) {
+        if let Some(peer) = self.peers.get_mut(&key) {
+            if peer.am_choking {
+                peer.am_choking = false;
+                Self::send(peer, key, Message::Unchoke, now, out);
+            }
+        }
+    }
+
+    /// Chokes a peer. Its queued requests are dropped, except allowed fast
+    /// pieces; with the fast extension each dropped one is rejected, as BEP
+    /// 6 requires (a choke no longer cancels requests implicitly).
+    fn choke_peer(&mut self, now: Instant, key: PeerKey, out: &mut Vec<Effect>) {
+        let Some(peer) = self.peers.get_mut(&key) else {
+            return;
+        };
+        if peer.am_choking {
+            return;
+        }
+        peer.am_choking = true;
+        Self::send(peer, key, Message::Choke, now, out);
+        let allowed = peer.allowed_out.clone();
+        let mut dropped: Vec<BlockRef> = Vec::new();
+        peer.upload_queue.retain(|b| {
+            let keep = allowed.contains(&b.piece);
+            if !keep {
+                dropped.push(*b);
+            }
+            keep
+        });
+        let mut reading: Vec<BlockRef> = peer
+            .reading
+            .iter()
+            .copied()
+            .filter(|b| !allowed.contains(&b.piece))
+            .collect();
+        reading.sort_unstable_by_key(|b| (b.piece, b.offset));
+        for block in &reading {
+            peer.reading.remove(block);
+        }
+        dropped.extend(reading);
+        if peer.fast {
+            for block in dropped {
+                Self::send(peer, key, Message::Reject(block.into()), now, out);
+            }
+        }
+    }
+
+    /// Chooses who we upload to for the next round (see
+    /// [`choker`](crate::choker)) and resets the per-round counters.
+    fn run_choker(&mut self, now: Instant, out: &mut Vec<Effect>) {
+        if !self.is_active() {
+            return;
+        }
+        let seeding = self.status == TorrentStatus::Finished;
+        let snub = self.config.snub_timeout;
+        let candidates: Vec<Candidate> = self
+            .sorted_keys()
+            .into_iter()
+            .filter_map(|key| {
+                let p = self.peers.get(&key)?;
+                Some(Candidate {
+                    key,
+                    interested: p.peer_interested,
+                    rate: if seeding { p.up_round } else { p.down_round },
+                    snubbed: !seeding && p.is_snubbing(now, snub),
+                    unchoked: !p.am_choking,
+                    waiting_since: p.last_optimistic,
+                })
+            })
+            .collect();
+        let before = self.choker.optimistic();
+        let selected = self.choker.round(now, &self.config, &candidates);
+        if let Some(key) = self.choker.optimistic().filter(|k| Some(*k) != before) {
+            if let Some(peer) = self.peers.get_mut(&key) {
+                peer.last_optimistic = now;
+            }
+        }
+        for candidate in &candidates {
+            if selected.contains(&candidate.key) {
+                self.unchoke_peer(now, candidate.key, out);
+            } else {
+                self.choke_peer(now, candidate.key, out);
+            }
+        }
+        for peer in self.peers.values_mut() {
+            peer.down_round = 0;
+            peer.up_round = 0;
+        }
+        self.pump_uploads(out);
+    }
+
+    /// Between rounds, unchokes interested peers while slots are free, so a
+    /// newcomer does not wait for the next round. Never chokes anyone.
+    fn fill_unchoke_slots(&mut self, now: Instant, out: &mut Vec<Effect>) {
+        if !self.is_active() {
+            return;
+        }
+        let limit = self.config.upload_slots + usize::from(self.config.optimistic_unchoke);
+        let unchoked = self.peers.values().filter(|p| !p.am_choking).count();
+        if unchoked >= limit {
+            return;
+        }
+        let seeding = self.status == TorrentStatus::Finished;
+        let snub = self.config.snub_timeout;
+        let mut waiting: Vec<(u64, PeerKey)> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| {
+                p.peer_interested && p.am_choking && (seeding || !p.is_snubbing(now, snub))
+            })
+            .map(|(k, p)| (if seeding { p.up_round } else { p.down_round }, *k))
+            .collect();
+        waiting.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (_, key) in waiting.into_iter().take(limit - unchoked) {
+            self.unchoke_peer(now, key, out);
+        }
+    }
+
+    /// Bans `ip` for bad data: closes its connections and forgets it.
+    fn ban(&mut self, ip: IpAddr, out: &mut Vec<Effect>) {
+        out.push(Effect::Alert(Alert::PeerBanned { ip }));
+        let keys: Vec<PeerKey> = self
+            .sorted_keys()
+            .into_iter()
+            .filter(|k| self.peers.get(k).is_some_and(|p| p.addr.ip() == ip))
+            .collect();
+        for key in keys {
+            self.remove_peer(key);
+            out.push(Effect::Disconnect { peer: key });
+        }
+        self.pool.remove_ip(ip);
+        self.fill_connections(out);
+    }
+
     /// Tells every PEX-capable peer which peers we connected to and dropped
     /// since our last message to it (BEP 11).
     fn send_pex(&mut self, now: Instant, out: &mut Vec<Effect>) {
         if !self.config.pex {
             return;
         }
-        let connected: HashSet<SocketAddr> = self.peers.values().map(|p| p.addr).collect();
+        // Only addresses others can dial: an incoming peer's source port is
+        // useless until its extension handshake names its listen port.
+        let connected: HashMap<SocketAddr, u8> = self
+            .peers
+            .values()
+            .filter_map(|p| {
+                let mut flags = dravity_wire::PEX_REACHABLE;
+                if p.has.is_full() {
+                    flags |= dravity_wire::PEX_SEED;
+                }
+                p.reachable.map(|a| (a, flags))
+            })
+            .collect();
         for key in self.sorted_keys() {
             let Some(peer) = self.peers.get_mut(&key) else {
                 continue;
@@ -1075,10 +1669,10 @@ impl TorrentState {
             let Some(id) = peer.ext.ut_pex else {
                 continue;
             };
-            let mut added: Vec<SocketAddr> = connected
+            let mut added: Vec<(SocketAddr, u8)> = connected
                 .iter()
-                .copied()
-                .filter(|a| *a != peer.addr && !peer.pex_known.contains(a))
+                .map(|(a, f)| (*a, *f))
+                .filter(|(a, _)| Some(*a) != peer.reachable && !peer.pex_known.contains(a))
                 .collect();
             added.sort_unstable();
             added.truncate(ext::PEX_MAX_SENT);
@@ -1086,14 +1680,14 @@ impl TorrentState {
                 .pex_known
                 .iter()
                 .copied()
-                .filter(|a| !connected.contains(a))
+                .filter(|a| !connected.contains_key(a))
                 .collect();
             dropped.sort_unstable();
             dropped.truncate(ext::PEX_MAX_SENT);
             if added.is_empty() && dropped.is_empty() {
                 continue;
             }
-            peer.pex_known.extend(added.iter().copied());
+            peer.pex_known.extend(added.iter().map(|(a, _)| *a));
             for addr in &dropped {
                 peer.pex_known.remove(addr);
             }

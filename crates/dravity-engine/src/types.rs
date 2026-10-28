@@ -1,6 +1,6 @@
 //! Inputs, outputs and configuration of [`TorrentState`](crate::TorrentState).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -40,7 +40,8 @@ pub enum TorrentStatus {
     Checking,
     /// Fetching pieces from peers.
     Downloading,
-    /// Every piece is present and verified.
+    /// Every piece is present and verified. With [`Config::seed`] the
+    /// torrent keeps announcing and uploads to peers (seeding).
     Finished,
     /// Stopped by command or after a fatal error.
     Stopped,
@@ -106,6 +107,49 @@ pub struct Config {
     pub check_existing: bool,
     /// Maximum concurrent hash jobs while checking.
     pub check_concurrency: u32,
+    /// Keep the torrent in the swarm once it is complete: announce, accept
+    /// connections and upload (seeding). When `false` a finished torrent
+    /// disconnects its peers and only announces `completed`.
+    pub seed: bool,
+    /// Peers unchoked for their upload to us (tit-for-tat) while
+    /// downloading, or for the fastest uploads while seeding. One optimistic
+    /// unchoke comes on top when [`Self::optimistic_unchoke`] is set.
+    pub upload_slots: usize,
+    /// Give one extra slot to a choked peer in turn, so newcomers get data
+    /// and better partners are discovered.
+    pub optimistic_unchoke: bool,
+    /// Time between two choker rounds (BEP 3 suggests ten seconds).
+    pub unchoke_interval: Duration,
+    /// Time between two changes of the optimistic unchoke.
+    pub optimistic_unchoke_interval: Duration,
+    /// A peer that holds our requests and sends no block for this long is
+    /// snubbing us: it loses its regular slot (anti-snubbing).
+    pub snub_timeout: Duration,
+    /// Upload rate limit in bytes per second (`None`: unlimited). Paces
+    /// block reads with a token bucket.
+    pub upload_rate_limit: Option<u64>,
+    /// Requests from one peer we queue before refusing more. Advertised as
+    /// `reqq` in our extension handshake.
+    pub max_upload_queue: usize,
+    /// Block reads for uploads in flight at once across all peers (disk
+    /// backpressure for seeding).
+    pub max_pending_reads: usize,
+    /// Advertise and use the BEP 6 fast extension (`have all`/`have none`,
+    /// `reject`, `allowed fast`). The driver must set the reserved bit to
+    /// match.
+    pub fast_extension: bool,
+    /// Size of the BEP 6 allowed fast set offered to fast-extension peers
+    /// (0: offer none). Needs [`TorrentState::with_info_hash`](crate::TorrentState::with_info_hash).
+    pub allowed_fast: usize,
+    /// Ban a peer's IP address once it has this many strikes for pieces that
+    /// failed the hash check (0: never ban). Sending every block of a failed
+    /// piece is two strikes; sharing a failed piece with other peers is one.
+    /// The default (4) forgives a single corrupt piece, which may be a
+    /// transient disk or memory error on the sender.
+    pub hash_fail_ban: u32,
+    /// Port we accept connections on, advertised in the extension handshake
+    /// (`p`) so peers that we dialed can tell others how to reach us.
+    pub listen_port: Option<u16>,
 }
 
 impl Default for Config {
@@ -133,6 +177,19 @@ impl Default for Config {
             max_pending_writes: 512,
             check_existing: true,
             check_concurrency: 4,
+            seed: true,
+            upload_slots: 4,
+            optimistic_unchoke: true,
+            unchoke_interval: Duration::from_secs(10),
+            optimistic_unchoke_interval: Duration::from_secs(30),
+            snub_timeout: Duration::from_secs(60),
+            upload_rate_limit: None,
+            max_upload_queue: 250,
+            max_pending_reads: 64,
+            fast_extension: true,
+            allowed_fast: dravity_wire::DEFAULT_ALLOWED_FAST,
+            hash_fail_ban: 4,
+            listen_port: None,
         }
     }
 }
@@ -153,6 +210,18 @@ pub enum Event {
         /// Handle chosen by the driver.
         peer: PeerKey,
         /// Remote address.
+        addr: SocketAddr,
+        /// Reserved bytes from the peer's handshake (extension flags).
+        reserved: Reserved,
+    },
+    /// A peer connected to us and completed its handshake for this torrent
+    /// (incoming connection). The engine may refuse it with
+    /// [`Effect::Disconnect`].
+    PeerAccepted {
+        /// Handle chosen by the driver.
+        peer: PeerKey,
+        /// Remote address (the source port is usually not the peer's
+        /// listening port).
         addr: SocketAddr,
         /// Reserved bytes from the peer's handshake (extension flags).
         reserved: Reserved,
@@ -198,6 +267,25 @@ pub enum Event {
         piece: u32,
         /// Whether the SHA-1 matched.
         ok: bool,
+    },
+    /// A block from [`Effect::ReadBlock`] was read from storage.
+    BlockRead {
+        /// The peer that asked for it.
+        peer: PeerKey,
+        /// Block address.
+        block: BlockRef,
+        /// Block data.
+        data: Bytes,
+    },
+    /// An [`Effect::ReadBlock`] failed. Fatal: a piece we verified cannot be
+    /// read back.
+    ReadFailed {
+        /// The peer that asked for it.
+        peer: PeerKey,
+        /// Block address.
+        block: BlockRef,
+        /// Human-readable cause.
+        error: String,
     },
     /// Reading or hashing a piece failed for a reason other than missing data.
     /// Fatal: the torrent stops.
@@ -266,6 +354,14 @@ pub enum Effect {
         /// Block data.
         data: Bytes,
     },
+    /// Read a block a peer asked for, then report [`Event::BlockRead`] or
+    /// [`Event::ReadFailed`].
+    ReadBlock {
+        /// The peer to upload to.
+        peer: PeerKey,
+        /// Block address.
+        block: BlockRef,
+    },
     /// Hash a piece from storage, then report [`Event::PieceHashed`].
     HashPiece {
         /// Piece index.
@@ -322,6 +418,12 @@ pub enum Alert {
     Finished,
     /// The `info` dictionary of a magnet link was received and verified.
     MetadataReceived,
+    /// A peer was banned for sending data that failed the hash check. Its
+    /// connections are closed and its address is not used again.
+    PeerBanned {
+        /// The banned address.
+        ip: IpAddr,
+    },
     /// A fatal error stopped the torrent.
     Error {
         /// Cause.
@@ -355,4 +457,12 @@ pub struct Stats {
     pub known_peers: usize,
     /// Blocks waiting to be written to storage.
     pub pending_writes: usize,
+    /// Peers we are uploading to (unchoked by us).
+    pub unchoked: usize,
+    /// Peers that are interested in our pieces.
+    pub interested: usize,
+    /// Block reads for uploads in flight.
+    pub pending_reads: usize,
+    /// IP addresses banned for bad data.
+    pub banned: usize,
 }

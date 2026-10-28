@@ -29,10 +29,30 @@
 //! * **DHT**: with [`Config::dht`] the engine schedules
 //!   [`Effect::DhtLookup`]s; the driver runs them.
 //!
-//! The engine is still download-only: peers are never unchoked (seeding and
-//! tit-for-tat are Phase 3).
+//!
+//! Good-citizen behavior (Phase 3):
+//!
+//! * **Seeding and uploads**: requests from unchoked peers are answered with
+//!   [`Effect::ReadBlock`]; the driver replies with [`Event::BlockRead`].
+//!   Reads are bounded by [`Config::max_pending_reads`] and paced by
+//!   [`Config::upload_rate_limit`]. With [`Config::seed`] a finished torrent
+//!   keeps serving until it is stopped.
+//! * **Choking**: every [`Config::unchoke_interval`] the
+//!   [`Config::upload_slots`] best peers are unchoked (tit-for-tat by
+//!   download rate while downloading, by upload rate while seeding); snubbed
+//!   peers lose their slot and one optimistic unchoke rotates every
+//!   [`Config::optimistic_unchoke_interval`].
+//! * **Fast extension** (BEP 6): `HaveAll`/`HaveNone`, `Reject` and an
+//!   allowed fast set for peers that set the reserved bit.
+//! * **Hash-failure bans**: addresses that keep sending bad data are banned
+//!   ([`Config::hash_fail_ban`], [`Alert::PeerBanned`]).
+//! * **Incoming peers**: [`Event::PeerAccepted`] adds a connection the
+//!   driver accepted; such peers are only shared over PEX once they
+//!   advertise a listen port.
 
+mod ban;
 mod bitfield;
+mod choker;
 mod ext;
 mod metadata;
 pub mod picker;

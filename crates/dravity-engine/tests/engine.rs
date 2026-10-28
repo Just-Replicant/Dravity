@@ -578,6 +578,7 @@ fn check_existing_resumes_partial_download() {
 fn complete_on_disk_finishes_without_announcing() {
     let mut c = config();
     c.check_existing = true;
+    c.seed = false;
     let mut h = Harness::new(c);
     h.ev(Event::Start);
     h.ev(Event::PieceHashed { piece: 0, ok: true });
@@ -586,6 +587,33 @@ fn complete_on_disk_finishes_without_announcing() {
     assert!(has_alert(&fx, |a| *a == Alert::Finished));
     assert!(!fx.iter().any(|e| matches!(e, Effect::Announce { .. })));
     assert_eq!(h.t.status(), TorrentStatus::Finished);
+}
+
+#[test]
+fn complete_on_disk_seeds() {
+    let mut c = config();
+    c.check_existing = true;
+    let mut h = Harness::new(c);
+    h.ev(Event::Start);
+    h.ev(Event::PieceHashed { piece: 0, ok: true });
+    h.ev(Event::PieceHashed { piece: 1, ok: true });
+    let fx = h.ev(Event::PieceHashed { piece: 2, ok: true });
+    assert!(has_alert(&fx, |a| *a == Alert::Finished));
+    // A seed joins the swarm with `started` and nothing left to download.
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        Effect::Announce {
+            event: AnnounceEvent::Started,
+            left: 0,
+            ..
+        }
+    )));
+    // Tracker peers are dialed while seeding.
+    let fx = h.ev(Event::Announced {
+        peers: vec![addr(1)],
+        interval: None,
+    });
+    assert!(fx.contains(&Effect::Connect { addr: addr(1) }));
 }
 
 #[test]
@@ -1334,13 +1362,29 @@ fn arb_message() -> impl Strategy<Value = Message> {
             id: 1,
             payload: MetadataMessage::Request { piece }.encode().unwrap(),
         }),
+        Just(Message::NotInterested),
+        arb_request().prop_map(Message::Request),
+        arb_request().prop_map(Message::Cancel),
+        arb_request().prop_map(Message::Reject),
+        (0u32..5).prop_map(|piece| Message::AllowedFast { piece }),
+        (0u32..5).prop_map(|piece| Message::Suggest { piece }),
     ]
+}
+
+fn arb_request() -> impl Strategy<Value = BlockRequest> {
+    (0u32..4, 0u32..3, 0u32..2).prop_map(|(piece, block, extra)| BlockRequest {
+        piece,
+        offset: block * BLOCK_SIZE,
+        length: BLOCK_SIZE - extra,
+    })
 }
 
 #[derive(Debug, Clone)]
 enum Step {
     Msg(u64, Message),
     Connect(u64),
+    Accept(u64),
+    Read(u64, u32, u32),
     Disconnect(u64),
     Tick(u64),
     Written(u32, u32),
@@ -1351,6 +1395,8 @@ fn arb_step() -> impl Strategy<Value = Step> {
     prop_oneof![
         4 => (1u64..4, arb_message()).prop_map(|(p, m)| Step::Msg(p, m)),
         1 => (1u64..4).prop_map(Step::Connect),
+        1 => (1u64..4).prop_map(Step::Accept),
+        1 => (1u64..4, 0u32..4, 0u32..3).prop_map(|(p, piece, b)| Step::Read(p, piece, b)),
         1 => (1u64..4).prop_map(Step::Disconnect),
         1 => (0u64..60).prop_map(Step::Tick),
         2 => (0u32..4, 0u32..3).prop_map(|(p, b)| Step::Written(p, b)),
@@ -1373,8 +1419,21 @@ proptest! {
                 Step::Connect(p) => h.ev(Event::PeerConnected {
                     peer: PeerKey(p),
                     addr: addr(p as u16),
-                    reserved: Reserved::new().with_extension_protocol(p % 2 == 1),
+                    reserved: Reserved::new().with_extension_protocol(p % 2 == 1).with_fast(p != 2),
                 }),
+                Step::Accept(p) => h.ev(Event::PeerAccepted {
+                    peer: PeerKey(p),
+                    addr: SocketAddr::from(([10, 0, 9, 1], 40_000 + p as u16)),
+                    reserved: Reserved::new().with_extension_protocol(true).with_fast(p != 3),
+                }),
+                Step::Read(p, piece, b) => {
+                    let Some(block) = layout().block(piece, b) else { continue };
+                    h.ev(Event::BlockRead {
+                        peer: PeerKey(p),
+                        block,
+                        data: Bytes::from(vec![0; block.length as usize]),
+                    })
+                }
                 Step::Disconnect(p) => h.ev(Event::PeerDisconnected { peer: PeerKey(p) }),
                 Step::Tick(s) => h.advance(Duration::from_secs(s)),
                 Step::Written(piece, b) => {
@@ -1385,16 +1444,26 @@ proptest! {
             };
             let mut asked = std::collections::HashSet::new();
             for e in &fx {
-                if let Effect::Send { peer, message: Message::Request(r) } = e {
-                    prop_assert!(layout().is_valid_request(block(*r)));
-                    prop_assert!((1..4).contains(&peer.0));
-                    prop_assert!(asked.insert((*peer, *r)), "block requested twice from one peer");
+                match e {
+                    Effect::Send { peer, message: Message::Request(r) } => {
+                        prop_assert!(layout().is_valid_request(block(*r)));
+                        prop_assert!((1..4).contains(&peer.0));
+                        prop_assert!(asked.insert((*peer, *r)), "block requested twice from one peer");
+                    }
+                    // Uploads only ever read verified pieces.
+                    Effect::ReadBlock { block, .. } => {
+                        prop_assert!(layout().is_valid_request(*block));
+                        prop_assert!(h.t.have().get(block.piece));
+                    }
+                    _ => {}
                 }
             }
             let s = h.t.stats();
             prop_assert!(s.pieces_have <= s.piece_count);
             prop_assert!(s.bytes_have <= s.total_length);
             prop_assert!(s.peers <= h.t.config().max_peers);
+            prop_assert!(s.pending_reads <= h.t.config().max_pending_reads);
+            prop_assert!(s.unchoked <= s.peers);
         }
     }
 }

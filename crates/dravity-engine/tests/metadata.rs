@@ -396,3 +396,54 @@ fn dht_and_pex_addresses_are_marked_for_a_private_handover() {
         "{handover:?}"
     );
 }
+
+#[test]
+fn accepted_peers_fetch_metadata_and_are_marked_incoming() {
+    let mut h = Harness::new(Config::default());
+    // An accepted connection was never dialed: no pool entry is needed.
+    let fx = h.ev(Event::PeerAccepted {
+        peer: PeerKey(7),
+        addr: SocketAddr::from(([10, 0, 9, 1], 51_000)),
+        reserved: Reserved::new().with_extension_protocol(true),
+    });
+    assert!(matches!(
+        fx.first(),
+        Some(Effect::Send {
+            message: Message::Extended { id: 0, .. },
+            ..
+        })
+    ));
+    let hs = ExtendedHandshake {
+        extensions: vec![("ut_metadata".into(), THEIRS)],
+        listen_port: None,
+        client: None,
+        your_ip: None,
+        request_queue: None,
+        metadata_size: Some(40_000),
+        ipv4: None,
+        ipv6: None,
+    };
+    let fx = h.msg(
+        7,
+        Message::Extended {
+            id: 0,
+            payload: Bytes::from(hs.encode().unwrap()),
+        },
+    );
+    assert_eq!(requests(&fx), [(7, 0), (7, 1)]);
+    let fx = h.peer(1, Some(40_000));
+    assert_eq!(requests(&fx), [(1, 2)]);
+    assert_eq!(h.m.stats().peers, 2);
+
+    let content = info();
+    h.msg(7, data(0, &content));
+    h.msg(1, data(2, &content));
+    assert_eq!(received(&h.msg(7, data(1, &content))), Some(content));
+    let handover = h.m.into_handover();
+    let incoming: Vec<_> = handover
+        .peers
+        .iter()
+        .map(|p| (p.peer, p.incoming))
+        .collect();
+    assert_eq!(incoming, [(PeerKey(1), false), (PeerKey(7), true)]);
+}

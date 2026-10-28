@@ -1,9 +1,11 @@
 //! BEP 10 extension protocol glue shared by the torrent and metadata states.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use bytes::Bytes;
 use dravity_wire::{ExtendedHandshake, Message, PexMessage, PexPeer, UT_METADATA, UT_PEX};
+
+use crate::types::Config;
 
 /// Extended message id peers use to send us `ut_metadata` messages.
 pub(crate) const OUR_UT_METADATA: u8 = 1;
@@ -45,22 +47,38 @@ impl PeerExtensions {
     }
 }
 
-/// Our extension handshake.
-pub(crate) fn our_handshake(metadata_size: Option<u64>, pex: bool) -> Message {
+/// Our extension handshake to the peer at `peer`: the extensions we speak,
+/// our listening port (`p`), how many requests we queue (`reqq`), and the
+/// address we see the peer at (`yourip`, which helps it learn its public
+/// address behind NAT).
+pub(crate) fn our_handshake(
+    config: &Config,
+    metadata_size: Option<u64>,
+    peer: SocketAddr,
+) -> Message {
     let mut extensions = vec![(UT_METADATA.to_owned(), OUR_UT_METADATA)];
-    if pex {
+    if config.pex {
         extensions.push((UT_PEX.to_owned(), OUR_UT_PEX));
     }
+    let your_ip = match peer.ip() {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(v4) => v4.octets().to_vec(),
+            None => ip.octets().to_vec(),
+        },
+    };
     let hs = ExtendedHandshake {
         extensions,
-        listen_port: None,
+        listen_port: config.listen_port,
         client: Some(
             concat!("Dravity ", env!("CARGO_PKG_VERSION"))
                 .as_bytes()
                 .to_vec(),
         ),
-        your_ip: None,
-        request_queue: None,
+        your_ip: Some(your_ip),
+        request_queue: u32::try_from(config.max_upload_queue)
+            .ok()
+            .filter(|&q| q > 0),
         metadata_size,
         ipv4: None,
         ipv6: None,
@@ -86,16 +104,12 @@ pub(crate) fn pex_added(payload: &[u8]) -> Option<Vec<SocketAddr>> {
     )
 }
 
-/// A PEX message announcing `added` and `dropped`.
-pub(crate) fn pex_message(id: u8, added: &[SocketAddr], dropped: &[SocketAddr]) -> Message {
+/// A PEX message announcing `added` (with BEP 11 flags) and `dropped`.
+pub(crate) fn pex_message(id: u8, added: &[(SocketAddr, u8)], dropped: &[SocketAddr]) -> Message {
     let msg = PexMessage {
         added: added
             .iter()
-            .map(|&addr| PexPeer {
-                addr,
-                // We dialed every peer we know, so each one is reachable.
-                flags: dravity_wire::PEX_REACHABLE,
-            })
+            .map(|&(addr, flags)| PexPeer { addr, flags })
             .collect(),
         dropped: dropped.to_vec(),
     };

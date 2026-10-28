@@ -6,7 +6,7 @@
 //! operation is allowed (e.g. no retries once a torrent is finished).
 
 use std::collections::{HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
 /// Upper bound on queued plus waiting peer addresses.
@@ -74,6 +74,13 @@ impl PeerPool {
             return;
         }
         self.retry.push_back((when, addr));
+    }
+
+    /// Forgets queued and waiting addresses of `ip` (a banned peer). Dials
+    /// in flight finish and are refused when they connect.
+    pub(crate) fn remove_ip(&mut self, ip: IpAddr) {
+        self.queue.retain(|a| a.ip() != ip);
+        self.retry.retain(|(_, a)| a.ip() != ip);
     }
 
     /// Moves due retries onto the dial queue.

@@ -63,6 +63,8 @@ impl Piece {
 #[derive(Debug, Clone)]
 struct MetaPeer {
     addr: SocketAddr,
+    /// The peer connected to us.
+    incoming: bool,
     reserved: Reserved,
     ext: PeerExtensions,
     /// The raw extension handshake, replayed after the hand-over.
@@ -84,6 +86,10 @@ pub struct HandoverPeer {
     pub addr: SocketAddr,
     /// Reserved bytes of the peer's handshake.
     pub reserved: Reserved,
+    /// The peer connected to us: replay it as
+    /// [`Event::PeerAccepted`](crate::Event::PeerAccepted) rather than
+    /// [`Event::PeerConnected`](crate::Event::PeerConnected).
+    pub incoming: bool,
     /// Messages to feed to the torrent after
     /// [`Event::PeerConnected`](crate::Event::PeerConnected), in order: the
     /// peer's extension handshake, its availability, and `unchoke` if it
@@ -212,6 +218,10 @@ impl MetadataState {
             connecting: self.pool.connecting(),
             known_peers: self.pool.known(),
             pending_writes: 0,
+            unchoked: 0,
+            interested: 0,
+            pending_reads: 0,
+            banned: self.banned.len(),
         }
     }
 
@@ -239,6 +249,7 @@ impl MetadataState {
                     peer: key,
                     addr: p.addr,
                     reserved: p.reserved,
+                    incoming: p.incoming,
                     replay,
                 })
             })
@@ -278,7 +289,12 @@ impl MetadataState {
                 peer,
                 addr,
                 reserved,
-            } => self.on_connected(now, peer, addr, reserved, &mut out),
+            } => self.on_connected(now, peer, addr, reserved, false, &mut out),
+            Event::PeerAccepted {
+                peer,
+                addr,
+                reserved,
+            } => self.on_connected(now, peer, addr, reserved, true, &mut out),
             Event::PeerConnectFailed { addr, retry } => {
                 self.pool.dial_done(addr);
                 if retry {
@@ -433,9 +449,12 @@ impl MetadataState {
         key: PeerKey,
         addr: SocketAddr,
         reserved: Reserved,
+        incoming: bool,
         out: &mut Vec<Effect>,
     ) {
-        self.pool.dial_done(addr);
+        if !incoming {
+            self.pool.dial_done(addr);
+        }
         if self.banned.contains(&addr)
             || self.status != TorrentStatus::FetchingMetadata
             || self.peers.len() >= self.config.max_peers
@@ -449,6 +468,7 @@ impl MetadataState {
         // they are kept for the download that follows.
         let peer = MetaPeer {
             addr,
+            incoming,
             reserved,
             ext: PeerExtensions::default(),
             handshake: None,
@@ -460,7 +480,7 @@ impl MetadataState {
         if reserved.extension_protocol() {
             out.push(Effect::Send {
                 peer: key,
-                message: ext::our_handshake(None, self.config.pex),
+                message: ext::our_handshake(&self.config, None, addr),
             });
         }
         self.peers.insert(key, peer);

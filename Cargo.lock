@@ -494,6 +494,7 @@ dependencies = [
  "fastrand",
  "futures-util",
  "sha1",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",

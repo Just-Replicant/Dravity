@@ -21,7 +21,9 @@ use dravity_bencode::{Dict, Value};
 use dravity_core::{InfoHash, Magnet, Metainfo, PeerId};
 use dravity_dht::{Dht, Testnet};
 use dravity_engine::{Alert, Bitfield, TorrentStatus};
-use dravity_session::{AddTorrentOptions, PeerCodec, Session, SessionAlert, SessionConfig};
+use dravity_session::{
+    AddTorrentOptions, ListenConfig, PeerCodec, Session, SessionAlert, SessionConfig,
+};
 use dravity_wire::{
     ExtendedHandshake, Handshake, METADATA_PIECE_LEN, Message, MetadataMessage, PexMessage,
     PexPeer, Reserved,
@@ -314,8 +316,9 @@ fn config() -> SessionConfig {
     let mut c = SessionConfig::default();
     c.tick_interval = Duration::from_millis(50);
     c.stop_announce_timeout = Duration::from_secs(1);
-    // Hermetic: no public DHT bootstrap.
+    // Hermetic: no public DHT bootstrap, loopback only, any free port.
     c.dht = None;
+    c.listen = Some(ListenConfig::loopback(0));
     c
 }
 
@@ -686,4 +689,96 @@ async fn tier_falls_back_to_the_next_tracker() {
     );
     handle.stop().await;
     assert_files(dir.path(), &content, len_a);
+}
+
+/// Writes `content` where a torrent from `make_torrent` expects it.
+fn write_files(dir: &std::path::Path, content: &[u8], len_a: usize) {
+    std::fs::create_dir_all(dir.join("payload")).unwrap();
+    std::fs::write(dir.join("payload/a.bin"), &content[..len_a]).unwrap();
+    std::fs::write(dir.join("payload/b.bin"), &content[len_a..]).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_seeds_to_another_session() {
+    let (len_a, len_b) = (90_000, 70_000);
+    let (metainfo, content) = make_torrent(None, len_a, len_b);
+    let hash = metainfo.info_hash();
+    let seed_dir = tempfile::tempdir().unwrap();
+    write_files(seed_dir.path(), &content, len_a);
+    let seeder = Session::new(config()).unwrap();
+    let port = seeder.listen_port().expect("seeder listens");
+    let mut seeder_alerts = seeder.subscribe();
+    let seeding = seeder
+        .add_torrent(metainfo, AddTorrentOptions::new(seed_dir.path()))
+        .unwrap();
+    // Complete on disk: verified, then seeding.
+    until_finished(&mut seeder_alerts, hash).await;
+
+    let leech_dir = tempfile::tempdir().unwrap();
+    let leecher = Session::new(config()).unwrap();
+    let mut alerts = leecher.subscribe();
+    let leeching = leecher
+        .add_torrent(
+            make_torrent(None, len_a, len_b).0,
+            AddTorrentOptions::new(leech_dir.path())
+                .with_peers([SocketAddr::from(([127, 0, 0, 1], port))]),
+        )
+        .unwrap();
+    let seen = until_finished(&mut alerts, hash).await;
+    assert!(
+        seen.contains(&Alert::StateChanged(TorrentStatus::Downloading)),
+        "{seen:?}"
+    );
+    assert_files(leech_dir.path(), &content, len_a);
+    let stats = seeding.stats().await.unwrap();
+    assert_eq!(stats.status, TorrentStatus::Finished, "still seeding");
+    assert!(stats.uploaded >= (len_a + len_b) as u64, "{stats:?}");
+    assert_eq!(
+        leeching.stats().await.unwrap().downloaded,
+        (len_a + len_b) as u64
+    );
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_connections_for_unknown_torrents_are_closed() {
+    let (metainfo, _) = make_torrent(None, 1000, 1000);
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(config()).unwrap();
+    let port = session.listen_port().unwrap();
+    let handle = session
+        .add_torrent(metainfo, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let hello = Handshake::new(InfoHash::new([0xee; 20]), PeerId::new([3; 20]));
+    sock.write_all(&hello.to_bytes()).await.unwrap();
+    let mut buf = [0u8; 68];
+    let read = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+        .await
+        .expect("closed promptly");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+
+    // The right info-hash gets our handshake back.
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let hello = Handshake::new(handle.info_hash(), PeerId::new([3; 20]));
+    sock.write_all(&hello.to_bytes()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut reply = BytesMut::from(&buf[..]);
+    let theirs = Handshake::decode(&mut reply).unwrap().unwrap();
+    assert_eq!(theirs.info_hash, handle.info_hash());
+    assert_eq!(theirs.peer_id, session.peer_id());
+    assert!(theirs.reserved.fast());
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_a_listener_nothing_is_accepted() {
+    let mut c = config();
+    c.listen = None;
+    let session = Session::new(c).unwrap();
+    assert_eq!(session.listen_port(), None);
 }

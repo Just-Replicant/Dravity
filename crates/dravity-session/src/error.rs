@@ -18,6 +18,9 @@ pub enum SessionError {
     /// The tracker client could not be created.
     #[error(transparent)]
     Tracker(#[from] dravity_tracker::TrackerError),
+    /// The listening sockets could not be set up.
+    #[error("cannot listen for peers: {0}")]
+    Listen(#[source] std::io::Error),
     /// The DHT node could not be started.
     #[error(transparent)]
     Dht(#[from] dravity_dht::DhtError),

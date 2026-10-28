@@ -17,6 +17,12 @@
 //! `info` dictionary is verified the task builds the storage and a
 //! [`TorrentState`], and replays the open connections into it as ordinary
 //! events, so no peer is reconnected.
+//!
+//! Connections accepted by the session's listener arrive as
+//! [`Command::Incoming`], already handshaken; they become
+//! [`Event::PeerAccepted`] and then run like dialed peers. Blocks peers
+//! request are read from storage on the blocking pool
+//! ([`Effect::ReadBlock`]) and reported back as [`Event::BlockRead`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -24,7 +30,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dravity_core::{BlockRef, InfoHash, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{
@@ -32,11 +38,13 @@ use dravity_engine::{
     TorrentState, TorrentStatus,
 };
 use dravity_storage::{
-    FileStorage, ResumeData, Storage, load_resume, save_resume, verify_piece, write_block,
+    FileStorage, ResumeData, Storage, load_resume, read_block, save_resume, verify_piece,
+    write_block,
 };
 use dravity_tracker::{AnnounceRequest, AnnounceResponse, TrackerClient};
-use dravity_wire::Message;
+use dravity_wire::{Message, Reserved};
 use futures_util::StreamExt;
+use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 
@@ -54,7 +62,7 @@ pub(crate) enum Input {
     Connected {
         key: PeerKey,
         addr: SocketAddr,
-        reserved: dravity_wire::Reserved,
+        reserved: Reserved,
     },
     ConnectFailed {
         key: PeerKey,
@@ -71,11 +79,23 @@ pub(crate) enum Input {
     Engine(Event),
 }
 
-/// Commands from [`TorrentHandle`](crate::TorrentHandle).
+/// A connection the listener accepted and handshook for this torrent.
+#[derive(Debug)]
+pub(crate) struct Accepted {
+    pub(crate) stream: TcpStream,
+    pub(crate) addr: SocketAddr,
+    /// The remote handshake's reserved bits.
+    pub(crate) reserved: Reserved,
+    /// Bytes that arrived after the handshake.
+    pub(crate) leftover: BytesMut,
+}
+
+/// Commands from [`TorrentHandle`](crate::TorrentHandle) and the listener.
 #[derive(Debug)]
 pub(crate) enum Command {
     Stats(oneshot::Sender<Stats>),
     AddPeers(Vec<SocketAddr>),
+    Incoming(Accepted),
     Stop(oneshot::Sender<()>),
 }
 
@@ -90,6 +110,8 @@ pub(crate) struct TorrentContext {
     pub(crate) config: Arc<SessionConfig>,
     pub(crate) alerts: broadcast::Sender<SessionAlert>,
     pub(crate) tracker_key: u32,
+    /// Port the session accepts peers on, if it listens.
+    pub(crate) listen_port: Option<u16>,
 }
 
 impl TorrentContext {
@@ -99,7 +121,18 @@ impl TorrentContext {
         let mut config = self.config.engine.clone();
         config.dht = self.dht.is_some() && !private;
         config.pex = config.pex && !private;
+        config.listen_port = self.listen_port;
         config
+    }
+
+    /// Port reported to trackers: the listener's, or the configured one.
+    fn announce_port(&self) -> u16 {
+        self.listen_port.unwrap_or(self.config.announce_port)
+    }
+
+    /// Reserved bits of our handshake.
+    pub(crate) fn reserved(&self) -> Reserved {
+        peer::our_reserved(self.config.engine.fast_extension)
     }
 
     /// Where this torrent's resume data lives, if resume is enabled.
@@ -201,7 +234,8 @@ impl TorrentTask {
         let (phase, content, download_dir) = match source {
             Source::Torrent { metainfo, storage } => {
                 let config = ctx.engine_config(metainfo.info().is_private());
-                let state = TorrentState::new(*metainfo.info().layout(), config);
+                let state = TorrentState::new(*metainfo.info().layout(), config)
+                    .with_info_hash(ctx.info_hash);
                 (
                     Phase::Download(Box::new(state)),
                     Some(Content { metainfo, storage }),
@@ -257,6 +291,7 @@ impl TorrentTask {
                         continue;
                     }
                     Some(Command::AddPeers(peers)) => Event::AddPeers { peers },
+                    Some(Command::Incoming(accepted)) => self.accept(accepted),
                     Some(Command::Stop(ack)) => {
                         stop_ack = Some(ack);
                         Event::Stop
@@ -350,7 +385,8 @@ impl TorrentTask {
         tracing::debug!(pieces = have.count(), "resuming without a full check");
         let mut config = self.ctx.engine_config(content.metainfo.info().is_private());
         config.check_existing = false;
-        let state = TorrentState::with_have(*content.metainfo.info().layout(), have, config);
+        let state = TorrentState::with_have(*content.metainfo.info().layout(), have, config)
+            .with_info_hash(self.ctx.info_hash);
         Some(match info {
             Some(info) => state.with_info_bytes(info.clone()),
             None => state,
@@ -447,6 +483,7 @@ impl TorrentTask {
                 *info_meta.layout(),
                 self.ctx.engine_config(info_meta.is_private()),
             )
+            .with_info_hash(self.ctx.info_hash)
             .with_info_bytes(info),
         };
         self.content = Some(content);
@@ -477,10 +514,18 @@ impl TorrentTask {
                 self.peers.remove(&peer.peer);
                 continue;
             }
-            self.local.push_back(Event::PeerConnected {
-                peer: peer.peer,
-                addr: peer.addr,
-                reserved: peer.reserved,
+            self.local.push_back(if peer.incoming {
+                Event::PeerAccepted {
+                    peer: peer.peer,
+                    addr: peer.addr,
+                    reserved: peer.reserved,
+                }
+            } else {
+                Event::PeerConnected {
+                    peer: peer.peer,
+                    addr: peer.addr,
+                    reserved: peer.reserved,
+                }
             });
             for message in peer.replay {
                 self.local.push_back(Event::Message {
@@ -517,6 +562,7 @@ impl TorrentTask {
             }
             Effect::WriteBlock { block, data } => self.write(block, data),
             Effect::HashPiece { piece } => self.hash(piece),
+            Effect::ReadBlock { peer, block } => self.read(peer, block),
             Effect::Announce {
                 event,
                 uploaded,
@@ -556,6 +602,7 @@ impl TorrentTask {
         };
         let info_hash = self.ctx.info_hash;
         let timeout = self.ctx.config.dht_lookup_timeout;
+        let listen_port = self.ctx.listen_port;
         let tx = self.events_tx.clone();
         self.background.spawn(async move {
             let (peers, failed) = lookup_peers(&dht, info_hash, timeout).await;
@@ -563,19 +610,60 @@ impl TorrentTask {
             let _ = tx
                 .send(Input::Engine(Event::DhtPeers { peers, failed }))
                 .await;
+            // Tell the DHT where to find us, so peers can connect: only
+            // after a lookup that reached nodes, bounded by the same timeout.
+            if let (Some(port), false) = (listen_port, failed) {
+                let announced =
+                    tokio::time::timeout(timeout, dht.announce(info_hash, Some(port))).await;
+                if let Ok(Err(e)) = announced {
+                    tracing::debug!(error = %e, "DHT announce failed");
+                }
+            }
         });
     }
 
-    fn connect(&mut self, addr: SocketAddr) {
+    /// A fresh peer key and command queue, registered in the peer map.
+    fn new_peer(&mut self) -> (PeerKey, mpsc::Receiver<PeerCommand>) {
         let key = PeerKey(self.next_key);
         self.next_key += 1;
         let (tx, rx) = mpsc::channel(self.ctx.config.peer_queue.max(1));
         self.peers.insert(key, tx);
+        (key, rx)
+    }
+
+    /// Starts a task for an accepted connection; the returned event tells
+    /// the engine about it before any of the peer's messages.
+    fn accept(&mut self, accepted: Accepted) -> Event {
+        let Accepted {
+            stream,
+            addr,
+            reserved,
+            leftover,
+        } = accepted;
+        let (key, rx) = self.new_peer();
+        tokio::spawn(peer::run_accepted(
+            key,
+            addr,
+            stream,
+            leftover,
+            self.events_tx.clone(),
+            rx,
+        ));
+        Event::PeerAccepted {
+            peer: key,
+            addr,
+            reserved,
+        }
+    }
+
+    fn connect(&mut self, addr: SocketAddr) {
+        let (key, rx) = self.new_peer();
         let params = PeerParams {
             key,
             addr,
             info_hash: self.ctx.info_hash,
             our_id: self.ctx.peer_id,
+            reserved: self.ctx.reserved(),
             connect_timeout: self.ctx.config.connect_timeout,
         };
         // Peer tasks are not in `background`: dropping their command sender
@@ -606,6 +694,44 @@ impl TorrentTask {
                     error: e.to_string(),
                 },
                 Err(e) => Event::WriteFailed {
+                    block,
+                    error: e.to_string(),
+                },
+            };
+            let _ = tx.send(Input::Engine(event)).await;
+        });
+    }
+
+    /// Reads a block a peer asked for. Reads share the disk set with writes
+    /// so a stop waits for them too.
+    fn read(&mut self, peer: PeerKey, block: BlockRef) {
+        let Some(content) = self.content.clone() else {
+            tracing::warn!(?block, "block read before metadata");
+            return;
+        };
+        let tx = self.events_tx.clone();
+        self.disk.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                read_block(
+                    content.storage.as_ref(),
+                    content.metainfo.info().layout(),
+                    block,
+                )
+            })
+            .await;
+            let event = match result {
+                Ok(Ok(data)) => Event::BlockRead {
+                    peer,
+                    block,
+                    data: Bytes::from(data),
+                },
+                Ok(Err(e)) => Event::ReadFailed {
+                    peer,
+                    block,
+                    error: e.to_string(),
+                },
+                Err(e) => Event::ReadFailed {
+                    peer,
                     block,
                     error: e.to_string(),
                 },
@@ -661,7 +787,7 @@ impl TorrentTask {
         AnnounceRequest {
             info_hash: self.ctx.info_hash,
             peer_id: self.ctx.peer_id,
-            port: self.ctx.config.announce_port,
+            port: self.ctx.announce_port(),
             uploaded,
             downloaded,
             left,

@@ -1,5 +1,8 @@
 //! One task per peer connection: handshake, then read → event and
 //! command → batched write. The task never touches torrent state.
+//!
+//! Dialed peers are connected and handshaken here ([`run`]); accepted
+//! peers arrive already handshaken from the listener ([`run_accepted`]).
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -30,6 +33,7 @@ pub(crate) struct PeerParams {
     pub(crate) addr: SocketAddr,
     pub(crate) info_hash: InfoHash,
     pub(crate) our_id: PeerId,
+    pub(crate) reserved: Reserved,
     pub(crate) connect_timeout: Duration,
 }
 
@@ -44,6 +48,8 @@ pub(crate) enum HandshakeError {
     WrongInfoHash,
     #[error("connected to ourselves")]
     SelfConnection,
+    #[error("torrent is too busy to take the connection")]
+    Busy,
     #[error(transparent)]
     Wire(#[from] dravity_wire::WireError),
     #[error(transparent)]
@@ -58,9 +64,12 @@ impl HandshakeError {
     }
 }
 
-/// Extensions we advertise: BEP 10 (metadata exchange, PEX).
-pub(crate) fn our_reserved() -> Reserved {
-    Reserved::new().with_extension_protocol(true)
+/// Extensions we advertise: BEP 10 (metadata exchange, PEX) and, when
+/// enabled, the fast extension (BEP 6).
+pub(crate) fn our_reserved(fast: bool) -> Reserved {
+    Reserved::new()
+        .with_extension_protocol(true)
+        .with_fast(fast)
 }
 
 /// Writes our handshake and reads the peer's. Returns the peer's handshake
@@ -69,6 +78,7 @@ pub(crate) async fn handshake<S>(
     stream: &mut S,
     info_hash: InfoHash,
     our_id: PeerId,
+    reserved: Reserved,
 ) -> Result<(Handshake, BytesMut), HandshakeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -76,7 +86,7 @@ where
     stream
         .write_all(
             &Handshake::new(info_hash, our_id)
-                .with_reserved(our_reserved())
+                .with_reserved(reserved)
                 .to_bytes(),
         )
         .await?;
@@ -102,19 +112,20 @@ where
 pub(crate) async fn run(
     params: PeerParams,
     events: mpsc::Sender<Input>,
-    mut commands: mpsc::Receiver<PeerCommand>,
+    commands: mpsc::Receiver<PeerCommand>,
 ) {
     let PeerParams {
         key,
         addr,
         info_hash,
         our_id,
+        reserved: ours,
         connect_timeout,
     } = params;
     let setup = async {
         let mut stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
-        let (theirs, leftover) = handshake(&mut stream, info_hash, our_id).await?;
+        let (theirs, leftover) = handshake(&mut stream, info_hash, our_id, ours).await?;
         Ok::<_, HandshakeError>((stream, theirs.reserved, leftover))
     };
     let (stream, reserved, leftover) = match tokio::time::timeout(connect_timeout, setup).await {
@@ -153,6 +164,34 @@ pub(crate) async fn run(
     {
         return;
     }
+    serve(key, addr, stream, leftover, &events, commands).await;
+}
+
+/// Runs a connection the listener accepted and handshook. The owner
+/// already told the engine about it.
+pub(crate) async fn run_accepted(
+    key: PeerKey,
+    addr: SocketAddr,
+    stream: TcpStream,
+    leftover: BytesMut,
+    events: mpsc::Sender<Input>,
+    commands: mpsc::Receiver<PeerCommand>,
+) {
+    serve(key, addr, stream, leftover, &events, commands).await;
+}
+
+/// Moves messages between an established connection and the owner until
+/// either side closes.
+async fn serve<S>(
+    key: PeerKey,
+    addr: SocketAddr,
+    stream: S,
+    leftover: BytesMut,
+    events: &mpsc::Sender<Input>,
+    mut commands: mpsc::Receiver<PeerCommand>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // Bytes that arrived with the handshake must be decoded before the
     // next socket read: `from_parts` marks a non-empty buffer readable.
     let mut parts = FramedParts::new::<Message>(stream, PeerCodec::default());
@@ -206,7 +245,7 @@ mod tests {
         let other = Handshake::new(InfoHash::new([3; 20]), PeerId::new([4; 20]));
         b.write_all(&other.to_bytes()).await.unwrap();
         assert!(matches!(
-            handshake(&mut a, hash, ours).await,
+            handshake(&mut a, hash, ours, Reserved::new()).await,
             Err(HandshakeError::WrongInfoHash)
         ));
 
@@ -215,7 +254,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            handshake(&mut a, hash, ours).await,
+            handshake(&mut a, hash, ours, Reserved::new()).await,
             Err(HandshakeError::SelfConnection)
         ));
 
@@ -225,13 +264,19 @@ mod tests {
             .to_vec();
         bytes.extend_from_slice(&[0, 0, 0, 1, 1]); // unchoke right behind it
         b.write_all(&bytes).await.unwrap();
-        let (hs, rest) = handshake(&mut a, hash, ours).await.unwrap();
+        let (hs, rest) = handshake(&mut a, hash, ours, Reserved::new())
+            .await
+            .unwrap();
         assert_eq!(hs.peer_id, PeerId::new([9; 20]));
         assert_eq!(&rest[..], &[0, 0, 0, 1, 1]);
 
         let (mut a, b) = tokio::io::duplex(1024);
         drop(b);
-        assert!(handshake(&mut a, hash, ours).await.is_err());
+        assert!(
+            handshake(&mut a, hash, ours, Reserved::new())
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -270,6 +315,7 @@ mod tests {
             addr,
             info_hash: hash,
             our_id: PeerId::new([7; 20]),
+            reserved: our_reserved(true),
             connect_timeout: Duration::from_secs(5),
         };
         tokio::spawn(run(params, events_tx, cmd_rx));

@@ -6,14 +6,19 @@ use std::time::Duration;
 use dravity_dht::DhtConfig;
 use dravity_tracker::ClientConfig;
 
+use crate::listen::ListenConfig;
+
 /// Session-wide settings. [`SessionConfig::default`] is a reasonable start.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct SessionConfig {
     /// Peer id prefix in Azureus style (`-DV0001-`); the rest is random.
     pub peer_id_prefix: Vec<u8>,
-    /// Port reported to trackers. Incoming connections are not accepted
-    /// yet (Phase 3), so this is informational.
+    /// Accept incoming peer connections; `None` only dials out.
+    pub listen: Option<ListenConfig>,
+    /// Port reported to trackers when the session does not listen (for
+    /// example behind a proxy that forwards to us). With a listener its
+    /// bound port is reported instead.
     pub announce_port: u16,
     /// Per-torrent engine tunables.
     pub engine: dravity_engine::Config,
@@ -50,6 +55,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             peer_id_prefix: b"-DV0001-".to_vec(),
+            listen: Some(ListenConfig::default()),
             announce_port: 6881,
             engine: dravity_engine::Config::default(),
             tracker: ClientConfig::default(),

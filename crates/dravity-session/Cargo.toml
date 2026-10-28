@@ -21,6 +21,7 @@ dravity-tracker.workspace = true
 dravity-wire.workspace = true
 fastrand.workspace = true
 futures-util.workspace = true
+socket2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "time", "sync", "macros", "io-util"] }
 tokio-util.workspace = true

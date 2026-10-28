@@ -32,12 +32,15 @@
 //! exchange (BEP 11) and explicit addresses. With
 //! [`SessionConfig::resume_dir`] set, restarts skip the full hash check.
 //!
-//! The session downloads only: it does not yet listen for incoming
-//! connections or upload (Phase 3).
+//! With [`SessionConfig::listen`] the session accepts incoming connections
+//! (IPv4 and IPv6) and routes them to torrents by info-hash; finished
+//! torrents keep seeding until stopped (see the engine's choker and
+//! [`dravity_engine::Config::seed`]).
 
 mod codec;
 mod config;
 mod error;
+mod listen;
 mod peer;
 mod torrent;
 
@@ -45,18 +48,22 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use dravity_core::{InfoHash, Magnet, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{Alert, Stats};
 use dravity_storage::{FileStorage, Storage};
 use dravity_tracker::TrackerClient;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub use codec::{CodecError, PeerCodec};
 pub use config::SessionConfig;
 pub use error::SessionError;
+pub use listen::ListenConfig;
 
+use crate::listen::{Acceptor, Bound, Registry};
 use crate::torrent::{Command, Source, TorrentContext, TorrentTask, prepare_tiers};
 
 /// An engine [`Alert`] tagged with the torrent it concerns.
@@ -114,7 +121,14 @@ struct Inner {
     tracker: TrackerClient,
     dht: Option<Dht>,
     alerts: broadcast::Sender<SessionAlert>,
-    torrents: Mutex<HashMap<InfoHash, mpsc::Sender<Command>>>,
+    torrents: Registry,
+    /// Bound sockets, until the first torrent starts the accept tasks
+    /// (which need a Tokio runtime).
+    listener: Mutex<Option<Bound>>,
+    listen_port: Option<u16>,
+    /// Ends the accept tasks when the last session clone is dropped.
+    _stop: DropGuard,
+    stop: CancellationToken,
 }
 
 /// A BitTorrent session. Cheap to clone; all clones share the torrents.
@@ -128,9 +142,13 @@ impl Session {
     ///
     /// Starts the DHT node when [`SessionConfig::dht`] is set.
     ///
+    /// Binds the listening sockets of [`SessionConfig::listen`]; they accept
+    /// once the first torrent is added.
+    ///
     /// # Errors
     /// [`SessionError::Tracker`] if the tracker HTTP/TLS client cannot be
-    /// built; [`SessionError::Dht`] if the DHT socket cannot be bound.
+    /// built; [`SessionError::Listen`] if no listening socket can be bound;
+    /// [`SessionError::Dht`] if the DHT socket cannot be bound.
     pub fn new(config: SessionConfig) -> Result<Self, SessionError> {
         let suffix: Vec<u8> = std::iter::repeat_with(fastrand::alphanumeric)
             .take(PeerId::LEN)
@@ -138,8 +156,16 @@ impl Session {
             .collect();
         let peer_id = PeerId::with_prefix(&config.peer_id_prefix, &suffix);
         let tracker = TrackerClient::new(config.tracker.clone())?;
+        let listener = config
+            .listen
+            .as_ref()
+            .map(listen::bind)
+            .transpose()
+            .map_err(SessionError::Listen)?;
+        let listen_port = listener.as_ref().map(|bound| bound.port);
         let dht = config.dht.as_ref().map(Dht::new).transpose()?;
         let (alerts, _) = broadcast::channel(config.alert_buffer.max(1));
+        let stop = CancellationToken::new();
         Ok(Self {
             inner: Arc::new(Inner {
                 config: Arc::new(config),
@@ -147,9 +173,46 @@ impl Session {
                 tracker,
                 dht,
                 alerts,
-                torrents: Mutex::new(HashMap::new()),
+                torrents: Arc::new(Mutex::new(HashMap::new())),
+                listener: Mutex::new(listener),
+                listen_port,
+                _stop: stop.clone().drop_guard(),
+                stop,
             }),
         })
+    }
+
+    /// The TCP port the session accepts peers on, if it listens.
+    #[must_use]
+    pub fn listen_port(&self) -> Option<u16> {
+        self.inner.listen_port
+    }
+
+    /// Starts accepting on the bound sockets (once; needs the runtime that
+    /// `add_torrent` runs in).
+    fn start_listening(&self) {
+        let Some(bound) = self
+            .inner
+            .listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        else {
+            return;
+        };
+        let config = &self.inner.config;
+        let acceptor = Acceptor {
+            registry: Arc::clone(&self.inner.torrents),
+            our_id: self.inner.peer_id,
+            reserved: peer::our_reserved(config.engine.fast_extension),
+            handshake_timeout: config.connect_timeout.max(Duration::from_secs(1)),
+            pending: Arc::new(Semaphore::new(
+                config.listen.as_ref().map_or(1, |l| l.max_pending.max(1)),
+            )),
+        };
+        if let Err(e) = listen::start(bound, &acceptor, &self.inner.stop) {
+            tracing::warn!(error = %e, "cannot accept peers");
+        }
     }
 
     /// Our peer id.
@@ -252,6 +315,7 @@ impl Session {
             return Err(SessionError::Duplicate(info_hash));
         }
         let source = source()?;
+        self.start_listening();
         let ctx = TorrentContext {
             info_hash,
             trackers: prepare_tiers(trackers),
@@ -261,6 +325,7 @@ impl Session {
             config: Arc::clone(&self.inner.config),
             alerts: self.inner.alerts.clone(),
             tracker_key: fastrand::u32(..),
+            listen_port: self.inner.listen_port,
         };
         let (tx, rx) = mpsc::channel(64);
         if !peers.is_empty() {

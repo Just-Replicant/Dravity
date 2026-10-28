@@ -18,6 +18,7 @@ dravity-storage = { path = "../crates/dravity-storage" }
 dravity-wire = { path = "../crates/dravity-wire" }
 dravity-tracker = { path = "../crates/dravity-tracker", default-features = false }
 dravity-utp = { path = "../crates/dravity-utp" }
+dravity-portmap = { path = "../crates/dravity-portmap" }
 
 # Standalone workspace: fuzzing needs nightly and is not part of the main build.
 [workspace]
@@ -106,6 +107,13 @@ bench = false
 [[bin]]
 name = "utp_packet"
 path = "fuzz_targets/utp_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "portmap_parse"
+path = "fuzz_targets/portmap_parse.rs"
 test = false
 doc = false
 bench = false

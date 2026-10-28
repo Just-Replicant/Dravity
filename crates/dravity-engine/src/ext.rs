@@ -11,8 +11,11 @@ pub(crate) const OUR_UT_METADATA: u8 = 1;
 pub(crate) const OUR_UT_PEX: u8 = 2;
 /// Extended message id of the handshake.
 pub(crate) const HANDSHAKE_ID: u8 = 0;
-/// PEX entries sent or accepted per message (BEP 11).
-pub(crate) const PEX_MAX_PER_MESSAGE: usize = 50;
+/// Incoming PEX addresses kept from one message. The codec allows 200 per
+/// list; outgoing messages stay at [`PEX_MAX_SENT`].
+pub(crate) const PEX_MAX_ACCEPTED: usize = 200;
+/// PEX entries sent in one list (BEP 11).
+pub(crate) const PEX_MAX_SENT: usize = 50;
 
 /// What a peer told us in its extension handshake.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -71,13 +74,13 @@ pub(crate) fn our_handshake(metadata_size: Option<u64>, pex: bool) -> Message {
 }
 
 /// Peers to add from a received PEX message (at most
-/// [`PEX_MAX_PER_MESSAGE`]); `None` if the payload is malformed.
+/// [`PEX_MAX_ACCEPTED`]); `None` if the payload is malformed.
 pub(crate) fn pex_added(payload: &[u8]) -> Option<Vec<SocketAddr>> {
     let msg = PexMessage::decode(payload).ok()?;
     Some(
         msg.added
             .into_iter()
-            .take(PEX_MAX_PER_MESSAGE)
+            .take(PEX_MAX_ACCEPTED)
             .map(|p| p.addr)
             .collect(),
     )

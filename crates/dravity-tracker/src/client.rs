@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use rustls_platform_verifier::BuilderVerifierExt;
 use tokio::net::UdpSocket;
+use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
 
 use crate::error::TrackerError;
@@ -44,19 +45,37 @@ pub const UDP_CONNECTION_TTL: Duration = Duration::from_secs(60);
 /// Most cached UDP connection ids; the oldest are dropped beyond this.
 const MAX_CACHED_CONNECTIONS: usize = 256;
 
+/// One UDP tracker socket and its BEP 15 connection id.
+///
+/// The id is only valid from the source port that performed `connect`, so
+/// the socket is reused. [`UdpEndpoint::gate`] admits one announce at a time:
+/// a datagram socket does not demultiplex responses, and a second `connect`
+/// from the same port replaces the id the first announce just stored.
+#[derive(Debug)]
+struct UdpEndpoint {
+    socket: Arc<UdpSocket>,
+    id: Option<u64>,
+    /// When `id` was stored, or when the socket was created if there is none.
+    at: Instant,
+    gate: Arc<AsyncMutex<()>>,
+}
+
 /// Announces to HTTP, HTTPS and UDP trackers.
 ///
 /// HTTPS uses rustls with the `ring` provider and the operating system's
 /// certificate verifier. UDP connection ids are cached per tracker address
-/// for [`UDP_CONNECTION_TTL`]; clones of a client share the cache. If an
-/// announce with a cached id fails (stale id, error response or no answer
-/// to a single attempt) the id is dropped and the announce is retried once
-/// with a fresh `connect`.
+/// for [`UDP_CONNECTION_TTL`] and sent from the socket that connected; clones
+/// of a client share both, and take turns on that socket. If an announce with
+/// a cached id fails (stale id, error response or no answer to a single
+/// attempt) that id is dropped — a newer id stored for the same address is
+/// left alone — and the announce is retried once with a fresh `connect` on
+/// the same socket. An I/O error drops the socket and the announce is tried
+/// once more from a new one.
 #[derive(Debug, Clone)]
 pub struct TrackerClient {
     http: reqwest::Client,
     config: ClientConfig,
-    connections: Arc<Mutex<HashMap<SocketAddr, (u64, Instant)>>>,
+    endpoints: Arc<Mutex<HashMap<SocketAddr, UdpEndpoint>>>,
 }
 
 impl TrackerClient {
@@ -80,7 +99,7 @@ impl TrackerClient {
         Ok(Self {
             http,
             config,
-            connections: Arc::default(),
+            endpoints: Arc::default(),
         })
     }
 
@@ -143,35 +162,110 @@ impl TrackerClient {
             .await?
             .next()
             .ok_or_else(|| TrackerError::Resolve(host.to_owned()))?;
-        let bind = if addr.is_ipv6() {
-            "[::]:0"
-        } else {
-            "0.0.0.0:0"
-        };
-        let socket = UdpSocket::bind(bind).await?;
-        socket.connect(addr).await?;
+        match self.announce_udp_at(addr, req).await {
+            // The socket may be dead (a refused datagram sticks to a connected
+            // UDP socket). Drop it and try once more from a new port.
+            Err(TrackerError::Io(_)) => {
+                self.drop_endpoint(addr);
+                self.announce_udp_at(addr, req).await
+            }
+            other => other,
+        }
+    }
 
+    /// One announce on the socket cached for `addr`, creating that socket if
+    /// needed. The endpoint's gate is held for the whole exchange.
+    async fn announce_udp_at(
+        &self,
+        addr: SocketAddr,
+        req: &AnnounceRequest,
+    ) -> Result<AnnounceResponse, TrackerError> {
+        let (socket, gate) = self.udp_socket(addr).await?;
+        let _hold = gate.lock().await;
         if let Some(connection_id) = self.cached_connection(addr) {
             match self
                 .udp_announce_with(&socket, addr, connection_id, req, 0)
                 .await
             {
-                Err(TrackerError::Io(e)) => return Err(TrackerError::Io(e)),
-                Err(_) => self.forget_connection(addr),
+                Err(e @ TrackerError::Io(_)) => return Err(self.fail_socket(addr, e)),
+                Err(_) => self.forget_connection(addr, connection_id),
                 ok => return ok,
             }
         }
 
         let tid = fastrand::u32(..);
         let packet = udp::connect_request(tid);
-        let connection_id = self
+        let connection_id = match self
             .exchange(&socket, &packet, self.config.udp_retries, |p| {
                 udp::parse_connect_response(p, tid)
             })
-            .await?;
-        self.remember_connection(addr, connection_id);
-        self.udp_announce_with(&socket, addr, connection_id, req, self.config.udp_retries)
             .await
+        {
+            Ok(id) => id,
+            Err(e @ TrackerError::Io(_)) => return Err(self.fail_socket(addr, e)),
+            Err(e) => return Err(e),
+        };
+        self.remember_connection(addr, connection_id, &socket, &gate);
+        match self
+            .udp_announce_with(&socket, addr, connection_id, req, self.config.udp_retries)
+            .await
+        {
+            Err(e @ TrackerError::Io(_)) => Err(self.fail_socket(addr, e)),
+            other => other,
+        }
+    }
+
+    /// The socket already connected to `addr`, or a new one, and the gate
+    /// that serializes announces on it.
+    ///
+    /// Two clones that miss the cache at once may each bind a socket; the
+    /// first one stored is kept, and the connection id always belongs to it.
+    async fn udp_socket(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<(Arc<UdpSocket>, Arc<AsyncMutex<()>>), TrackerError> {
+        if let Some((socket, gate)) = self.endpoint_handle(addr) {
+            return Ok((socket, gate));
+        }
+        let bind = if addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let socket = Arc::new(UdpSocket::bind(bind).await?);
+        socket.connect(addr).await?;
+        let mut endpoints = self.lock_endpoints();
+        if let Some(existing) = endpoints.get(&addr) {
+            return Ok((Arc::clone(&existing.socket), Arc::clone(&existing.gate)));
+        }
+        let gate = Arc::new(AsyncMutex::new(()));
+        self.evict_expired(&mut endpoints);
+        endpoints.insert(
+            addr,
+            UdpEndpoint {
+                socket: Arc::clone(&socket),
+                id: None,
+                at: Instant::now(),
+                gate: Arc::clone(&gate),
+            },
+        );
+        Ok((socket, gate))
+    }
+
+    fn endpoint_handle(&self, addr: SocketAddr) -> Option<(Arc<UdpSocket>, Arc<AsyncMutex<()>>)> {
+        self.lock_endpoints()
+            .get(&addr)
+            .map(|endpoint| (Arc::clone(&endpoint.socket), Arc::clone(&endpoint.gate)))
+    }
+
+    /// Forgets `addr` after an I/O error so the next attempt binds a new socket.
+    fn fail_socket(&self, addr: SocketAddr, err: TrackerError) -> TrackerError {
+        self.drop_endpoint(addr);
+        err
+    }
+
+    fn drop_endpoint(&self, addr: SocketAddr) {
+        self.lock_endpoints().remove(&addr);
     }
 
     async fn udp_announce_with(
@@ -190,38 +284,94 @@ impl TrackerClient {
         .await
     }
 
-    fn lock_connections(&self) -> std::sync::MutexGuard<'_, HashMap<SocketAddr, (u64, Instant)>> {
-        self.connections
+    fn lock_endpoints(&self) -> std::sync::MutexGuard<'_, HashMap<SocketAddr, UdpEndpoint>> {
+        self.endpoints
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn cached_connection(&self, addr: SocketAddr) -> Option<u64> {
-        let mut cache = self.lock_connections();
-        match cache.get(&addr) {
-            Some(&(id, at)) if at.elapsed() < UDP_CONNECTION_TTL => Some(id),
+        let mut endpoints = self.lock_endpoints();
+        let endpoint = endpoints.get_mut(&addr)?;
+        match endpoint.id {
+            Some(id) if endpoint.at.elapsed() < UDP_CONNECTION_TTL => Some(id),
             Some(_) => {
-                cache.remove(&addr);
+                endpoint.id = None;
                 None
             }
             None => None,
         }
     }
 
-    fn remember_connection(&self, addr: SocketAddr, id: u64) {
-        let mut cache = self.lock_connections();
-        cache.retain(|_, (_, at)| at.elapsed() < UDP_CONNECTION_TTL);
-        while cache.len() >= MAX_CACHED_CONNECTIONS {
-            let Some(oldest) = cache.iter().min_by_key(|(_, (_, at))| *at).map(|(a, _)| *a) else {
+    fn evict_expired(&self, endpoints: &mut HashMap<SocketAddr, UdpEndpoint>) {
+        endpoints.retain(|_, endpoint| {
+            endpoint.id.is_none() || endpoint.at.elapsed() < UDP_CONNECTION_TTL
+        });
+        while endpoints.len() >= MAX_CACHED_CONNECTIONS {
+            let Some(oldest) = endpoints
+                .iter()
+                .min_by_key(|(_, endpoint)| endpoint.at)
+                .map(|(addr, _)| *addr)
+            else {
                 break;
             };
-            cache.remove(&oldest);
+            endpoints.remove(&oldest);
         }
-        cache.insert(addr, (id, Instant::now()));
     }
 
-    fn forget_connection(&self, addr: SocketAddr) {
-        self.lock_connections().remove(&addr);
+    fn remember_connection(
+        &self,
+        addr: SocketAddr,
+        id: u64,
+        socket: &Arc<UdpSocket>,
+        gate: &Arc<AsyncMutex<()>>,
+    ) {
+        let mut endpoints = self.lock_endpoints();
+        endpoints.retain(|kept, endpoint| {
+            *kept == addr || endpoint.id.is_none() || endpoint.at.elapsed() < UDP_CONNECTION_TTL
+        });
+        while endpoints.len() >= MAX_CACHED_CONNECTIONS {
+            let Some(oldest) = endpoints
+                .iter()
+                .filter(|(candidate, _)| **candidate != addr)
+                .min_by_key(|(_, endpoint)| endpoint.at)
+                .map(|(candidate, _)| *candidate)
+            else {
+                break;
+            };
+            endpoints.remove(&oldest);
+        }
+        match endpoints.get_mut(&addr) {
+            // The id was issued to this source port. A replacement socket
+            // must not inherit it.
+            Some(endpoint) if Arc::ptr_eq(&endpoint.socket, socket) => {
+                endpoint.id = Some(id);
+                endpoint.at = Instant::now();
+            }
+            Some(_) => {}
+            None => {
+                endpoints.insert(
+                    addr,
+                    UdpEndpoint {
+                        socket: Arc::clone(socket),
+                        id: Some(id),
+                        at: Instant::now(),
+                        gate: Arc::clone(gate),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Drops `id` if it is still the one stored. A newer id from another
+    /// clone is left in place.
+    fn forget_connection(&self, addr: SocketAddr, id: u64) {
+        let mut endpoints = self.lock_endpoints();
+        if let Some(endpoint) = endpoints.get_mut(&addr) {
+            if endpoint.id == Some(id) {
+                endpoint.id = None;
+            }
+        }
     }
 
     /// Sends `packet` and waits for a response `parse` accepts, retrying with

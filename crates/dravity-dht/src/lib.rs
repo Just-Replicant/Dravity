@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use dravity_core::InfoHash;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use mainline::async_dht::AsyncDht;
 
 /// Default cap on peers collected by one [`Dht::get_peers`] lookup.
@@ -151,20 +151,43 @@ impl Dht {
         self.inner.to_bootstrap().await
     }
 
+    /// Batches of peers for `info_hash`, as the DHT reports them.
+    ///
+    /// The session applies its own deadline so addresses found before a
+    /// timeout are kept. Addresses are untrusted. Port 0 and unspecified
+    /// addresses are dropped. The stream does not cap itself; callers stop
+    /// at [`DEFAULT_MAX_PEERS`].
+    pub fn peer_batches(
+        &self,
+        info_hash: InfoHash,
+    ) -> impl Stream<Item = Vec<SocketAddr>> + Send + '_ {
+        self.inner
+            .get_peers(mainline::Id::from(*info_hash.as_bytes()))
+            .map(|batch| {
+                batch
+                    .into_iter()
+                    .filter_map(|addr| {
+                        let addr = SocketAddr::V4(addr);
+                        (addr.port() != 0 && !addr.ip().is_unspecified()).then_some(addr)
+                    })
+                    .collect()
+            })
+    }
+
     /// Looks up peers for `info_hash`, returning distinct addresses as they
     /// arrive until the query finishes or the peer cap is reached.
     ///
-    /// The result is untrusted: addresses come from arbitrary DHT nodes.
+    /// A timeout wrapped around this method drops peers already collected.
+    /// [`Self::peer_batches`] yields them as they arrive so the caller can
+    /// keep a partial result. Addresses come from arbitrary DHT nodes and
+    /// are untrusted.
     pub async fn get_peers(&self, info_hash: InfoHash) -> Vec<SocketAddr> {
-        let mut stream = self
-            .inner
-            .get_peers(mainline::Id::from(*info_hash.as_bytes()));
         let mut seen = HashSet::new();
         let mut out = Vec::new();
+        let mut stream = std::pin::pin!(self.peer_batches(info_hash));
         while let Some(batch) = stream.next().await {
             for addr in batch {
-                let addr = SocketAddr::V4(addr);
-                if addr.port() != 0 && !addr.ip().is_unspecified() && seen.insert(addr) {
+                if seen.insert(addr) {
                     out.push(addr);
                     if out.len() >= self.max_peers {
                         return out;

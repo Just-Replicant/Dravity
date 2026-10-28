@@ -158,7 +158,16 @@ impl FileStorage {
             let Some(evict) = cache.order.pop_front() else {
                 break;
             };
-            cache.open.remove(&evict);
+            if let Some(open) = cache.open.remove(&evict) {
+                // Data must be durable before the descriptor leaves the cache,
+                // or a later resume can trust bytes that never reached disk.
+                let path = self
+                    .files
+                    .get(evict)
+                    .map(|spec| spec.path.clone())
+                    .unwrap_or_default();
+                open.sync_data().map_err(|e| StorageError::io(path, e))?;
+            }
         }
         cache.open.insert(index, Arc::clone(&file));
         cache.order.push_back(index);

@@ -287,6 +287,30 @@ fn rejects_path_traversal_and_absolute_paths() {
 }
 
 #[test]
+fn windows_names_follow_the_running_platform() {
+    let multi = |path: &[&str]| parse(multi_info("root", vec![file(path, 1)], 1, 16384));
+    if cfg!(windows) {
+        assert_eq!(
+            unsafe_path(multi(&["src", "aux.c"])),
+            PathError::Reserved("aux.c".into())
+        );
+        assert_eq!(
+            unsafe_path(multi(&["file:stream"])),
+            PathError::InvalidCharacter("file:stream".into())
+        );
+    } else {
+        // Legal names on Unix (e.g. Linux kernel sources ship `aux.c`).
+        assert!(multi(&["src", "aux.c"]).is_ok());
+        assert!(multi(&["file:stream"]).is_ok());
+    }
+    let long = "x".repeat(256);
+    assert_eq!(
+        unsafe_path(multi(&[&long])),
+        PathError::TooLong(long.clone())
+    );
+}
+
+#[test]
 fn rejects_duplicate_and_conflicting_paths() {
     let dup = parse(multi_info(
         "r",

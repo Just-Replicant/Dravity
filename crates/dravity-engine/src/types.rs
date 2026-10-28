@@ -76,8 +76,11 @@ pub struct Config {
     /// Ask the driver to look up peers in the DHT ([`Effect::DhtLookup`]).
     /// Disable for private torrents or when the driver runs no DHT.
     pub dht: bool,
-    /// Time between DHT lookups for one torrent.
+    /// Time between DHT lookups for one torrent after a lookup finishes.
     pub dht_interval: Duration,
+    /// Time before another DHT lookup when the previous one timed out or the
+    /// node was not ready. Shorter than [`Self::dht_interval`].
+    pub dht_retry: Duration,
     /// Largest `info` dictionary accepted from peers for a magnet link.
     pub max_metadata_size: u64,
     /// A request without an answer after this long is given to other peers.
@@ -118,6 +121,7 @@ impl Default for Config {
             pex_interval: Duration::from_secs(60),
             dht: false,
             dht_interval: Duration::from_secs(5 * 60),
+            dht_retry: Duration::from_secs(15),
             max_metadata_size: 8 * 1024 * 1024,
             request_timeout: Duration::from_secs(30),
             peer_timeout: Duration::from_secs(180),

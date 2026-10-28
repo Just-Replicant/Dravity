@@ -88,6 +88,19 @@ fn requests(effects: &[Effect], peer: u64) -> Vec<BlockRequest> {
         .collect()
 }
 
+fn cancels(effects: &[Effect], peer: u64) -> Vec<BlockRequest> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Send {
+                peer: p,
+                message: Message::Cancel(r),
+            } if *p == PeerKey(peer) => Some(*r),
+            _ => None,
+        })
+        .collect()
+}
+
 fn has_alert(effects: &[Effect], f: impl Fn(&Alert) -> bool) -> bool {
     effects
         .iter()
@@ -453,9 +466,14 @@ fn timeouts_and_keepalives() {
     h.msg(1, Message::HaveAll);
     let first = requests(&h.msg(1, Message::Unchoke), 1);
     // After the request timeout the same blocks are requested again, with
-    // the AIMD window halved.
+    // the AIMD window halved. The half that no longer fits is cancelled.
     let fx = h.advance(h.t.config().request_timeout);
-    assert_eq!(requests(&fx, 1), first[..first.len() / 2]);
+    let again = requests(&fx, 1);
+    assert_eq!(again, first[..first.len() / 2]);
+    let dropped = cancels(&fx, 1);
+    for old in &first[first.len() / 2..] {
+        assert!(dropped.contains(old), "{dropped:?}");
+    }
     let fx = h.advance(h.t.config().keepalive_interval);
     assert!(fx.contains(&Effect::Send {
         peer: PeerKey(1),
@@ -474,10 +492,11 @@ fn reannounces_on_interval_and_retries_failures() {
         error: "boom".into(),
     });
     let fx = h.advance(h.t.config().announce_retry);
+    // The failed announce was `started`, so the retry is `started` again.
     assert!(fx.iter().any(|e| matches!(
         e,
         Effect::Announce {
-            event: AnnounceEvent::None,
+            event: AnnounceEvent::Started,
             ..
         }
     )));
@@ -836,6 +855,65 @@ fn pex_adds_peers_and_reports_connections() {
 }
 
 #[test]
+fn pex_accepts_more_than_fifty_peers() {
+    let mut c = config();
+    c.max_peers = 80;
+    let mut h = Harness::new(c);
+    h.ev(Event::Start);
+    connect(&mut h, 1, extended());
+    h.msg(1, ext_handshake("6:ut_pexi7e"));
+    let added: Vec<PexPeer> = (1..=60u8)
+        .map(|n| PexPeer {
+            addr: SocketAddr::from(([10, 1, 0, n], 6881)),
+            flags: 0,
+        })
+        .collect();
+    let fx = h.msg(
+        1,
+        Message::Extended {
+            id: 2,
+            payload: Bytes::from(
+                PexMessage {
+                    added,
+                    dropped: vec![],
+                }
+                .encode(),
+            ),
+        },
+    );
+    let connects = fx
+        .iter()
+        .filter(|e| matches!(e, Effect::Connect { .. }))
+        .count();
+    assert_eq!(connects, 60, "incoming PEX keeps the codec's 200, not 50");
+}
+
+#[test]
+fn pex_outgoing_lists_are_capped_at_fifty() {
+    let mut c = config();
+    c.max_peers = 60;
+    let mut h = Harness::new(c);
+    h.ev(Event::Start);
+    for n in 1..=55 {
+        connect(&mut h, n, extended());
+    }
+    h.msg(1, ext_handshake("6:ut_pexi7e"));
+    let fx = h.advance(h.t.config().pex_interval);
+    let (_id, payload) = only_extended(&fx, 1);
+    let msg = PexMessage::decode(&payload).unwrap();
+    assert_eq!(msg.added.len(), 50, "BEP 11 caps each list at 50");
+    assert!(msg.dropped.is_empty());
+    for n in 2..=55 {
+        h.ev(Event::PeerDisconnected { peer: PeerKey(n) });
+    }
+    let fx = h.advance(h.t.config().pex_interval);
+    let (_id, payload) = only_extended(&fx, 1);
+    let msg = PexMessage::decode(&payload).unwrap();
+    assert!(msg.added.is_empty(), "{msg:?}");
+    assert_eq!(msg.dropped.len(), 50, "{msg:?}");
+}
+
+#[test]
 fn pex_disabled_for_private_torrents() {
     let mut c = config();
     c.pex = false;
@@ -890,6 +968,123 @@ fn request_window_grows_and_respects_reqq() {
     let fx = h.msg(1, data_for(first[1]));
     assert_eq!(requests(&fx, 1).len(), 1);
     assert_eq!(h.t.stats().peers, 1);
+}
+
+#[test]
+fn reqq_timeout_halves_the_pipeline_and_cancels_surplus() {
+    let big = PieceLayout::new(64 * BLOCK_SIZE, u64::from(64 * BLOCK_SIZE)).unwrap();
+    let mut c = config();
+    c.max_requests_per_peer = 32;
+    c.initial_requests_per_peer = 8;
+    c.request_timeout = Duration::from_secs(30);
+    let mut h = Harness::new(c.clone());
+    h.t = TorrentState::new(big, c);
+    h.ev(Event::Start);
+    connect(&mut h, 1, extended());
+    h.msg(1, Message::HaveAll);
+    let first = requests(&h.msg(1, Message::Unchoke), 1);
+    assert_eq!(first.len(), 8);
+    // Learning reqq below the live pipeline cancels the surplus.
+    let fx = h.msg(1, ext_handshake("e4:reqqi3"));
+    assert_eq!(cancels(&fx, 1).len(), 5, "{:?}", cancels(&fx, 1));
+    // The first three requests stay in flight; answering them grows the
+    // window past reqq while the pipeline stays at 3.
+    assert!(requests(&fx, 1).is_empty(), "already at reqq");
+    let mut outstanding: Vec<_> = first.into_iter().take(3).collect();
+    for _ in 0..20 {
+        let batch = std::mem::take(&mut outstanding);
+        if batch.is_empty() {
+            break;
+        }
+        for request in &batch {
+            outstanding.extend(requests(&h.msg(1, data_for(*request)), 1));
+        }
+    }
+    // Let the outstanding requests time out. The next batch is half of reqq,
+    // and every request that is not asked again is cancelled.
+    let fx = h.advance(Duration::from_secs(30));
+    let again = requests(&fx, 1);
+    assert_eq!(again.len(), 1, "reqq 3 halves to 1");
+    let dropped = cancels(&fx, 1);
+    for old in &outstanding {
+        if !again.contains(old) {
+            assert!(
+                dropped.contains(old),
+                "uncancelled surplus {old:?} in {dropped:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn inflated_window_timeout_halves_reqq_and_cancels_surplus() {
+    // One piece large enough for the window to reach 128 with a full pipeline.
+    let blocks: u32 = 300;
+    let piece = blocks * BLOCK_SIZE;
+    let big = PieceLayout::new(piece, u64::from(piece)).unwrap();
+    let mut c = config();
+    c.max_requests_per_peer = 128;
+    c.initial_requests_per_peer = 4;
+    c.request_timeout = Duration::from_secs(30);
+    let mut h = Harness::new(c.clone());
+    h.t = TorrentState::new(big, c);
+    h.ev(Event::Start);
+    connect(&mut h, 1, extended());
+    h.msg(1, Message::HaveAll);
+    let mut outstanding = requests(&h.msg(1, Message::Unchoke), 1);
+    assert_eq!(outstanding.len(), 4);
+    // No reqq yet, so each answered block opens one more slot. 124 answers
+    // take the congestion window from 4 to 128.
+    for _ in 0..124 {
+        assert!(!outstanding.is_empty(), "pipeline stalled");
+        let request = outstanding.remove(0);
+        outstanding.extend(requests(&h.msg(1, data_for(request)), 1));
+    }
+    assert_eq!(outstanding.len(), 128, "window grew to its maximum");
+    // The peer only accepts 4. The congestion window stays at 128.
+    let fx = h.msg(1, ext_handshake("e4:reqqi4"));
+    assert_eq!(cancels(&fx, 1).len(), 124, "live cap falls to reqq");
+    assert!(requests(&fx, 1).is_empty());
+    let mut live: Vec<_> = outstanding.into_iter().take(4).collect();
+    // Age three of them into a new round so one request times out alone.
+    h.advance(Duration::from_secs(29));
+    let survivor = live.pop().unwrap();
+    let mut young = Vec::new();
+    for request in live {
+        young.extend(requests(&h.msg(1, data_for(request)), 1));
+    }
+    assert_eq!(young.len(), 3, "pipeline stayed at reqq");
+    let fx = h.advance(Duration::from_secs(1));
+    assert!(
+        requests(&fx, 1).is_empty(),
+        "halved limit is already full, not back at reqq"
+    );
+    let dropped = cancels(&fx, 1);
+    assert!(
+        dropped.contains(&survivor),
+        "timed-out request still occupies reqq: {dropped:?}"
+    );
+    assert!(
+        dropped.contains(&young[2]),
+        "request past the halved limit was kept: {dropped:?}"
+    );
+    assert!(!dropped.contains(&young[0]), "{dropped:?}");
+    assert!(!dropped.contains(&young[1]), "{dropped:?}");
+}
+
+#[test]
+fn unsolicited_piece_does_not_cancel_the_peer_we_asked() {
+    let mut h = Harness::started_with_peer(config());
+    connect(&mut h, 2, Reserved::new());
+    h.msg(1, Message::HaveAll);
+    h.msg(2, Message::HaveAll);
+    let asked = requests(&h.msg(1, Message::Unchoke), 1);
+    assert!(!asked.is_empty());
+    let fx = h.msg(2, data_for(asked[0]));
+    assert!(!fx.iter().any(|e| matches!(e, Effect::WriteBlock { .. })));
+    assert!(sent(&fx, 1).is_empty(), "{fx:?}");
+    let fx = h.msg(1, data_for(asked[0]));
+    assert!(fx.iter().any(|e| matches!(e, Effect::WriteBlock { .. })));
 }
 
 #[test]
@@ -963,14 +1158,42 @@ fn dht_lookups_are_scheduled() {
     );
     let fx = h.ev(Event::DhtPeers {
         peers: vec![addr(9)],
+        failed: false,
     });
     assert!(fx.contains(&Effect::Connect { addr: addr(9) }));
     let interval = h.t.config().dht_interval;
     assert!(!h.advance(interval / 2).contains(&Effect::DhtLookup));
     assert!(h.advance(interval / 2).contains(&Effect::DhtLookup));
+    // A failed lookup is retried after dht_retry, not the full interval.
+    let mut c = config();
+    c.dht = true;
+    c.dht_retry = Duration::from_secs(15);
+    let mut h = Harness::new(c);
+    h.ev(Event::Start);
+    h.ev(Event::DhtPeers {
+        peers: Vec::new(),
+        failed: true,
+    });
+    assert!(
+        !h.advance(Duration::from_secs(14))
+            .contains(&Effect::DhtLookup)
+    );
+    assert!(
+        h.advance(Duration::from_secs(1))
+            .contains(&Effect::DhtLookup)
+    );
     // Disabled by default.
     let mut h = Harness::new(config());
     assert!(!h.ev(Event::Start).contains(&Effect::DhtLookup));
+    // The first lookup does not wait for the initial hash check.
+    let mut c = config();
+    c.dht = true;
+    c.check_existing = true;
+    let mut h = Harness::new(c.clone());
+    h.t = TorrentState::new(layout(), c);
+    let fx = h.ev(Event::Start);
+    assert_eq!(h.t.status(), TorrentStatus::Checking);
+    assert!(fx.contains(&Effect::DhtLookup));
 }
 
 #[test]
@@ -1011,6 +1234,77 @@ fn peers_handed_over_while_checking_start_after_the_check() {
             ..
         }
     )));
+}
+
+#[test]
+fn failed_dial_during_check_is_retried() {
+    let mut c = config();
+    c.check_existing = true;
+    c.check_concurrency = 3;
+    c.peer_retry = Duration::from_secs(5);
+    let mut h = Harness::new(c);
+    h.t = TorrentState::new(layout(), h.t.config().clone()).with_connecting([addr(7)]);
+    h.ev(Event::Start);
+    assert!(
+        !h.ev(Event::PeerConnectFailed {
+            addr: addr(7),
+            retry: true,
+        })
+        .contains(&Effect::Connect { addr: addr(7) })
+    );
+    h.advance(Duration::from_secs(5));
+    h.ev(Event::PieceHashed {
+        piece: 0,
+        ok: false,
+    });
+    h.ev(Event::PieceHashed {
+        piece: 1,
+        ok: false,
+    });
+    let fx = h.ev(Event::PieceHashed {
+        piece: 2,
+        ok: false,
+    });
+    assert!(fx.contains(&Effect::Connect { addr: addr(7) }), "{fx:?}");
+}
+
+#[test]
+fn failed_pending_started_is_retried_after_the_check() {
+    let mut c = config();
+    c.check_existing = true;
+    c.check_concurrency = 3;
+    let mut h = Harness::new(c);
+    h.t = TorrentState::new(layout(), h.t.config().clone()).with_started_pending(true);
+    let fx = h.ev(Event::Start);
+    assert!(
+        !fx.iter().any(|e| matches!(e, Effect::Announce { .. })),
+        "the metadata fetch's started announce is still in flight"
+    );
+    h.ev(Event::AnnounceFailed {
+        error: "down".into(),
+    });
+    h.ev(Event::PieceHashed {
+        piece: 0,
+        ok: false,
+    });
+    h.ev(Event::PieceHashed {
+        piece: 1,
+        ok: false,
+    });
+    let fx = h.ev(Event::PieceHashed {
+        piece: 2,
+        ok: false,
+    });
+    assert!(
+        fx.iter().any(|e| matches!(
+            e,
+            Effect::Announce {
+                event: AnnounceEvent::Started,
+                ..
+            }
+        )),
+        "a failed started is not stuck on event=none: {fx:?}"
+    );
 }
 
 fn arb_message() -> impl Strategy<Value = Message> {

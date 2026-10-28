@@ -17,6 +17,7 @@ dravity-core = { path = "../crates/dravity-core" }
 dravity-storage = { path = "../crates/dravity-storage" }
 dravity-wire = { path = "../crates/dravity-wire" }
 dravity-tracker = { path = "../crates/dravity-tracker", default-features = false }
+dravity-utp = { path = "../crates/dravity-utp" }
 
 # Standalone workspace: fuzzing needs nightly and is not part of the main build.
 [workspace]
@@ -98,6 +99,13 @@ bench = false
 [[bin]]
 name = "storage_resume"
 path = "fuzz_targets/storage_resume.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "utp_packet"
+path = "fuzz_targets/utp_packet.rs"
 test = false
 doc = false
 bench = false

@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8a87f700e1f675b86704eb561ef96045400f34fad5658d3cd8277d81af485cf3 # shrinks to seed = 0, loss = 0, delay_ms = 1, jitter_ms = 0, len_a = 0, len_b = 2981
+cc 5d65d1b511ab94980122dddeca88887e9fc1f6bc577cb529266cb74d19a624af # shrinks to seed = 822078163505601457, loss = 34, delay_ms = 9, jitter_ms = 1, len_a = 48371, len_b = 12645
+cc 240d32d45a3c124f92f8278f62971dd5709b4b8b0b0493f1549b0c8f981285bf # shrinks to seed = 17546117706277174128, loss = 84, delay_ms = 5, jitter_ms = 35, len_a = 44225, len_b = 6911
+cc fbf298c6faaee16dae283203e573a66977b06a51c5489eca3b9a175d85f5fbf7 # shrinks to seed = 521341165095980448, loss = 100, delay_ms = 47, jitter_ms = 6, len_a = 88449, len_b = 17967
+cc 86b68f47b8738d5438bb9e238ad5ff7d26461eb0874bac8b3b5b8e79d3ad5f95 # shrinks to seed = 13387599690390369529, loss = 82, delay_ms = 1, jitter_ms = 0, len_a = 0, len_b = 0

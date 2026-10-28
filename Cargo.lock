@@ -531,6 +531,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dravity-utp"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "fastrand",
+ "proptest",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dravity-wire"
 version = "0.1.0"
 dependencies = [

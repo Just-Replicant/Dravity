@@ -2,6 +2,7 @@
 
 #![allow(
     clippy::unwrap_used,
+    clippy::expect_used,
     clippy::indexing_slicing,
     clippy::cast_possible_wrap,
     clippy::cast_possible_truncation
@@ -266,4 +267,62 @@ fn reports_bad_torrent() {
         .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("error: parsing"));
+}
+
+/// Reads `child`'s stderr until the "accepting peers on port N" line.
+fn listen_port(child: &mut std::process::Child) -> u16 {
+    use std::io::BufRead;
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { return };
+            if let Some(port) = line.strip_prefix("accepting peers on port ") {
+                let _ = tx.send(port.trim().parse::<u16>().unwrap());
+            }
+        }
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("listen port line")
+}
+
+#[test]
+fn seed_serves_another_download() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = content();
+    let (torrent, _) = write_torrent(dir.path(), &data);
+    let seed_dir = dir.path().join("seed");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    std::fs::write(seed_dir.join("hello.bin"), &data).unwrap();
+    let mut seeder = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .arg("--output")
+        .arg(&seed_dir)
+        .args(["--seed", "--port", "0", "--no-dht", "--no-resume"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let port = listen_port(&mut seeder);
+
+    let out_dir = dir.path().join("out");
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .arg("--output")
+        .arg(&out_dir)
+        .arg("--peer")
+        .arg(format!("127.0.0.1:{port}"))
+        .args(["--no-dht", "--no-listen", "--quiet"])
+        .output()
+        .unwrap();
+    seeder.kill().unwrap();
+    let _ = seeder.wait();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(out_dir.join("hello.bin")).unwrap(), data);
 }

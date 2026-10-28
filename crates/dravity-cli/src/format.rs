@@ -78,6 +78,17 @@ pub(crate) fn progress_line(stats: &Stats, rate: u64) -> String {
     )
 }
 
+/// The status line while seeding: what we have uploaded and how fast.
+pub(crate) fn seeding_line(stats: &Stats, up_rate: u64) -> String {
+    format!(
+        "seeding {} up {}/s peers {} unchoked {}",
+        bytes(stats.uploaded),
+        bytes(up_rate),
+        stats.peers,
+        stats.unchoked,
+    )
+}
+
 /// Parses a byte rate: a plain number, or one with a binary `K`, `M` or
 /// `G` suffix (`500K`, `1.5M`). A trailing `B`, `iB` or `/s` is accepted.
 pub(crate) fn parse_rate(s: &str) -> Result<u64, String> {
@@ -147,6 +158,18 @@ mod tests {
         assert!(parse_rate("1.25M").is_err());
         assert!(parse_rate("-1").is_err());
         assert!(parse_rate("99999999999999999999G").is_err());
+    }
+
+    #[test]
+    fn seeding_shows_uploads() {
+        let state = dravity_engine::TorrentState::new(
+            dravity_core::PieceLayout::new(16_384, 16_384).unwrap(),
+            dravity_engine::Config::default(),
+        );
+        assert_eq!(
+            seeding_line(&state.stats(), 2048),
+            "seeding 0 B up 2.0 KiB/s peers 0 unchoked 0"
+        );
     }
 
     #[test]

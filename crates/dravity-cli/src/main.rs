@@ -1,4 +1,4 @@
-//! `dravity`: download torrents from the command line.
+//! `dravity`: download and seed torrents from the command line.
 //!
 //! The CLI only sends session commands and renders session alerts; the
 //! download loop lives in `dravity-session`.
@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use dravity_core::{Magnet, Metainfo};
 use dravity_engine::{Alert, TorrentStatus};
-use dravity_session::{AddTorrentOptions, Session, SessionConfig};
+use dravity_session::{AddTorrentOptions, ListenConfig, Session, SessionConfig};
 use tokio::sync::broadcast::error::RecvError;
 
 /// A portable BitTorrent client.
@@ -27,7 +27,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Download a torrent and exit when it is complete.
+    /// Download a torrent and exit when it is complete (or, with `--seed`,
+    /// keep seeding until interrupted).
     Download {
         /// Path to a `.torrent` file, or a `magnet:` link.
         torrent: String,
@@ -37,9 +38,23 @@ enum Command {
         /// Extra peer to connect to (repeatable), e.g. `10.0.0.2:6881`.
         #[arg(long = "peer", value_name = "ADDR")]
         peers: Vec<SocketAddr>,
-        /// Port reported to trackers.
+        /// TCP port to accept peers on (0: any free port). A port in use
+        /// falls back to a free one.
         #[arg(long, default_value_t = 6881)]
         port: u16,
+        /// Do not accept incoming connections; the port is only reported
+        /// to trackers.
+        #[arg(long)]
+        no_listen: bool,
+        /// Keep seeding after the download completes, until Ctrl-C.
+        #[arg(long)]
+        seed: bool,
+        /// Upload rate limit in bytes per second, like `--download-limit`.
+        #[arg(long, value_name = "RATE", value_parser = format::parse_rate)]
+        upload_limit: Option<u64>,
+        /// Peers unchoked (uploaded to) at once, plus one optimistic slot.
+        #[arg(long, default_value_t = 4, value_name = "N")]
+        upload_slots: usize,
         /// Maximum connected peers.
         #[arg(long, default_value_t = 50)]
         max_peers: usize,
@@ -116,6 +131,10 @@ fn run(cli: Cli) -> Result<()> {
             output,
             peers,
             port,
+            no_listen,
+            seed,
+            upload_limit,
+            upload_slots,
             max_peers,
             download_limit,
             no_dht,
@@ -126,6 +145,10 @@ fn run(cli: Cli) -> Result<()> {
             let input = load(&torrent)?;
             let mut config = SessionConfig::default();
             config.announce_port = port;
+            config.listen = (!no_listen).then(|| ListenConfig::new(port));
+            config.engine.seed = seed;
+            config.engine.upload_slots = upload_slots;
+            config.engine.upload_rate_limit = upload_limit.filter(|&r| r > 0);
             config.engine.max_peers = max_peers.max(1);
             config.engine.download_rate_limit = download_limit.filter(|&r| r > 0);
             if no_dht {
@@ -137,7 +160,7 @@ fn run(cli: Cli) -> Result<()> {
                 Some(resume_dir.unwrap_or_else(|| output.join(".dravity")))
             };
             let runtime = tokio::runtime::Runtime::new().context("starting the Tokio runtime")?;
-            runtime.block_on(download(input, output, peers, config, quiet))
+            runtime.block_on(download(input, output, peers, config, quiet, seed))
         }
     }
 }
@@ -225,9 +248,13 @@ async fn download(
     peers: Vec<SocketAddr>,
     config: SessionConfig,
     quiet: bool,
+    seed: bool,
 ) -> Result<()> {
     let name = input.name();
     let session = Session::new(config).context("creating the session")?;
+    if let (Some(port), false) = (session.listen_port(), quiet) {
+        let _ = writeln!(std::io::stderr(), "accepting peers on port {port}");
+    }
     let mut alerts = session.subscribe();
     let options = AddTorrentOptions::new(&output).with_peers(peers);
     let torrent = match input {
@@ -237,13 +264,20 @@ async fn download(
     .context("adding the torrent")?;
     let tty = std::io::stderr().is_terminal();
     let mut last_downloaded = 0u64;
+    let mut last_uploaded = 0u64;
     let mut ticks = 0u64;
+    let mut complete = false;
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     let result = loop {
         let alert = tokio::select! {
             alert = alerts.recv() => alert,
-            _ = &mut ctrl_c => break Err(anyhow::anyhow!("interrupted")),
+            // Interrupting a seed is how it is meant to end.
+            _ = &mut ctrl_c => break if complete {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("interrupted"))
+            },
         };
         let alert = match alert {
             Ok(a) if a.info_hash == torrent.info_hash() => a.alert,
@@ -254,9 +288,15 @@ async fn download(
             Alert::Stats(stats) => {
                 if !quiet {
                     let rate = stats.downloaded.saturating_sub(last_downloaded);
+                    let up_rate = stats.uploaded.saturating_sub(last_uploaded);
                     last_downloaded = stats.downloaded;
+                    last_uploaded = stats.uploaded;
                     ticks += 1;
-                    let line = format::progress_line(&stats, rate);
+                    let line = if stats.status == TorrentStatus::Finished {
+                        format::seeding_line(&stats, up_rate)
+                    } else {
+                        format::progress_line(&stats, rate)
+                    };
                     let mut err = std::io::stderr().lock();
                     if tty {
                         let _ = write!(err, "\r{line}\x1b[K");
@@ -266,8 +306,12 @@ async fn download(
                 }
                 // `Finished` can be dropped if a slow subscriber lags the
                 // broadcast. The next stats snapshot still carries the state.
-                if stats.status == TorrentStatus::Finished {
-                    break Ok(());
+                if stats.status == TorrentStatus::Finished && !complete {
+                    complete = true;
+                    if !seed {
+                        break Ok(());
+                    }
+                    announce_seeding(&name, &output, tty, quiet);
                 }
             }
             Alert::TrackerError { message } => {
@@ -276,7 +320,13 @@ async fn download(
                 }
                 let _ = writeln!(std::io::stderr(), "tracker: {message}");
             }
-            Alert::Finished => break Ok(()),
+            Alert::Finished if !complete => {
+                complete = true;
+                if !seed {
+                    break Ok(());
+                }
+                announce_seeding(&name, &output, tty, quiet);
+            }
             Alert::Error { message } => break Err(anyhow::anyhow!(message)),
             _ => {}
         }
@@ -286,10 +336,26 @@ async fn download(
     }
     session.shutdown().await;
     result?;
-    writeln!(
-        std::io::stdout(),
-        "{name}: complete in {}",
-        output.display()
-    )?;
+    if !seed {
+        writeln!(
+            std::io::stdout(),
+            "{name}: complete in {}",
+            output.display()
+        )?;
+    }
     Ok(())
+}
+
+/// Reports that the download finished and seeding goes on.
+fn announce_seeding(name: &str, output: &Path, tty: bool, quiet: bool) {
+    let mut out = std::io::stdout().lock();
+    if tty && !quiet {
+        let _ = writeln!(std::io::stderr());
+    }
+    let _ = writeln!(
+        out,
+        "{name}: complete in {}; seeding (Ctrl-C to stop)",
+        output.display()
+    );
+    let _ = out.flush();
 }

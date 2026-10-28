@@ -15,8 +15,9 @@ use crate::ExtendedError;
 /// Extension name in the BEP 10 handshake `m` dictionary.
 pub const UT_PEX: &str = "ut_pex";
 
-/// Most entries decoded from one list. BEP 11 allows 50 per message; the
-/// cap bounds memory for hostile messages and extra entries are ignored.
+/// Most entries decoded from one list. Outgoing messages stay at 50
+/// (BEP 11); this cap bounds memory for hostile messages and extra entries
+/// are ignored.
 pub const MAX_PEX_ENTRIES: usize = 200;
 
 /// `added.f` flag: the peer prefers encryption.

@@ -27,9 +27,37 @@ const MAX_REPLAY: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Piece {
-    Missing,
-    Requested { peer: PeerKey, since: Instant },
+    /// Not downloaded. `avoid` is a peer that just failed this piece; other
+    /// peers may take it immediately, and that peer only after the instant.
+    Missing {
+        avoid: Option<(PeerKey, Instant)>,
+    },
+    Requested {
+        peer: PeerKey,
+        since: Instant,
+    },
     Have,
+}
+
+impl Piece {
+    const fn is_have(self) -> bool {
+        matches!(self, Self::Have)
+    }
+
+    const fn is_requested(self) -> bool {
+        matches!(self, Self::Requested { .. })
+    }
+
+    /// Whether `key` may be asked for this piece at `now`.
+    fn can_ask(self, key: PeerKey, now: Instant) -> bool {
+        match self {
+            Self::Missing { avoid: None } => true,
+            Self::Missing {
+                avoid: Some((peer, at)),
+            } => peer != key || now >= at,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -37,8 +65,6 @@ struct MetaPeer {
     addr: SocketAddr,
     reserved: Reserved,
     ext: PeerExtensions,
-    /// The peer rejected a request: it cannot serve metadata.
-    rejected: bool,
     /// The raw extension handshake, replayed after the hand-over.
     handshake: Option<Bytes>,
     /// Availability messages (`bitfield`, `have all/none`, `have`).
@@ -73,8 +99,14 @@ pub struct Handover {
     pub peers: Vec<HandoverPeer>,
     /// Addresses not connected yet (for [`Event::AddPeers`]).
     pub known: Vec<SocketAddr>,
-    /// Whether the `started` announce was sent.
+    /// Dials already in flight. The new state must not dial them again.
+    pub connecting: Vec<SocketAddr>,
+    /// Addresses learned from DHT or PEX. A private torrent drops these.
+    pub swarm: Vec<SocketAddr>,
+    /// Whether a `started` announce was sent and not yet rejected.
     pub started_announced: bool,
+    /// A `started` announce was sent and the tracker has not answered yet.
+    pub started_pending: bool,
 }
 
 /// Sans-IO metadata fetcher for a magnet link: connects to peers, exchanges
@@ -107,12 +139,21 @@ pub struct MetadataState {
     next_announce: Option<Instant>,
     announce_in_flight: bool,
     started_announced: bool,
+    /// The announce the driver is currently performing.
+    pending_announce: Option<AnnounceEvent>,
     dht: DhtSchedule,
     size: Option<usize>,
+    /// Sizes a peer advertised that produced no metadata before another peer
+    /// offered a different size.
+    abandoned: HashSet<u64>,
     pieces: Vec<Piece>,
     buffer: Vec<u8>,
     /// Peers that sent pieces of the current attempt.
     sources: HashSet<PeerKey>,
+    /// Addresses that contributed metadata which failed the info-hash.
+    banned: HashSet<SocketAddr>,
+    /// Addresses learned from DHT or PEX (not from a tracker or the user).
+    swarm: HashSet<SocketAddr>,
     downloaded: u64,
     complete: bool,
 }
@@ -130,11 +171,15 @@ impl MetadataState {
             next_announce: None,
             announce_in_flight: false,
             started_announced: false,
+            pending_announce: None,
             dht: DhtSchedule::default(),
             size: None,
+            abandoned: HashSet::new(),
             pieces: Vec::new(),
             buffer: Vec::new(),
             sources: HashSet::new(),
+            banned: HashSet::new(),
+            swarm: HashSet::new(),
             downloaded: 0,
             complete: false,
         }
@@ -198,22 +243,36 @@ impl MetadataState {
                 })
             })
             .collect();
+        let (known, connecting) = self.pool.drain_handover();
+        let mut swarm: Vec<SocketAddr> = self.swarm.iter().copied().collect();
+        swarm.sort_unstable();
         Handover {
             peers,
-            known: self.pool.drain_known(),
+            known,
+            connecting,
+            swarm,
             started_announced: self.started_announced,
+            started_pending: self.pending_announce == Some(AnnounceEvent::Started),
         }
     }
 
     /// Processes one event and returns the effects the driver must perform.
     pub fn update(&mut self, now: Instant, event: Event) -> Vec<Effect> {
         let mut out = Vec::new();
-        if self.complete || self.status == TorrentStatus::Stopped {
+        if self.status == TorrentStatus::Stopped {
+            return out;
+        }
+        // `Stop` still runs after the metadata is verified, so a failure
+        // while the driver builds storage can finish the task.
+        if matches!(event, Event::Stop) {
+            self.stop(&mut out);
+            return out;
+        }
+        if self.complete {
             return out;
         }
         match event {
             Event::Start => self.on_start(now, &mut out),
-            Event::Stop => self.stop(&mut out),
             Event::Tick => self.on_tick(now, &mut out),
             Event::PeerConnected {
                 peer,
@@ -235,25 +294,33 @@ impl MetadataState {
             }
             Event::Message { peer, message } => self.on_message(now, peer, message, &mut out),
             Event::Announced { peers, interval } => {
+                self.pending_announce = None;
                 self.announce_in_flight = false;
                 let interval = interval
                     .unwrap_or(self.config.default_announce_interval)
                     .max(self.config.min_announce_interval);
                 self.next_announce = Some(now + interval);
+                self.note_swarm(&peers, false);
                 self.add_to_pool(peers);
                 self.fill_connections(&mut out);
             }
             Event::AnnounceFailed { error } => {
+                if self.pending_announce == Some(AnnounceEvent::Started) {
+                    self.started_announced = false;
+                }
+                self.pending_announce = None;
                 self.announce_in_flight = false;
                 self.next_announce = Some(now + self.config.announce_retry);
                 out.push(Effect::Alert(Alert::TrackerError { message: error }));
             }
             Event::AddPeers { peers } => {
+                self.note_swarm(&peers, false);
                 self.add_to_pool(peers);
                 self.fill_connections(&mut out);
             }
-            Event::DhtPeers { peers } => {
-                self.dht.done(now, &self.config);
+            Event::DhtPeers { peers, failed } => {
+                self.dht.done(now, &self.config, failed);
+                self.note_swarm(&peers, true);
                 self.add_to_pool(peers);
                 self.fill_connections(&mut out);
             }
@@ -286,6 +353,7 @@ impl MetadataState {
             self.started_announced = false;
         }
         self.pool.clear();
+        self.swarm.clear();
         self.status = TorrentStatus::Stopped;
         out.push(Effect::Alert(Alert::StateChanged(self.status)));
     }
@@ -295,6 +363,7 @@ impl MetadataState {
             return;
         }
         self.announce_in_flight = true;
+        self.pending_announce = Some(event);
         self.next_announce = Some(now + self.config.default_announce_interval);
         self.push_announce(event, out);
         if event == AnnounceEvent::Started {
@@ -315,9 +384,23 @@ impl MetadataState {
         peers.values().any(|p| p.addr == addr)
     }
 
+    fn note_swarm(&mut self, peers: &[SocketAddr], from_swarm: bool) {
+        if from_swarm {
+            self.swarm.extend(peers.iter().copied());
+        } else {
+            for addr in peers {
+                self.swarm.remove(addr);
+            }
+        }
+    }
+
     fn add_to_pool(&mut self, peers: Vec<SocketAddr>) {
         let connected: HashSet<SocketAddr> = self.peers.values().map(|p| p.addr).collect();
-        self.pool.add(peers, |a| connected.contains(&a));
+        let banned = &self.banned;
+        self.pool
+            .add(peers.into_iter().filter(|a| !banned.contains(a)), |a| {
+                connected.contains(&a)
+            });
     }
 
     fn schedule_retry(&mut self, now: Instant, addr: SocketAddr) {
@@ -353,7 +436,8 @@ impl MetadataState {
         out: &mut Vec<Effect>,
     ) {
         self.pool.dial_done(addr);
-        if self.status != TorrentStatus::FetchingMetadata
+        if self.banned.contains(&addr)
+            || self.status != TorrentStatus::FetchingMetadata
             || self.peers.len() >= self.config.max_peers
             || self.peers.contains_key(&key)
             || Self::is_connected(&self.peers, addr)
@@ -367,7 +451,6 @@ impl MetadataState {
             addr,
             reserved,
             ext: PeerExtensions::default(),
-            rejected: false,
             handshake: None,
             replay: Vec::new(),
             choked: true,
@@ -387,7 +470,7 @@ impl MetadataState {
         let peer = self.peers.remove(&key)?;
         for piece in &mut self.pieces {
             if matches!(piece, Piece::Requested { peer, .. } if *peer == key) {
-                *piece = Piece::Missing;
+                *piece = Piece::Missing { avoid: None };
             }
         }
         Some(peer.addr)
@@ -420,8 +503,11 @@ impl MetadataState {
                             data,
                         }) => self.on_data(key, piece, total_size, &data, out),
                         Ok(MetadataMessage::Reject { piece }) => {
-                            peer.rejected = true;
-                            self.release(key, piece);
+                            // One reject means this piece, not the peer: a
+                            // client still fetching metadata rejects what it
+                            // does not have yet.
+                            let retry_at = now + self.config.request_timeout;
+                            self.avoid(key, piece, retry_at);
                         }
                         Ok(MetadataMessage::Request { piece }) => {
                             // We have nothing to serve yet.
@@ -439,6 +525,7 @@ impl MetadataState {
                     }
                 } else if id == ext::OUR_UT_PEX && self.config.pex {
                     if let Some(added) = ext::pex_added(&payload) {
+                        self.note_swarm(&added, true);
                         self.add_to_pool(added);
                         self.fill_connections(out);
                     }
@@ -473,7 +560,7 @@ impl MetadataState {
         let Some(size) = self.peers.get(&key).and_then(|p| p.ext.metadata_size) else {
             return;
         };
-        if size == 0 || size > self.config.max_metadata_size {
+        if size == 0 || size > self.config.max_metadata_size || self.abandoned.contains(&size) {
             return;
         }
         let (Ok(len), Ok(count)) = (
@@ -484,16 +571,20 @@ impl MetadataState {
         };
         self.size = Some(len);
         self.buffer = vec![0; len];
-        self.pieces = vec![Piece::Missing; count];
+        self.pieces = vec![Piece::Missing { avoid: None }; count];
     }
 
-    fn release(&mut self, key: PeerKey, index: u32) {
+    /// Returns a request to the pool and keeps `key` off it until `retry_at`
+    /// when another peer can take it sooner.
+    fn avoid(&mut self, key: PeerKey, index: u32, retry_at: Instant) {
         let slot = usize::try_from(index)
             .ok()
             .and_then(|i| self.pieces.get_mut(i));
         if let Some(piece) = slot {
             if matches!(piece, Piece::Requested { peer, .. } if *peer == key) {
-                *piece = Piece::Missing;
+                *piece = Piece::Missing {
+                    avoid: Some((key, retry_at)),
+                };
             }
         }
     }
@@ -521,7 +612,7 @@ impl MetadataState {
         else {
             return;
         };
-        if *piece == Piece::Have || dst.len() != data.len() {
+        if piece.is_have() || dst.len() != data.len() {
             return;
         }
         dst.copy_from_slice(data);
@@ -530,7 +621,7 @@ impl MetadataState {
         self.downloaded = self
             .downloaded
             .saturating_add(u64::try_from(data.len()).unwrap_or(0));
-        if self.pieces.iter().all(|p| *p == Piece::Have) {
+        if self.pieces.iter().all(|p| p.is_have()) {
             self.verify(out);
         }
     }
@@ -545,11 +636,15 @@ impl MetadataState {
             return;
         }
         // Someone sent garbage (or a different size). Drop every peer that
-        // contributed and start over; they are not dialed again.
+        // contributed and do not dial those addresses again.
         let mut bad: Vec<PeerKey> = self.sources.drain().collect();
         bad.sort_unstable();
         for key in bad {
-            self.disconnect(key, out);
+            if let Some(addr) = self.remove_peer(key) {
+                self.banned.insert(addr);
+                self.swarm.remove(&addr);
+            }
+            out.push(Effect::Disconnect { peer: key });
         }
         self.size = None;
         self.pieces.clear();
@@ -575,7 +670,7 @@ impl MetadataState {
             let Some(id) = peer.ext.ut_metadata else {
                 continue;
             };
-            if peer.rejected || peer.ext.metadata_size != size {
+            if peer.ext.metadata_size != size {
                 continue;
             }
             let mut outstanding = self
@@ -587,7 +682,7 @@ impl MetadataState {
                 if outstanding >= PIPELINE {
                     break;
                 }
-                if *piece != Piece::Missing {
+                if !piece.can_ask(key, now) {
                     continue;
                 }
                 let Ok(index) = u32::try_from(index) else {
@@ -615,15 +710,20 @@ impl MetadataState {
             let peers = &self.peers;
             self.pool.promote(now, |a| Self::is_connected(peers, a));
         }
-        // Timed-out requests go to another peer.
+        // Timed-out requests go to another peer. The peer that stalled is
+        // skipped until `request_timeout` has passed again, unless it is the
+        // only one that can serve the piece.
         let timeout = self.config.request_timeout;
         for piece in &mut self.pieces {
-            if let Piece::Requested { since, .. } = *piece {
+            if let Piece::Requested { peer, since } = *piece {
                 if now.saturating_duration_since(since) >= timeout {
-                    *piece = Piece::Missing;
+                    *piece = Piece::Missing {
+                        avoid: Some((peer, now + timeout)),
+                    };
                 }
             }
         }
+        self.abandon_stalled_size();
         let mut keys: Vec<PeerKey> = self.peers.keys().copied().collect();
         keys.sort_unstable();
         let mut dead = Vec::new();
@@ -649,9 +749,61 @@ impl MetadataState {
         self.fill_requests(now, out);
         self.dht.poll(now, &self.config, out);
         if self.next_announce.is_some_and(|t| now >= t) {
-            self.announce(now, AnnounceEvent::None, out);
+            let event = if self.started_announced {
+                AnnounceEvent::None
+            } else {
+                AnnounceEvent::Started
+            };
+            self.announce(now, event, out);
         }
         self.fill_connections(out);
         out.push(Effect::Alert(Alert::Stats(self.stats())));
+    }
+
+    /// Drops a metadata size that has produced no bytes once another peer
+    /// advertises a different in-range size. The first advertisement is
+    /// otherwise kept, so one stalled peer would block the fetch forever.
+    fn abandon_stalled_size(&mut self) {
+        let Some(size) = self.size else {
+            return;
+        };
+        if self
+            .pieces
+            .iter()
+            .any(|piece| piece.is_have() || piece.is_requested())
+        {
+            return;
+        }
+        let stalled = self
+            .pieces
+            .iter()
+            .any(|piece| matches!(piece, Piece::Missing { avoid: Some(_), .. }));
+        if !stalled {
+            return;
+        }
+        let Ok(size) = u64::try_from(size) else {
+            return;
+        };
+        let alternative = self.peers.values().any(|peer| {
+            peer.ext.metadata_size.is_some_and(|other| {
+                other != size
+                    && other > 0
+                    && other <= self.config.max_metadata_size
+                    && !self.abandoned.contains(&other)
+            })
+        });
+        if !alternative {
+            return;
+        }
+        self.abandoned.insert(size);
+        self.size = None;
+        self.pieces.clear();
+        self.buffer.clear();
+        self.sources.clear();
+        let mut keys: Vec<PeerKey> = self.peers.keys().copied().collect();
+        keys.sort_unstable();
+        for key in keys {
+            self.learn_size(key);
+        }
     }
 }

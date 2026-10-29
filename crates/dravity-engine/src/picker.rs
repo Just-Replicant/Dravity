@@ -1,15 +1,22 @@
-//! Rarest-first piece picker with per-block state.
+//! Rarest-first piece picker with per-block state, priorities and an
+//! urgent (streaming) list.
 //!
 //! The picker tracks, for every piece we do not have yet:
 //!
+//! * its **priority** ([`Priority`]): skipped pieces are never started;
+//!   among the others a higher priority always wins over rarity;
 //! * its **availability** (how many connected peers have it), kept in an
-//!   ordered set of `(availability, piece)` so the rarest wanted piece is found
-//!   without scanning the whole torrent (rarity buckets);
+//!   ordered set of `(priority rank, availability, piece)` so the best wanted
+//!   piece is found without scanning the whole torrent (rarity buckets);
 //! * once started, the state of each block: missing → requested → received →
 //!   written. When every block is written the piece is handed out for hashing.
 //!
-//! Partially downloaded pieces are always finished before new pieces are
-//! started, which keeps the number of partial pieces (and wasted memory and
+//! **Urgent** pieces ([`Picker::set_urgent`]) come before everything else,
+//! in the order given and regardless of rarity or priority: a streaming
+//! reader marks the pieces just ahead of its read position this way.
+//!
+//! Partially downloaded pieces are finished before new pieces are started,
+//! which keeps the number of partial pieces (and wasted memory and
 //! re-requests) low.
 //!
 //! Once every wanted block is requested, [`Picker::requested_blocks`] lists
@@ -21,6 +28,84 @@ use std::collections::{BTreeMap, BTreeSet};
 use dravity_core::{BlockRef, PieceLayout};
 
 use crate::bitfield::Bitfield;
+
+/// Download priority of a piece (or, in the session, of a file).
+///
+/// Ordered from lowest to highest. [`Priority::Skip`] pieces are not
+/// downloaded at all (unless urgent); for the others, any piece of a higher
+/// priority is started before any piece of a lower one, and rarest-first
+/// applies within one priority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Priority {
+    /// Do not download.
+    Skip,
+    /// Download after everything else.
+    Low,
+    /// The default.
+    #[default]
+    Normal,
+    /// Download before normal and low pieces.
+    High,
+}
+
+impl Priority {
+    /// All priorities, lowest first.
+    pub const ALL: [Self; 4] = [Self::Skip, Self::Low, Self::Normal, Self::High];
+
+    /// Whether pieces of this priority are downloaded.
+    #[must_use]
+    pub const fn is_wanted(self) -> bool {
+        !matches!(self, Self::Skip)
+    }
+
+    /// Sort rank: 0 for the highest priority.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::High => 0,
+            Self::Normal => 1,
+            Self::Low => 2,
+            Self::Skip => 3,
+        }
+    }
+
+    /// A short lowercase name (`skip`, `low`, `normal`, `high`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::Low => "low",
+            Self::Normal => "normal",
+            Self::High => "high",
+        }
+    }
+}
+
+impl std::fmt::Display for Priority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error parsing a [`Priority`] from text.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown priority `{0}` (expected skip, low, normal or high)")]
+pub struct ParsePriorityError(String);
+
+impl std::str::FromStr for Priority {
+    type Err = ParsePriorityError;
+
+    /// Parses `skip`/`off`/`0`, `low`/`1`, `normal`/`2`, `high`/`3`
+    /// (case-insensitive).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "skip" | "off" | "0" => Ok(Self::Skip),
+            "low" | "1" => Ok(Self::Low),
+            "normal" | "2" => Ok(Self::Normal),
+            "high" | "3" => Ok(Self::High),
+            _ => Err(ParsePriorityError(s.to_owned())),
+        }
+    }
+}
 
 /// Download state of one block of a started piece.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +160,16 @@ impl Partial {
             _ => false,
         }
     }
+
+    /// The first missing block, marked requested.
+    fn take_missing(&mut self) -> Option<usize> {
+        if self.hashing || self.missing == 0 {
+            return None;
+        }
+        let b = self.blocks.iter().position(|s| *s == BlockState::Missing)?;
+        self.transition(b, BlockState::Missing, BlockState::Requested);
+        Some(b)
+    }
 }
 
 /// Outcome of [`Picker::block_received`].
@@ -86,19 +181,31 @@ pub enum Received {
     Ignored,
 }
 
-/// Rarest-first piece and block picker.
+/// Rarest-first piece and block picker with priorities.
 #[derive(Debug, Clone)]
 pub struct Picker {
     layout: PieceLayout,
     have: Bitfield,
     availability: Vec<u32>,
-    /// Wanted, not yet started pieces ordered by `(availability, index)`.
-    queue: BTreeSet<(u32, u32)>,
+    priority: Vec<Priority>,
+    /// Wanted, not yet started pieces ordered by
+    /// `(priority rank, availability, index)`.
+    queue: BTreeSet<(u8, u32, u32)>,
     partial: BTreeMap<u32, Partial>,
+    /// Pieces to fetch before anything else, in this order. Never contains
+    /// a piece we have.
+    urgent: Vec<u32>,
+    /// Pieces with [`Priority::Skip`].
+    skipped: u32,
+    /// Pieces that are wanted (not skipped) and missing.
+    wanted_missing: u32,
+    /// Bytes of the pieces in `wanted_missing`.
+    wanted_left: u64,
 }
 
 impl Picker {
-    /// A picker for `layout` that already has the pieces in `have`.
+    /// A picker for `layout` that already has the pieces in `have`. Every
+    /// piece starts at [`Priority::Normal`].
     ///
     /// # Panics
     /// Never; a `have` bitfield of the wrong length is treated as empty.
@@ -110,16 +217,26 @@ impl Picker {
         } else {
             Bitfield::new(count)
         };
+        let rank = Priority::Normal.rank();
         let queue = (0..count)
             .filter(|&p| !have.get(p))
-            .map(|p| (0, p))
+            .map(|p| (rank, 0, p))
             .collect();
+        let wanted_left = (0..count)
+            .filter(|&p| !have.get(p))
+            .map(|p| u64::from(layout.piece_size(p).unwrap_or(0)))
+            .sum();
         Self {
             layout,
+            wanted_missing: count - have.count(),
             have,
             availability: vec![0; usize::try_from(count).unwrap_or(0)],
+            priority: vec![Priority::Normal; usize::try_from(count).unwrap_or(0)],
             queue,
             partial: BTreeMap::new(),
+            urgent: Vec::new(),
+            skipped: 0,
+            wanted_left,
         }
     }
 
@@ -141,6 +258,19 @@ impl Picker {
         self.have.is_full()
     }
 
+    /// Whether every wanted piece (not skipped, or urgent) is verified.
+    /// Equal to [`Self::is_complete`] when nothing is skipped.
+    #[must_use]
+    pub fn is_done(&self) -> bool {
+        self.wanted_missing == 0 && self.urgent.is_empty()
+    }
+
+    /// Bytes of wanted pieces we do not have yet.
+    #[must_use]
+    pub const fn wanted_left(&self) -> u64 {
+        self.wanted_left
+    }
+
     /// Number of started but unverified pieces.
     #[must_use]
     pub fn partial_count(&self) -> usize {
@@ -159,6 +289,100 @@ impl Picker {
             .and_then(|i| self.availability.get(i))
     }
 
+    /// Priority of `piece` ([`Priority::Skip`] if out of range).
+    #[must_use]
+    pub fn priority(&self, piece: u32) -> Priority {
+        usize::try_from(piece)
+            .ok()
+            .and_then(|i| self.priority.get(i))
+            .copied()
+            .unwrap_or(Priority::Skip)
+    }
+
+    /// Pieces marked urgent and not yet verified, in pick order.
+    #[must_use]
+    pub fn urgent(&self) -> &[u32] {
+        &self.urgent
+    }
+
+    /// Whether `piece` is missing and should be downloaded.
+    #[must_use]
+    pub fn is_wanted(&self, piece: u32) -> bool {
+        piece < self.layout.piece_count()
+            && !self.have.get(piece)
+            && (self.priority(piece).is_wanted() || self.urgent.contains(&piece))
+    }
+
+    /// Sets the priority of one piece. Pieces already started stay started;
+    /// a skipped partial piece is simply not continued.
+    pub fn set_priority(&mut self, piece: u32, priority: Priority) {
+        let Some(slot) = usize::try_from(piece)
+            .ok()
+            .and_then(|i| self.priority.get_mut(i))
+        else {
+            return;
+        };
+        let old = *slot;
+        if old == priority {
+            return;
+        }
+        *slot = priority;
+        if old == Priority::Skip {
+            self.skipped -= 1;
+        }
+        if priority == Priority::Skip {
+            self.skipped += 1;
+        }
+        if self.have.get(piece) {
+            return;
+        }
+        let size = u64::from(self.layout.piece_size(piece).unwrap_or(0));
+        match (old.is_wanted(), priority.is_wanted()) {
+            (true, false) => {
+                self.wanted_missing -= 1;
+                self.wanted_left = self.wanted_left.saturating_sub(size);
+            }
+            (false, true) => {
+                self.wanted_missing += 1;
+                self.wanted_left = self.wanted_left.saturating_add(size);
+            }
+            _ => {}
+        }
+        if self.partial.contains_key(&piece) {
+            return;
+        }
+        let avail = self.availability(piece);
+        self.queue.remove(&(old.rank(), avail, piece));
+        if priority.is_wanted() {
+            self.queue.insert((priority.rank(), avail, piece));
+        }
+    }
+
+    /// Sets every piece's priority. Returns `false` (and changes nothing)
+    /// when `priorities` does not have one entry per piece.
+    pub fn set_priorities(&mut self, priorities: &[Priority]) -> bool {
+        if priorities.len() != self.priority.len() {
+            return false;
+        }
+        for (piece, &priority) in (0u32..).zip(priorities) {
+            self.set_priority(piece, priority);
+        }
+        true
+    }
+
+    /// Replaces the urgent list: these pieces are picked first, in order,
+    /// even when skipped. Out-of-range, duplicate and verified pieces are
+    /// dropped.
+    pub fn set_urgent(&mut self, pieces: impl IntoIterator<Item = u32>) {
+        let count = self.layout.piece_count();
+        self.urgent.clear();
+        for piece in pieces {
+            if piece < count && !self.have.get(piece) && !self.urgent.contains(&piece) {
+                self.urgent.push(piece);
+            }
+        }
+    }
+
     fn change_availability(&mut self, piece: u32, up: bool) {
         let Some(slot) = usize::try_from(piece)
             .ok()
@@ -173,8 +397,9 @@ impl Picker {
             old.saturating_sub(1)
         };
         *slot = new;
-        if self.queue.remove(&(old, piece)) {
-            self.queue.insert((new, piece));
+        let rank = self.priority(piece).rank();
+        if self.queue.remove(&(rank, old, piece)) {
+            self.queue.insert((rank, new, piece));
         }
     }
 
@@ -200,7 +425,18 @@ impl Picker {
     /// Whether a peer with `pieces` has something we still want.
     #[must_use]
     pub fn is_interesting(&self, pieces: &Bitfield) -> bool {
-        pieces.has_any_missing_from(&self.have)
+        if self.skipped == 0 {
+            return pieces.has_any_missing_from(&self.have);
+        }
+        self.urgent.iter().any(|&p| pieces.get(p))
+            || pieces
+                .ones()
+                .any(|p| !self.have.get(p) && self.priority(p).is_wanted())
+    }
+
+    /// Whether a started piece should be continued.
+    fn continues(&self, piece: u32) -> bool {
+        self.priority(piece).is_wanted() || self.urgent.contains(&piece)
     }
 
     /// Whether some wanted block is neither requested nor received: a new
@@ -208,18 +444,23 @@ impl Picker {
     /// this is `false` the download is in its endgame.
     #[must_use]
     pub fn has_unrequested(&self) -> bool {
-        !self.queue.is_empty() || self.partial.values().any(|p| !p.hashing && p.missing > 0)
+        !self.queue.is_empty()
+            || self.urgent.iter().any(|p| !self.partial.contains_key(p))
+            || self
+                .partial
+                .iter()
+                .any(|(&i, p)| !p.hashing && p.missing > 0 && self.continues(i))
     }
 
-    /// Blocks that are requested but not yet received, in pieces the peer
-    /// with `pieces` has. Used to request them again from another peer.
+    /// Blocks that are requested but not yet received, in wanted pieces the
+    /// peer with `pieces` has. Used to request them again from another peer.
     pub fn requested_blocks<'a>(
         &'a self,
         pieces: &'a Bitfield,
     ) -> impl Iterator<Item = BlockRef> + 'a {
         self.partial
             .iter()
-            .filter(|(index, p)| !p.hashing && pieces.get(**index))
+            .filter(|(index, p)| !p.hashing && pieces.get(**index) && self.continues(**index))
             .flat_map(move |(&index, p)| {
                 p.blocks
                     .iter()
@@ -230,36 +471,76 @@ impl Picker {
     }
 
     /// Picks the next block to request from a peer with `pieces`, marking it
-    /// requested. Unfinished pieces come first, then the rarest new piece the
-    /// peer has (ties broken by lowest index).
+    /// requested. Urgent pieces come first, then unfinished pieces, then the
+    /// best new piece the peer has: highest priority, then rarest (ties
+    /// broken by lowest index).
     pub fn pick(&mut self, pieces: &Bitfield) -> Option<BlockRef> {
+        self.pick_with_hint(pieces, &[])
+    }
+
+    /// Like [`Self::pick`], but a new piece in `hint` (e.g. the peer's BEP 6
+    /// `suggest`s) is preferred over rarest-first when its priority is at
+    /// least that of the piece rarest-first would start.
+    pub fn pick_with_hint(&mut self, pieces: &Bitfield, hint: &[u32]) -> Option<BlockRef> {
+        if let Some(block) = self.pick_urgent(pieces) {
+            return Some(block);
+        }
         if let Some(block) = self.pick_from_partial(pieces) {
             return Some(block);
         }
-        let piece = self.queue.iter().find(|&&(_, p)| pieces.get(p)).copied()?;
-        self.queue.remove(&piece);
-        let index = piece.1;
-        let blocks = self.layout.block_count(index)?;
-        self.partial.insert(index, Partial::new(blocks));
-        self.pick_from_partial(pieces)
+        let best = self
+            .queue
+            .iter()
+            .find(|&&(_, _, p)| pieces.get(p))
+            .copied()?;
+        let chosen = hint
+            .iter()
+            .filter(|&&p| pieces.get(p))
+            .map(|&p| (self.priority(p).rank(), self.availability(p), p))
+            .find(|key| key.0 <= best.0 && self.queue.contains(key))
+            .unwrap_or(best);
+        self.start(chosen.2)
+    }
+
+    /// Starts `piece` (removing it from the queue) and returns its first
+    /// block.
+    fn start(&mut self, piece: u32) -> Option<BlockRef> {
+        let key = (self.priority(piece).rank(), self.availability(piece), piece);
+        self.queue.remove(&key);
+        let blocks = self.layout.block_count(piece)?;
+        let partial = self
+            .partial
+            .entry(piece)
+            .or_insert_with(|| Partial::new(blocks));
+        let b = partial.take_missing()?;
+        self.layout.block(piece, u32::try_from(b).ok()?)
+    }
+
+    fn pick_urgent(&mut self, pieces: &Bitfield) -> Option<BlockRef> {
+        let piece = self.urgent.iter().copied().find(|&p| {
+            pieces.get(p)
+                && self
+                    .partial
+                    .get(&p)
+                    .is_none_or(|partial| !partial.hashing && partial.missing > 0)
+        })?;
+        self.start(piece)
     }
 
     fn pick_from_partial(&mut self, pieces: &Bitfield) -> Option<BlockRef> {
-        for (&index, partial) in &mut self.partial {
-            if partial.hashing || partial.missing == 0 || !pieces.get(index) {
-                continue;
-            }
-            if let Some(b) = partial
-                .blocks
-                .iter()
-                .position(|s| *s == BlockState::Missing)
-            {
-                let block = self.layout.block(index, u32::try_from(b).ok()?)?;
-                partial.transition(b, BlockState::Missing, BlockState::Requested);
-                return Some(block);
-            }
-        }
-        None
+        let index = self
+            .partial
+            .iter()
+            .find(|&(&index, partial)| {
+                !partial.hashing
+                    && partial.missing > 0
+                    && pieces.get(index)
+                    && self.continues(index)
+            })
+            .map(|(&index, _)| index)?;
+        let partial = self.partial.get_mut(&index)?;
+        let b = partial.take_missing()?;
+        self.layout.block(index, u32::try_from(b).ok()?)
     }
 
     fn block_state(&mut self, block: BlockRef) -> Option<(&mut Partial, usize)> {
@@ -343,8 +624,15 @@ impl Picker {
             return false;
         }
         self.partial.remove(&piece);
+        self.urgent.retain(|&p| p != piece);
+        let priority = self.priority(piece);
         let avail = self.availability(piece);
-        self.queue.remove(&(avail, piece));
+        self.queue.remove(&(priority.rank(), avail, piece));
+        if priority.is_wanted() {
+            self.wanted_missing -= 1;
+            let size = u64::from(self.layout.piece_size(piece).unwrap_or(0));
+            self.wanted_left = self.wanted_left.saturating_sub(size);
+        }
         true
     }
 }
@@ -468,5 +756,111 @@ mod tests {
         assert!(p.is_interesting(&all));
         assert!(p.mark_have(0) && p.mark_have(1) && p.mark_have(2));
         assert!(!p.is_interesting(&all));
+    }
+    #[test]
+    fn higher_priority_beats_rarity() {
+        let mut p = Picker::new(layout(3, BLOCK_SIZE), Bitfield::new(3));
+        let all = Bitfield::full(3);
+        let mut only_0 = Bitfield::new(3);
+        only_0.set(0);
+        p.add_peer_pieces(&all);
+        p.add_peer_pieces(&all);
+        p.add_peer_pieces(&only_0);
+        p.set_priority(1, Priority::Low);
+        p.set_priority(2, Priority::High);
+        // 0 is commonest, 2 is high: high wins, then normal, then low.
+        let order: Vec<u32> = std::iter::from_fn(|| p.pick(&all).map(|b| b.piece)).collect();
+        assert_eq!(order, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn skipped_pieces_are_not_picked_and_done_ignores_them() {
+        let mut p = Picker::new(layout(3, BLOCK_SIZE), Bitfield::new(3));
+        let all = Bitfield::full(3);
+        assert!(p.set_priorities(&[Priority::Skip, Priority::Normal, Priority::Skip]));
+        assert!(!p.set_priorities(&[Priority::Skip]), "wrong length");
+        assert_eq!(p.wanted_left(), u64::from(BLOCK_SIZE));
+        let mut only_0 = Bitfield::new(3);
+        only_0.set(0);
+        assert!(!p.is_interesting(&only_0));
+        assert!(p.is_interesting(&all));
+        let a = p.pick(&all).unwrap();
+        assert_eq!(a.piece, 1);
+        assert_eq!(p.pick(&all), None);
+        p.block_received(a);
+        assert_eq!(p.block_written(a), Some(1));
+        assert!(!p.is_done());
+        assert!(p.piece_hashed(1, true));
+        assert!(p.is_done());
+        assert!(!p.is_complete());
+        assert_eq!(p.wanted_left(), 0);
+        // Wanting a skipped piece again re-opens the download.
+        p.set_priority(2, Priority::Low);
+        assert!(!p.is_done());
+        assert_eq!(p.pick(&all).map(|b| b.piece), Some(2));
+    }
+
+    #[test]
+    fn skipping_a_partial_piece_pauses_it() {
+        let mut p = Picker::new(layout(2, 2 * BLOCK_SIZE), Bitfield::new(2));
+        let all = Bitfield::full(2);
+        let a = p.pick(&all).unwrap();
+        assert_eq!(a.piece, 0);
+        p.set_priority(0, Priority::Skip);
+        assert_eq!(p.pick(&all).map(|b| b.piece), Some(1));
+        assert_eq!(p.requested_blocks(&all).filter(|b| b.piece == 0).count(), 0);
+        p.set_priority(0, Priority::Normal);
+        let next = p.pick(&all).unwrap();
+        assert_eq!((next.piece, next.offset), (0, BLOCK_SIZE), "continued");
+    }
+
+    #[test]
+    fn urgent_pieces_come_first_in_order() {
+        let mut p = Picker::new(layout(5, BLOCK_SIZE), Bitfield::new(5));
+        let all = Bitfield::full(5);
+        p.set_priority(4, Priority::Skip);
+        p.set_urgent([4, 3, 3, 9]);
+        assert_eq!(p.urgent(), &[4, 3]);
+        assert!(p.is_wanted(4), "urgent overrides skip");
+        let mut only_0 = Bitfield::new(5);
+        only_0.set(4);
+        assert!(p.is_interesting(&only_0));
+        let first = p.pick(&all).unwrap();
+        let second = p.pick(&all).unwrap();
+        assert_eq!((first.piece, second.piece), (4, 3));
+        p.block_received(first);
+        p.block_written(first);
+        assert!(p.piece_hashed(4, true));
+        assert_eq!(p.urgent(), &[3]);
+        assert_eq!(p.pick(&all).map(|b| b.piece), Some(0));
+    }
+
+    #[test]
+    fn hints_win_within_the_same_priority() {
+        let mut p = Picker::new(layout(4, BLOCK_SIZE), Bitfield::new(4));
+        let all = Bitfield::full(4);
+        p.add_peer_pieces(&all);
+        let mut rare = Bitfield::new(4);
+        rare.set(0);
+        p.remove_peer_pieces(&rare);
+        // Rarest-first would start 0; the hint asks for 3.
+        assert_eq!(p.pick_with_hint(&all, &[3]).map(|b| b.piece), Some(3));
+        p.set_priority(1, Priority::High);
+        // A hint never beats a higher priority.
+        assert_eq!(p.pick_with_hint(&all, &[2]).map(|b| b.piece), Some(1));
+        // Hints the peer lacks or that already started are ignored.
+        assert_eq!(p.pick_with_hint(&rare, &[2, 3]).map(|b| b.piece), Some(0));
+    }
+
+    #[test]
+    fn priorities_parse_and_print() {
+        for prio in Priority::ALL {
+            assert_eq!(prio.as_str().parse::<Priority>(), Ok(prio));
+        }
+        assert_eq!("OFF".parse::<Priority>(), Ok(Priority::Skip));
+        assert_eq!("3".parse::<Priority>(), Ok(Priority::High));
+        assert!("urgent".parse::<Priority>().is_err());
+        assert!(Priority::High > Priority::Normal && Priority::Low > Priority::Skip);
+        assert_eq!(Priority::default(), Priority::Normal);
     }
 }

@@ -14,7 +14,7 @@ use crate::ban::HashBans;
 use crate::bitfield::Bitfield;
 use crate::choker::{Candidate, Choker};
 use crate::ext::{self, PeerExtensions};
-use crate::picker::{Picker, Received};
+use crate::picker::{Picker, Priority, Received};
 use crate::pool::PeerPool;
 use crate::rate::TokenBucket;
 use crate::types::{Alert, AnnounceEvent, Config, Effect, Event, PeerKey, Stats, TorrentStatus};
@@ -23,6 +23,9 @@ use crate::window::Window;
 /// Most peers that may hold a request for the same block (endgame and
 /// stealing): the original requester plus one more.
 const MAX_BLOCK_OWNERS: usize = 2;
+
+/// Suggestions (BEP 6 `suggest`) remembered per peer.
+const MAX_SUGGESTED: usize = 16;
 
 /// Messages that may arrive before `bitfield` / `have all` / `have none`.
 ///
@@ -74,6 +77,9 @@ struct Peer {
     allowed_in: HashSet<u32>,
     /// Pieces we let the peer request while we choke it (BEP 6).
     allowed_out: HashSet<u32>,
+    /// Pieces the peer suggested (BEP 6), oldest first, at most
+    /// [`MAX_SUGGESTED`]. Preferred when a new piece is started.
+    suggested: VecDeque<u32>,
     /// Requests from the peer waiting for a disk read.
     upload_queue: VecDeque<BlockRef>,
     /// Requests whose read is in flight. A cancel, a choke, or a drop
@@ -125,6 +131,7 @@ impl Peer {
             am_choking: true,
             allowed_in: HashSet::new(),
             allowed_out: HashSet::new(),
+            suggested: VecDeque::new(),
             upload_queue: VecDeque::new(),
             reading: HashSet::new(),
             down_round: 0,
@@ -223,6 +230,8 @@ pub struct TorrentState {
     next_announce: Option<Instant>,
     announce_in_flight: bool,
     started_announced: bool,
+    /// `completed` was announced; it is sent once, when every piece is in.
+    completed_announced: bool,
     /// The announce the driver is currently performing.
     pending_announce: Option<AnnounceEvent>,
     /// DHT and PEX addresses refused after a magnet turns out private.
@@ -275,6 +284,7 @@ impl TorrentState {
             next_announce: None,
             announce_in_flight: false,
             started_announced: false,
+            completed_announced: false,
             pending_announce: None,
             swarm_ban: HashSet::new(),
             dht: DhtSchedule::default(),
@@ -330,6 +340,20 @@ impl TorrentState {
         self
     }
 
+    /// Starts with these piece priorities (see [`Event::SetPriorities`]).
+    /// A slice of the wrong length is ignored.
+    #[must_use]
+    pub fn with_priorities(mut self, priorities: &[Priority]) -> Self {
+        self.picker.set_priorities(priorities);
+        self
+    }
+
+    /// The piece picker (priorities, availability, urgent pieces).
+    #[must_use]
+    pub const fn picker(&self) -> &Picker {
+        &self.picker
+    }
+
     /// Addresses whose TCP handshake is already in progress.
     #[must_use]
     pub fn with_connecting(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
@@ -372,6 +396,7 @@ impl TorrentState {
             pieces_have: self.picker.have().count(),
             total_length: layout.total_length(),
             bytes_have: self.bytes_have,
+            wanted_left: self.picker.wanted_left(),
             downloaded: self.downloaded,
             uploaded: self.uploaded,
             peers: self.peers.len(),
@@ -465,6 +490,15 @@ impl TorrentState {
                 self.add_to_pool(peers);
                 self.fill_connections(&mut out);
             }
+            Event::SetPriorities { priorities } => {
+                if self.picker.set_priorities(&priorities) {
+                    self.wanted_changed(now, &mut out);
+                }
+            }
+            Event::SetUrgent { pieces } => {
+                self.picker.set_urgent(pieces);
+                self.wanted_changed(now, &mut out);
+            }
             Event::AnnounceFailed { error } => {
                 if self.pending_announce == Some(AnnounceEvent::Started) {
                     self.started_announced = false;
@@ -547,7 +581,7 @@ impl TorrentState {
     }
 
     fn begin_download(&mut self, now: Instant, out: &mut Vec<Effect>) {
-        if self.picker.is_complete() {
+        if self.picker.is_done() {
             self.finish(now, out);
             return;
         }
@@ -569,17 +603,26 @@ impl TorrentState {
         self.fill_connections(out);
     }
 
-    /// Every piece is verified. A seeding torrent stays in the swarm: it
-    /// announces (`completed`, or `started` if it never announced, as when
-    /// it was complete on disk), drops peers that are seeds too and keeps
-    /// uploading. Otherwise it leaves the swarm.
+    /// Every wanted piece is verified. A seeding torrent stays in the
+    /// swarm: it announces (`completed` once every piece is in, or
+    /// `started` if it never announced, as when it was complete on disk),
+    /// drops peers that are seeds too and keeps uploading. Otherwise it
+    /// leaves the swarm.
     fn finish(&mut self, now: Instant, out: &mut Vec<Effect>) {
         self.set_status(TorrentStatus::Finished, out);
         out.push(Effect::Alert(Alert::Finished));
+        let complete = self.picker.is_complete();
         if !self.config.seed {
             self.pool.clear_known();
             if self.started_announced {
-                self.push_announce(AnnounceEvent::Completed, out);
+                if complete && !self.completed_announced {
+                    self.completed_announced = true;
+                    self.push_announce(AnnounceEvent::Completed, out);
+                } else if !complete {
+                    // Only part of the torrent is wanted: leave the swarm.
+                    self.push_announce(AnnounceEvent::Stopped, out);
+                    self.started_announced = false;
+                }
             }
             self.next_announce = None;
             for key in self.sorted_keys() {
@@ -588,10 +631,11 @@ impl TorrentState {
             }
             return;
         }
-        if self.started_announced {
-            self.push_announce(AnnounceEvent::Completed, out);
-        } else {
+        if !self.started_announced {
             self.announce(now, AnnounceEvent::Started, out);
+        } else if complete && !self.completed_announced {
+            self.completed_announced = true;
+            self.push_announce(AnnounceEvent::Completed, out);
         }
         if self.next_pex.is_none() {
             self.next_pex = Some(now + self.config.pex_interval);
@@ -600,14 +644,56 @@ impl TorrentState {
         let seeds: Vec<PeerKey> = self
             .sorted_keys()
             .into_iter()
-            .filter(|k| self.peers.get(k).is_some_and(|p| p.has.is_full()))
+            .filter(|k| self.peers.get(k).is_some_and(|p| p.has.is_full()) && complete)
             .collect();
         for key in seeds {
             self.remove_peer(key);
             out.push(Effect::Disconnect { peer: key });
         }
+        for key in self.sorted_keys() {
+            self.update_interest(now, key, out);
+        }
         // Rankings switch from download to upload rates.
         self.run_choker(now, out);
+        self.fill_connections(out);
+    }
+
+    /// Priorities or urgent pieces changed: finish when nothing wanted is
+    /// missing any more, go back to downloading when something is, and
+    /// re-evaluate interest and requests.
+    fn wanted_changed(&mut self, now: Instant, out: &mut Vec<Effect>) {
+        match self.status {
+            TorrentStatus::Downloading if self.picker.is_done() => self.finish(now, out),
+            TorrentStatus::Finished if !self.picker.is_done() => self.resume_download(now, out),
+            TorrentStatus::Downloading => {
+                for key in self.sorted_keys() {
+                    self.update_interest(now, key, out);
+                }
+                self.fill_all_requests(now, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// A finished torrent wants more pieces: download again. Peers keep
+    /// their connections (when seeding); a torrent that left the swarm
+    /// announces `started` again.
+    fn resume_download(&mut self, now: Instant, out: &mut Vec<Effect>) {
+        self.set_status(TorrentStatus::Downloading, out);
+        if !self.started_announced {
+            self.announce(now, AnnounceEvent::Started, out);
+        } else if self.next_announce.is_none() {
+            self.next_announce = Some(now + self.config.default_announce_interval);
+        }
+        if self.next_pex.is_none() {
+            self.next_pex = Some(now + self.config.pex_interval);
+        }
+        self.dht.poll(now, &self.config, out);
+        for key in self.sorted_keys() {
+            self.update_interest(now, key, out);
+        }
+        self.run_choker(now, out);
+        self.fill_all_requests(now, out);
         self.fill_connections(out);
     }
 
@@ -1011,6 +1097,14 @@ impl TorrentState {
                     peer.allowed_in.insert(piece);
                 }
             }
+            Message::Suggest { piece } if peer.fast => {
+                if piece < piece_count && !peer.suggested.contains(&piece) {
+                    if peer.suggested.len() >= MAX_SUGGESTED {
+                        peer.suggested.pop_front();
+                    }
+                    peer.suggested.push_back(piece);
+                }
+            }
             Message::Piece {
                 piece,
                 offset,
@@ -1022,7 +1116,6 @@ impl TorrentState {
                     self.fill_connections(out);
                 }
             }
-            // `suggest` is only a hint; rarest-first already picks well.
             // Fast-extension messages from a peer without the extension and
             // DHT `port` are ignored.
             _ => {}
@@ -1219,7 +1312,10 @@ impl TorrentState {
             {
                 break;
             }
-            let block = match self.picker.pick(has) {
+            let block = match self
+                .picker
+                .pick_with_hint(has, peer.suggested.make_contiguous())
+            {
                 Some(block) => block,
                 None => match duplicate_candidate(
                     &self.picker,
@@ -1291,7 +1387,7 @@ impl TorrentState {
                 self.offer_allowed_fast_piece(now, key, piece, out);
                 self.update_interest(now, key, out);
             }
-            if self.picker.is_complete() {
+            if self.status == TorrentStatus::Downloading && self.picker.is_done() {
                 self.finish(now, out);
                 return;
             }

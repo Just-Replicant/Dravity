@@ -7,6 +7,8 @@ use bytes::Bytes;
 use dravity_core::BlockRef;
 use dravity_wire::{Message, Reserved};
 
+use crate::picker::Priority;
+
 /// Opaque handle for a connected peer, allocated by the driver.
 ///
 /// The driver (`dravity-session`) owns the connection; the engine only ever
@@ -40,8 +42,11 @@ pub enum TorrentStatus {
     Checking,
     /// Fetching pieces from peers.
     Downloading,
-    /// Every piece is present and verified. With [`Config::seed`] the
-    /// torrent keeps announcing and uploads to peers (seeding).
+    /// Every wanted piece is present and verified (every piece, unless
+    /// some are [`Priority::Skip`]). With [`Config::seed`] the torrent keeps
+    /// announcing and uploads what it has to peers (seeding). Wanting more
+    /// pieces ([`Event::SetPriorities`], [`Event::SetUrgent`]) returns it to
+    /// [`TorrentStatus::Downloading`].
     Finished,
     /// Stopped by command or after a fatal error.
     Stopped,
@@ -316,6 +321,22 @@ pub enum Event {
         /// Peer addresses.
         peers: Vec<SocketAddr>,
     },
+    /// Sets the download priority of every piece (one entry per piece;
+    /// any other length is ignored). [`Priority::Skip`] pieces are not
+    /// downloaded; the torrent is [`TorrentStatus::Finished`] once every
+    /// other piece is verified. The session derives these from file
+    /// priorities.
+    SetPriorities {
+        /// Priority per piece.
+        priorities: Vec<Priority>,
+    },
+    /// Replaces the urgent pieces: they are requested before anything else,
+    /// in this order, even when skipped (streaming reads). An empty list
+    /// clears it.
+    SetUrgent {
+        /// Pieces, most urgent first.
+        pieces: Vec<u32>,
+    },
     /// Every tracker failed for an announce.
     AnnounceFailed {
         /// Human-readable cause.
@@ -432,7 +453,7 @@ pub enum Alert {
         /// Cause.
         message: String,
     },
-    /// Every piece is present and verified.
+    /// Every wanted piece is present and verified.
     Finished,
     /// The `info` dictionary of a magnet link was received and verified.
     MetadataReceived,
@@ -463,6 +484,9 @@ pub struct Stats {
     pub total_length: u64,
     /// Verified content bytes.
     pub bytes_have: u64,
+    /// Bytes of wanted (not skipped, or urgent) pieces still missing. Equal
+    /// to `total_length - bytes_have` when nothing is skipped.
+    pub wanted_left: u64,
     /// Payload bytes received from peers (including discarded data).
     pub downloaded: u64,
     /// Payload bytes sent to peers.

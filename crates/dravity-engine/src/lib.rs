@@ -51,6 +51,17 @@
 //! * **Incoming peers**: [`Event::PeerAccepted`] adds a connection the
 //!   driver accepted; such peers are only shared over PEX once they
 //!   advertise a listen port.
+//!
+//! Product surface (Phase 4):
+//!
+//! * **Priorities**: [`Event::SetPriorities`] gives every piece a
+//!   [`Priority`]. Skipped pieces are not downloaded and a torrent is
+//!   [`TorrentStatus::Finished`] once every wanted piece is in; wanting more
+//!   later resumes the download. Higher priorities start before rarer pieces.
+//! * **Urgent pieces**: [`Event::SetUrgent`] lists pieces to fetch first, in
+//!   order (the session's streaming readers).
+//! * **Suggestions**: BEP 6 `suggest` messages are remembered per peer and
+//!   preferred when a new piece of the same priority is started.
 
 mod ban;
 mod bitfield;
@@ -66,7 +77,7 @@ mod window;
 
 pub use bitfield::Bitfield;
 pub use metadata::{Handover, HandoverPeer, MetadataState};
-pub use picker::Picker;
+pub use picker::{ParsePriorityError, Picker, Priority};
 pub use rate::TokenBucket;
 pub use state::TorrentState;
 pub use types::{Alert, AnnounceEvent, Config, Effect, Event, PeerKey, Stats, TorrentStatus};

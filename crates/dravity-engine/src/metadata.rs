@@ -212,6 +212,7 @@ impl MetadataState {
             pieces_have: 0,
             total_length: 0,
             bytes_have: 0,
+            wanted_left: 0,
             downloaded: self.downloaded,
             uploaded: 0,
             peers: self.peers.len(),

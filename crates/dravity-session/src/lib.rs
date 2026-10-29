@@ -546,6 +546,13 @@ impl Session {
             utp: self.inner.utp.get().cloned().unwrap_or_default(),
             catalog: Arc::clone(&self.inner.catalog),
             persist: self.inner.persister().cloned(),
+            port_map: self
+                .inner
+                .port_mapper
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .map(PortMapper::subscribe),
         };
         let (tx, rx) = mpsc::channel(64);
         if !peers.is_empty() {

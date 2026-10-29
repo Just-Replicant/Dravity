@@ -5,8 +5,8 @@
 //! round trip to the default gateway) and UPnP IGD second, renews the
 //! mappings at half their lifetime and removes them when stopped. The
 //! external port is requested to equal the listen port. When NAT-PMP
-//! returns a different one, a warning is logged and announces keep using
-//! the listen port. Failure is normal (no router, feature disabled,
+//! returns a different one, [`Status::external_port`] reports it, so the
+//! session announces the port peers can actually reach. Failure is normal (no router, feature disabled,
 //! carrier-grade NAT) and only reported in [`Status`]; outgoing
 //! connections work regardless.
 //!
@@ -110,6 +110,19 @@ pub struct Status {
     pub mapped: Vec<Mapped>,
     /// Why mapping failed last, if it did.
     pub error: Option<String>,
+}
+
+impl Status {
+    /// Public port the router forwards for `protocol`, if a mapping is
+    /// active and the router said which (UPnP mappings report the requested
+    /// port; `0` means unknown and is ignored).
+    #[must_use]
+    pub fn external_port(&self, protocol: Protocol) -> Option<u16> {
+        self.mapped
+            .iter()
+            .find(|m| m.mapping.protocol == protocol && m.external_port != 0)
+            .map(|m| m.external_port)
+    }
 }
 
 /// Why a mapping attempt failed.
@@ -297,13 +310,11 @@ async fn map_natpmp(
             natpmp_exchange(server, request).await?
         {
             if external_port != mapping.port {
-                // Announcing the mapped port is deferred. Peers are still
-                // told the listen port.
-                tracing::warn!(
+                tracing::info!(
                     protocol = ?mapping.protocol,
                     listen_port = mapping.port,
                     external_port,
-                    "NAT-PMP external port differs from the listen port; announces still use the listen port"
+                    "NAT-PMP external port differs from the listen port; announcing the external one"
                 );
             }
             status.mapped.push(Mapped {
@@ -437,4 +448,32 @@ async fn unmap_all(config: &PortMapConfig, mappings: &[Mapping], active: &Active
 #[must_use]
 pub fn fuzz_http_response(data: &[u8]) -> bool {
     http::parse_response(data).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Mapped, Mapping, Protocol, Status};
+
+    #[test]
+    fn the_external_port_is_the_routers_choice_and_zero_is_unknown() {
+        let mapped = |protocol, port, external_port| Mapped {
+            mapping: Mapping { protocol, port },
+            external_port,
+        };
+        let status = Status {
+            mapped: vec![
+                mapped(Protocol::Udp, 6881, 6881),
+                mapped(Protocol::Tcp, 6881, 40_000),
+            ],
+            ..Status::default()
+        };
+        assert_eq!(status.external_port(Protocol::Tcp), Some(40_000));
+        assert_eq!(status.external_port(Protocol::Udp), Some(6881));
+        let unknown = Status {
+            mapped: vec![mapped(Protocol::Tcp, 6881, 0)],
+            ..Status::default()
+        };
+        assert_eq!(unknown.external_port(Protocol::Tcp), None);
+        assert_eq!(Status::default().external_port(Protocol::Tcp), None);
+    }
 }

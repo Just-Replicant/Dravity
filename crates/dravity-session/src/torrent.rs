@@ -157,6 +157,8 @@ pub(crate) struct TorrentContext {
     pub(crate) catalog: Catalog,
     /// Session state writer, with a state directory.
     pub(crate) persist: Option<Persister>,
+    /// Router port mapping status, when mapping runs.
+    pub(crate) port_map: Option<tokio::sync::watch::Receiver<dravity_portmap::Status>>,
 }
 
 impl TorrentContext {
@@ -170,9 +172,15 @@ impl TorrentContext {
         config
     }
 
-    /// Port reported to trackers: the listener's, or the configured one.
+    /// Port reported to trackers and the DHT: the router's public TCP port
+    /// when port mapping got one, else the listener's, else the configured
+    /// one.
     fn announce_port(&self) -> u16 {
-        self.listen_port.unwrap_or(self.config.announce_port)
+        let mapped = self
+            .port_map
+            .as_ref()
+            .and_then(|rx| rx.borrow().external_port(dravity_portmap::Protocol::Tcp));
+        announce_port(mapped, self.listen_port, self.config.announce_port)
     }
 
     /// Reserved bits of our handshake.
@@ -802,7 +810,7 @@ impl TorrentTask {
         };
         let info_hash = self.ctx.info_hash;
         let timeout = self.ctx.config.dht_lookup_timeout;
-        let listen_port = self.ctx.listen_port;
+        let listen_port = self.ctx.listen_port.map(|_| self.ctx.announce_port());
         let tx = self.events_tx.clone();
         self.background.spawn(async move {
             let (peers, failed) = lookup_peers(&dht, info_hash, timeout).await;
@@ -1221,6 +1229,12 @@ fn max_duration(
 }
 
 /// Formats an error with its `source()` chain (`outer: inner: root`).
+/// Port to announce: the router's mapped port, the listen port, or the
+/// configured fallback, in that order.
+fn announce_port(mapped: Option<u16>, listen: Option<u16>, configured: u16) -> u16 {
+    mapped.or(listen).unwrap_or(configured)
+}
+
 fn error_chain(e: &dyn std::error::Error) -> String {
     let mut text = e.to_string();
     let mut source = e.source();
@@ -1243,8 +1257,16 @@ mod tests {
     use dravity_tracker::AnnounceResponse;
 
     use super::{
-        AnnounceMerge, announce_tier, dht_lookup_failed, error_chain, prepare_tiers, promote,
+        AnnounceMerge, announce_port, announce_tier, dht_lookup_failed, error_chain, prepare_tiers,
+        promote,
     };
+
+    #[test]
+    fn the_mapped_port_is_announced_before_the_listen_port() {
+        assert_eq!(announce_port(Some(40_000), Some(6881), 6881), 40_000);
+        assert_eq!(announce_port(None, Some(6882), 6881), 6882);
+        assert_eq!(announce_port(None, None, 6881), 6881);
+    }
 
     #[test]
     fn dht_failure_is_a_timeout_or_a_node_with_no_neighbors() {

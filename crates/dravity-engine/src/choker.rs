@@ -9,7 +9,8 @@
 //!   whoever can take data fastest.
 //!
 //! Peers that snub us (hold our requests and deliver nothing) do not get a
-//! regular slot while we download. Ties keep the peers that are already
+//! regular slot while we download. They stay eligible for the optimistic
+//! slot, so a stall is not permanent. Ties keep the peers that are already
 //! unchoked, so slots do not flap.
 //!
 //! One more slot is the **optimistic unchoke**: every
@@ -89,9 +90,11 @@ impl Choker {
             self.optimistic = None;
             return selected;
         }
+        // Snubbed peers are skipped for regular slots above, and kept here:
+        // the optimistic slot is how a stall gets another chance.
         let eligible: Vec<&Candidate> = candidates
             .iter()
-            .filter(|c| c.interested && !c.snubbed && !selected.contains(&c.key))
+            .filter(|c| c.interested && !selected.contains(&c.key))
             .collect();
         let holder_ok = self
             .optimistic
@@ -170,15 +173,17 @@ mod tests {
     }
 
     #[test]
-    fn uninterested_and_snubbing_peers_get_nothing() {
+    fn uninterested_peers_get_nothing_and_snubbed_peers_stay_optimistic() {
         let now = Instant::now();
         let mut choker = Choker::default();
         let mut peers = [cand(1, 100, now), cand(2, 90, now), cand(3, 1, now)];
         peers[0].interested = false;
         peers[1].snubbed = true;
         let set = choker.round(now, &config(1), &peers);
-        // Peer 3 has the regular slot; no one is left for the optimistic one.
-        assert_eq!(keys(&set), [3]);
+        // Peer 3 has the regular slot. The snubbed peer still gets the
+        // optimistic one; it has waited longer than anyone left over.
+        assert_eq!(keys(&set), [2, 3]);
+        assert_eq!(choker.optimistic(), Some(PeerKey(2)));
     }
 
     #[test]

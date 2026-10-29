@@ -1,0 +1,37 @@
+[package]
+name = "dravity-http"
+description = "HTTP API for a Dravity session: torrents, files, streaming, alerts and Prometheus metrics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum.workspace = true
+bytes.workspace = true
+dravity-core.workspace = true
+dravity-engine.workspace = true
+dravity-session.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "sync", "time", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+dravity-bencode.workspace = true
+http-body-util.workspace = true
+proptest.workspace = true
+sha1.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tower.workspace = true
+
+[lints]
+workspace = true

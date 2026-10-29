@@ -2,10 +2,13 @@
 //!
 //! Peers can only connect to us if the home router forwards our listening
 //! port. [`PortMapper`] asks the router to do so, NAT-PMP first (one UDP
-//! round trip) and UPnP IGD second, renews the mappings at half their
-//! lifetime and removes them when stopped. Failure is normal (no router,
-//! feature disabled, carrier-grade NAT) and only reported in
-//! [`Status`]; outgoing connections work regardless.
+//! round trip to the default gateway) and UPnP IGD second, renews the
+//! mappings at half their lifetime and removes them when stopped. The
+//! external port is requested to equal the listen port. When NAT-PMP
+//! returns a different one, a warning is logged and announces keep using
+//! the listen port. Failure is normal (no router, feature disabled,
+//! carrier-grade NAT) and only reported in [`Status`]; outgoing
+//! connections work regardless.
 //!
 //! The protocol modules ([`natpmp`], [`upnp`]) are sans-IO and fuzzed; the
 //! mapper task does the networking.
@@ -24,7 +27,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-pub use gateway::{default_gateway, parse_proc_net_route};
+pub use gateway::{
+    default_gateway, parse_proc_net_route, parse_route_get_default, parse_windows_route,
+};
 pub use http::Url;
 pub use natpmp::{NatPmpError, Protocol};
 pub use upnp::UpnpError;
@@ -291,6 +296,16 @@ async fn map_natpmp(
         if let natpmp::Response::Map { external_port, .. } =
             natpmp_exchange(server, request).await?
         {
+            if external_port != mapping.port {
+                // Announcing the mapped port is deferred. Peers are still
+                // told the listen port.
+                tracing::warn!(
+                    protocol = ?mapping.protocol,
+                    listen_port = mapping.port,
+                    external_port,
+                    "NAT-PMP external port differs from the listen port; announces still use the listen port"
+                );
+            }
             status.mapped.push(Mapped {
                 mapping: *mapping,
                 external_port,
@@ -379,6 +394,9 @@ async fn map_upnp(
             }
             Err(e) => return Err(e),
         }
+        // The device is not asked which external port it chose, so a
+        // rewrite stays invisible here. Announcing a different port is
+        // left to a later phase.
         status.mapped.push(Mapped {
             mapping: *mapping,
             external_port: mapping.port,

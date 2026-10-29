@@ -145,8 +145,14 @@ pub struct Config {
     /// failed the hash check (0: never ban). Sending every block of a failed
     /// piece is two strikes; sharing a failed piece with other peers is one.
     /// The default (4) forgives a single corrupt piece, which may be a
-    /// transient disk or memory error on the sender.
+    /// transient disk or memory error on the sender. Strikes older than
+    /// [`Self::hash_fail_quiet`] are forgotten; a ban lasts for the torrent.
+    /// An IPv4-mapped IPv6 address is the same key as its IPv4 address.
     pub hash_fail_ban: u32,
+    /// Forget an address's hash-failure strikes after this long with no new
+    /// failure, so a shared NAT is not banned for mistakes spread over the
+    /// whole download. Bans themselves are not lifted.
+    pub hash_fail_quiet: Duration,
     /// Port we accept connections on, advertised in the extension handshake
     /// (`p`) so peers that we dialed can tell others how to reach us.
     pub listen_port: Option<u16>,
@@ -189,6 +195,7 @@ impl Default for Config {
             fast_extension: true,
             allowed_fast: dravity_wire::DEFAULT_ALLOWED_FAST,
             hash_fail_ban: 4,
+            hash_fail_quiet: Duration::from_secs(60 * 60),
             listen_port: None,
         }
     }

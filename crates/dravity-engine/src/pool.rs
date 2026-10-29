@@ -3,7 +3,8 @@
 //!
 //! Shared by [`TorrentState`](crate::TorrentState) and
 //! [`MetadataState`](crate::MetadataState); the owner decides *when* each
-//! operation is allowed (e.g. no retries once a torrent is finished).
+//! operation is allowed. A seeding torrent retries; one that left the swarm
+//! does not.
 
 use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -76,11 +77,15 @@ impl PeerPool {
         self.retry.push_back((when, addr));
     }
 
-    /// Forgets queued and waiting addresses of `ip` (a banned peer). Dials
-    /// in flight finish and are refused when they connect.
+    /// Forgets queued and waiting addresses of `ip` (a banned peer),
+    /// including the IPv4-mapped form of the same host. Dials in flight
+    /// finish and are refused when they connect.
     pub(crate) fn remove_ip(&mut self, ip: IpAddr) {
-        self.queue.retain(|a| a.ip() != ip);
-        self.retry.retain(|(_, a)| a.ip() != ip);
+        let ip = crate::ban::canonical_ip(ip);
+        self.queue
+            .retain(|a| crate::ban::canonical_ip(a.ip()) != ip);
+        self.retry
+            .retain(|(_, a)| crate::ban::canonical_ip(a.ip()) != ip);
     }
 
     /// Moves due retries onto the dial queue.
@@ -163,6 +168,7 @@ impl PeerPool {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
     use std::time::Duration;
 
     use super::*;
@@ -210,6 +216,18 @@ mod tests {
         assert_eq!(next.next_dial(|_| false), None, "already connecting");
         next.dial_done(addr(1));
         assert_eq!(next.connecting(), 0);
+    }
+
+    #[test]
+    fn remove_ip_forgets_the_mapped_form() {
+        let mut pool = PeerPool::default();
+        let v4 = Ipv4Addr::new(10, 1, 2, 3);
+        let plain = SocketAddr::from((v4, 1));
+        let mapped = SocketAddr::new(IpAddr::V6(v4.to_ipv6_mapped()), 2);
+        pool.add([plain, mapped], |_| false);
+        pool.schedule_retry(Instant::now(), SocketAddr::from((v4, 9)), |_| false);
+        pool.remove_ip(IpAddr::V6(v4.to_ipv6_mapped()));
+        assert_eq!(pool.known(), 0);
     }
 
     #[test]

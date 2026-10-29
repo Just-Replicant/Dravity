@@ -40,12 +40,14 @@
 //! * **Choking**: every [`Config::unchoke_interval`] the
 //!   [`Config::upload_slots`] best peers are unchoked (tit-for-tat by
 //!   download rate while downloading, by upload rate while seeding); snubbed
-//!   peers lose their slot and one optimistic unchoke rotates every
-//!   [`Config::optimistic_unchoke_interval`].
+//!   peers lose their regular slot and can still receive the optimistic
+//!   unchoke, which rotates every [`Config::optimistic_unchoke_interval`].
 //! * **Fast extension** (BEP 6): `HaveAll`/`HaveNone`, `Reject` and an
 //!   allowed fast set for peers that set the reserved bit.
 //! * **Hash-failure bans**: addresses that keep sending bad data are banned
-//!   ([`Config::hash_fail_ban`], [`Alert::PeerBanned`]).
+//!   ([`Config::hash_fail_ban`], [`Alert::PeerBanned`]). Strikes expire after
+//!   [`Config::hash_fail_quiet`] with no new failure; IPv4-mapped addresses
+//!   share a key with the IPv4 host.
 //! * **Incoming peers**: [`Event::PeerAccepted`] adds a connection the
 //!   driver accepted; such peers are only shared over PEX once they
 //!   advertise a listen port.

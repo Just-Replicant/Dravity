@@ -9,7 +9,7 @@
     clippy::panic
 )]
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -326,6 +326,120 @@ fn upload_rate_limit_paces_reads() {
 }
 
 #[test]
+fn cancelling_an_in_flight_upload_returns_the_tokens() {
+    let mut c = config();
+    c.upload_rate_limit = Some(u64::from(BLOCK_SIZE));
+    let mut h = Harness::seed(c);
+    h.accept(1, fast());
+    h.msg(1, Message::Interested);
+    let first = req(0, 0, BLOCK_SIZE);
+    let second = req(0, BLOCK_SIZE, BLOCK_SIZE);
+    assert_eq!(reads(&h.msg(1, Message::Request(first))).len(), 1);
+    assert!(reads(&h.msg(1, Message::Request(second))).is_empty());
+    // The charge was for a read that will not be sent, so the queued
+    // block goes out without waiting for the bucket to refill.
+    let fx = h.msg(1, Message::Cancel(first));
+    assert!(sent(&fx, 1).contains(&Message::Reject(first)));
+    assert_eq!(reads(&fx), [(1, block(second))]);
+    let late = h.ev(Event::BlockRead {
+        peer: PeerKey(1),
+        block: block(first),
+        data: Bytes::from(vec![1; BLOCK_SIZE as usize]),
+    });
+    assert!(pieces_sent(&late, 1).is_empty());
+    assert_eq!(h.t.stats().uploaded, 0);
+    // Refunded once: the replacement read still holds the only token.
+    assert!(reads(&h.msg(1, Message::Request(req(1, 0, BLOCK_SIZE)))).is_empty());
+}
+
+#[test]
+fn cancelling_a_queued_request_does_not_mint_tokens() {
+    let mut c = config();
+    c.upload_rate_limit = Some(u64::from(BLOCK_SIZE));
+    let mut h = Harness::seed(c);
+    h.accept(1, fast());
+    h.msg(1, Message::Interested);
+    let first = req(0, 0, BLOCK_SIZE);
+    let second = req(0, BLOCK_SIZE, BLOCK_SIZE);
+    assert_eq!(reads(&h.msg(1, Message::Request(first))).len(), 1);
+    assert!(reads(&h.msg(1, Message::Request(second))).is_empty());
+    let fx = h.msg(1, Message::Cancel(second));
+    assert_eq!(sent(&fx, 1), [Message::Reject(second)]);
+    assert!(reads(&fx).is_empty());
+    assert!(reads(&h.msg(1, Message::Request(req(1, 0, BLOCK_SIZE)))).is_empty());
+}
+
+#[test]
+fn choking_an_in_flight_upload_returns_the_tokens() {
+    let mut c = config();
+    c.upload_rate_limit = Some(u64::from(BLOCK_SIZE));
+    c.optimistic_unchoke = false;
+    c.allowed_fast = 0;
+    let mut h = Harness::seed(c);
+    for p in [1, 2] {
+        h.accept(p, fast());
+        h.msg(p, Message::Interested);
+    }
+    let first = req(0, 0, BLOCK_SIZE);
+    assert_eq!(reads(&h.msg(1, Message::Request(first))).len(), 1);
+    let waiting = req(1, 0, BLOCK_SIZE);
+    assert!(reads(&h.msg(2, Message::Request(waiting))).is_empty());
+    let fx = h.msg(1, Message::NotInterested);
+    assert!(sent(&fx, 1).contains(&Message::Choke));
+    assert!(sent(&fx, 1).contains(&Message::Reject(first)));
+    assert_eq!(reads(&fx), [(2, block(waiting))]);
+}
+
+#[test]
+fn a_dropped_peer_returns_its_upload_tokens() {
+    let mut c = config();
+    c.upload_rate_limit = Some(u64::from(BLOCK_SIZE));
+    c.optimistic_unchoke = false;
+    let mut h = Harness::seed(c);
+    for p in [1, 2] {
+        h.accept(p, fast());
+        h.msg(p, Message::Interested);
+    }
+    assert_eq!(
+        reads(&h.msg(1, Message::Request(req(0, 0, BLOCK_SIZE)))).len(),
+        1
+    );
+    let waiting = req(1, 0, BLOCK_SIZE);
+    assert!(reads(&h.msg(2, Message::Request(waiting))).is_empty());
+    let fx = h.ev(Event::PeerDisconnected { peer: PeerKey(1) });
+    assert_eq!(reads(&fx), [(2, block(waiting))]);
+    let late = h.ev(Event::BlockRead {
+        peer: PeerKey(1),
+        block: block(req(0, 0, BLOCK_SIZE)),
+        data: Bytes::from(vec![1; BLOCK_SIZE as usize]),
+    });
+    assert!(pieces_sent(&late, 1).is_empty());
+    assert!(reads(&late).is_empty(), "not refunded a second time");
+}
+
+#[test]
+fn a_failed_upload_read_returns_the_tokens() {
+    let mut c = config();
+    c.upload_rate_limit = Some(u64::from(BLOCK_SIZE));
+    let mut h = Harness::seed(c);
+    h.accept(1, fast());
+    h.msg(1, Message::Interested);
+    let first = req(0, 0, BLOCK_SIZE);
+    let fx = h.msg(1, Message::Request(first));
+    assert_eq!(reads(&fx).len(), 1);
+    let failed = h.ev(Event::ReadFailed {
+        peer: PeerKey(1),
+        block: block(first),
+        error: "disk".to_owned(),
+    });
+    assert!(sent(&failed, 1).contains(&Message::Reject(first)));
+    assert_eq!(
+        reads(&h.msg(1, Message::Request(req(0, BLOCK_SIZE, BLOCK_SIZE)))).len(),
+        1
+    );
+}
+
+#[test]
 fn choking_rejects_pending_requests_except_allowed_fast() {
     let mut c = config();
     c.upload_slots = 1;
@@ -378,7 +492,7 @@ fn allowed_fast_set_follows_bep_6_for_ipv4_only() {
     });
     let mut expected = dravity_wire::allowed_fast_set(
         &InfoHash::new([0xaa; 20]),
-        std::net::Ipv4Addr::new(80, 4, 4, 200),
+        Ipv4Addr::new(80, 4, 4, 200),
         3,
         10,
     );
@@ -399,6 +513,65 @@ fn allowed_fast_set_follows_bep_6_for_ipv4_only() {
         reserved: fast(),
     });
     assert_eq!(sent(&fx, 2), [Message::HaveAll]);
+}
+
+#[test]
+fn a_piece_completed_later_is_offered_as_allowed_fast() {
+    let mut c = config();
+    c.allowed_fast = 1;
+    c.upload_slots = 0;
+    c.optimistic_unchoke = false;
+    let mut h = Harness::with_have(c, &[]);
+    let fx = h.accept(1, fast());
+    assert_eq!(sent(&fx, 1), [Message::HaveNone]);
+    let v6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 6881));
+    h.ev(Event::PeerAccepted {
+        peer: PeerKey(2),
+        addr: v6,
+        reserved: fast(),
+    });
+    let set = dravity_wire::allowed_fast_set(
+        &InfoHash::new([0xaa; 20]),
+        Ipv4Addr::new(10, 0, 1, 1),
+        3,
+        1,
+    );
+    let in_set = set[0];
+    let outside = (0..3).find(|p| *p != in_set).expect("another piece");
+    let fx = h.ev(Event::PieceHashed {
+        piece: outside,
+        ok: true,
+    });
+    assert!(sent(&fx, 1).contains(&Message::Have { piece: outside }));
+    assert!(
+        !sent(&fx, 1)
+            .iter()
+            .any(|m| matches!(m, Message::AllowedFast { .. }))
+    );
+    assert!(
+        !sent(&fx, 2)
+            .iter()
+            .any(|m| matches!(m, Message::AllowedFast { .. }))
+    );
+    let fx = h.ev(Event::PieceHashed {
+        piece: in_set,
+        ok: true,
+    });
+    assert!(sent(&fx, 1).contains(&Message::Have { piece: in_set }));
+    assert!(sent(&fx, 1).contains(&Message::AllowedFast { piece: in_set }));
+    assert!(
+        !sent(&fx, 2)
+            .iter()
+            .any(|m| matches!(m, Message::AllowedFast { .. }))
+    );
+    // Choked, and only the offered piece may be requested.
+    assert_eq!(
+        reads(&h.msg(1, Message::Request(req(in_set, 0, BLOCK_SIZE)))).len(),
+        1
+    );
+    let refused = h.msg(1, Message::Request(req(outside, 0, BLOCK_SIZE)));
+    assert!(reads(&refused).is_empty());
+    assert!(sent(&refused, 1).contains(&Message::Reject(req(outside, 0, BLOCK_SIZE))));
 }
 
 /// A downloading torrent (no pieces) with fast peer 1 that has everything.
@@ -571,6 +744,31 @@ fn snubbing_peers_lose_their_slot() {
 }
 
 #[test]
+fn a_snubbed_peer_keeps_the_optimistic_slot() {
+    let mut c = config();
+    c.upload_slots = 1;
+    let mut h = Harness::with_have(c, &[0]);
+    h.connect(1, Reserved::new());
+    h.connect(2, Reserved::new());
+    h.msg(1, Message::HaveAll);
+    h.msg(1, Message::Interested);
+    h.msg(2, Message::Interested);
+    feed(&mut h, 1, 1);
+    let mut choked = false;
+    for _ in 0..8 {
+        let fx = h.advance(Duration::from_secs(10));
+        if unchoked(&fx, 1) == Some(false) {
+            choked = true;
+        }
+        for p in 1..=2 {
+            h.msg(p, Message::KeepAlive);
+        }
+    }
+    assert!(!choked, "the optimistic slot stays with the snubbed peer");
+    assert_eq!(h.t.stats().unchoked, 2);
+}
+
+#[test]
 fn a_seed_keeps_stable_slots_and_drops_other_seeds() {
     let mut c = config();
     c.upload_slots = 1;
@@ -665,6 +863,24 @@ fn fail_piece_zero(h: &mut Harness, senders: &[u64]) -> Vec<Effect> {
     })
 }
 
+/// Fails piece 0 again from peer 1, which already advertised the piece.
+fn fail_piece_zero_again(h: &mut Harness) -> Vec<Effect> {
+    for r in [req(0, 0, BLOCK_SIZE), req(0, BLOCK_SIZE, BLOCK_SIZE)] {
+        h.msg(
+            1,
+            Message::Piece {
+                piece: r.piece,
+                offset: r.offset,
+                data: Bytes::from(vec![0; r.length as usize]),
+            },
+        );
+    }
+    h.ev(Event::PieceHashed {
+        piece: 0,
+        ok: false,
+    })
+}
+
 #[test]
 fn the_only_sender_of_a_bad_piece_is_banned() {
     let mut c = config();
@@ -742,6 +958,70 @@ fn shared_bad_pieces_need_two_strikes() {
     );
     assert_eq!(h.t.stats().banned, 0);
     assert_eq!(h.t.stats().peers, 2);
+}
+
+#[test]
+fn strikes_expire_after_a_quiet_interval() {
+    let mut c = config();
+    c.hash_fail_quiet = Duration::from_secs(60);
+    c.max_requests_per_peer = 2;
+    c.initial_requests_per_peer = 2;
+    let mut h = Harness::with_have(c, &[]);
+    h.connect(1, Reserved::new());
+    let fx = fail_piece_zero(&mut h, &[1]);
+    assert!(!disconnects(&fx, 1));
+    assert_eq!(h.t.stats().banned, 0);
+    h.advance(Duration::from_secs(120));
+    // The same peer sends the piece twice more. The quiet gap drops the
+    // first strikes, so only the two fresh ones reach the ban.
+    let fx = fail_piece_zero_again(&mut h);
+    assert!(!disconnects(&fx, 1), "the first strikes went quiet");
+    assert_eq!(h.t.stats().banned, 0);
+    let fx = fail_piece_zero_again(&mut h);
+    assert!(disconnects(&fx, 1));
+    assert_eq!(h.t.stats().banned, 1);
+}
+
+#[test]
+fn ipv4_mapped_address_shares_the_ban() {
+    let mut c = config();
+    c.max_requests_per_peer = 2;
+    c.initial_requests_per_peer = 2;
+    let mut h = Harness::with_have(c, &[]);
+    let v4 = Ipv4Addr::new(10, 9, 8, 7);
+    let mapped = SocketAddr::new(IpAddr::V6(v4.to_ipv6_mapped()), 40000);
+    let plain = SocketAddr::from((v4, 6881));
+    h.ev(Event::PeerConnected {
+        peer: PeerKey(1),
+        addr: mapped,
+        reserved: Reserved::new(),
+    });
+    let fx = fail_piece_zero(&mut h, &[1]);
+    assert!(!disconnects(&fx, 1));
+    assert_eq!(h.t.stats().banned, 0);
+    h.ev(Event::PeerConnected {
+        peer: PeerKey(2),
+        addr: plain,
+        reserved: Reserved::new(),
+    });
+    let fx = fail_piece_zero(&mut h, &[2]);
+    assert!(fx.contains(&Effect::Alert(Alert::PeerBanned { ip: IpAddr::V4(v4) })));
+    assert!(disconnects(&fx, 1) && disconnects(&fx, 2));
+    assert_eq!(h.t.stats().banned, 1);
+    let fx = h.ev(Event::AddPeers {
+        peers: vec![plain, mapped, addr(5)],
+    });
+    assert!(fx.contains(&Effect::Connect { addr: addr(5) }));
+    assert!(
+        !fx.iter()
+            .any(|e| matches!(e, Effect::Connect { addr } if addr.ip() == IpAddr::V4(v4) || addr.ip() == mapped.ip()))
+    );
+    let fx = h.ev(Event::PeerAccepted {
+        peer: PeerKey(8),
+        addr: SocketAddr::new(IpAddr::V6(v4.to_ipv6_mapped()), 40001),
+        reserved: Reserved::new(),
+    });
+    assert!(disconnects(&fx, 8));
 }
 
 #[test]
@@ -853,7 +1133,100 @@ fn incoming_peers_are_refused_while_idle_and_when_full() {
 }
 
 #[test]
-fn a_failed_upload_read_stops_the_torrent() {
+fn a_seed_retries_failed_dials_and_dropped_peers() {
+    let mut c = config();
+    c.peer_retry = Duration::from_secs(15);
+    let mut h = Harness::seed(c);
+    assert_eq!(h.t.status(), TorrentStatus::Finished);
+    h.ev(Event::AddPeers {
+        peers: vec![addr(1)],
+    });
+    let fx = h.ev(Event::PeerConnectFailed {
+        addr: addr(1),
+        retry: true,
+    });
+    assert!(
+        !fx.iter().any(|e| matches!(e, Effect::Connect { .. })),
+        "a failure is not redialed in the same turn"
+    );
+    assert_eq!(h.t.stats().known_peers, 1);
+    assert!(
+        !h.advance(Duration::from_secs(14))
+            .iter()
+            .any(|e| matches!(e, Effect::Connect { addr: peer } if *peer == addr(1)))
+    );
+    assert!(
+        h.advance(Duration::from_secs(1))
+            .contains(&Effect::Connect { addr: addr(1) })
+    );
+
+    let mut h = Harness::seed(config());
+    h.accept(1, Reserved::new());
+    h.ev(Event::PeerDisconnected { peer: PeerKey(1) });
+    assert_eq!(h.t.stats().peers, 0);
+    assert!(
+        h.advance(h.t.config().peer_retry)
+            .contains(&Effect::Connect { addr: addr(1) })
+    );
+}
+
+#[test]
+fn a_retry_waiting_at_finish_is_dialed_while_seeding() {
+    let mut c = config();
+    c.peer_retry = Duration::from_secs(20);
+    let mut h = Harness::with_have(c, &[0, 1]);
+    assert_eq!(h.t.status(), TorrentStatus::Downloading);
+    h.ev(Event::AddPeers {
+        peers: vec![addr(9)],
+    });
+    h.ev(Event::PeerConnectFailed {
+        addr: addr(9),
+        retry: true,
+    });
+    let fx = h.ev(Event::PieceHashed { piece: 2, ok: true });
+    assert!(fx.contains(&Effect::Alert(Alert::Finished)));
+    assert_eq!(h.t.status(), TorrentStatus::Finished);
+    assert!(
+        !h.advance(Duration::from_secs(19))
+            .iter()
+            .any(|e| matches!(e, Effect::Connect { addr: peer } if *peer == addr(9)))
+    );
+    assert!(
+        h.advance(Duration::from_secs(1))
+            .contains(&Effect::Connect { addr: addr(9) })
+    );
+}
+
+#[test]
+fn a_failed_upload_read_rejects_and_keeps_seeding() {
+    let mut h = Harness::seed(config());
+    h.accept(1, fast());
+    h.msg(1, Message::Interested);
+    let fx = h.msg(1, Message::Request(req(0, 0, BLOCK_SIZE)));
+    let (_, b) = reads(&fx)[0];
+    let fx = h.ev(Event::ReadFailed {
+        peer: PeerKey(1),
+        block: b,
+        error: "gone".into(),
+    });
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        Effect::Alert(Alert::UploadFailed { piece: 0, message }) if message == "gone"
+    )));
+    assert!(sent(&fx, 1).contains(&Message::Reject(req(0, 0, BLOCK_SIZE))));
+    assert_eq!(h.t.status(), TorrentStatus::Finished);
+    assert_eq!(h.t.stats().pending_reads, 0);
+    assert!(!fx.iter().any(|e| matches!(
+        e,
+        Effect::Announce {
+            event: AnnounceEvent::Stopped,
+            ..
+        }
+    )));
+    // The same block can be asked for again, and another peer is unaffected.
+    let fx = h.msg(1, Message::Request(req(0, 0, BLOCK_SIZE)));
+    assert_eq!(reads(&fx), [(1, b)]);
+
     let mut h = Harness::seed(config());
     h.accept(1, Reserved::new());
     h.msg(1, Message::Interested);
@@ -865,15 +1238,8 @@ fn a_failed_upload_read_stops_the_torrent() {
         error: "gone".into(),
     });
     assert!(
-        fx.iter()
-            .any(|e| matches!(e, Effect::Alert(Alert::Error { .. })))
+        !sent(&fx, 1).contains(&Message::Reject(req(0, 0, BLOCK_SIZE))),
+        "without the fast extension the request is dropped"
     );
-    assert_eq!(h.t.status(), TorrentStatus::Stopped);
-    assert!(fx.iter().any(|e| matches!(
-        e,
-        Effect::Announce {
-            event: AnnounceEvent::Stopped,
-            ..
-        }
-    )));
+    assert_eq!(h.t.status(), TorrentStatus::Finished);
 }

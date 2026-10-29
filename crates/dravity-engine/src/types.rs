@@ -123,10 +123,12 @@ pub struct Config {
     /// Time between two changes of the optimistic unchoke.
     pub optimistic_unchoke_interval: Duration,
     /// A peer that holds our requests and sends no block for this long is
-    /// snubbing us: it loses its regular slot (anti-snubbing).
+    /// snubbing us: it loses its regular slot (anti-snubbing) and can still
+    /// receive the optimistic unchoke.
     pub snub_timeout: Duration,
     /// Upload rate limit in bytes per second (`None`: unlimited). Paces
-    /// block reads with a token bucket.
+    /// block reads with a token bucket. A read that is choked, cancelled,
+    /// or dropped before the bytes go out returns its tokens.
     pub upload_rate_limit: Option<u64>,
     /// Requests from one peer we queue before refusing more. Advertised as
     /// `reqq` in our extension handshake.
@@ -284,8 +286,9 @@ pub enum Event {
         /// Block data.
         data: Bytes,
     },
-    /// An [`Effect::ReadBlock`] failed. Fatal: a piece we verified cannot be
-    /// read back.
+    /// An [`Effect::ReadBlock`] failed. The request is dropped and, when the
+    /// peer speaks the fast extension, rejected. The torrent keeps running.
+    /// A failure of storage itself is [`Event::StorageFailed`].
     ReadFailed {
         /// The peer that asked for it.
         peer: PeerKey,
@@ -418,6 +421,14 @@ pub enum Alert {
     },
     /// An announce failed; it will be retried.
     TrackerError {
+        /// Cause.
+        message: String,
+    },
+    /// A block could not be read back for upload. The request is dropped
+    /// and the torrent keeps running.
+    UploadFailed {
+        /// Piece that could not be read.
+        piece: u32,
         /// Cause.
         message: String,
     },

@@ -71,6 +71,12 @@ impl TokenBucket {
             false
         }
     }
+
+    /// Puts `n` tokens back, never above capacity. A read that was charged
+    /// and then not sent (cancelled, choked, or dropped) returns what it took.
+    pub fn refund(&mut self, n: u64) {
+        self.tokens = self.tokens.saturating_add(n).min(self.capacity);
+    }
 }
 
 #[cfg(test)]
@@ -94,5 +100,16 @@ mod tests {
         b.refill(t0 + Duration::from_secs(100));
         assert_eq!(b.available(), 10);
         assert_eq!(b.rate(), 3);
+    }
+
+    #[test]
+    fn refund_restores_tokens_up_to_capacity() {
+        let t0 = Instant::now();
+        let mut b = TokenBucket::new(100, 50, t0);
+        assert!(b.try_take(40));
+        b.refund(10);
+        assert_eq!(b.available(), 20);
+        b.refund(1_000);
+        assert_eq!(b.available(), 50);
     }
 }

@@ -342,6 +342,12 @@ async fn download(
                 }
                 let _ = writeln!(std::io::stderr(), "tracker: {message}");
             }
+            Alert::UploadFailed { piece, message } => {
+                if tty {
+                    let _ = writeln!(std::io::stderr());
+                }
+                let _ = writeln!(std::io::stderr(), "upload: piece {piece}: {message}");
+            }
             Alert::Finished if !complete => {
                 complete = true;
                 if !seed {

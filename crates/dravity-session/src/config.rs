@@ -60,6 +60,11 @@ pub struct SessionConfig {
     /// torrent saves its verified pieces on stop and, on the next start,
     /// skips the full check if no file changed since. `None` disables it.
     pub resume_dir: Option<PathBuf>,
+    /// Directory for session state ([`crate::persist`]): the torrents of
+    /// the session, their directories, file priorities and paused flags, so
+    /// [`crate::Session::restore`] can bring them back after a restart.
+    /// `None` keeps nothing.
+    pub state_dir: Option<PathBuf>,
 }
 
 impl Default for SessionConfig {
@@ -83,6 +88,7 @@ impl Default for SessionConfig {
             dht: Some(DhtConfig::default()),
             dht_lookup_timeout: Duration::from_secs(30),
             resume_dir: None,
+            state_dir: None,
         }
     }
 }

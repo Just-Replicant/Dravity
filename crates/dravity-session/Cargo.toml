@@ -13,6 +13,7 @@ publish.workspace = true
 
 [dependencies]
 bytes.workspace = true
+dravity-bencode.workspace = true
 dravity-core.workspace = true
 dravity-dht.workspace = true
 dravity-engine.workspace = true
@@ -30,7 +31,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-dravity-bencode.workspace = true
+proptest.workspace = true
 sha1.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }

@@ -28,6 +28,29 @@ pub enum SessionError {
     /// are not supported yet.
     #[error("magnet link has no v1 (btih) info-hash")]
     MagnetWithoutV1Hash,
+    /// The torrent is not in the session.
+    #[error("torrent {0} is not in the session")]
+    Unknown(InfoHash),
+    /// The torrent's metadata (a magnet link's `info`) is not known yet.
+    #[error("the metadata of torrent {0} is not known yet")]
+    NoMetadata(InfoHash),
+    /// No such file in the torrent (or a padding file).
+    #[error("no file with index {0}")]
+    NoSuchFile(usize),
+    /// File priorities do not have one entry per file.
+    #[error("expected {expected} file priorities, got {got}")]
+    FileCount {
+        /// Files in the torrent.
+        expected: usize,
+        /// Priorities given.
+        got: usize,
+    },
+    /// The session has no state directory ([`crate::SessionConfig::state_dir`]).
+    #[error("the session has no state directory")]
+    NoStateDir,
+    /// A file-system operation failed.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     /// A custom storage backend was given for a magnet link, whose size is
     /// unknown until the metadata arrives.
     #[error("custom storage is not supported for magnet links")]

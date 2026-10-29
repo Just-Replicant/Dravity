@@ -505,6 +505,7 @@ dependencies = [
  "dravity-wire",
  "fastrand",
  "futures-util",
+ "proptest",
  "sha1",
  "socket2",
  "tempfile",

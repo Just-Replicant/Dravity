@@ -24,7 +24,7 @@
 //! request are read from storage on the blocking pool
 //! ([`Effect::ReadBlock`]) and reported back as [`Event::BlockRead`].
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -34,7 +34,7 @@ use bytes::{Bytes, BytesMut};
 use dravity_core::{BlockRef, InfoHash, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{
-    Alert, AnnounceEvent, Bitfield, Config, Effect, Event, MetadataState, PeerKey, Stats,
+    Alert, AnnounceEvent, Bitfield, Config, Effect, Event, MetadataState, PeerKey, Priority, Stats,
     TorrentState, TorrentStatus,
 };
 use dravity_storage::{
@@ -48,9 +48,12 @@ use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::SessionAlert;
+use crate::catalog::{Catalog, EntrySource};
 use crate::config::SessionConfig;
+use crate::files::{self, FileProgress};
 use crate::listen::UtpSockets;
 use crate::peer::{self, PeerCommand, PeerParams};
+use crate::persist::Persister;
 use crate::stream::PeerStream;
 
 /// Tracker tiers (BEP 12), shared with announce tasks so a tracker that
@@ -91,12 +94,47 @@ pub(crate) struct Accepted {
     pub(crate) leftover: BytesMut,
 }
 
-/// Commands from [`TorrentHandle`](crate::TorrentHandle) and the listener.
+/// A torrent's content, once its metadata is known.
+#[derive(Debug, Clone)]
+pub(crate) struct ContentRef {
+    pub(crate) metainfo: Arc<Metainfo>,
+    pub(crate) storage: Arc<dyn Storage>,
+}
+
+/// A progress snapshot with per-file detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TorrentProgress {
+    /// Torrent-wide numbers.
+    pub stats: Stats,
+    /// Per-file progress and priority; `None` until the metadata of a
+    /// magnet link is known.
+    pub files: Option<Vec<FileProgress>>,
+}
+
+/// Commands from [`TorrentHandle`](crate::TorrentHandle), streams and the
+/// listener.
 #[derive(Debug)]
 pub(crate) enum Command {
     Stats(oneshot::Sender<Stats>),
+    Progress(oneshot::Sender<TorrentProgress>),
     AddPeers(Vec<SocketAddr>),
     Incoming(Accepted),
+    /// One priority per file (already validated against the metadata, or
+    /// kept until it arrives).
+    SetFilePriorities(Vec<Priority>),
+    Content(oneshot::Sender<Option<ContentRef>>),
+    /// Answer once `piece` is verified (dropped if the torrent stops).
+    WaitPiece {
+        piece: u32,
+        reply: oneshot::Sender<()>,
+    },
+    /// A stream's urgent window, replacing its previous one.
+    Stream {
+        id: u64,
+        pieces: Vec<u32>,
+    },
+    CloseStream(u64),
     Stop(oneshot::Sender<()>),
 }
 
@@ -115,6 +153,10 @@ pub(crate) struct TorrentContext {
     pub(crate) listen_port: Option<u16>,
     /// uTP sockets for dialing (empty without a listener or uTP).
     pub(crate) utp: UtpSockets,
+    /// The session's torrents, updated when a magnet's metadata arrives.
+    pub(crate) catalog: Catalog,
+    /// Session state writer, with a state directory.
+    pub(crate) persist: Option<Persister>,
 }
 
 impl TorrentContext {
@@ -217,6 +259,13 @@ pub(crate) struct TorrentTask {
     /// Block writes and piece hashes. Drained on stop, before resume data
     /// is stamped, so a write cannot land after the stamp.
     disk: JoinSet<()>,
+    /// File priorities: one per file once the metadata is known, otherwise
+    /// as given (applied, if they fit, when it arrives).
+    file_priorities: Vec<Priority>,
+    /// Readers waiting for a piece.
+    waiters: HashMap<u32, Vec<oneshot::Sender<()>>>,
+    /// Urgent windows of open streams.
+    streams: BTreeMap<u64, Vec<u32>>,
 }
 
 impl std::fmt::Debug for TorrentTask {
@@ -232,13 +281,19 @@ impl TorrentTask {
     pub(crate) fn new(
         ctx: TorrentContext,
         source: Source,
+        file_priorities: Vec<Priority>,
         commands: mpsc::Receiver<Command>,
     ) -> Self {
+        let mut file_priorities = file_priorities;
         let (phase, content, download_dir) = match source {
             Source::Torrent { metainfo, storage } => {
                 let config = ctx.engine_config(metainfo.info().is_private());
+                file_priorities = files::normalize(metainfo.info(), &file_priorities)
+                    .unwrap_or_else(|| vec![Priority::Normal; metainfo.info().files().len()]);
+                let pieces = files::piece_priorities(metainfo.info(), &file_priorities);
                 let state = TorrentState::new(*metainfo.info().layout(), config)
-                    .with_info_hash(ctx.info_hash);
+                    .with_info_hash(ctx.info_hash)
+                    .with_priorities(&pieces);
                 (
                     Phase::Download(Box::new(state)),
                     Some(Content { metainfo, storage }),
@@ -267,7 +322,120 @@ impl TorrentTask {
             hash_slots,
             background: JoinSet::new(),
             disk: JoinSet::new(),
+            file_priorities,
+            waiters: HashMap::new(),
+            streams: BTreeMap::new(),
         }
+    }
+
+    /// Piece priorities for `content` from the file priorities.
+    fn piece_priorities(&self, content: &Content) -> Vec<Priority> {
+        files::piece_priorities(content.metainfo.info(), &self.file_priorities)
+    }
+
+    /// Handles a command that does not become an engine event; returns the
+    /// event for those that do.
+    fn command(&mut self, command: Command) -> Option<Event> {
+        match command {
+            Command::Stats(reply) => {
+                let _ = reply.send(self.phase.stats());
+                None
+            }
+            Command::Progress(reply) => {
+                let files = match (&self.content, &self.phase) {
+                    (Some(content), Phase::Download(state)) => Some(files::progress(
+                        content.metainfo.info(),
+                        state.have(),
+                        &self.file_priorities,
+                    )),
+                    _ => None,
+                };
+                let _ = reply.send(TorrentProgress {
+                    stats: self.phase.stats(),
+                    files,
+                });
+                None
+            }
+            Command::AddPeers(peers) => Some(Event::AddPeers { peers }),
+            Command::Incoming(accepted) => Some(self.accept(accepted)),
+            Command::SetFilePriorities(priorities) => {
+                self.file_priorities = priorities;
+                let content = self.content.clone()?;
+                Some(Event::SetPriorities {
+                    priorities: self.piece_priorities(&content),
+                })
+            }
+            Command::Content(reply) => {
+                let _ = reply.send(self.content.as_ref().map(|c| ContentRef {
+                    metainfo: Arc::clone(&c.metainfo),
+                    storage: Arc::clone(&c.storage),
+                }));
+                None
+            }
+            Command::WaitPiece { piece, reply } => {
+                if self.has_piece(piece) {
+                    let _ = reply.send(());
+                } else {
+                    self.waiters.entry(piece).or_default().push(reply);
+                }
+                None
+            }
+            Command::Stream { id, pieces } => {
+                self.streams.insert(id, pieces);
+                Some(self.urgent_event())
+            }
+            Command::CloseStream(id) => {
+                self.streams.remove(&id)?;
+                Some(self.urgent_event())
+            }
+            // Handled by the run loop.
+            Command::Stop(_) => None,
+        }
+    }
+
+    fn has_piece(&self, piece: u32) -> bool {
+        match &self.phase {
+            Phase::Download(state) => state.have().get(piece),
+            Phase::Metadata(_) => false,
+        }
+    }
+
+    /// Every open stream's window, oldest stream first.
+    fn urgent_event(&self) -> Event {
+        let mut pieces = Vec::new();
+        for window in self.streams.values() {
+            for &piece in window {
+                if !pieces.contains(&piece) {
+                    pieces.push(piece);
+                }
+            }
+        }
+        Event::SetUrgent { pieces }
+    }
+
+    /// Answers readers whose piece is now verified; drops readers of pieces
+    /// that cannot exist.
+    fn wake_waiters(&mut self) {
+        if self.waiters.is_empty() {
+            return;
+        }
+        let Phase::Download(state) = &self.phase else {
+            return;
+        };
+        let have = state.have();
+        self.waiters.retain(|&piece, waiting| {
+            if piece >= have.len() {
+                return false;
+            }
+            if have.get(piece) {
+                for reply in waiting.drain(..) {
+                    let _ = reply.send(());
+                }
+                return false;
+            }
+            waiting.retain(|reply| !reply.is_closed());
+            !waiting.is_empty()
+        });
     }
 
     /// Runs until the torrent stops, then flushes storage, writes resume
@@ -289,16 +457,14 @@ impl TorrentTask {
             }
             let event = tokio::select! {
                 command = self.commands.recv() => match command {
-                    Some(Command::Stats(reply)) => {
-                        let _ = reply.send(self.phase.stats());
-                        continue;
-                    }
-                    Some(Command::AddPeers(peers)) => Event::AddPeers { peers },
-                    Some(Command::Incoming(accepted)) => self.accept(accepted),
                     Some(Command::Stop(ack)) => {
                         stop_ack = Some(ack);
                         Event::Stop
                     }
+                    Some(command) => match self.command(command) {
+                        Some(event) => event,
+                        None => continue,
+                    },
                     // Every handle and the session are gone.
                     None => Event::Stop,
                 },
@@ -389,7 +555,8 @@ impl TorrentTask {
         let mut config = self.ctx.engine_config(content.metainfo.info().is_private());
         config.check_existing = false;
         let state = TorrentState::with_have(*content.metainfo.info().layout(), have, config)
-            .with_info_hash(self.ctx.info_hash);
+            .with_info_hash(self.ctx.info_hash)
+            .with_priorities(&self.piece_priorities(content));
         Some(match info {
             Some(info) => state.with_info_bytes(info.clone()),
             None => state,
@@ -439,6 +606,7 @@ impl TorrentTask {
         if let Some(info) = self.metadata.take() {
             self.start_download(info).await;
         }
+        self.wake_waiters();
     }
 
     fn alert(&self, alert: Alert) {
@@ -477,6 +645,12 @@ impl TorrentTask {
             Ok(storage) => Arc::new(storage),
             Err(e) => return self.fail(format!("setting up storage: {e}")),
         };
+        self.file_priorities = files::normalize(metainfo.info(), &self.file_priorities)
+            .unwrap_or_else(|| {
+                tracing::warn!("file priorities do not match the metadata; using normal");
+                vec![Priority::Normal; metainfo.info().files().len()]
+            });
+        self.record_metadata(&metainfo);
         let content = Content { metainfo, storage };
         let info_meta = content.metainfo.info();
         let private = info_meta.is_private();
@@ -487,7 +661,8 @@ impl TorrentTask {
                 self.ctx.engine_config(info_meta.is_private()),
             )
             .with_info_hash(self.ctx.info_hash)
-            .with_info_bytes(info),
+            .with_info_bytes(info)
+            .with_priorities(&self.piece_priorities(&content)),
         };
         self.content = Some(content);
         // Swap in a throwaway (allocation-free) metadata state to take the
@@ -544,6 +719,28 @@ impl TorrentTask {
             .collect();
         if !known.is_empty() {
             self.local.push_back(Event::AddPeers { peers: known });
+        }
+    }
+
+    /// A magnet's metadata arrived: the catalog (and the state directory)
+    /// now hold the torrent, so a resume or restart does not fetch it again.
+    fn record_metadata(&self, metainfo: &Arc<Metainfo>) {
+        let record = {
+            let mut catalog = self
+                .ctx
+                .catalog
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(entry) = catalog.get_mut(&self.ctx.info_hash) else {
+                return;
+            };
+            entry.source = EntrySource::Torrent(Arc::clone(metainfo));
+            entry.priorities.clone_from(&self.file_priorities);
+            entry.record(self.ctx.info_hash)
+        };
+        if let Some(persist) = &self.ctx.persist {
+            persist.save_torrent(metainfo);
+            persist.save_record(&record);
         }
     }
 

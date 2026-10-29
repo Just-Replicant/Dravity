@@ -128,8 +128,9 @@ verified on loopback and against fakes.
 | Item | Phase |
 |---|---|
 | IPv6 DHT (BEP 32), BEP 5 `port` messages | when the DHT backend supports them |
-| PCP (RFC 6887), IPv6 pinholes, announcing a mapped port that differs from the listen port | 4 |
-| `suggest` (BEP 6) used for picking | 4 |
-| uTP tail-loss probe; path MTU discovery (fixed 1382-byte payload) | 4 |
+| PCP (RFC 6887), IPv6 pinholes | 5 (moved from 4) |
+| Announcing a mapped port that differs from the listen port | done in 4 ([phase-4.md](phase-4.md)) |
+| `suggest` (BEP 6) used for picking | done in 4 |
+| uTP tail-loss probe; path MTU discovery (fixed 1382-byte payload) | 5 (moved from 4) |
 | Directory symlink race on Windows (no `openat`; checked, then opened without following reparse points) | 5, with the io_uring/platform backends |
-| Peer banning by other evidence (bad messages, ban lists) | 4 |
+| Peer banning by other evidence (bad messages, ban lists) | 5 (moved from 4) |

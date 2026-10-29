@@ -6,15 +6,17 @@ dispatch effects. CLI and HTTP send commands and read alerts. Tokio is the
 default runtime. See [`docs/rust-torrent-plan.md`](docs/rust-torrent-plan.md)
 for the full architecture, comparison with existing clients, and roadmap.
 
-> **Status: Phase 3 (good citizen) complete.** Dravity downloads and
-> seeds v1 `.torrent` files and magnet links (metadata over BEP 9/10),
-> finding peers through HTTP/UDP trackers (BEP 12 tiers), the mainline DHT
-> and PEX. It accepts incoming peers over TCP and uTP (BEP 29, LEDBAT) on
-> IPv4 and IPv6, maps its port with NAT-PMP or UPnP, chokes tit-for-tat
-> with an optimistic unchoke, speaks the fast extension (BEP 6), bans peers
-> that send corrupt data and refuses hostile paths. See
-> [`docs/phase-1.md`](docs/phase-1.md), [`docs/phase-2.md`](docs/phase-2.md)
-> and [`docs/phase-3.md`](docs/phase-3.md).
+> **Status: Phase 4 (product surface) complete, except the Web UI.**
+> Dravity downloads and seeds v1 `.torrent` files and magnet links
+> (metadata over BEP 9/10), finding peers through HTTP/UDP trackers (BEP 12
+> tiers), the mainline DHT and PEX. It accepts incoming peers over TCP and
+> uTP (BEP 29, LEDBAT) on IPv4 and IPv6, maps its port with NAT-PMP or UPnP,
+> chokes tit-for-tat, speaks the fast extension (BEP 6), bans peers that
+> send corrupt data and refuses hostile paths. Phase 4 adds file
+> priorities, streaming reads with seek, pause/resume/remove, a persisted
+> session with a watch folder, an HTTP API with Prometheus metrics
+> (`dravity-http`), `dravity serve` and a terminal UI. See
+> [`docs/phase-1.md`](docs/phase-1.md) to [`docs/phase-4.md`](docs/phase-4.md).
 
 ## Workspace
 
@@ -23,15 +25,16 @@ for the full architecture, comparison with existing clients, and roadmap.
 | [`dravity-bencode`](crates/dravity-bencode) | ✅ Phase 0 | Zero-copy bencode `Value`, serde `Deserializer`/`Serializer`, `RawValue` for exact byte capture, depth and item caps |
 | [`dravity-core`](crates/dravity-core) | ✅ Phase 3 | `InfoHash` (v1, v2 type), `PeerId`, `.torrent` parsing (`Metainfo`, also from fetched `info` bytes), magnet links, compact peers, piece/block/file math, per-platform path-safety checks |
 | [`dravity-wire`](crates/dravity-wire) | ✅ Phase 3 | Handshake + reserved bits, BEP 3/5/6 messages and allowed fast set, BEP 10 extended handshake, BEP 9 `ut_metadata`, BEP 11 `ut_pex`, streaming zero-copy decoder |
-| [`dravity-engine`](crates/dravity-engine) | ✅ Phase 3 | Sans-IO `TorrentState::update(now, Event) -> Vec<Effect>`: rarest-first picker, AIMD request window, endgame + block stealing, rate limits, choker (tit-for-tat + optimistic unchoke), seeding, BEP 6, bans, PEX, metadata serving, data check, tracker/DHT scheduling; `MetadataState` for magnets |
+| [`dravity-engine`](crates/dravity-engine) | ✅ Phase 4 | Sans-IO `TorrentState::update(now, Event) -> Vec<Effect>`: rarest-first picker with piece priorities and urgent pieces, AIMD request window, endgame + block stealing, rate limits, choker (tit-for-tat + optimistic unchoke), seeding, BEP 6, bans, PEX, metadata serving, data check, tracker/DHT scheduling; `MetadataState` for magnets |
 | [`dravity-storage`](crates/dravity-storage) | ✅ Phase 3 | `Storage` trait; filesystem backend (LRU FD cache, positional I/O, files opened without following symlinks) and memory backend; block reads; piece verification; fastresume data with file stamps |
 | [`dravity-tracker`](crates/dravity-tracker) | ✅ Phase 2 | HTTP (BEP 3/7/23) and UDP (BEP 15, cached connection ids) announce: sans-IO codecs + async client (rustls) |
 | [`dravity-dht`](crates/dravity-dht) | ✅ Phase 2 | Mainline DHT (BEP 5) peer lookups and announces, wrapping [`mainline`](https://crates.io/crates/mainline) |
-| [`dravity-session`](crates/dravity-session) | ✅ Phase 3 | The only I/O driver: per-torrent owner task on Tokio, peer tasks, TCP/uTP listener (IPv4 + IPv6), disk/hash offload, uploads, magnets, DHT, port mapping, fastresume, BEP 12 tiers, alerts |
-| [`dravity-cli`](crates/dravity-cli) | ✅ Phase 3 | `dravity download` / `dravity info` for files and magnet links, seeding with `--seed`; renders alerts, never drives I/O |
+| [`dravity-session`](crates/dravity-session) | ✅ Phase 4 | The only I/O driver: per-torrent owner task on Tokio, peer tasks, TCP/uTP listener (IPv4 + IPv6), disk/hash offload, uploads, magnets, DHT, port mapping, fastresume, BEP 12 tiers, alerts; file priorities, streaming `FileStream`, pause/resume/remove, persisted state + restore, watch folder |
+| [`dravity-http`](crates/dravity-http) | ✅ Phase 4 | axum JSON API over the session: torrents, files, priorities, streaming with `Range`, server-sent alerts, Prometheus `/metrics`, bearer token |
+| [`dravity-cli`](crates/dravity-cli) | ✅ Phase 4 | `dravity download` / `info` / `serve` for files and magnet links, seeding, file selection, ratatui `--tui`; renders alerts, never drives I/O |
 | [`dravity-utp`](crates/dravity-utp) | ✅ Phase 3 | uTP (BEP 29): packet codec, sans-IO connection with LEDBAT congestion control, Tokio socket and streams |
-| [`dravity-portmap`](crates/dravity-portmap) | ✅ Phase 3 | Router port mapping: NAT-PMP (RFC 6886) and UPnP IGD codecs, `PortMapper` that maps, renews and removes |
-| `dravity-http`, … | ⏳ Phase 4+ | See the roadmap |
+| [`dravity-portmap`](crates/dravity-portmap) | ✅ Phase 4 | Router port mapping: NAT-PMP (RFC 6886) and UPnP IGD codecs, `PortMapper` that maps, renews and removes and reports the external port |
+| Web UI, v2/hybrid torrents, … | ⏳ Phase 5+ | See the roadmap |
 
 ## Phase 0 checklist
 
@@ -78,6 +81,20 @@ for the full architecture, comparison with existing clients, and roadmap.
 - [x] Path hardening: per-platform name rules, symlink-free opens on Unix
 - [x] Tests: seeding/choker scripts + proptest, simulated lossy network for uTP, fake NAT-PMP/UPnP routers, loopback swarms (TCP, uTP, IPv6, seeding), CLI seed; fuzz targets `utp_packet`, `portmap_parse`
 
+## Phase 4 checklist
+
+- [x] File priorities (`skip`/`low`/`normal`/`high`) mapped to piece priorities; `Finished` means every wanted piece
+- [x] Streaming seek: `TorrentHandle::open_file` → `FileStream` reads while downloading, urgent readahead window
+- [x] Pause, resume and remove (optionally deleting files, never through symlinks); `Session::list`
+- [x] Session persistence: `SessionConfig::state_dir`, atomic writes off the owner tasks, `Session::restore`
+- [x] Watch folder for `.torrent` and `.magnet` files
+- [x] `dravity-http`: JSON API, file streaming with `Range`, server-sent alerts, bearer token, loopback by default
+- [x] Prometheus `/metrics`
+- [x] TUI (`--tui`, ratatui) and `dravity serve`; `--files` / `--file-priority`
+- [x] Phase 3 leftovers: BEP 6 `suggest` used for picking; announce the router's mapped port
+- [ ] Web UI (not in this phase; the API is ready for one)
+- [x] Tests: engine priority scripts + proptest, loopback session product tests, HTTP API via `tower` oneshot, TUI via `TestBackend`, CLI `serve`; fuzz targets `session_state`, `http_range`
+
 ## Command line
 
 ```sh
@@ -102,6 +119,22 @@ first.
 
 Fastresume data goes to `<output>/.dravity` (`--resume-dir DIR` to move it,
 `--no-resume` to always check existing files).
+
+```sh
+# only files 0 and 2-4 (indices from `dravity info`), file 3 first
+cargo run --release -p dravity-cli -- download example.torrent --files 0,2-4 --file-priority 3=high
+# full-screen terminal UI (q quits, space pauses, tab + s/l/n/h set file priorities)
+cargo run --release -p dravity-cli -- download example.torrent --tui
+# a daemon: saved session, watch folder, HTTP API on 127.0.0.1:9091
+DRAVITY_TOKEN=change-me cargo run --release -p dravity-cli -- serve \
+    --download-dir downloads --watch torrents
+curl -H 'Authorization: Bearer change-me' localhost:9091/api/v1/torrents
+```
+
+`dravity serve` keeps its state in `<download-dir>/.dravity` (`--state-dir`
+to move it), restores it on start, seeds (unless `--no-seed`) and stops on
+Ctrl-C. The API is described in [`docs/phase-4.md`](docs/phase-4.md) and the
+[`dravity-http` docs](crates/dravity-http/src/lib.rs).
 
 `DRAVITY_LOG=dravity_session=debug` enables logging (tracing `EnvFilter` syntax).
 

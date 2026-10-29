@@ -11,7 +11,8 @@ Thanks for helping! A few rules keep the codebase consistent with the
    tasks, or read the clock (the engine takes `now` as an argument).
    `dravity-session` owns the only production loop: poll I/O →
    `update(Event)` → dispatch `Effect`s. Binaries send session commands and
-   read alerts; they never write that loop.
+   read alerts; they never write that loop. `dravity-http` is such a client
+   too: it calls the public session API only.
    I/O crates such as `dravity-dht`, the tracker client, the `dravity-utp`
    socket and the `dravity-portmap` `PortMapper` are called by
    the session only, and keep third-party types (e.g. `mainline`) out of

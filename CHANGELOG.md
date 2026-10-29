@@ -6,6 +6,45 @@ the roadmap phases until the first release.
 
 ## [Unreleased]
 
+### Phase 4 — Product surface
+
+See [`docs/phase-4.md`](docs/phase-4.md) for design notes. The Web UI is
+not part of this phase.
+
+#### Added
+
+- File priorities: `dravity_engine::Priority`, per-piece priorities and
+  urgent pieces in the picker (`Event::SetPriorities`, `Event::SetUrgent`,
+  `Stats::wanted_left`); `AddTorrentOptions::with_file_priorities`,
+  `Session::set_file_priorities`, `Session::set_file_priority`.
+- `TorrentHandle::progress` (`TorrentProgress`, `FileProgress`).
+- Streaming: `TorrentHandle::open_file` returns a seekable `FileStream`
+  that waits for pieces and fetches a readahead window first.
+- `Session::list`, `pause`, `resume`, `remove` (optionally deleting the
+  files), `metainfo`; `AddTorrentOptions::paused`.
+- Session persistence: `SessionConfig::state_dir`, `Session::restore`
+  (`RestoreReport`), `dravity_session::persist`.
+- Watch folder: `Session::watch` (`WatchConfig`, `WatchHandle`).
+- `dravity-http`: JSON API over the session (torrents, files, priorities,
+  peers, pause/resume/delete), file streaming with `Range`, alerts as
+  server-sent events, Prometheus `/metrics`, optional bearer token.
+- CLI: `dravity serve` (restore, seed, `--watch`, `--http`, `--token` /
+  `DRAVITY_TOKEN`), `download --files` and `--file-priority`, `--tui`;
+  `info` numbers the files.
+- BEP 6 `suggest` messages steer piece selection.
+- Announces use the router's external port when NAT-PMP mapped a
+  different one (`dravity_portmap::Status::external_port`).
+- Fuzz targets `session_state`, `http_range`.
+
+#### Changed
+
+- `TorrentStatus::Finished` / `Alert::Finished` mean every *wanted* piece
+  is verified. Trackers get `completed` once, only when every piece is in;
+  a partial download that does not seed announces `stopped`.
+- `TorrentHandle::stop` also removes the torrent from the session (and its
+  saved state); `Session::shutdown` keeps the saved state.
+- CLI networking options are shared by `download` and `serve`.
+
 ### Phase 3 — Good citizen
 
 See [`docs/phase-3.md`](docs/phase-3.md) for design notes.

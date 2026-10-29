@@ -23,19 +23,23 @@ for incoming peers, the upload rate limit and DHT `announce_peer`.
 - **Choker.** Every `unchoke_interval` (10 s) the `upload_slots` (4)
   interested peers that upload fastest to us are unchoked (while seeding:
   those we upload to fastest). A peer that holds our requests and sends
-  nothing for `snub_timeout` (60 s) loses its regular slot. One extra
-  optimistic slot rotates every 30 s to the choked, interested peer that
-  waited longest, so newcomers get their first pieces.
+  nothing for `snub_timeout` (60 s) loses its regular slot and can still
+  hold the optimistic one. One extra optimistic slot rotates every 30 s
+  to the choked, interested peer that waited longest, so newcomers get
+  their first pieces.
 - **Uploads are sans-IO too.** A request from an unchoked peer becomes
   `Effect::ReadBlock`; the session reads on the blocking pool and answers
   `Event::BlockRead` (or `ReadFailed`). At most `max_pending_reads` (64)
   reads are in flight, peers are served round-robin, and a token bucket
-  paces them (`upload_rate_limit`). A peer queues at most
+  paces them (`upload_rate_limit`). Tokens taken when a read is queued are
+  returned when that block is not sent. A peer queues at most
   `max_upload_queue` (250, our `reqq`) requests; with BEP 6 extra requests
   get `reject`, without it they are dropped.
 - **BEP 6.** `have all`/`have none` replace empty or full bitfields, choked
   requests are rejected, and IPv4 peers get the canonical allowed fast set
-  (10 pieces). `suggest` is accepted and ignored.
+  (10 pieces). A piece finished after the handshake is offered to a fast
+  peer whose set includes it, so a choked peer can request it. `suggest`
+  is accepted and ignored.
 - **Seeding.** With `Config::seed` (default) a finished torrent keeps
   accepting and uploading; seed-to-seed connections are closed. The CLI
   exits after the download unless `--seed` is given (then Ctrl-C ends it,
@@ -44,7 +48,10 @@ for incoming peers, the upload rate limit and DHT `announce_peer`.
   from one peer is two strikes, a share of one is one strike, and
   `hash_fail_ban` (4) strikes ban the address. The default forgives one
   corrupt piece (a transient error on the sender, or a shared piece with a
-  bad peer). Bans filter dials, accepts and PEX.
+  bad peer). Strikes are forgotten after `hash_fail_quiet` (one hour) with
+  no new failure, so a shared NAT is not banned for mistakes spread over
+  the download; a ban lasts for the torrent. An IPv4-mapped IPv6 address
+  is the same key as its IPv4 address. Bans filter dials, accepts and PEX.
 - **Listener.** One port for TCP and UDP (uTP), on IPv4 and IPv6
   (`IPV6_V6ONLY`, so both families can use the same port). A port in use
   falls back to a free one; `Session::listen_port` tells which. The accept
@@ -61,15 +68,20 @@ for incoming peers, the upload rate limit and DHT `announce_peer`.
   testable on a simulated network, and adds no dependencies.
 - **Dial order.** TCP first, uTP when TCP fails with a retryable error
   (refused, reset, timeout); `prefer_utp` reverses it.
-- **Port mapping is in-house.** NAT-PMP first (gateway from
-  `/proc/net/route`, else the `.1` address of our subnet), then UPnP IGD via
-  SSDP (`WANIPConnection:2` > `:1` > `WANPPPConnection:1`). A minimal
-  HTTP/1.1 client and a tolerant tag scanner replace an HTTP and an XML
-  crate. Mappings (TCP, plus UDP with uTP) last two hours and are renewed
-  at half that; UPnP error 725 retries with a permanent lease. Shutdown
-  removes them, bounded to five seconds. Failure is normal and only shows
-  in `Session::port_mapping()`. The mapped external port is requested to
-  equal the listen port; we do not announce a different one.
+- **Port mapping is in-house.** NAT-PMP first (the next hop of the IPv4
+  default route: `/proc/net/route` on Linux, `route print -4` on Windows,
+  `route -n get default` on macOS — not the `.1` address of a guessed
+  `/24`, and not skipped on CGNAT), then UPnP IGD via SSDP
+  (`WANIPConnection:2` > `:1` > `WANPPPConnection:1`). A minimal HTTP/1.1
+  client and a tolerant tag scanner replace an HTTP and an XML crate.
+  Mappings (TCP, plus UDP with uTP) last two hours and are renewed at half
+  that; UPnP error 725 retries with a permanent lease. Shutdown removes
+  them, bounded to five seconds. Failure is normal and only shows in
+  `Session::port_mapping()`. The mapped external port is requested to
+  equal the listen port; we do not announce a different one. When NAT-PMP
+  returns another port, a warning is logged. UPnP does not read the
+  external port back, so that mismatch stays invisible. Announcing a
+  mapped port that differs is phase 4.
 - **IPv6.** Dual listeners, IPv6 peers from trackers (BEP 7), PEX
   (`added6`) and dials over TCP and uTP. The BEP 6 allowed fast set is
   IPv4-only, as in the BEP.

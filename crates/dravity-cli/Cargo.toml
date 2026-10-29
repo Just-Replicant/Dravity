@@ -17,10 +17,13 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
+crossterm.workspace = true
 dravity-core.workspace = true
 dravity-engine.workspace = true
+dravity-http.workspace = true
 dravity-session.workspace = true
+ratatui.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tracing-subscriber.workspace = true
 

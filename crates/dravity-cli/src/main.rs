@@ -4,6 +4,9 @@
 //! download loop lives in `dravity-session`.
 
 mod format;
+mod select;
+mod serve;
+mod tui;
 
 use std::io::{IsTerminal, Write};
 use std::net::SocketAddr;
@@ -11,9 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use dravity_core::{Magnet, Metainfo};
-use dravity_engine::{Alert, TorrentStatus};
+use dravity_engine::{Alert, Priority, TorrentStatus};
 use dravity_session::{AddTorrentOptions, ListenConfig, Session, SessionConfig};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -38,42 +41,16 @@ enum Command {
         /// Extra peer to connect to (repeatable), e.g. `10.0.0.2:6881`.
         #[arg(long = "peer", value_name = "ADDR")]
         peers: Vec<SocketAddr>,
-        /// TCP port to accept peers on (0: any free port). A port in use
-        /// falls back to a free one.
-        #[arg(long, default_value_t = 6881)]
-        port: u16,
-        /// Do not accept incoming connections; the port is only reported
-        /// to trackers.
-        #[arg(long)]
-        no_listen: bool,
-        /// Speak TCP only: no uTP (BEP 29) sockets.
-        #[arg(long, conflicts_with = "prefer_utp")]
-        no_utp: bool,
-        /// Dial peers over uTP first, falling back to TCP.
-        #[arg(long)]
-        prefer_utp: bool,
-        /// Do not ask the router (NAT-PMP, UPnP) to forward the port.
-        #[arg(long)]
-        no_port_mapping: bool,
+        /// Download only these files (indices from `dravity info`), e.g.
+        /// `0,2-4`; the others are skipped.
+        #[arg(long, value_name = "LIST", value_parser = select::parse_file_list)]
+        files: Option<select::FileList>,
+        /// Set one file's priority (repeatable): `INDEX=skip|low|normal|high`.
+        #[arg(long = "file-priority", value_name = "INDEX=PRIORITY", value_parser = select::parse_file_priority)]
+        file_priorities: Vec<(usize, Priority)>,
         /// Keep seeding after the download completes, until Ctrl-C.
         #[arg(long)]
         seed: bool,
-        /// Upload rate limit in bytes per second, like `--download-limit`.
-        #[arg(long, value_name = "RATE", value_parser = format::parse_rate)]
-        upload_limit: Option<u64>,
-        /// Peers unchoked (uploaded to) at once, plus one optimistic slot.
-        #[arg(long, default_value_t = 4, value_name = "N")]
-        upload_slots: usize,
-        /// Maximum connected peers.
-        #[arg(long, default_value_t = 50)]
-        max_peers: usize,
-        /// Download rate limit in bytes per second; accepts `K`/`M`/`G`
-        /// suffixes (binary), e.g. `500K` or `2M`.
-        #[arg(long, value_name = "RATE", value_parser = format::parse_rate)]
-        download_limit: Option<u64>,
-        /// Do not use the DHT for peer discovery.
-        #[arg(long)]
-        no_dht: bool,
         /// Directory for fastresume data (defaults to OUTPUT/.dravity).
         #[arg(long, value_name = "DIR", conflicts_with = "no_resume")]
         resume_dir: Option<PathBuf>,
@@ -81,14 +58,120 @@ enum Command {
         #[arg(long)]
         no_resume: bool,
         /// Suppress the progress line.
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "tui")]
         quiet: bool,
+        /// Show a full-screen terminal UI instead of the progress line.
+        #[arg(long)]
+        tui: bool,
+        #[command(flatten)]
+        network: NetworkArgs,
+    },
+    /// Run as a daemon: restore the saved torrents, seed them, take new ones
+    /// from a watch folder and the HTTP API, until Ctrl-C.
+    Serve {
+        /// Where new torrents download to.
+        #[arg(short, long, default_value = ".")]
+        download_dir: PathBuf,
+        /// Session state: the torrents, their settings and fastresume data
+        /// (defaults to DOWNLOAD_DIR/.dravity).
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+        /// Add `.torrent` and `.magnet` files dropped into this directory.
+        #[arg(long, value_name = "DIR")]
+        watch: Option<PathBuf>,
+        /// Address of the HTTP API.
+        #[arg(
+            long,
+            value_name = "ADDR",
+            default_value = "127.0.0.1:9091",
+            conflicts_with = "no_http"
+        )]
+        http: SocketAddr,
+        /// Do not serve the HTTP API.
+        #[arg(long)]
+        no_http: bool,
+        /// Bearer token the HTTP API requires.
+        #[arg(long, env = "DRAVITY_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+        /// Stop uploading once a torrent is complete.
+        #[arg(long)]
+        no_seed: bool,
+        /// Show a full-screen terminal UI.
+        #[arg(long)]
+        tui: bool,
+        #[command(flatten)]
+        network: NetworkArgs,
     },
     /// Show what a `.torrent` file or `magnet:` link contains.
     Info {
         /// Path to a `.torrent` file, or a `magnet:` link.
         torrent: String,
     },
+}
+
+/// Networking options shared by `download` and `serve`.
+#[derive(Debug, Args)]
+struct NetworkArgs {
+    /// TCP port to accept peers on (0: any free port). A port in use
+    /// falls back to a free one.
+    #[arg(long, default_value_t = 6881)]
+    port: u16,
+    /// Do not accept incoming connections; the port is only reported
+    /// to trackers.
+    #[arg(long)]
+    no_listen: bool,
+    /// Speak TCP only: no uTP (BEP 29) sockets.
+    #[arg(long, conflicts_with = "prefer_utp")]
+    no_utp: bool,
+    /// Dial peers over uTP first, falling back to TCP.
+    #[arg(long)]
+    prefer_utp: bool,
+    /// Do not ask the router (NAT-PMP, UPnP) to forward the port.
+    #[arg(long)]
+    no_port_mapping: bool,
+    /// Upload rate limit in bytes per second, like `--download-limit`.
+    #[arg(long, value_name = "RATE", value_parser = format::parse_rate)]
+    upload_limit: Option<u64>,
+    /// Peers unchoked (uploaded to) at once, plus one optimistic slot.
+    #[arg(long, default_value_t = 4, value_name = "N")]
+    upload_slots: usize,
+    /// Maximum connected peers.
+    #[arg(long, default_value_t = 50)]
+    max_peers: usize,
+    /// Download rate limit in bytes per second; accepts `K`/`M`/`G`
+    /// suffixes (binary), e.g. `500K` or `2M`.
+    #[arg(long, value_name = "RATE", value_parser = format::parse_rate)]
+    download_limit: Option<u64>,
+    /// Do not use the DHT for peer discovery.
+    #[arg(long)]
+    no_dht: bool,
+}
+
+impl NetworkArgs {
+    /// A session configuration with these options.
+    fn config(&self) -> SessionConfig {
+        let mut config = SessionConfig::default();
+        config.announce_port = self.port;
+        config.listen = (!self.no_listen).then(|| {
+            let mut listen = ListenConfig::new(self.port);
+            if self.no_utp {
+                listen.utp = None;
+            }
+            listen
+        });
+        config.prefer_utp = self.prefer_utp;
+        if self.no_port_mapping {
+            config.port_mapping = None;
+        }
+        config.engine.upload_slots = self.upload_slots;
+        config.engine.upload_rate_limit = self.upload_limit.filter(|&r| r > 0);
+        config.engine.max_peers = self.max_peers.max(1);
+        config.engine.download_rate_limit = self.download_limit.filter(|&r| r > 0);
+        if self.no_dht {
+            config.dht = None;
+        }
+        config
+    }
 }
 
 fn main() -> ExitCode {
@@ -129,6 +212,14 @@ impl Input {
     }
 }
 
+/// `--tui` draws on stdout and reads keys from stdin.
+fn check_terminal(tui: bool) -> Result<()> {
+    if tui && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        bail!("--tui needs a terminal");
+    }
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Info { torrent } => match load(&torrent)? {
@@ -139,50 +230,77 @@ fn run(cli: Cli) -> Result<()> {
             torrent,
             output,
             peers,
-            port,
-            no_listen,
-            no_utp,
-            prefer_utp,
-            no_port_mapping,
+            files,
+            file_priorities,
             seed,
-            upload_limit,
-            upload_slots,
-            max_peers,
-            download_limit,
-            no_dht,
             resume_dir,
             no_resume,
             quiet,
+            tui,
+            network,
         } => {
+            check_terminal(tui)?;
             let input = load(&torrent)?;
-            let mut config = SessionConfig::default();
-            config.announce_port = port;
-            config.listen = (!no_listen).then(|| {
-                let mut listen = ListenConfig::new(port);
-                if no_utp {
-                    listen.utp = None;
+            let priorities = match &input {
+                Input::File(m) => select::file_priorities(
+                    m.info().files().len(),
+                    files.as_ref().map(|f| f.0.as_slice()),
+                    &file_priorities,
+                )
+                .map_err(anyhow::Error::msg)?,
+                Input::Magnet(_) if files.is_some() || !file_priorities.is_empty() => {
+                    bail!(
+                        "--files and --file-priority need a .torrent file (a magnet's files are unknown until its metadata arrives)"
+                    )
                 }
-                listen
-            });
-            config.prefer_utp = prefer_utp;
-            if no_port_mapping {
-                config.port_mapping = None;
-            }
+                Input::Magnet(_) => Vec::new(),
+            };
+            let mut config = network.config();
             config.engine.seed = seed;
-            config.engine.upload_slots = upload_slots;
-            config.engine.upload_rate_limit = upload_limit.filter(|&r| r > 0);
-            config.engine.max_peers = max_peers.max(1);
-            config.engine.download_rate_limit = download_limit.filter(|&r| r > 0);
-            if no_dht {
-                config.dht = None;
-            }
             config.resume_dir = if no_resume {
                 None
             } else {
                 Some(resume_dir.unwrap_or_else(|| output.join(".dravity")))
             };
+            let options = AddTorrentOptions::new(&output)
+                .with_peers(peers)
+                .with_file_priorities(priorities);
             let runtime = tokio::runtime::Runtime::new().context("starting the Tokio runtime")?;
-            runtime.block_on(download(input, output, peers, config, quiet, seed))
+            let ui = if tui {
+                Ui::Tui
+            } else if quiet {
+                Ui::Quiet
+            } else {
+                Ui::Line
+            };
+            runtime.block_on(download(input, output, options, config, ui, seed))
+        }
+        Command::Serve {
+            download_dir,
+            state_dir,
+            watch,
+            http,
+            no_http,
+            token,
+            no_seed,
+            tui,
+            network,
+        } => {
+            check_terminal(tui)?;
+            let state_dir = state_dir.unwrap_or_else(|| download_dir.join(".dravity"));
+            let mut config = network.config();
+            config.engine.seed = !no_seed;
+            config.state_dir = Some(state_dir.join("torrents"));
+            config.resume_dir = Some(state_dir.join("resume"));
+            let options = serve::Options {
+                download_dir,
+                watch,
+                http: (!no_http).then_some(http),
+                token,
+                tui,
+            };
+            let runtime = tokio::runtime::Runtime::new().context("starting the Tokio runtime")?;
+            runtime.block_on(serve::run(config, options))
         }
     }
 }
@@ -248,7 +366,10 @@ fn info(m: &Metainfo) -> Result<()> {
     for (tier, urls) in m.trackers().iter().enumerate() {
         writeln!(out, "tracker:    [{tier}] {}", urls.join(" "))?;
     }
-    writeln!(out, "files:")?;
+    writeln!(
+        out,
+        "files:      (select with --files or --file-priority INDEX=…)"
+    )?;
     for (index, file) in i.files().iter().enumerate() {
         if file.is_padding() {
             continue;
@@ -256,7 +377,7 @@ fn info(m: &Metainfo) -> Result<()> {
         let path = i.file_path(index).unwrap_or_default();
         writeln!(
             out,
-            "  {:>10}  {}",
+            "  [{index}] {:>10}  {}",
             format::bytes(file.length()),
             path.display()
         )?;
@@ -264,26 +385,62 @@ fn info(m: &Metainfo) -> Result<()> {
     Ok(())
 }
 
+/// How `download` shows progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ui {
+    /// A progress line on stderr.
+    Line,
+    /// Nothing but the final result.
+    Quiet,
+    /// The full-screen terminal UI.
+    Tui,
+}
+
 async fn download(
     input: Input,
     output: PathBuf,
-    peers: Vec<SocketAddr>,
+    options: AddTorrentOptions,
     config: SessionConfig,
-    quiet: bool,
+    ui: Ui,
     seed: bool,
 ) -> Result<()> {
     let name = input.name();
     let session = Session::new(config).context("creating the session")?;
-    if let (Some(port), false) = (session.listen_port(), quiet) {
+    if let (Some(port), Ui::Line) = (session.listen_port(), ui) {
         let _ = writeln!(std::io::stderr(), "accepting peers on port {port}");
     }
     let mut alerts = session.subscribe();
-    let options = AddTorrentOptions::new(&output).with_peers(peers);
     let torrent = match input {
         Input::File(metainfo) => session.add_torrent(*metainfo, options),
         Input::Magnet(magnet) => session.add_magnet(&magnet, options),
     }
     .context("adding the torrent")?;
+    if ui == Ui::Tui {
+        let info_hash = torrent.info_hash();
+        let mut finished = false;
+        let ui_result = tui::run(&session, |view| {
+            finished |= view.torrents.iter().any(|t| {
+                t.info_hash == info_hash
+                    && t.stats.is_some_and(|s| s.status == TorrentStatus::Finished)
+            });
+            finished && !seed
+        })
+        .await;
+        session.shutdown().await;
+        ui_result?;
+        if !finished && !seed {
+            bail!("interrupted");
+        }
+        if finished {
+            writeln!(
+                std::io::stdout(),
+                "{name}: complete in {}",
+                output.display()
+            )?;
+        }
+        return Ok(());
+    }
+    let quiet = ui == Ui::Quiet;
     let tty = std::io::stderr().is_terminal();
     let mut last_downloaded = 0u64;
     let mut last_uploaded = 0u64;

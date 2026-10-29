@@ -6,7 +6,12 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # `paste` is unmaintained (no known vulnerability). It is a compile-time
+    # macro crate pulled in by ratatui 0.29; ratatui 0.30 drops it but needs
+    # Rust 1.86, above the MSRV. Revisit when the MSRV moves.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained build-time macro crate via ratatui 0.29; no vulnerability" },
+]
 
 [licenses]
 version = 2

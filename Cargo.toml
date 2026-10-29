@@ -35,6 +35,9 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 fastrand = "2"
+# Terminal UI (`dravity --tui`), with its crossterm backend.
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = "0.28"
 mainline = { version = "8", default-features = false, features = ["async"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # Directory-relative `openat`/`O_NOFOLLOW` opens (storage path hardening).

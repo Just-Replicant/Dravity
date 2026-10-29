@@ -45,7 +45,8 @@ pub(crate) fn bar(permille: u64, width: usize) -> String {
     )
 }
 
-fn status(s: TorrentStatus) -> &'static str {
+/// A short name for an engine state.
+pub(crate) fn status(s: TorrentStatus) -> &'static str {
     match s {
         TorrentStatus::Idle => "idle",
         TorrentStatus::FetchingMetadata => "fetching metadata",

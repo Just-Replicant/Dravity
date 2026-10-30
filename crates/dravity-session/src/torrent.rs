@@ -456,6 +456,12 @@ impl TorrentTask {
         }
         let mut tick = tokio::time::interval(self.ctx.config.tick_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The value already in the watch is what `Event::Start` announces.
+        // Later updates are a new external port (or the mapping going away).
+        if let Some(rx) = &mut self.ctx.port_map {
+            rx.borrow_and_update();
+        }
+        let mut announced_port = self.ctx.announce_port();
         let mut stop_ack: Option<oneshot::Sender<()>> = None;
         self.handle(Event::Start).await;
         while self.phase.status() != TorrentStatus::Stopped {
@@ -483,6 +489,15 @@ impl TorrentTask {
                 _ = tick.tick() => Event::Tick,
                 // Reap finished background work so the set does not grow.
                 Some(_) = self.background.join_next(), if !self.background.is_empty() => continue,
+                () = await_port_change(&mut self.ctx.port_map) => {
+                    let port = self.ctx.announce_port();
+                    if port == announced_port {
+                        continue;
+                    }
+                    announced_port = port;
+                    self.announce_dht_port();
+                    Event::Reannounce
+                }
             };
             self.handle(event).await;
         }
@@ -689,6 +704,7 @@ impl TorrentTask {
         let state = state
             .with_started_announced(handover.started_announced)
             .with_started_pending(handover.started_pending)
+            .with_announce_again(handover.announce_again)
             .with_connecting(handover.connecting.iter().copied())
             .ban_peers(swarm.iter().copied());
         self.phase = Phase::Download(Box::new(state));
@@ -810,7 +826,13 @@ impl TorrentTask {
         };
         let info_hash = self.ctx.info_hash;
         let timeout = self.ctx.config.dht_lookup_timeout;
-        let listen_port = self.ctx.listen_port.map(|_| self.ctx.announce_port());
+        let port_map = self.ctx.port_map.clone();
+        let listen_port = self.ctx.listen_port;
+        let configured = self.ctx.config.announce_port;
+        let private = self
+            .content
+            .as_ref()
+            .is_some_and(|c| c.metainfo.info().is_private());
         let tx = self.events_tx.clone();
         self.background.spawn(async move {
             let (peers, failed) = lookup_peers(&dht, info_hash, timeout).await;
@@ -820,12 +842,48 @@ impl TorrentTask {
                 .await;
             // Tell the DHT where to find us, so peers can connect: only
             // after a lookup that reached nodes, bounded by the same timeout.
-            if let (Some(port), false) = (listen_port, failed) {
+            // The port is read now, not when the lookup started: NAT-PMP may
+            // have chosen an external port while the lookup was in flight.
+            if private || failed {
+                return;
+            }
+            let mapped = port_map
+                .as_ref()
+                .and_then(|rx| rx.borrow().external_port(dravity_portmap::Protocol::Tcp));
+            if let Some(port) = listen_port.map(|_| announce_port(mapped, listen_port, configured))
+            {
                 let announced =
                     tokio::time::timeout(timeout, dht.announce(info_hash, Some(port))).await;
                 if let Ok(Err(e)) = announced {
                     tracing::debug!(error = %e, "DHT announce failed");
                 }
+            }
+        });
+    }
+
+    /// Publishes the current TCP port to the DHT without waiting for the
+    /// next lookup. Private torrents and sessions without a DHT skip it.
+    fn announce_dht_port(&mut self) {
+        if self
+            .content
+            .as_ref()
+            .is_some_and(|c| c.metainfo.info().is_private())
+        {
+            return;
+        }
+        let Some(dht) = self.ctx.dht.clone() else {
+            return;
+        };
+        let Some(port) = self.ctx.listen_port.map(|_| self.ctx.announce_port()) else {
+            return;
+        };
+        let info_hash = self.ctx.info_hash;
+        let timeout = self.ctx.config.dht_lookup_timeout;
+        self.background.spawn(async move {
+            let announced =
+                tokio::time::timeout(timeout, dht.announce(info_hash, Some(port))).await;
+            if let Ok(Err(e)) = announced {
+                tracing::debug!(error = %e, "DHT announce failed");
             }
         });
     }
@@ -1228,13 +1286,29 @@ fn max_duration(
     }
 }
 
-/// Formats an error with its `source()` chain (`outer: inner: root`).
+/// Waits until the router's port-mapping status changes. With no mapper,
+/// or after the mapper task has ended, waits forever so the torrent loop
+/// does not spin.
+async fn await_port_change(
+    port_map: &mut Option<tokio::sync::watch::Receiver<dravity_portmap::Status>>,
+) {
+    match port_map {
+        Some(rx) => {
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// Port to announce: the router's mapped port, the listen port, or the
 /// configured fallback, in that order.
 fn announce_port(mapped: Option<u16>, listen: Option<u16>, configured: u16) -> u16 {
     mapped.or(listen).unwrap_or(configured)
 }
 
+/// Formats an error with its `source()` chain (`outer: inner: root`).
 fn error_chain(e: &dyn std::error::Error) -> String {
     let mut text = e.to_string();
     let mut source = e.source();

@@ -6,7 +6,7 @@ dispatch effects. CLI and HTTP send commands and read alerts. Tokio is the
 default runtime. See [`docs/rust-torrent-plan.md`](docs/rust-torrent-plan.md)
 for the full architecture, comparison with existing clients, and roadmap.
 
-> **Status: Phase 4 (product surface) complete, except the Web UI.**
+> **Status: Phase 4 (product surface) complete.**
 > Dravity downloads and seeds v1 `.torrent` files and magnet links
 > (metadata over BEP 9/10), finding peers through HTTP/UDP trackers (BEP 12
 > tiers), the mainline DHT and PEX. It accepts incoming peers over TCP and
@@ -17,6 +17,7 @@ for the full architecture, comparison with existing clients, and roadmap.
 > session with a watch folder, an HTTP API with Prometheus metrics
 > (`dravity-http`), `dravity serve` and a terminal UI. See
 > [`docs/phase-1.md`](docs/phase-1.md) to [`docs/phase-4.md`](docs/phase-4.md).
+> Phase 5 (planned) is a full terminal UI: [`docs/phase-5.md`](docs/phase-5.md).
 
 ## Workspace
 
@@ -34,7 +35,7 @@ for the full architecture, comparison with existing clients, and roadmap.
 | [`dravity-cli`](crates/dravity-cli) | ✅ Phase 4 | `dravity download` / `info` / `serve` for files and magnet links, seeding, file selection, ratatui `--tui`; renders alerts, never drives I/O |
 | [`dravity-utp`](crates/dravity-utp) | ✅ Phase 3 | uTP (BEP 29): packet codec, sans-IO connection with LEDBAT congestion control, Tokio socket and streams |
 | [`dravity-portmap`](crates/dravity-portmap) | ✅ Phase 4 | Router port mapping: NAT-PMP (RFC 6886) and UPnP IGD codecs, `PortMapper` that maps, renews and removes and reports the external port |
-| Web UI, v2/hybrid torrents, … | ⏳ Phase 5+ | See the roadmap |
+| v2/hybrid torrents, … | ⏳ Phase 6+ | See the roadmap. Phase 5 is the full TUI ([`docs/phase-5.md`](docs/phase-5.md)) |
 
 ## Phase 0 checklist
 
@@ -92,7 +93,6 @@ for the full architecture, comparison with existing clients, and roadmap.
 - [x] Prometheus `/metrics`
 - [x] TUI (`--tui`, ratatui) and `dravity serve`; `--files` / `--file-priority`
 - [x] Phase 3 leftovers: BEP 6 `suggest` used for picking; announce the router's mapped port
-- [ ] Web UI (not in this phase; the API is ready for one)
 - [x] Tests: engine priority scripts + proptest, loopback session product tests, HTTP API via `tower` oneshot, TUI via `TestBackend`, CLI `serve`; fuzz targets `session_state`, `http_range`
 
 ## Command line

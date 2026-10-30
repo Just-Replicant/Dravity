@@ -23,6 +23,7 @@ use dravity_dht::{Dht, Testnet};
 use dravity_engine::{Alert, Bitfield, TorrentStatus};
 use dravity_session::{
     AddTorrentOptions, ListenConfig, PeerCodec, Session, SessionAlert, SessionConfig,
+    TrackerOutcome, Transport,
 };
 use dravity_wire::{
     ExtendedHandshake, Handshake, METADATA_PIECE_LEN, Message, MetadataMessage, PexMessage,
@@ -688,6 +689,32 @@ async fn tier_falls_back_to_the_next_tracker() {
         !seen.iter().any(|a| matches!(a, Alert::TrackerError { .. })),
         "one tracker of the tier answered: {seen:?}"
     );
+    // The tracker list keeps the tier and the last outcome per URL; the
+    // tracker that answered moved to the front.
+    let trackers = handle.trackers().await.unwrap();
+    assert_eq!(trackers.len(), 2, "{trackers:?}");
+    assert!(trackers.iter().all(|t| t.tier == 0));
+    let first = &trackers[0];
+    assert_eq!(first.url, magnet.trackers[1]);
+    assert!(
+        matches!(
+            first.last,
+            Some(TrackerOutcome::Ok {
+                interval: Some(i),
+                peers: 1,
+                ..
+            }) if i == Duration::from_secs(1800)
+        ),
+        "{first:?}"
+    );
+    assert!(first.updated.is_some());
+    let dead = &trackers[1];
+    assert_eq!(dead.url, magnet.trackers[0]);
+    // Shuffled into second place, it was never asked; first, it failed.
+    assert!(
+        matches!(dead.last, None | Some(TrackerOutcome::Failed { .. })),
+        "{dead:?}"
+    );
     handle.stop().await;
     assert_files(dir.path(), &content, len_a);
 }
@@ -817,6 +844,65 @@ async fn incoming_utp_connections_are_routed_like_tcp() {
         .unwrap()
         .unwrap();
     assert_eq!(theirs.peer_id, session.peer_id());
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peers_are_listed_with_their_transport() {
+    let (metainfo, _) = make_torrent(None, 1000, 1000);
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(config()).unwrap();
+    let port = session.listen_port().unwrap();
+    let handle = session
+        .add_torrent(metainfo, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    assert!(handle.peers().await.unwrap().is_empty());
+    assert!(handle.trackers().await.unwrap().is_empty(), "no trackers");
+
+    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let hello = Handshake::new(handle.info_hash(), PeerId::new([5; 20]));
+    tcp.write_all(&hello.to_bytes()).await.unwrap();
+    let mut buf = [0u8; 68];
+    tcp.read_exact(&mut buf).await.unwrap();
+
+    let client = dravity_utp::UtpSocket::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        dravity_utp::Config::default(),
+    )
+    .await
+    .unwrap();
+    let mut utp = client
+        .connect(SocketAddr::from(([127, 0, 0, 1], port)))
+        .await
+        .unwrap();
+    let hello = Handshake::new(handle.info_hash(), PeerId::new([6; 20]));
+    utp.write_all(&hello.to_bytes()).await.unwrap();
+    utp.read_exact(&mut buf).await.unwrap();
+
+    let peers = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let peers = handle.peers().await.unwrap();
+            if peers.len() == 2 {
+                return peers;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both peers listed");
+    let utp_addr = client.local_addr();
+    for peer in &peers {
+        assert!(peer.info.incoming);
+        assert_eq!(peer.info.pieces_have, 0);
+        assert_eq!(peer.info.piece_count, 1);
+        let expected = if peer.info.addr == utp_addr {
+            Transport::Utp
+        } else {
+            Transport::Tcp
+        };
+        assert_eq!(peer.transport, expected, "{peer:?}");
+    }
+    assert!(peers.iter().any(|p| p.transport == Transport::Utp));
     session.shutdown().await;
 }
 

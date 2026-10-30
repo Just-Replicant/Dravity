@@ -45,6 +45,40 @@ pub(crate) fn bar(permille: u64, width: usize) -> String {
     )
 }
 
+/// Share ratio `uploaded / downloaded` with two decimals, or `—` when
+/// nothing was downloaded.
+#[must_use]
+pub(crate) fn ratio(uploaded: u64, downloaded: u64) -> String {
+    if downloaded == 0 {
+        return "—".to_owned();
+    }
+    let hundredths =
+        u64::try_from(u128::from(uploaded) * 100 / u128::from(downloaded)).unwrap_or(u64::MAX);
+    format!("{}.{:02}", hundredths / 100, hundredths % 100)
+}
+
+/// Time left for `left` bytes at `rate` bytes per second (`1h02m`,
+/// `3m05s`, `42s`, `>99d`), or `—` when the rate is 0.
+#[must_use]
+pub(crate) fn eta(left: u64, rate: u64) -> String {
+    if rate == 0 {
+        return "—".to_owned();
+    }
+    let secs = left.div_ceil(rate);
+    let (d, h, m, s) = (secs / 86_400, secs / 3600 % 24, secs / 60 % 60, secs % 60);
+    if d > 99 {
+        ">99d".to_owned()
+    } else if d > 0 {
+        format!("{d}d{h:02}h")
+    } else if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
 /// A short name for an engine state.
 pub(crate) fn status(s: TorrentStatus) -> &'static str {
     match s {
@@ -144,6 +178,24 @@ mod tests {
         assert_eq!(permille(u64::MAX, u64::MAX), 1000);
         assert_eq!(bar(500, 10), "[#####.....]");
         assert_eq!(bar(2000, 4), "[####]");
+    }
+
+    #[test]
+    fn ratio_and_eta() {
+        assert_eq!(ratio(0, 0), "—");
+        assert_eq!(ratio(5, 0), "—");
+        assert_eq!(ratio(0, 10), "0.00");
+        assert_eq!(ratio(3, 2), "1.50");
+        assert_eq!(ratio(1, 3), "0.33");
+        // Saturates instead of overflowing.
+        assert!(ratio(u64::MAX, 1).starts_with(&(u64::MAX / 100).to_string()));
+        assert_eq!(eta(100, 0), "—");
+        assert_eq!(eta(0, 10), "0s");
+        assert_eq!(eta(41, 1), "41s");
+        assert_eq!(eta(185, 1), "3m05s");
+        assert_eq!(eta(3720, 1), "1h02m");
+        assert_eq!(eta(90_000, 1), "1d01h");
+        assert_eq!(eta(u64::MAX, 1), ">99d");
     }
 
     #[test]

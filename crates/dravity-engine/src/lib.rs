@@ -63,6 +63,13 @@
 //! * **Suggestions**: BEP 6 `suggest` messages are remembered per peer (the
 //!   newest of the last 16) and preferred when a new piece of the same
 //!   priority is started.
+//!
+//! Full terminal UI (Phase 5):
+//!
+//! * **Peer snapshots**: [`TorrentState::peers`] and
+//!   [`MetadataState::peers`] copy what the engine keeps about each
+//!   connected peer into a [`PeerInfo`] (address, pieces, byte totals,
+//!   choke and interest flags). They add no events or effects.
 
 mod ban;
 mod bitfield;
@@ -81,4 +88,6 @@ pub use metadata::{Handover, HandoverPeer, MetadataState};
 pub use picker::{ParsePriorityError, Picker, Priority};
 pub use rate::TokenBucket;
 pub use state::TorrentState;
-pub use types::{Alert, AnnounceEvent, Config, Effect, Event, PeerKey, Stats, TorrentStatus};
+pub use types::{
+    Alert, AnnounceEvent, Config, Effect, Event, PeerInfo, PeerKey, Stats, TorrentStatus,
+};

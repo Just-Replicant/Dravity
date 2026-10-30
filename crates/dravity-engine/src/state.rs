@@ -17,7 +17,9 @@ use crate::ext::{self, PeerExtensions};
 use crate::picker::{Picker, Priority, Received};
 use crate::pool::PeerPool;
 use crate::rate::TokenBucket;
-use crate::types::{Alert, AnnounceEvent, Config, Effect, Event, PeerKey, Stats, TorrentStatus};
+use crate::types::{
+    Alert, AnnounceEvent, Config, Effect, Event, PeerInfo, PeerKey, Stats, TorrentStatus,
+};
 use crate::window::Window;
 
 /// Most peers that may hold a request for the same block (endgame and
@@ -91,6 +93,10 @@ struct Peer {
     down_round: u64,
     /// Payload bytes sent to the peer since the last choker round.
     up_round: u64,
+    /// Payload bytes received from the peer since it connected.
+    downloaded: u64,
+    /// Payload bytes sent to the peer since it connected.
+    uploaded: u64,
     /// Since when the peer has held our requests without delivering a
     /// block (snub detection). A request timeout does not reset it.
     snub_since: Option<Instant>,
@@ -137,6 +143,8 @@ impl Peer {
             reading: HashSet::new(),
             down_round: 0,
             up_round: 0,
+            downloaded: 0,
+            uploaded: 0,
             snub_since: None,
             last_optimistic: now,
         }
@@ -421,6 +429,31 @@ impl TorrentState {
             pending_reads: self.pending_reads,
             banned: self.bans.count(),
         }
+    }
+
+    /// A snapshot of every connected peer, ordered by address.
+    #[must_use]
+    pub fn peers(&self) -> Vec<PeerInfo> {
+        let piece_count = self.picker.layout().piece_count();
+        let mut peers: Vec<PeerInfo> = self
+            .peers
+            .iter()
+            .map(|(&key, p)| PeerInfo {
+                key,
+                addr: p.addr,
+                incoming: p.incoming,
+                pieces_have: p.has.count(),
+                piece_count,
+                downloaded: p.downloaded,
+                uploaded: p.uploaded,
+                am_choking: p.am_choking,
+                am_interested: p.am_interested,
+                peer_choking: p.peer_choking,
+                peer_interested: p.peer_interested,
+            })
+            .collect();
+        peers.sort_by_key(|p| (p.addr, p.key));
+        peers
     }
 
     fn left(&self) -> u64 {
@@ -1266,6 +1299,7 @@ impl TorrentState {
                 peer.window.on_block();
             }
             peer.down_round = peer.down_round.saturating_add(u64::from(length));
+            peer.downloaded = peer.downloaded.saturating_add(u64::from(length));
             peer.snub_since = (!peer.inflight.is_empty()).then_some(now);
             from_ip = Some(peer.addr.ip());
         }
@@ -1696,6 +1730,7 @@ impl TorrentState {
                 if peer.may_download(block.piece) {
                     let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
                     peer.up_round = peer.up_round.saturating_add(len);
+                    peer.uploaded = peer.uploaded.saturating_add(len);
                     self.uploaded = self.uploaded.saturating_add(len);
                     let message = Message::Piece {
                         piece: block.piece,

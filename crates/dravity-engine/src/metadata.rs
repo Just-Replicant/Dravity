@@ -13,7 +13,9 @@ use dravity_wire::{
 use crate::ext::{self, PeerExtensions};
 use crate::pool::PeerPool;
 use crate::state::DhtSchedule;
-use crate::types::{Alert, AnnounceEvent, Config, Effect, Event, PeerKey, Stats, TorrentStatus};
+use crate::types::{
+    Alert, AnnounceEvent, Config, Effect, Event, PeerInfo, PeerKey, Stats, TorrentStatus,
+};
 
 /// Metadata requests outstanding per peer.
 const PIPELINE: usize = 2;
@@ -207,6 +209,31 @@ impl MetadataState {
     #[must_use]
     pub const fn is_complete(&self) -> bool {
         self.complete
+    }
+
+    /// A snapshot of every connected peer, ordered by address. Piece counts
+    /// are zero: the torrent's size is not known yet.
+    #[must_use]
+    pub fn peers(&self) -> Vec<PeerInfo> {
+        let mut peers: Vec<PeerInfo> = self
+            .peers
+            .iter()
+            .map(|(&key, p)| PeerInfo {
+                key,
+                addr: p.addr,
+                incoming: p.incoming,
+                pieces_have: 0,
+                piece_count: 0,
+                downloaded: 0,
+                uploaded: 0,
+                am_choking: true,
+                am_interested: false,
+                peer_choking: p.choked,
+                peer_interested: false,
+            })
+            .collect();
+        peers.sort_by_key(|p| (p.addr, p.key));
+        peers
     }
 
     /// A progress snapshot (sizes are unknown, so they are zero).

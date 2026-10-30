@@ -512,3 +512,36 @@ pub struct Stats {
     /// IP addresses banned for bad data.
     pub banned: usize,
 }
+
+/// A copy of what the engine keeps about one connected peer
+/// ([`TorrentState::peers`](crate::TorrentState::peers),
+/// [`MetadataState::peers`](crate::MetadataState::peers)).
+///
+/// Byte counters are totals since the peer connected, so a client derives
+/// rates from two snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PeerInfo {
+    /// The driver's handle.
+    pub key: PeerKey,
+    /// Remote address.
+    pub addr: SocketAddr,
+    /// The peer connected to us.
+    pub incoming: bool,
+    /// Pieces the peer has (0 while a magnet's metadata is unknown).
+    pub pieces_have: u32,
+    /// Pieces of the torrent (0 while a magnet's metadata is unknown).
+    pub piece_count: u32,
+    /// Payload bytes received from the peer.
+    pub downloaded: u64,
+    /// Payload bytes sent to the peer.
+    pub uploaded: u64,
+    /// We refuse to upload to the peer.
+    pub am_choking: bool,
+    /// We want pieces the peer has.
+    pub am_interested: bool,
+    /// The peer refuses to upload to us.
+    pub peer_choking: bool,
+    /// The peer wants pieces we have.
+    pub peer_interested: bool,
+}

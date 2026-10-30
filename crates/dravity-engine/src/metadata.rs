@@ -113,6 +113,9 @@ pub struct Handover {
     pub started_announced: bool,
     /// A `started` announce was sent and the tracker has not answered yet.
     pub started_pending: bool,
+    /// A regular announce should follow the one in flight: the port we
+    /// publish changed while it was on the wire.
+    pub announce_again: bool,
 }
 
 /// Sans-IO metadata fetcher for a magnet link: connects to peers, exchanges
@@ -147,6 +150,8 @@ pub struct MetadataState {
     started_announced: bool,
     /// The announce the driver is currently performing.
     pending_announce: Option<AnnounceEvent>,
+    /// Send another regular announce when the one in flight finishes.
+    announce_again: bool,
     dht: DhtSchedule,
     size: Option<usize>,
     /// Sizes a peer advertised that produced no metadata before another peer
@@ -178,6 +183,7 @@ impl MetadataState {
             announce_in_flight: false,
             started_announced: false,
             pending_announce: None,
+            announce_again: false,
             dht: DhtSchedule::default(),
             size: None,
             abandoned: HashSet::new(),
@@ -265,6 +271,7 @@ impl MetadataState {
             swarm,
             started_announced: self.started_announced,
             started_pending: self.pending_announce == Some(AnnounceEvent::Started),
+            announce_again: self.announce_again,
         }
     }
 
@@ -320,6 +327,7 @@ impl MetadataState {
                 self.note_swarm(&peers, false);
                 self.add_to_pool(peers);
                 self.fill_connections(&mut out);
+                self.settle_reannounce(now, &mut out);
             }
             Event::AnnounceFailed { error } => {
                 if self.pending_announce == Some(AnnounceEvent::Started) {
@@ -329,7 +337,9 @@ impl MetadataState {
                 self.announce_in_flight = false;
                 self.next_announce = Some(now + self.config.announce_retry);
                 out.push(Effect::Alert(Alert::TrackerError { message: error }));
+                self.settle_reannounce(now, &mut out);
             }
+            Event::Reannounce => self.reannounce(now, &mut out),
             Event::AddPeers { peers } => {
                 self.note_swarm(&peers, false);
                 self.add_to_pool(peers);
@@ -379,12 +389,37 @@ impl MetadataState {
         if self.announce_in_flight {
             return;
         }
+        self.announce_again = false;
         self.announce_in_flight = true;
         self.pending_announce = Some(event);
         self.next_announce = Some(now + self.config.default_announce_interval);
         self.push_announce(event, out);
         if event == AnnounceEvent::Started {
             self.started_announced = true;
+        }
+    }
+
+    /// The address we publish changed. Announce again while metadata is
+    /// still being fetched. An announce already on the wire is followed by
+    /// one more.
+    fn reannounce(&mut self, now: Instant, out: &mut Vec<Effect>) {
+        if !self.started_announced || self.status != TorrentStatus::FetchingMetadata {
+            return;
+        }
+        if self.announce_in_flight {
+            self.announce_again = true;
+            return;
+        }
+        self.announce(now, AnnounceEvent::None, out);
+    }
+
+    fn settle_reannounce(&mut self, now: Instant, out: &mut Vec<Effect>) {
+        if !self.announce_again {
+            return;
+        }
+        self.announce_again = false;
+        if self.started_announced && self.status == TorrentStatus::FetchingMetadata {
+            self.announce(now, AnnounceEvent::None, out);
         }
     }
 

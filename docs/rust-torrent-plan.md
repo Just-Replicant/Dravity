@@ -191,7 +191,7 @@ Peers addressed by arena handles (`slotmap`), not `String` ids. Picker keeps rar
 | `dravity-utp` | uTP transport (own impl or wrap a permissive crate; not GPL) |
 | `dravity-session` | The only driver: poll → `update` → dispatch effects. Limits, resume, metrics, torrent map |
 | `dravity-cli` | clap CLI + optional ratatui TUI. Session commands and alerts only |
-| `dravity-http` | axum session API + optional Web UI statics. Session commands and alerts only |
+| `dravity-http` | axum session API. Session commands and alerts only |
 
 Workspace root: `dravity` (meta) documenting the library entry via `dravity-session`.
 
@@ -246,8 +246,8 @@ Workspace root: `dravity` (meta) documenting the library entry via `dravity-sess
 ### Product features
 
 - Library session API with alerts
-- CLI with progress; optional Ratatui TUI
-- HTTP API (axum) + optional Web UI
+- CLI with progress; Ratatui TUI (viewer in phase 4, full client in phase 5)
+- HTTP API (axum)
 - Fastresume (have-bitfield + mtime/size; no full rehash)
 - File priorities, streaming seek, watch folder
 - Rate limits, peer ban on bad hashes
@@ -272,9 +272,12 @@ Workspace root: `dravity` (meta) documenting the library entry via `dravity-sess
    Tit-for-tat + optimistic unchoke; seeding; BEP 6; uTP (`dravity-utp`); IPv6; UPnP/NAT-PMP; peer banning; path hardening.
 
 5. **Phase 4 — Product surface**  
-   Session persistence; `dravity-http`; TUI/Web UI; streaming seek; file priorities; watch folder; Prometheus.
+   Session persistence; `dravity-http`; a first TUI (list, pause, file priorities); streaming seek; watch folder; Prometheus.
 
-6. **Phase 5 — Advanced**  
+6. **Phase 5 — Full terminal UI**  
+   The Phase 4 screen becomes a client: add a magnet or a `.torrent` while it is running, remove, peers, trackers, alerts, sort and filter. Still session commands and alerts only. See [`docs/phase-5.md`](phase-5.md).
+
+7. **Phase 6 — Advanced**  
    BEP 52 v2/hybrid + Merkle; web seeds (BEP 19); optional io_uring backend; protocol encryption if required.
 
 Each phase ships a usable artifact; later phases do not rewrite the sans-IO core.

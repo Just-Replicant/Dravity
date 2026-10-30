@@ -770,6 +770,36 @@ async fn a_session_seeds_to_another_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_serves_metadata_to_a_magnet_link() {
+    let (len_a, len_b) = (40_000, 25_000);
+    let (metainfo, content) = make_torrent(None, len_a, len_b);
+    let hash = metainfo.info_hash();
+    let seed_dir = tempfile::tempdir().unwrap();
+    write_files(seed_dir.path(), &content, len_a);
+    let seeder = Session::new(config()).unwrap();
+    let port = seeder.listen_port().unwrap();
+    let mut seeder_alerts = seeder.subscribe();
+    let _seeding = seeder
+        .add_torrent(metainfo, AddTorrentOptions::new(seed_dir.path()))
+        .unwrap();
+    until_finished(&mut seeder_alerts, hash).await;
+
+    let leecher = Session::new(config()).unwrap();
+    let mut alerts = leecher.subscribe();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let magnet =
+        Magnet::parse(&format!("magnet:?xt=urn:btih:{hash}&x.pe=127.0.0.1:{port}")).unwrap();
+    leecher
+        .add_magnet(&magnet, AddTorrentOptions::new(leech_dir.path()))
+        .unwrap();
+    let seen = until_finished(&mut alerts, hash).await;
+    assert!(seen.contains(&Alert::MetadataReceived), "{seen:?}");
+    assert_files(leech_dir.path(), &content, len_a);
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incoming_connections_for_unknown_torrents_are_closed() {
     let (metainfo, _) = make_torrent(None, 1000, 1000);
     let dir = tempfile::tempdir().unwrap();

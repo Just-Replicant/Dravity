@@ -312,8 +312,11 @@ impl TorrentTask {
                 file_priorities = files::normalize(metainfo.info(), &file_priorities)
                     .unwrap_or_else(|| vec![Priority::Normal; metainfo.info().files().len()]);
                 let pieces = files::piece_priorities(metainfo.info(), &file_priorities);
+                // Served to magnet-link peers over BEP 9.
+                let info = Bytes::copy_from_slice(metainfo.info_bytes());
                 let state = TorrentState::new(*metainfo.info().layout(), config)
                     .with_info_hash(ctx.info_hash)
+                    .with_info_bytes(info)
                     .with_priorities(&pieces);
                 (
                     Phase::Download(Box::new(state)),
@@ -621,10 +624,10 @@ impl TorrentTask {
         let state = TorrentState::with_have(*content.metainfo.info().layout(), have, config)
             .with_info_hash(self.ctx.info_hash)
             .with_priorities(&self.piece_priorities(content));
-        Some(match info {
-            Some(info) => state.with_info_bytes(info.clone()),
-            None => state,
-        })
+        let info = info
+            .cloned()
+            .unwrap_or_else(|| Bytes::copy_from_slice(content.metainfo.info_bytes()));
+        Some(state.with_info_bytes(info))
     }
 
     /// Maps peer-task inputs to engine events, keeping the peer map in sync.

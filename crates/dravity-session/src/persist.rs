@@ -13,8 +13,9 @@
 //!
 //! Piece progress is not stored here; that is fastresume's job
 //! ([`dravity_storage::resume`]). Files are written atomically (temporary
-//! file, sync, rename) by one background task, in order, so the owner tasks
-//! and callers never block on the disk.
+//! file, sync, rename, then a sync of the directory) by one background
+//! task. Each path keeps only its latest write or removal, so a slow disk
+//! cannot drop a save or a removal, and callers never block on the disk.
 //!
 //! The `.state` format is a bencoded dictionary:
 //!
@@ -24,14 +25,15 @@
 //! ```
 
 use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use dravity_bencode::{Dict, Value};
 use dravity_core::{InfoHash, Metainfo};
 use dravity_engine::Priority;
-use tokio::sync::{mpsc, oneshot};
 
 /// Current `.state` format version.
 const VERSION: i64 = 1;
@@ -96,12 +98,7 @@ impl TorrentRecord {
             key("info-hash"),
             Value::Bytes(Cow::Owned(self.info_hash.as_bytes().to_vec())),
         );
-        d.insert(
-            key("download-dir"),
-            Value::Bytes(Cow::Owned(
-                self.download_dir.to_string_lossy().as_bytes().to_vec(),
-            )),
-        );
+        insert_download_dir(&mut d, &self.download_dir);
         if let Some(magnet) = &self.magnet {
             d.insert(
                 key("magnet"),
@@ -142,11 +139,7 @@ impl TorrentRecord {
             .and_then(Value::as_bytes)
             .and_then(|b| b.try_into().ok())
             .ok_or(RecordError::Invalid("missing or malformed info-hash"))?;
-        let download_dir = get("download-dir")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .ok_or(RecordError::Invalid("missing download-dir"))?;
+        let download_dir = download_dir_from(d)?;
         let magnet = match get("magnet") {
             None => None,
             Some(v) => Some(
@@ -204,6 +197,99 @@ const fn priority_from_code(code: i64) -> Option<Priority> {
     }
 }
 
+/// Stores `path` without rewriting bytes that are not valid Unicode.
+///
+/// Unix paths are raw bytes. Windows paths that are Unicode stay UTF-8, so
+/// older state files still decode. A Windows path that is not Unicode is
+/// stored as UTF-16LE under `download-dir-wide` instead of being lossily
+/// replaced.
+fn insert_download_dir(dict: &mut Dict<'_>, path: &Path) {
+    let key = |k: &str| Cow::Owned(k.as_bytes().to_vec());
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        dict.insert(
+            key("download-dir"),
+            Value::Bytes(Cow::Owned(path.as_os_str().as_bytes().to_vec())),
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        if let Some(text) = path.to_str() {
+            dict.insert(
+                key("download-dir"),
+                Value::Bytes(Cow::Owned(text.as_bytes().to_vec())),
+            );
+        } else {
+            let wide: Vec<u8> = path
+                .as_os_str()
+                .encode_wide()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect();
+            dict.insert(key("download-dir-wide"), Value::Bytes(Cow::Owned(wide)));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    if let Some(text) = path.to_str() {
+        dict.insert(
+            key("download-dir"),
+            Value::Bytes(Cow::Owned(text.as_bytes().to_vec())),
+        );
+    }
+}
+
+fn download_dir_from(dict: &Dict<'_>) -> Result<PathBuf, RecordError> {
+    if let Some(wide) = dict
+        .get(b"download-dir-wide".as_slice())
+        .and_then(Value::as_bytes)
+    {
+        return path_from_wide(wide);
+    }
+    let bytes = dict
+        .get(b"download-dir".as_slice())
+        .and_then(Value::as_bytes)
+        .filter(|bytes| !bytes.is_empty())
+        .ok_or(RecordError::Invalid("missing download-dir"))?;
+    path_from_bytes(bytes)
+}
+
+#[cfg(unix)]
+fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf, RecordError> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: &[u8]) -> Result<PathBuf, RecordError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| RecordError::Invalid("download-dir is not Unicode"))?;
+    Ok(PathBuf::from(text))
+}
+
+/// UTF-16LE path from a Windows state file.
+fn path_from_wide(bytes: &[u8]) -> Result<PathBuf, RecordError> {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
+        return Err(RecordError::Invalid("download-dir-wide is malformed"));
+    }
+    let (chunks, _) = bytes.as_chunks::<2>();
+    let units: Vec<u16> = chunks.iter().copied().map(u16::from_le_bytes).collect();
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        Ok(PathBuf::from(std::ffi::OsString::from_wide(&units)))
+    }
+    #[cfg(not(windows))]
+    {
+        let text = String::from_utf16(&units)
+            .map_err(|_| RecordError::Invalid("download-dir-wide is not Unicode"))?;
+        if text.is_empty() {
+            return Err(RecordError::Invalid("missing download-dir"));
+        }
+        Ok(PathBuf::from(text))
+    }
+}
+
 /// Seconds since the Unix epoch (0 if the clock is before it).
 pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -246,7 +332,8 @@ pub(crate) fn path_for(dir: &Path, info_hash: &InfoHash, extension: &str) -> Pat
     dir.join(format!("{}.{extension}", info_hash.to_hex()))
 }
 
-/// Writes `bytes` to `path` atomically (temporary file, sync, rename).
+/// Writes `bytes` to `path` atomically (temporary file, sync, rename) and
+/// syncs the parent directory so a crash cannot lose the directory entry.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         fs::create_dir_all(dir)?;
@@ -258,7 +345,8 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let mut file = fs::File::create(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&tmp, path)
+        fs::rename(&tmp, path)?;
+        sync_parent(path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -266,11 +354,194 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-/// Removes `path`; a missing file is fine.
+/// Removes `path`; a missing file is fine. The parent directory is synced
+/// after a removal so the deletion survives a crash.
 pub(crate) fn remove_if_exists(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
+        Err(_) => Ok(()),
+        Ok(()) => sync_parent(path),
+    }
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    sync_dir(dir)
+}
+
+/// `std::fs::File::open` on a directory works on Unix. Windows needs backup
+/// semantics, which that call does not request; the file sync already done
+/// is what Windows will persist.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// The latest operation for one state file.
+#[derive(Debug)]
+enum Kind {
+    Write(Vec<u8>),
+    Remove,
+}
+
+/// Operations waiting for the writer. One entry per path: a later write or
+/// removal replaces the earlier one, and a removal after a write (or the
+/// reverse) keeps the later intent.
+#[derive(Debug, Default)]
+struct Mail {
+    order: VecDeque<PathBuf>,
+    jobs: HashMap<PathBuf, Kind>,
+    flushes: Vec<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Mail {
+    fn push(&mut self, path: PathBuf, kind: Kind) {
+        if !self.jobs.contains_key(&path) {
+            self.order.push_back(path.clone());
+        }
+        self.jobs.insert(path, kind);
+    }
+
+    fn drain(&mut self) -> (Vec<(PathBuf, Kind)>, Vec<tokio::sync::oneshot::Sender<()>>) {
+        let jobs = self
+            .order
+            .drain(..)
+            .filter_map(|path| self.jobs.remove(&path).map(|kind| (path, kind)))
+            .collect();
+        (jobs, std::mem::take(&mut self.flushes))
+    }
+}
+
+struct Shared {
+    mail: Mutex<Mail>,
+    notify: tokio::sync::Notify,
+}
+
+/// Writes session state in a background task. The latest change to each
+/// file is kept until it is on disk.
+#[derive(Clone)]
+pub(crate) struct Persister {
+    /// The state directory.
+    dir: PathBuf,
+    shared: std::sync::Arc<Shared>,
+    /// Dropped with the last clone; the writer finishes what is queued and
+    /// then stops.
+    alive: tokio::sync::mpsc::Sender<()>,
+}
+
+impl std::fmt::Debug for Persister {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Persister")
+            .field("dir", &self.dir)
+            .field("open", &!self.alive.is_closed())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Persister {
+    /// Starts the writer task. Must be called within a Tokio runtime.
+    pub(crate) fn start(dir: PathBuf) -> Self {
+        let shared = std::sync::Arc::new(Shared {
+            mail: Mutex::new(Mail::default()),
+            notify: tokio::sync::Notify::new(),
+        });
+        let (alive, mut closed) = tokio::sync::mpsc::channel::<()>(1);
+        let worker = std::sync::Arc::clone(&shared);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = closed.recv() => {
+                        apply(&worker).await;
+                        break;
+                    }
+                    () = worker.notify.notified() => apply(&worker).await,
+                }
+            }
+        });
+        Self { dir, shared, alive }
+    }
+
+    fn enqueue(&self, path: PathBuf, kind: Kind) {
+        self.shared
+            .mail
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(path, kind);
+        self.shared.notify.notify_one();
+    }
+
+    /// Saves a torrent's record.
+    pub(crate) fn save_record(&self, record: &TorrentRecord) {
+        let path = path_for(&self.dir, &record.info_hash, "state");
+        self.enqueue(path, Kind::Write(record.encode()));
+    }
+
+    /// Saves a torrent's metainfo.
+    pub(crate) fn save_torrent(&self, metainfo: &Metainfo) {
+        let path = path_for(&self.dir, &metainfo.info_hash(), "torrent");
+        self.enqueue(path, Kind::Write(torrent_file_bytes(metainfo)));
+    }
+
+    /// Forgets a torrent.
+    pub(crate) fn remove(&self, info_hash: &InfoHash) {
+        for extension in ["state", "torrent"] {
+            self.enqueue(path_for(&self.dir, info_hash, extension), Kind::Remove);
+        }
+    }
+
+    /// Waits until everything submitted so far is on disk.
+    pub(crate) async fn flush(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.shared
+            .mail
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .flushes
+            .push(tx);
+        self.shared.notify.notify_one();
+        let _ = rx.await;
+    }
+}
+
+/// Applies every queued operation, then acknowledges flushes that were
+/// waiting for those operations. Repeats while more work arrived.
+async fn apply(shared: &Shared) {
+    loop {
+        let (jobs, flushes) = shared
+            .mail
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain();
+        if jobs.is_empty() && flushes.is_empty() {
+            return;
+        }
+        for (path, kind) in jobs {
+            let shown = path.clone();
+            let done = tokio::task::spawn_blocking(move || match kind {
+                Kind::Write(bytes) => write_atomic(&path, &bytes),
+                Kind::Remove => remove_if_exists(&path),
+            });
+            match done.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(path = %shown.display(), error = %e, "saving session state failed");
+                }
+                Err(e) => {
+                    tracing::warn!(path = %shown.display(), error = %e, "session state task failed");
+                }
+            }
+        }
+        for ack in flushes {
+            let _ = ack.send(());
+        }
     }
 }
 
@@ -284,92 +555,6 @@ pub(crate) fn read_bounded(path: &Path, max: u64) -> io::Result<Vec<u8>> {
         ));
     }
     fs::read(path)
-}
-
-/// One write for the persistence task.
-#[derive(Debug)]
-enum Op {
-    Write(PathBuf, Vec<u8>),
-    Remove(PathBuf),
-    Flush(oneshot::Sender<()>),
-}
-
-/// Writes session state in a background task, in submission order.
-#[derive(Debug, Clone)]
-pub(crate) struct Persister {
-    /// The state directory.
-    dir: PathBuf,
-    tx: mpsc::Sender<Op>,
-}
-
-impl Persister {
-    /// Starts the writer task. Must be called within a Tokio runtime.
-    pub(crate) fn start(dir: PathBuf) -> Self {
-        let (tx, mut rx) = mpsc::channel::<Op>(1024);
-        tokio::spawn(async move {
-            while let Some(op) = rx.recv().await {
-                let result = match op {
-                    Op::Flush(ack) => {
-                        let _ = ack.send(());
-                        continue;
-                    }
-                    Op::Write(path, bytes) => {
-                        let shown = path.clone();
-                        let done = tokio::task::spawn_blocking(move || write_atomic(&path, &bytes));
-                        (shown, done.await)
-                    }
-                    Op::Remove(path) => {
-                        let shown = path.clone();
-                        let done = tokio::task::spawn_blocking(move || remove_if_exists(&path));
-                        (shown, done.await)
-                    }
-                };
-                match result {
-                    (_, Ok(Ok(()))) => {}
-                    (path, Ok(Err(e))) => {
-                        tracing::warn!(path = %path.display(), error = %e, "saving session state failed");
-                    }
-                    (path, Err(e)) => {
-                        tracing::warn!(path = %path.display(), error = %e, "session state task failed");
-                    }
-                }
-            }
-        });
-        Self { dir, tx }
-    }
-
-    fn submit(&self, op: Op) {
-        if self.tx.try_send(op).is_err() {
-            tracing::warn!("session state queue full; a state update was dropped");
-        }
-    }
-
-    /// Saves a torrent's record.
-    pub(crate) fn save_record(&self, record: &TorrentRecord) {
-        let path = path_for(&self.dir, &record.info_hash, "state");
-        self.submit(Op::Write(path, record.encode()));
-    }
-
-    /// Saves a torrent's metainfo.
-    pub(crate) fn save_torrent(&self, metainfo: &Metainfo) {
-        let path = path_for(&self.dir, &metainfo.info_hash(), "torrent");
-        self.submit(Op::Write(path, torrent_file_bytes(metainfo)));
-    }
-
-    /// Forgets a torrent.
-    pub(crate) fn remove(&self, info_hash: &InfoHash) {
-        for extension in ["state", "torrent"] {
-            self.submit(Op::Remove(path_for(&self.dir, info_hash, extension)));
-        }
-    }
-
-    /// Waits until everything submitted so far is on disk.
-    pub(crate) async fn flush(&self) {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(Op::Flush(tx)).await.is_ok() {
-            let _ = rx.await;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -427,6 +612,57 @@ mod tests {
             TorrentRecord::decode(b"d"),
             Err(RecordError::Decode(_))
         ));
+    }
+
+    #[test]
+    fn the_latest_operation_for_a_path_is_the_one_written() {
+        use std::path::PathBuf;
+
+        use super::{Kind, Mail};
+
+        let mut mail = Mail::default();
+        let path = PathBuf::from("a.state");
+        mail.push(path.clone(), Kind::Write(b"old".to_vec()));
+        mail.push(path.clone(), Kind::Write(b"new".to_vec()));
+        mail.push(PathBuf::from("b.state"), Kind::Write(b"b".to_vec()));
+        mail.push(path.clone(), Kind::Remove);
+        let (jobs, flushes) = mail.drain();
+        assert!(flushes.is_empty());
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].0, path);
+        assert!(matches!(jobs[0].1, Kind::Remove));
+        assert_eq!(jobs[1].0, PathBuf::from("b.state"));
+        assert!(matches!(jobs[1].1, Kind::Write(ref bytes) if bytes == b"b"));
+    }
+
+    #[test]
+    fn atomic_write_replaces_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.state");
+        super::write_atomic(&path, b"one").unwrap();
+        super::write_atomic(&path, b"two").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert!(!dir.path().join("a.state.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_download_dir_roundtrips() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut record = sample();
+        record.download_dir = std::ffi::OsString::from_vec(b"/tmp/downl\xffads".to_vec()).into();
+        assert_eq!(TorrentRecord::decode(&record.encode()).unwrap(), record);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_non_unicode_download_dir_roundtrips() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let mut record = sample();
+        record.download_dir = std::ffi::OsString::from_wide(&[0xD800, 0x20]).into();
+        assert_eq!(TorrentRecord::decode(&record.encode()).unwrap(), record);
     }
 
     proptest! {

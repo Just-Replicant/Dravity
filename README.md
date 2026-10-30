@@ -6,7 +6,7 @@ dispatch effects. CLI and HTTP send commands and read alerts. Tokio is the
 default runtime. See [`docs/rust-torrent-plan.md`](docs/rust-torrent-plan.md)
 for the full architecture, comparison with existing clients, and roadmap.
 
-> **Status: Phase 4 (product surface) complete.**
+> **Status: Phase 5 (full terminal UI) complete.**
 > Dravity downloads and seeds v1 `.torrent` files and magnet links
 > (metadata over BEP 9/10), finding peers through HTTP/UDP trackers (BEP 12
 > tiers), the mainline DHT and PEX. It accepts incoming peers over TCP and
@@ -15,9 +15,10 @@ for the full architecture, comparison with existing clients, and roadmap.
 > send corrupt data and refuses hostile paths. Phase 4 adds file
 > priorities, streaming reads with seek, pause/resume/remove, a persisted
 > session with a watch folder, an HTTP API with Prometheus metrics
-> (`dravity-http`), `dravity serve` and a terminal UI. See
-> [`docs/phase-1.md`](docs/phase-1.md) to [`docs/phase-4.md`](docs/phase-4.md).
-> Phase 5 (planned) is a full terminal UI: [`docs/phase-5.md`](docs/phase-5.md).
+> (`dravity-http`), `dravity serve` and a terminal UI. Phase 5 makes that
+> UI a full client: add magnets and `.torrent` files, remove, peers,
+> trackers, alerts, sort and filter. See
+> [`docs/phase-1.md`](docs/phase-1.md) to [`docs/phase-5.md`](docs/phase-5.md).
 
 ## Workspace
 
@@ -26,16 +27,16 @@ for the full architecture, comparison with existing clients, and roadmap.
 | [`dravity-bencode`](crates/dravity-bencode) | ✅ Phase 0 | Zero-copy bencode `Value`, serde `Deserializer`/`Serializer`, `RawValue` for exact byte capture, depth and item caps |
 | [`dravity-core`](crates/dravity-core) | ✅ Phase 3 | `InfoHash` (v1, v2 type), `PeerId`, `.torrent` parsing (`Metainfo`, also from fetched `info` bytes), magnet links, compact peers, piece/block/file math, per-platform path-safety checks |
 | [`dravity-wire`](crates/dravity-wire) | ✅ Phase 3 | Handshake + reserved bits, BEP 3/5/6 messages and allowed fast set, BEP 10 extended handshake, BEP 9 `ut_metadata`, BEP 11 `ut_pex`, streaming zero-copy decoder |
-| [`dravity-engine`](crates/dravity-engine) | ✅ Phase 4 | Sans-IO `TorrentState::update(now, Event) -> Vec<Effect>`: rarest-first picker with piece priorities and urgent pieces, AIMD request window, endgame + block stealing, rate limits, choker (tit-for-tat + optimistic unchoke), seeding, BEP 6, bans, PEX, metadata serving, data check, tracker/DHT scheduling; `MetadataState` for magnets |
+| [`dravity-engine`](crates/dravity-engine) | ✅ Phase 5 | Sans-IO `TorrentState::update(now, Event) -> Vec<Effect>`: rarest-first picker with piece priorities and urgent pieces, peer snapshots, AIMD request window, endgame + block stealing, rate limits, choker (tit-for-tat + optimistic unchoke), seeding, BEP 6, bans, PEX, metadata serving, data check, tracker/DHT scheduling; `MetadataState` for magnets |
 | [`dravity-storage`](crates/dravity-storage) | ✅ Phase 3 | `Storage` trait; filesystem backend (LRU FD cache, positional I/O, files opened without following symlinks) and memory backend; block reads; piece verification; fastresume data with file stamps |
 | [`dravity-tracker`](crates/dravity-tracker) | ✅ Phase 2 | HTTP (BEP 3/7/23) and UDP (BEP 15, cached connection ids) announce: sans-IO codecs + async client (rustls) |
 | [`dravity-dht`](crates/dravity-dht) | ✅ Phase 2 | Mainline DHT (BEP 5) peer lookups and announces, wrapping [`mainline`](https://crates.io/crates/mainline) |
-| [`dravity-session`](crates/dravity-session) | ✅ Phase 4 | The only I/O driver: per-torrent owner task on Tokio, peer tasks, TCP/uTP listener (IPv4 + IPv6), disk/hash offload, uploads, magnets, DHT, port mapping, fastresume, BEP 12 tiers, alerts; file priorities, streaming `FileStream`, pause/resume/remove, persisted state + restore, watch folder |
+| [`dravity-session`](crates/dravity-session) | ✅ Phase 5 | The only I/O driver: per-torrent owner task on Tokio, peer tasks, TCP/uTP listener (IPv4 + IPv6), disk/hash offload, uploads, magnets, DHT, port mapping, fastresume, BEP 12 tiers, alerts; file priorities, streaming `FileStream`, pause/resume/remove, persisted state + restore, watch folder; peer and tracker reads |
 | [`dravity-http`](crates/dravity-http) | ✅ Phase 4 | axum JSON API over the session: torrents, files, priorities, streaming with `Range`, server-sent alerts, Prometheus `/metrics`, bearer token |
-| [`dravity-cli`](crates/dravity-cli) | ✅ Phase 4 | `dravity download` / `info` / `serve` for files and magnet links, seeding, file selection, ratatui `--tui`; renders alerts, never drives I/O |
+| [`dravity-cli`](crates/dravity-cli) | ✅ Phase 5 | `dravity download` / `info` / `serve` for files and magnet links, seeding, file selection, a full ratatui `--tui` client (add, remove, peers, trackers, alerts); renders alerts, never drives I/O |
 | [`dravity-utp`](crates/dravity-utp) | ✅ Phase 3 | uTP (BEP 29): packet codec, sans-IO connection with LEDBAT congestion control, Tokio socket and streams |
 | [`dravity-portmap`](crates/dravity-portmap) | ✅ Phase 4 | Router port mapping: NAT-PMP (RFC 6886) and UPnP IGD codecs, `PortMapper` that maps, renews and removes and reports the external port |
-| v2/hybrid torrents, … | ⏳ Phase 6+ | See the roadmap. Phase 5 is the full TUI ([`docs/phase-5.md`](docs/phase-5.md)) |
+| v2/hybrid torrents, … | ⏳ Phase 6+ | See the roadmap |
 
 ## Phase 0 checklist
 
@@ -95,6 +96,18 @@ for the full architecture, comparison with existing clients, and roadmap.
 - [x] Phase 3 leftovers: BEP 6 `suggest` used for picking; announce the router's mapped port
 - [x] Tests: engine priority scripts + proptest, loopback session product tests, HTTP API via `tower` oneshot, TUI via `TestBackend`, CLI `serve`; fuzz targets `session_state`, `http_range`
 
+## Phase 5 checklist
+
+- [x] Add a magnet or a `.torrent` from the screen into the session's download directory; errors keep the prompt open
+- [x] Remove, or remove and delete files, behind a confirm prompt that names the torrent
+- [x] Detail panes: files, peers (`TorrentHandle::peers`: flags, rates, TCP/uTP), trackers (`TorrentHandle::trackers`: last outcome per URL); add one peer
+- [x] Alert log per torrent from `Session::subscribe`; ratio, ETA and a session header
+- [x] Sort and name filter as view state; `?` key list; mouse selects rows; resize redraws at once
+- [x] One 500 ms deadline for the whole refresh; unanswered torrents keep their last numbers
+- [x] `download --tui` keeps running while added torrents are unfinished
+- [x] Fix: sessions serve BEP 9 metadata for torrents added from a file
+- [x] Tests: engine peer snapshots, loopback peer transports and tracker outcomes, TUI draw/key/update tests on `TestBackend`, a loopback paste-a-magnet → pause → remove test
+
 ## Command line
 
 ```sh
@@ -123,8 +136,10 @@ Fastresume data goes to `<output>/.dravity` (`--resume-dir DIR` to move it,
 ```sh
 # only files 0 and 2-4 (indices from `dravity info`), file 3 first
 cargo run --release -p dravity-cli -- download example.torrent --files 0,2-4 --file-priority 3=high
-# full-screen terminal UI (q quits, space pauses, tab + s/l/n/h set file priorities)
+# full-screen terminal UI: a adds a magnet or .torrent, d/D remove, enter shows
+# files/peers/trackers (1/2/3), space pauses, s/l/n/h set file priorities, ? lists keys
 cargo run --release -p dravity-cli -- download example.torrent --tui
+cargo run --release -p dravity-cli -- serve --download-dir downloads --tui
 # a daemon: saved session, watch folder, HTTP API on 127.0.0.1:9091
 DRAVITY_TOKEN=change-me cargo run --release -p dravity-cli -- serve \
     --download-dir downloads --watch torrents

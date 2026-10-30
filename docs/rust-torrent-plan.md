@@ -275,7 +275,7 @@ Workspace root: `dravity` (meta) documenting the library entry via `dravity-sess
    Session persistence; `dravity-http`; a first TUI (list, pause, file priorities); streaming seek; watch folder; Prometheus.
 
 6. **Phase 5 — Full terminal UI**  
-   The Phase 4 screen becomes a client: add a magnet or a `.torrent` while it is running, remove, peers, trackers, alerts, sort and filter. Still session commands and alerts only. See [`docs/phase-5.md`](phase-5.md).
+   The Phase 4 screen becomes a client: add a magnet or a `.torrent` while it is running, remove, peers, trackers, alerts, sort and filter. Still session commands and alerts only. Done: see [`docs/phase-5.md`](phase-5.md).
 
 7. **Phase 6 — Advanced**  
    BEP 52 v2/hybrid + Merkle; web seeds (BEP 19); optional io_uring backend; protocol encryption if required.

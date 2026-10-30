@@ -6,6 +6,40 @@ the roadmap phases until the first release.
 
 ## [Unreleased]
 
+### Phase 5 — Full terminal UI
+
+See [`docs/phase-5.md`](docs/phase-5.md) for design notes.
+
+#### Added
+
+- `dravity_engine::PeerInfo`, `TorrentState::peers`, `MetadataState::peers`:
+  a snapshot of each connected peer (address, direction, pieces, payload
+  totals, choke and interest flags).
+- `TorrentHandle::peers` (`PeerStatus`, `Transport`) and
+  `TorrentHandle::trackers` (`TrackerStatus`, `TrackerOutcome`): the last
+  announce outcome per tracker URL, in tier order.
+- `--tui` is a full client: add a magnet or a `.torrent` file while it
+  runs (`a`), remove a torrent or remove it and delete its files after a
+  confirm prompt (`d` / `D`), detail panes for files, peers and trackers
+  (`1` `2` `3`, add a peer with `a`), a per-torrent alert log, ratio and
+  ETA columns, a header with listen port, DHT, mapped port and totals,
+  sort (`o`), name filter (`/`), a key list (`?`), mouse row selection.
+
+#### Changed
+
+- The TUI refreshes every torrent at once under one 500 ms deadline; a
+  torrent that does not answer keeps its previous numbers instead of
+  stalling the frame.
+- `download --tui` keeps running once a second torrent was added from the
+  screen, until every torrent is finished (or `q`).
+- A magnet still fetching metadata shows no size or progress in the TUI
+  (it showed 100 %).
+
+#### Fixed
+
+- Torrents added from a `.torrent` file now serve their metadata over
+  BEP 9, so magnet-link peers can start from a Dravity seed.
+
 ### Toolchain and dependencies
 
 #### Changed

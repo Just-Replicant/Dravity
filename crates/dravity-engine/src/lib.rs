@@ -60,8 +60,9 @@
 //!   later resumes the download. Higher priorities start before rarer pieces.
 //! * **Urgent pieces**: [`Event::SetUrgent`] lists pieces to fetch first, in
 //!   order (the session's streaming readers).
-//! * **Suggestions**: BEP 6 `suggest` messages are remembered per peer and
-//!   preferred when a new piece of the same priority is started.
+//! * **Suggestions**: BEP 6 `suggest` messages are remembered per peer (the
+//!   newest of the last 16) and preferred when a new piece of the same
+//!   priority is started.
 
 mod ban;
 mod bitfield;

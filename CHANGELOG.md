@@ -28,8 +28,7 @@ the roadmap phases until the first release.
 
 ### Phase 4 — Product surface
 
-See [`docs/phase-4.md`](docs/phase-4.md) for design notes. The Web UI is
-not part of this phase.
+See [`docs/phase-4.md`](docs/phase-4.md) for design notes.
 
 #### Added
 

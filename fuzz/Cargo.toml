@@ -9,9 +9,9 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
-bytes = "1.7"
+bytes = "1.12"
 libfuzzer-sys = "0.4"
-serde = "1.0.200"
+serde = "1.0.229"
 dravity-bencode = { path = "../crates/dravity-bencode" }
 dravity-core = { path = "../crates/dravity-core" }
 dravity-storage = { path = "../crates/dravity-storage" }

@@ -2,8 +2,8 @@
 //!
 //! [`router`] builds an [axum] router that drives the session through its
 //! public API only (commands in, alerts out), like the CLI does. [`serve`]
-//! runs it on a listener until a shutdown signal. There is no Web UI in
-//! this crate; any client that speaks JSON can use it.
+//! runs it on a listener until a shutdown signal. Any client that speaks
+//! JSON can use it.
 //!
 //! | Method | Path | |
 //! |---|---|---|

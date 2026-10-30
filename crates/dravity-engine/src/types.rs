@@ -337,6 +337,10 @@ pub enum Event {
         /// Pieces, most urgent first.
         pieces: Vec<u32>,
     },
+    /// The port published to trackers and the DHT changed. When the torrent
+    /// is in the swarm, announce again so peers are told the current port.
+    /// An announce already in flight is followed by one more.
+    Reannounce,
     /// Every tracker failed for an announce.
     AnnounceFailed {
         /// Human-readable cause.

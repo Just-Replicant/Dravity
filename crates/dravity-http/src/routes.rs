@@ -7,7 +7,7 @@ use std::str::FromStr;
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -287,10 +287,13 @@ pub(crate) async fn add_peers(
 }
 
 /// Streams a file, honoring a single `Range`. Reads wait for missing
-/// pieces, which are fetched first.
+/// pieces, which are fetched first. `HEAD` returns the same status and
+/// headers and no body, so a player can learn the length before a ranged
+/// `GET` without starting a download.
 pub(crate) async fn content(
     State(state): State<AppState>,
     Path((id, index)): Path<(String, usize)>,
+    method: Method,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let handle = running(&state, info_hash(&id)?)?;
@@ -320,32 +323,53 @@ pub(crate) async fn content(
         ),
         Some(Ok(None)) | None => (StatusCode::OK, 0, len, None),
     };
-    stream
-        .seek(SeekFrom::Start(start))
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let body = futures_util::stream::unfold((stream, count), |(mut stream, left)| async move {
-        if left == 0 {
-            return None;
-        }
-        let max = usize::try_from(left).unwrap_or(CHUNK).min(CHUNK);
-        match stream.read_chunk(max).await {
-            Ok(chunk) if chunk.is_empty() => None,
-            Ok(chunk) => {
-                let read = u64::try_from(chunk.len()).unwrap_or(left);
-                Some((Ok(chunk), (stream, left.saturating_sub(read))))
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        stream
+            .seek(SeekFrom::Start(start))
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        let body = futures_util::stream::unfold((stream, count), |(mut stream, left)| async move {
+            if left == 0 {
+                return None;
             }
-            Err(e) => Some((Err(e), (stream, 0))),
-        }
-    });
-    let mut response = Response::new(Body::from_stream(body));
+            let max = usize::try_from(left).unwrap_or(CHUNK).min(CHUNK);
+            match stream.read_chunk(max).await {
+                Ok(chunk) if chunk.is_empty() => None,
+                Ok(chunk) => {
+                    let read = u64::try_from(chunk.len()).unwrap_or(left);
+                    Some((Ok(chunk), (stream, left.saturating_sub(read))))
+                }
+                Err(e) => Some((Err(e), (stream, 0))),
+            }
+        });
+        Body::from_stream(body)
+    };
+    Ok(file_response(
+        status,
+        content_type,
+        count,
+        content_range.as_deref(),
+        body,
+    ))
+}
+
+fn file_response(
+    status: StatusCode,
+    content_type: &str,
+    count: u64,
+    content_range: Option<&str>,
+    body: Body,
+) -> Response {
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     insert(&mut response, header::CONTENT_TYPE, content_type);
     insert(&mut response, header::CONTENT_LENGTH, &count.to_string());
     insert(&mut response, header::ACCEPT_RANGES, "bytes");
     if let Some(value) = content_range {
-        insert(&mut response, header::CONTENT_RANGE, &value);
+        insert(&mut response, header::CONTENT_RANGE, value);
     }
-    Ok(response)
+    response
 }
 
 fn insert(response: &mut Response, name: header::HeaderName, value: &str) {

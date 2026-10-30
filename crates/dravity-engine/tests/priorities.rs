@@ -304,6 +304,29 @@ fn suggested_pieces_are_preferred() {
     assert_eq!(requested_pieces(&fx), vec![3]);
 }
 
+#[test]
+fn the_newest_suggestion_is_preferred() {
+    let mut h = Harness::new(config(), &[]);
+    h.ev(Event::Start);
+    h.ev(Event::Announced {
+        peers: vec![addr(1)],
+        interval: None,
+    });
+    let reserved = Reserved::new().with_fast(true);
+    h.ev(Event::PeerConnected {
+        peer: PeerKey(1),
+        addr: addr(1),
+        reserved,
+    });
+    h.msg(1, Message::HaveAll);
+    h.msg(1, Message::Suggest { piece: 1 });
+    h.msg(1, Message::Suggest { piece: 2 });
+    // Suggesting 1 again makes it the newest of the two.
+    h.msg(1, Message::Suggest { piece: 1 });
+    let fx = h.msg(1, Message::Unchoke);
+    assert_eq!(requested_pieces(&fx), vec![1]);
+}
+
 proptest! {
     /// Whatever the priorities, only wanted pieces are requested and the
     /// torrent finishes with exactly those.

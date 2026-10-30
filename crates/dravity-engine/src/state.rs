@@ -78,7 +78,8 @@ struct Peer {
     /// Pieces we let the peer request while we choke it (BEP 6).
     allowed_out: HashSet<u32>,
     /// Pieces the peer suggested (BEP 6), oldest first, at most
-    /// [`MAX_SUGGESTED`]. Preferred when a new piece is started.
+    /// [`MAX_SUGGESTED`]. A repeat moves that piece to the newest end.
+    /// The picker prefers the newest suggestion of the best priority.
     suggested: VecDeque<u32>,
     /// Requests from the peer waiting for a disk read.
     upload_queue: VecDeque<BlockRef>,
@@ -234,6 +235,9 @@ pub struct TorrentState {
     completed_announced: bool,
     /// The announce the driver is currently performing.
     pending_announce: Option<AnnounceEvent>,
+    /// Send another regular announce when the one in flight finishes.
+    /// Set when the published port changes mid-announce.
+    announce_again: bool,
     /// DHT and PEX addresses refused after a magnet turns out private.
     swarm_ban: HashSet<SocketAddr>,
     dht: DhtSchedule,
@@ -286,6 +290,7 @@ impl TorrentState {
             started_announced: false,
             completed_announced: false,
             pending_announce: None,
+            announce_again: false,
             swarm_ban: HashSet::new(),
             dht: DhtSchedule::default(),
             next_pex: None,
@@ -325,6 +330,14 @@ impl TorrentState {
     #[must_use]
     pub const fn with_started_announced(mut self, started: bool) -> Self {
         self.started_announced = started;
+        self
+    }
+
+    /// The port we announce changed while an announce was in flight, so
+    /// another regular one should follow it.
+    #[must_use]
+    pub const fn with_announce_again(mut self, again: bool) -> Self {
+        self.announce_again = again;
         self
     }
 
@@ -499,6 +512,7 @@ impl TorrentState {
                 self.picker.set_urgent(pieces);
                 self.wanted_changed(now, &mut out);
             }
+            Event::Reannounce => self.reannounce(now, &mut out),
             Event::AnnounceFailed { error } => {
                 if self.pending_announce == Some(AnnounceEvent::Started) {
                     self.started_announced = false;
@@ -507,6 +521,7 @@ impl TorrentState {
                 self.announce_in_flight = false;
                 self.next_announce = Some(now + self.config.announce_retry);
                 out.push(Effect::Alert(Alert::TrackerError { message: error }));
+                self.settle_reannounce(now, &mut out);
             }
             Event::DhtPeers { peers, failed } => {
                 self.dht.done(now, &self.config, failed);
@@ -725,12 +740,38 @@ impl TorrentState {
         if self.announce_in_flight {
             return;
         }
+        self.announce_again = false;
         self.announce_in_flight = true;
         self.pending_announce = Some(event);
         self.next_announce = Some(now + self.config.default_announce_interval);
         self.push_announce(event, out);
         if event == AnnounceEvent::Started {
             self.started_announced = true;
+        }
+    }
+
+    /// The address we publish changed. Tell trackers again when this torrent
+    /// is in the swarm. An announce already on the wire is followed by one
+    /// more, so the port it carried is not the last word.
+    fn reannounce(&mut self, now: Instant, out: &mut Vec<Effect>) {
+        if !self.started_announced || !self.is_active() {
+            return;
+        }
+        if self.announce_in_flight {
+            self.announce_again = true;
+            return;
+        }
+        self.announce(now, AnnounceEvent::None, out);
+    }
+
+    /// Sends the follow-up announce queued by [`Self::reannounce`], once.
+    fn settle_reannounce(&mut self, now: Instant, out: &mut Vec<Effect>) {
+        if !self.announce_again {
+            return;
+        }
+        self.announce_again = false;
+        if self.started_announced && self.is_active() {
+            self.announce(now, AnnounceEvent::None, out);
         }
     }
 
@@ -758,6 +799,7 @@ impl TorrentState {
         self.next_announce = Some(now + interval);
         self.add_to_pool(peers);
         self.fill_connections(out);
+        self.settle_reannounce(now, out);
     }
 
     fn is_connected(peers: &HashMap<PeerKey, Peer>, addr: SocketAddr) -> bool {
@@ -1098,7 +1140,10 @@ impl TorrentState {
                 }
             }
             Message::Suggest { piece } if peer.fast => {
-                if piece < piece_count && !peer.suggested.contains(&piece) {
+                if piece < piece_count {
+                    if let Some(i) = peer.suggested.iter().position(|&p| p == piece) {
+                        peer.suggested.remove(i);
+                    }
                     if peer.suggested.len() >= MAX_SUGGESTED {
                         peer.suggested.pop_front();
                     }

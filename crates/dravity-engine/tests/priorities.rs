@@ -327,6 +327,33 @@ fn the_newest_suggestion_is_preferred() {
     assert_eq!(requested_pieces(&fx), vec![1]);
 }
 
+#[test]
+fn a_changed_port_is_announced_again() {
+    let mut h = Harness::new(config(), &[]);
+    let fx = h.ev(Event::Start);
+    assert!(
+        announces(&fx)
+            .iter()
+            .any(|(event, _)| *event == AnnounceEvent::Started)
+    );
+    let left = layout().total_length();
+    // The started announce is still on the wire: remember, don't send two.
+    assert!(announces(&h.ev(Event::Reannounce)).is_empty());
+    let fx = h.ev(Event::Announced {
+        peers: vec![],
+        interval: None,
+    });
+    assert_eq!(announces(&fx), vec![(AnnounceEvent::None, left)]);
+    // That follow-up is in flight until the tracker answers.
+    let fx = h.ev(Event::Announced {
+        peers: vec![],
+        interval: None,
+    });
+    assert!(announces(&fx).is_empty());
+    let fx = h.ev(Event::Reannounce);
+    assert_eq!(announces(&fx), vec![(AnnounceEvent::None, left)]);
+}
+
 proptest! {
     /// Whatever the priorities, only wanted pieces are requested and the
     /// torrent finishes with exactly those.

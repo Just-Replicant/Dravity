@@ -240,7 +240,13 @@ async fn a_torrent_is_added_downloaded_streamed_and_removed_through_the_api() {
     assert_eq!(list[0]["name"], "payload");
     let detail = get(&app, &format!("/api/v1/torrents/{hash}")).await.json();
     assert_eq!(detail["stats"], Json::Null);
-    assert_eq!(detail["files"][1]["path"], "payload/movie.mp4");
+    assert_eq!(
+        detail["files"][1]["path"],
+        Path::new("payload")
+            .join("movie.mp4")
+            .to_string_lossy()
+            .as_ref()
+    );
     assert_eq!(detail["files"][1]["have"], Json::Null);
 
     let set = send_json(
@@ -260,6 +266,18 @@ async fn a_torrent_is_added_downloaded_streamed_and_removed_through_the_api() {
     .await;
     assert_eq!(one.status, StatusCode::NO_CONTENT);
 
+    let paused_head = call(
+        &app,
+        request(
+            Method::HEAD,
+            &format!("/api/v1/torrents/{hash}/files/1/content"),
+        )
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(paused_head.status, StatusCode::CONFLICT);
+
     let resumed = post(&app, &format!("/api/v1/torrents/{hash}/resume")).await;
     assert_eq!(resumed.status, StatusCode::NO_CONTENT);
     let peers = send_json(
@@ -270,6 +288,59 @@ async fn a_torrent_is_added_downloaded_streamed_and_removed_through_the_api() {
     )
     .await;
     assert_eq!(peers.status, StatusCode::NO_CONTENT);
+
+    // A player can ask for the length before any ranged read. The body
+    // stays empty, including when the bytes are not on disk yet.
+    let head = call(
+        &app,
+        request(
+            Method::HEAD,
+            &format!("/api/v1/torrents/{hash}/files/1/content"),
+        )
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(head.status, StatusCode::OK);
+    assert!(head.body.is_empty());
+    assert_eq!(head.header(header::CONTENT_TYPE), "video/mp4");
+    assert_eq!(head.header(header::ACCEPT_RANGES), "bytes");
+    assert_eq!(head.header(header::CONTENT_LENGTH), len_b.to_string());
+    assert!(!head.headers.contains_key(header::CONTENT_RANGE));
+
+    let head_range = request(
+        Method::HEAD,
+        &format!("/api/v1/torrents/{hash}/files/1/content"),
+    )
+    .header(header::RANGE, "bytes=40000-")
+    .body(Body::empty())
+    .unwrap();
+    let head_range = call(&app, head_range).await;
+    assert_eq!(head_range.status, StatusCode::PARTIAL_CONTENT);
+    assert!(head_range.body.is_empty());
+    assert_eq!(
+        head_range.header(header::CONTENT_LENGTH),
+        (len_b - 40_000).to_string()
+    );
+    assert_eq!(
+        head_range.header(header::CONTENT_RANGE),
+        format!("bytes 40000-{}/{len_b}", len_b - 1)
+    );
+
+    let head_outside = request(
+        Method::HEAD,
+        &format!("/api/v1/torrents/{hash}/files/0/content"),
+    )
+    .header(header::RANGE, format!("bytes={len_a}-"))
+    .body(Body::empty())
+    .unwrap();
+    let head_outside = call(&app, head_outside).await;
+    assert_eq!(head_outside.status, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert!(head_outside.body.is_empty());
+    assert_eq!(
+        head_outside.header(header::CONTENT_RANGE),
+        format!("bytes */{len_a}")
+    );
 
     // Streaming works while (or after) the file downloads.
     let ranged = request(

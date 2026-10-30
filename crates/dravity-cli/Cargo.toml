@@ -24,7 +24,7 @@ dravity-engine.workspace = true
 dravity-http.workspace = true
 dravity-session.workspace = true
 ratatui.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tracing-subscriber.workspace = true
 
 [dev-dependencies]

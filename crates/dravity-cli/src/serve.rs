@@ -76,7 +76,7 @@ pub(crate) async fn run(config: SessionConfig, options: Options) -> Result<()> {
     };
 
     let result = if options.tui {
-        tui::run(&session, |_| false).await
+        tui::run(&session, options.download_dir.clone(), |_| false).await
     } else {
         tokio::signal::ctrl_c().await.context("waiting for Ctrl-C")
     };

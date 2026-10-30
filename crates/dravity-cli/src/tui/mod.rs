@@ -1,612 +1,682 @@
-//! Full-screen terminal UI (`--tui`): every torrent of the session, the
-//! selected torrent's files, and keys to pause, resume and change
-//! priorities. It reads the session like any other client: summaries,
-//! stats and progress through the public API.
+//! Full-screen terminal UI (`--tui`): a client for one session.
+//!
+//! It lists every torrent, shows the selected one's files, peers, trackers
+//! and recent alerts, and adds magnets or `.torrent` files, pauses,
+//! resumes, removes and sets file priorities. Like any other client it
+//! sends session commands and reads alerts; it never polls sockets or
+//! drives a torrent.
+//!
+//! [`view`] holds the model and the state changes keys make, [`keys`] maps
+//! keys to actions, [`draw`] renders a view, and this module runs the loop:
+//! terminal events, alerts and a refresh tick.
+
+mod draw;
+mod keys;
+mod view;
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use dravity_core::InfoHash;
-use dravity_engine::{Priority, Stats, TorrentStatus};
-use dravity_session::{FileProgress, Session, TorrentSummary};
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style, Stylize};
-use ratatui::widgets::{Block, Gauge, Paragraph, Row, Table, TableState};
-use tokio::sync::mpsc;
+use dravity_engine::Stats;
+use dravity_session::{
+    AddTorrentOptions, PeerStatus, PortMapProtocol, Session, TorrentProgress, TrackerStatus,
+};
+use ratatui::layout::Rect;
+use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinSet;
 
-use crate::format;
+use crate::Input;
 
-/// How often the screen is refreshed from the session.
+use view::{Action, Focus, Header, Pane, PeerRow, Request, TrackerRow};
+pub(crate) use view::{TorrentRow, View};
+
+/// How often the screen is refreshed from the session, and how long one
+/// refresh waits for the torrents to answer.
 const REFRESH: Duration = Duration::from_millis(500);
 
-/// One torrent as shown.
-#[derive(Debug, Clone)]
-pub(crate) struct TorrentRow {
-    pub(crate) info_hash: InfoHash,
-    pub(crate) name: String,
-    pub(crate) paused: bool,
-    pub(crate) running: bool,
-    /// Live numbers, while running.
-    pub(crate) stats: Option<StatsRow>,
-    /// Bytes per second.
-    pub(crate) down_rate: u64,
-    /// Bytes per second.
-    pub(crate) up_rate: u64,
+/// A terminal event the input thread forwards.
+#[derive(Debug)]
+enum UiEvent {
+    Key(KeyEvent),
+    Mouse(MouseEvent),
+    Resize,
 }
 
-/// The numbers shown for a running torrent.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct StatsRow {
-    pub(crate) status: TorrentStatus,
-    pub(crate) total_length: u64,
-    pub(crate) bytes_have: u64,
-    pub(crate) wanted_left: u64,
-    pub(crate) uploaded: u64,
-    pub(crate) peers: usize,
+/// One torrent's answer to a refresh.
+#[derive(Debug)]
+enum Reply {
+    Stats(InfoHash, Stats),
+    /// The selected torrent's detail.
+    Progress(TorrentProgress),
+    Peers(Vec<PeerStatus>),
+    Trackers(Vec<TrackerStatus>),
 }
 
-impl From<&Stats> for StatsRow {
-    fn from(s: &Stats) -> Self {
-        Self {
-            status: s.status,
-            total_length: s.total_length,
-            bytes_have: s.bytes_have,
-            wanted_left: s.wanted_left,
-            uploaded: s.uploaded,
-            peers: s.peers,
-        }
-    }
-}
-
-impl TorrentRow {
-    fn new(summary: &TorrentSummary, stats: Option<&Stats>) -> Self {
-        Self {
-            info_hash: summary.info_hash,
-            name: summary
-                .name
-                .clone()
-                .unwrap_or_else(|| summary.info_hash.to_hex()),
-            paused: summary.paused,
-            running: summary.running,
-            stats: stats.map(Into::into),
-            down_rate: 0,
-            up_rate: 0,
-        }
-    }
-}
-
-/// One file as shown (padding files are left out).
-#[derive(Debug, Clone)]
-pub(crate) struct FileRow {
-    pub(crate) index: usize,
-    pub(crate) path: String,
-    pub(crate) length: u64,
-    pub(crate) have: u64,
-    pub(crate) priority: Priority,
-}
-
-impl From<&FileProgress> for FileRow {
-    fn from(f: &FileProgress) -> Self {
-        Self {
-            index: f.index,
-            path: f.path.display().to_string(),
-            length: f.length,
-            have: f.have,
-            priority: f.priority,
-        }
-    }
-}
-
-/// What the screen shows.
+/// Byte counters of the previous sample, for rates.
 #[derive(Debug, Default)]
-pub(crate) struct View {
-    pub(crate) torrents: Vec<TorrentRow>,
-    pub(crate) selected: usize,
-    /// Files of the selected torrent (empty when unknown).
-    pub(crate) files: Vec<FileRow>,
-    pub(crate) selected_file: usize,
-    /// `true` while the file list has the focus.
-    pub(crate) in_files: bool,
-    /// Last action's outcome.
-    pub(crate) message: String,
+struct Samples {
+    torrents: HashMap<InfoHash, (Instant, u64, u64)>,
+    peers: HashMap<(InfoHash, SocketAddr), (Instant, u64, u64)>,
 }
 
-impl View {
-    fn selected(&self) -> Option<&TorrentRow> {
-        self.torrents.get(self.selected)
-    }
-}
-
-/// Draws the whole screen.
-pub(crate) fn draw(frame: &mut Frame<'_>, view: &View) {
-    let [header, list, detail, files, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(4),
-        Constraint::Length(3),
-        Constraint::Min(4),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
-
-    let title = format!(
-        " dravity — {} torrent{}",
-        view.torrents.len(),
-        if view.torrents.len() == 1 { "" } else { "s" }
-    );
-    frame.render_widget(Paragraph::new(title).bold(), header);
-    draw_torrents(frame, view, list);
-    draw_detail(frame, view, detail);
-    draw_files(frame, view, files);
-    let keys = if view.in_files {
-        "q quit · ↑↓ file · s/l/n/h skip/low/normal/high · tab torrents"
-    } else {
-        "q quit · ↑↓ torrent · space pause/resume · tab files"
+/// Bytes per second between a previous sample and now.
+fn rates(previous: Option<&(Instant, u64, u64)>, now: Instant, down: u64, up: u64) -> (u64, u64) {
+    let Some(&(at, prev_down, prev_up)) = previous else {
+        return (0, 0);
     };
-    let footer_text = if view.message.is_empty() {
-        keys.to_owned()
-    } else {
-        format!("{} · {keys}", view.message)
-    };
-    frame.render_widget(Paragraph::new(footer_text).dim(), footer);
-}
-
-fn state(row: &TorrentRow) -> &'static str {
-    if row.paused {
-        "paused"
-    } else if let Some(stats) = &row.stats {
-        format::status(stats.status)
-    } else if row.running {
-        "starting"
-    } else {
-        "stopped"
-    }
-}
-
-fn percent(have: u64, total: u64) -> String {
-    let p = format::permille(have, total);
-    format!("{}.{}%", p / 10, p % 10)
-}
-
-fn draw_torrents(frame: &mut Frame<'_>, view: &View, area: Rect) {
-    let rows = view.torrents.iter().map(|t| {
-        let (progress, size, peers) = t.stats.as_ref().map_or_else(
-            || ("-".to_owned(), "-".to_owned(), "-".to_owned()),
-            |s| {
-                (
-                    percent(s.bytes_have, s.total_length),
-                    format::bytes(s.total_length),
-                    s.peers.to_string(),
-                )
-            },
-        );
-        Row::new(vec![
-            t.name.clone(),
-            state(t).to_owned(),
-            progress,
-            size,
-            format!("{}/s", format::bytes(t.down_rate)),
-            format!("{}/s", format::bytes(t.up_rate)),
-            peers,
-        ])
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Fill(1),
-            Constraint::Length(17),
-            Constraint::Length(7),
-            Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(5),
-        ],
+    let ms = u64::try_from(now.saturating_duration_since(at).as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    (
+        down.saturating_sub(prev_down).saturating_mul(1000) / ms,
+        up.saturating_sub(prev_up).saturating_mul(1000) / ms,
     )
-    .header(
-        Row::new(["Name", "State", "Done", "Size", "Down", "Up", "Peers"])
-            .style(Style::new().add_modifier(Modifier::BOLD)),
-    )
-    .row_highlight_style(highlight(!view.in_files))
-    .block(Block::bordered().title(" Torrents "));
-    let mut state =
-        TableState::new().with_selected((!view.torrents.is_empty()).then_some(view.selected));
-    frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn highlight(focused: bool) -> Style {
-    if focused {
-        Style::new().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::new().add_modifier(Modifier::UNDERLINED)
-    }
-}
-
-fn draw_detail(frame: &mut Frame<'_>, view: &View, area: Rect) {
-    let block = Block::bordered().title(" Selected ");
-    let Some(row) = view.selected() else {
-        frame.render_widget(
-            Paragraph::new("No torrents. Add some through the API or the watch folder.")
-                .block(block),
-            area,
-        );
-        return;
+/// Reads the session into `view`. Every running torrent is asked at once;
+/// after [`REFRESH`] the frame uses what answered and keeps the previous
+/// numbers for the rest, so one stuck torrent cannot freeze the UI.
+async fn refresh(session: &Session, view: &mut View, samples: &mut Samples) {
+    view.header = Header {
+        listen_port: session.listen_port(),
+        dht: session.dht().is_some(),
+        mapped_port: session
+            .port_mapping()
+            .and_then(|s| s.external_port(PortMapProtocol::Tcp)),
     };
-    let Some(stats) = &row.stats else {
-        let text = format!("{} · {}", row.info_hash, state(row));
-        frame.render_widget(Paragraph::new(text).block(block), area);
-        return;
-    };
-    let ratio = if stats.total_length == 0 {
-        1.0
-    } else {
-        // Precision loss is irrelevant for a progress bar.
-        #[allow(clippy::cast_precision_loss)]
-        let r = stats.bytes_have as f64 / stats.total_length as f64;
-        r.clamp(0.0, 1.0)
-    };
-    let label = format!(
-        "{} of {} · {} left wanted · up {} · {} peers{}",
-        format::bytes(stats.bytes_have),
-        format::bytes(stats.total_length),
-        format::bytes(stats.wanted_left),
-        format::bytes(stats.uploaded),
-        stats.peers,
-        if stats.status == TorrentStatus::Finished {
-            " · seeding"
-        } else {
-            ""
-        },
-    );
-    frame.render_widget(
-        Gauge::default().block(block).ratio(ratio).label(label),
-        area,
-    );
-}
-
-fn draw_files(frame: &mut Frame<'_>, view: &View, area: Rect) {
-    let rows = view.files.iter().map(|f| {
-        Row::new(vec![
-            f.priority.as_str().to_owned(),
-            percent(f.have, f.length),
-            format::bytes(f.length),
-            f.path.clone(),
-        ])
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(8),
-            Constraint::Length(7),
-            Constraint::Length(10),
-            Constraint::Fill(1),
-        ],
-    )
-    .header(
-        Row::new(["Priority", "Done", "Size", "Path"])
-            .style(Style::new().add_modifier(Modifier::BOLD)),
-    )
-    .row_highlight_style(highlight(view.in_files))
-    .block(Block::bordered().title(" Files "));
-    let mut state =
-        TableState::new().with_selected((!view.files.is_empty()).then_some(view.selected_file));
-    frame.render_stateful_widget(table, area, &mut state);
-}
-
-/// What a key asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Action {
-    Quit,
-    Up,
-    Down,
-    SwitchFocus,
-    TogglePause,
-    SetPriority(Priority),
-    None,
-}
-
-/// Maps a key press to an action.
-pub(crate) fn action(key: KeyEvent, in_files: bool) -> Action {
-    if key.kind != KeyEventKind::Press {
-        return Action::None;
-    }
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
-        KeyCode::Up | KeyCode::Char('k') => Action::Up,
-        KeyCode::Down | KeyCode::Char('j') => Action::Down,
-        KeyCode::Tab | KeyCode::BackTab => Action::SwitchFocus,
-        KeyCode::Char(' ' | 'p') if !in_files => Action::TogglePause,
-        KeyCode::Char(c) if in_files => match c {
-            's' => Action::SetPriority(Priority::Skip),
-            'l' => Action::SetPriority(Priority::Low),
-            'n' => Action::SetPriority(Priority::Normal),
-            'h' => Action::SetPriority(Priority::High),
-            _ => Action::None,
-        },
-        _ => Action::None,
-    }
-}
-
-/// Reads the session into `view`, keeping the selection on the same
-/// torrent. `previous` holds last refresh's byte counters for the rates.
-async fn refresh(
-    session: &Session,
-    view: &mut View,
-    previous: &mut HashMap<InfoHash, (Instant, u64, u64)>,
-) {
-    let selected = view.selected().map(|t| t.info_hash);
     let mut summaries = session.list();
     summaries.sort_by_key(|t| (t.added_at, t.info_hash));
-    let mut rows = Vec::with_capacity(summaries.len());
-    for summary in summaries {
-        let stats = match session.torrent(summary.info_hash) {
-            Some(handle) => tokio::time::timeout(REFRESH, handle.stats())
-                .await
-                .ok()
-                .and_then(Result::ok),
-            None => None,
+    let selected = view
+        .selected_row()
+        .map(|t| t.info_hash)
+        .or_else(|| summaries.first().map(|s| s.info_hash));
+
+    let mut set = JoinSet::new();
+    for summary in &summaries {
+        let Some(handle) = session.torrent(summary.info_hash) else {
+            continue;
         };
-        let now = Instant::now();
-        let (down_rate, up_rate) = match (&stats, previous.get(&summary.info_hash)) {
-            (Some(s), Some(&(at, down, up))) => {
-                let ms = u64::try_from(now.duration_since(at).as_millis())
-                    .unwrap_or(u64::MAX)
-                    .max(1);
-                (
-                    s.downloaded.saturating_sub(down).saturating_mul(1000) / ms,
-                    s.uploaded.saturating_sub(up).saturating_mul(1000) / ms,
-                )
-            }
-            _ => (0, 0),
-        };
-        if let Some(s) = &stats {
-            previous.insert(summary.info_hash, (now, s.downloaded, s.uploaded));
+        let ih = summary.info_hash;
+        if Some(ih) == selected {
+            let h = handle.clone();
+            set.spawn(async move { h.progress().await.ok().map(Reply::Progress) });
+            let h = handle.clone();
+            set.spawn(async move { h.peers().await.ok().map(Reply::Peers) });
+            let h = handle.clone();
+            set.spawn(async move { h.trackers().await.ok().map(Reply::Trackers) });
         }
-        let mut row = TorrentRow::new(&summary, stats.as_ref());
-        row.down_rate = down_rate;
-        row.up_rate = up_rate;
-        rows.push(row);
+        set.spawn(async move { handle.stats().await.ok().map(|s| Reply::Stats(ih, s)) });
     }
-    view.torrents = rows;
-    view.selected = selected
-        .and_then(|ih| view.torrents.iter().position(|t| t.info_hash == ih))
-        .unwrap_or(0)
-        .min(view.torrents.len().saturating_sub(1));
-    view.files = match view.selected().and_then(|t| session.torrent(t.info_hash)) {
-        Some(handle) => handle
-            .progress()
-            .await
-            .ok()
-            .and_then(|p| p.files)
+    let deadline = tokio::time::Instant::now() + REFRESH;
+    let mut stats = HashMap::new();
+    let mut progress = None;
+    let mut peers = None;
+    let mut trackers = None;
+    while let Ok(Some(joined)) = tokio::time::timeout_at(deadline, set.join_next()).await {
+        match joined.ok().flatten() {
+            Some(Reply::Stats(ih, s)) => {
+                stats.insert(ih, s);
+            }
+            Some(Reply::Progress(p)) => progress = Some(p),
+            Some(Reply::Peers(p)) => peers = Some(p),
+            Some(Reply::Trackers(t)) => trackers = Some(t),
+            None => {}
+        }
+    }
+    // Whatever did not answer in time is dropped (and aborted) here.
+    drop(set);
+
+    let now = Instant::now();
+    let previous: HashMap<InfoHash, TorrentRow> = view
+        .torrents
+        .drain(..)
+        .map(|row| (row.info_hash, row))
+        .collect();
+    view.torrents = summaries
+        .iter()
+        .map(|summary| {
+            let ih = summary.info_hash;
+            let mut row = TorrentRow {
+                info_hash: ih,
+                name: summary.name.clone().unwrap_or_else(|| ih.to_hex()),
+                paused: summary.paused,
+                running: summary.running,
+                stats: None,
+                down_rate: 0,
+                up_rate: 0,
+            };
+            if let Some(s) = stats.get(&ih) {
+                (row.down_rate, row.up_rate) =
+                    rates(samples.torrents.get(&ih), now, s.downloaded, s.uploaded);
+                samples.torrents.insert(ih, (now, s.downloaded, s.uploaded));
+                row.stats = Some(s.into());
+            } else if summary.running
+                && let Some(old) = previous.get(&ih)
+            {
+                // No answer in time: keep the last numbers.
+                row.stats = old.stats;
+                row.down_rate = old.down_rate;
+                row.up_rate = old.up_rate;
+            }
+            row
+        })
+        .collect();
+    samples
+        .torrents
+        .retain(|ih, _| summaries.iter().any(|s| s.info_hash == *ih));
+
+    if view.detail_of != selected {
+        view.detail_of = selected;
+        view.files.clear();
+        view.peers.clear();
+        view.trackers.clear();
+    }
+    if let Some(p) = progress {
+        view.files = p
+            .files
             .unwrap_or_default()
             .iter()
             .filter(|f| !f.padding)
             .map(Into::into)
-            .collect(),
-        None => Vec::new(),
-    };
+            .collect();
+    }
+    if let (Some(peers), Some(ih)) = (peers, selected) {
+        view.peers = peers
+            .iter()
+            .map(|p| {
+                let mut row = PeerRow::from(p);
+                let key = (ih, row.addr);
+                (row.down_rate, row.up_rate) =
+                    rates(samples.peers.get(&key), now, row.downloaded, row.uploaded);
+                samples
+                    .peers
+                    .insert(key, (now, row.downloaded, row.uploaded));
+                row
+            })
+            .collect();
+        let shown: Vec<_> = view.peers.iter().map(|p| (ih, p.addr)).collect();
+        samples.peers.retain(|key, _| shown.contains(key));
+    }
+    if let Some(trackers) = trackers {
+        view.trackers = trackers.iter().map(TrackerRow::from).collect();
+    }
+    if !summaries.iter().any(|s| Some(s.info_hash) == view.selected) {
+        view.selected = selected;
+    }
     view.selected_file = view.selected_file.min(view.files.len().saturating_sub(1));
+    view.selected_peer = view.selected_peer.min(view.peers.len().saturating_sub(1));
+    view.selected_tracker = view
+        .selected_tracker
+        .min(view.trackers.len().saturating_sub(1));
 }
 
-/// Applies an action; returns `false` to quit.
-async fn apply(session: &Session, view: &mut View, action: Action) -> bool {
-    match action {
-        Action::Quit => return false,
-        Action::Up if view.in_files => view.selected_file = view.selected_file.saturating_sub(1),
-        Action::Up => view.selected = view.selected.saturating_sub(1),
-        Action::Down if view.in_files => view.selected_file = view.selected_file.saturating_add(1),
-        Action::Down => view.selected = view.selected.saturating_add(1),
-        Action::SwitchFocus => view.in_files = !view.in_files,
-        Action::TogglePause => {
-            if let Some(row) = view.selected() {
-                let ih = row.info_hash;
-                let result = if row.paused || !row.running {
-                    session.resume(ih).map(|_| "resumed")
-                } else {
-                    session.pause(ih).await.map(|()| "paused")
-                };
-                view.message = match result {
-                    Ok(done) => done.to_owned(),
-                    Err(e) => e.to_string(),
-                };
-            }
-        }
-        Action::SetPriority(priority) => {
-            let file = view.files.get(view.selected_file).map(|f| f.index);
-            if let (Some(row), Some(index)) = (view.selected(), file) {
-                view.message = match session
-                    .set_file_priority(row.info_hash, index, priority)
-                    .await
-                {
-                    Ok(()) => format!("file {index}: {priority}"),
-                    Err(e) => e.to_string(),
-                };
-            }
-        }
-        Action::None => {}
+/// Adds the add prompt's line to the session: a `magnet:` link, or a path
+/// to a `.torrent` file parsed the way `dravity download` does. Returns the
+/// new torrent and its name.
+async fn add(session: &Session, line: &str, download_dir: &Path) -> Result<(InfoHash, String)> {
+    let line = line.trim().to_owned();
+    anyhow::ensure!(!line.is_empty(), "type a magnet: link or a .torrent path");
+    let input = tokio::task::spawn_blocking(move || crate::load(&line))
+        .await
+        .context("reading the torrent")??;
+    let name = input.name();
+    let options = AddTorrentOptions::new(download_dir);
+    let handle = match input {
+        Input::File(metainfo) => session.add_torrent(*metainfo, options),
+        Input::Magnet(magnet) => session.add_magnet(&magnet, options),
     }
+    .context("adding the torrent")?;
+    Ok((handle.info_hash(), name))
+}
+
+/// Connects the torrent to one `host:port`.
+async fn add_peer(session: &Session, info_hash: InfoHash, text: &str) -> Result<SocketAddr> {
+    let text = text.trim();
+    let addr = match text.parse::<SocketAddr>() {
+        Ok(addr) => addr,
+        Err(_) => tokio::net::lookup_host(text)
+            .await
+            .with_context(|| format!("resolving {text} (expected host:port)"))?
+            .next()
+            .with_context(|| format!("{text} has no address"))?,
+    };
+    let handle = session
+        .torrent(info_hash)
+        .context("the torrent is not running")?;
+    handle.add_peers([addr]).await?;
+    Ok(addr)
+}
+
+/// Performs a request. Returns `false` to quit.
+async fn execute(
+    session: &Session,
+    view: &mut View,
+    request: Request,
+    download_dir: &Path,
+) -> bool {
+    view.message = match request {
+        Request::Quit => return false,
+        Request::Pause(ih) => match session.pause(ih).await {
+            Ok(()) => "paused".to_owned(),
+            Err(e) => e.to_string(),
+        },
+        Request::Resume(ih) => match session.resume(ih) {
+            Ok(_) => "resumed".to_owned(),
+            Err(e) => e.to_string(),
+        },
+        Request::SetPriority {
+            info_hash,
+            file,
+            priority,
+        } => match session.set_file_priority(info_hash, file, priority).await {
+            Ok(()) => format!("file {file}: {priority}"),
+            Err(e) => e.to_string(),
+        },
+        Request::Add(line) => match add(session, &line, download_dir).await {
+            Ok((info_hash, name)) => {
+                view.prompt = None;
+                view.selected = Some(info_hash);
+                view.focus = Focus::Torrents;
+                format!("added {name}")
+            }
+            // The prompt stays open with the error under it.
+            Err(e) => format!("{e:#}"),
+        },
+        Request::AddPeer { info_hash, text } => match add_peer(session, info_hash, &text).await {
+            Ok(addr) => {
+                view.prompt = None;
+                format!("connecting to {addr}")
+            }
+            Err(e) => format!("{e:#}"),
+        },
+        Request::Remove {
+            info_hash,
+            name,
+            delete_files,
+        } => match session.remove(info_hash, delete_files).await {
+            Ok(()) if delete_files => format!("removed {name} and deleted its files"),
+            Ok(()) => format!("removed {name}"),
+            Err(e) => format!("{e:#}"),
+        },
+    };
     true
 }
 
-/// Runs the UI until the user quits or `done` resolves to `true` on a
-/// refresh (e.g. a download completed).
-pub(crate) async fn run(session: &Session, mut done: impl FnMut(&View) -> bool) -> Result<()> {
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        anyhow::bail!("--tui needs a terminal");
+/// Moves the selection to the torrent or file row under a left click.
+fn click(view: &mut View, screen: Rect, mouse: MouseEvent) {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) || view.prompt.is_some() {
+        return;
     }
-    let mut terminal = ratatui::try_init().context("starting the terminal UI")?;
-    let (tx, mut keys) = mpsc::channel(16);
-    // Terminal input is blocking; read it on its own thread, which ends
-    // when the UI drops the receiver.
+    let areas = draw::areas(screen, view);
+    let (column, row) = (mouse.column, mouse.row);
+    if let Some(index) = draw::table_row_at(areas.torrents, view.selected_index(), column, row) {
+        if index < view.visible().len() {
+            view.select_index(index);
+            view.focus = Focus::Torrents;
+        }
+    } else if view.pane == Pane::Files
+        && let Some(index) = draw::table_row_at(areas.detail, view.selected_file, column, row)
+        && index < view.files.len()
+    {
+        view.selected_file = index;
+        view.focus = Focus::Detail;
+    }
+}
+
+/// Reads terminal events on a thread (they block) until the UI drops the
+/// receiver.
+fn spawn_input(tx: mpsc::Sender<UiEvent>) {
     std::thread::spawn(move || {
         loop {
             match event::poll(Duration::from_millis(100)) {
-                Ok(true) => match event::read() {
-                    Ok(Event::Key(key)) => {
-                        if tx.blocking_send(key).is_err() {
-                            return;
-                        }
+                Ok(true) => {
+                    let ui = match event::read() {
+                        Ok(Event::Key(key)) => UiEvent::Key(key),
+                        Ok(Event::Mouse(mouse)) => UiEvent::Mouse(mouse),
+                        Ok(Event::Resize(..)) => UiEvent::Resize,
+                        Ok(_) => continue,
+                        Err(_) => return,
+                    };
+                    if tx.blocking_send(ui).is_err() {
+                        return;
                     }
-                    Ok(_) => {}
-                    Err(_) => return,
-                },
+                }
                 Ok(false) if tx.is_closed() => return,
                 Ok(false) => {}
                 Err(_) => return,
             }
         }
     });
+}
+
+/// Puts the terminal back, mouse reporting included.
+fn restore() {
+    let _ = crossterm::execute!(std::io::stdout(), event::DisableMouseCapture);
+    ratatui::restore();
+}
+
+/// Runs the UI until the user quits or `done` returns `true` on a refresh
+/// (e.g. a download completed). Torrents added from the screen download to
+/// `download_dir`.
+pub(crate) async fn run(
+    session: &Session,
+    download_dir: PathBuf,
+    mut done: impl FnMut(&View) -> bool,
+) -> Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        anyhow::bail!("--tui needs a terminal");
+    }
+    let mut terminal = ratatui::try_init().context("starting the terminal UI")?;
+    // Keys still work without mouse reporting.
+    let _ = crossterm::execute!(std::io::stdout(), event::EnableMouseCapture);
+    let (tx, mut events) = mpsc::channel(16);
+    spawn_input(tx);
+    let mut alerts = session.subscribe();
     let mut view = View::default();
-    let mut previous = HashMap::new();
+    let mut samples = Samples::default();
     let mut tick = tokio::time::interval(REFRESH);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let result = loop {
         tokio::select! {
             _ = tick.tick() => {
-                refresh(session, &mut view, &mut previous).await;
+                refresh(session, &mut view, &mut samples).await;
                 if done(&view) {
                     break Ok(());
                 }
             }
-            key = keys.recv() => {
-                let Some(key) = key else { break Ok(()) };
-                let action = action(key, view.in_files);
-                if !apply(session, &mut view, action).await {
-                    break Ok(());
+            event = events.recv() => match event {
+                None => break Ok(()),
+                Some(UiEvent::Resize) => {}
+                Some(UiEvent::Mouse(mouse)) => {
+                    let size = terminal.size().unwrap_or_default();
+                    click(&mut view, Rect::new(0, 0, size.width, size.height), mouse);
                 }
-                refresh(session, &mut view, &mut previous).await;
-            }
+                Some(UiEvent::Key(key)) => {
+                    let action = keys::action(key, &view);
+                    if action == Action::None {
+                        continue;
+                    }
+                    if let Some(request) = view.update(action) {
+                        if !execute(session, &mut view, request, &download_dir).await {
+                            break Ok(());
+                        }
+                        refresh(session, &mut view, &mut samples).await;
+                    }
+                }
+            },
+            alert = alerts.recv() => match alert {
+                Ok(alert) => {
+                    if !view.record_alert(alert.info_hash, &alert.alert) {
+                        continue;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    view.message = format!("missed {n} alerts");
+                }
+                Err(broadcast::error::RecvError::Closed) => break Ok(()),
+            },
         }
-        if let Err(e) = terminal.draw(|frame| draw(frame, &view)) {
+        if let Err(e) = terminal.draw(|frame| draw::draw(frame, &view)) {
             break Err(e.into());
         }
     };
-    ratatui::restore();
+    restore();
     result
-}
-
-/// The screen as text, for tests.
-#[cfg(test)]
-fn render(view: &View, width: u16, height: u16) -> String {
-    let mut terminal =
-        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-    terminal.draw(|frame| draw(frame, view)).unwrap();
-    let buffer = terminal.backend().buffer().clone();
-    let mut out = String::new();
-    for y in 0..buffer.area.height {
-        let line: String = (0..buffer.area.width)
-            .map(|x| buffer[(x, y)].symbol().to_owned())
-            .collect();
-        out.push_str(line.trim_end());
-        out.push('\n');
-    }
-    out
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation
+    )]
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use dravity_engine::Priority;
+    use std::borrow::Cow;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
 
-    use dravity_engine::TorrentStatus;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use dravity_bencode::{Dict, Value};
+    use dravity_core::Metainfo;
+    use dravity_engine::Alert;
+    use dravity_session::{AddTorrentOptions, ListenConfig, Session, SessionConfig};
+    use ratatui::layout::Rect;
+    use sha1::{Digest, Sha1};
+    use tokio::sync::broadcast;
 
-    use super::{Action, FileRow, StatsRow, TorrentRow, View, action, render};
+    use super::view::tests::view;
+    use super::view::{Action, Focus, Prompt, Request, View};
+    use super::{Samples, click, draw, execute, rates, refresh};
 
-    fn view() -> View {
-        let info_hash = "ab".repeat(20).parse().unwrap();
-        View {
-            torrents: vec![TorrentRow {
-                info_hash,
-                name: "debian.iso".to_owned(),
-                paused: false,
-                running: true,
-                stats: Some(StatsRow {
-                    status: TorrentStatus::Downloading,
-                    total_length: 4 * 1024 * 1024,
-                    bytes_have: 1024 * 1024,
-                    wanted_left: 3 * 1024 * 1024,
-                    uploaded: 0,
-                    peers: 3,
-                }),
-                down_rate: 512 * 1024,
-                up_rate: 0,
-            }],
-            files: vec![
-                FileRow {
-                    index: 0,
-                    path: "debian/disk.iso".to_owned(),
-                    length: 4 * 1024 * 1024 - 100,
-                    have: 1024 * 1024,
-                    priority: Priority::High,
-                },
-                FileRow {
-                    index: 1,
-                    path: "debian/README".to_owned(),
-                    length: 100,
-                    have: 0,
-                    priority: Priority::Skip,
-                },
-            ],
-            ..View::default()
+    #[test]
+    fn rates_need_a_previous_sample() {
+        let now = Instant::now();
+        assert_eq!(rates(None, now, 100, 100), (0, 0));
+        let before = now.checked_sub(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            rates(Some(&(before, 0, 1000)), now, 4096, 3000),
+            (2048, 1000)
+        );
+        // A counter that went backwards (a restarted torrent) is not negative.
+        assert_eq!(rates(Some(&(before, 5000, 0)), now, 100, 0), (0, 0));
+    }
+
+    #[test]
+    fn a_click_selects_the_torrent_or_file_row_under_it() {
+        let mut v = view();
+        let screen = Rect::new(0, 0, 100, 30);
+        let areas = draw::areas(screen, &v);
+        let mouse = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        click(&mut v, screen, mouse(areas.torrents.y + 3));
+        assert_eq!(v.selected, Some(v.torrents[1].info_hash));
+        assert_eq!(v.focus, Focus::Torrents);
+        click(&mut v, screen, mouse(areas.detail.y + 3));
+        assert_eq!(v.selected_file, 1);
+        assert_eq!(v.focus, Focus::Detail);
+        // Past the last row, and right clicks, change nothing.
+        click(&mut v, screen, mouse(areas.torrents.y + 4));
+        assert_eq!(v.selected, Some(v.torrents[1].info_hash));
+        let mut right = mouse(areas.torrents.y + 2);
+        right.kind = MouseEventKind::Down(MouseButton::Right);
+        click(&mut v, screen, right);
+        assert_eq!(v.selected, Some(v.torrents[1].info_hash));
+    }
+
+    fn bytes(b: &[u8]) -> Value<'static> {
+        Value::Bytes(Cow::Owned(b.to_vec()))
+    }
+
+    fn dict(entries: Vec<(&str, Value<'static>)>) -> Value<'static> {
+        let mut d = Dict::new();
+        for (k, v) in entries {
+            d.insert(Cow::Owned(k.as_bytes().to_vec()), v);
+        }
+        Value::Dict(d)
+    }
+
+    const PIECE_LEN: usize = 16 * 1024;
+
+    /// A single-file torrent; returns it and its content.
+    fn torrent() -> (Vec<u8>, Vec<u8>) {
+        let content: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let pieces: Vec<u8> = content
+            .chunks(PIECE_LEN)
+            .flat_map(|c| Sha1::digest(c).to_vec())
+            .collect();
+        let info = dict(vec![
+            ("name", bytes(b"tui.bin")),
+            ("length", Value::Int(content.len() as i64)),
+            ("piece length", Value::Int(PIECE_LEN as i64)),
+            ("pieces", bytes(&pieces)),
+        ]);
+        (dict(vec![("info", info)]).to_vec(), content)
+    }
+
+    fn config() -> SessionConfig {
+        let mut c = SessionConfig::default();
+        c.tick_interval = Duration::from_millis(50);
+        c.stop_announce_timeout = Duration::from_secs(1);
+        c.dht = None;
+        c.listen = Some(ListenConfig::loopback(0));
+        c.port_mapping = None;
+        c
+    }
+
+    /// Refreshes until `check` holds (or panics after 20 s).
+    async fn until(
+        session: &Session,
+        view: &mut View,
+        samples: &mut Samples,
+        what: &str,
+        check: impl Fn(&View) -> bool,
+    ) {
+        let start = Instant::now();
+        loop {
+            refresh(session, view, samples).await;
+            if check(view) {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "timed out: {what}: {view:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
-    #[test]
-    fn torrents_and_files_are_listed_with_progress() {
-        let screen = render(&view(), 110, 20);
-        assert!(screen.contains("dravity — 1 torrent\n"), "{screen}");
-        assert!(screen.contains("debian.iso"), "{screen}");
-        assert!(screen.contains("downloading"), "{screen}");
-        assert!(screen.contains("25.0%"), "{screen}");
-        assert!(screen.contains("512.0 KiB/s"), "{screen}");
-        assert!(screen.contains("1.0 MiB of 4.0 MiB"), "{screen}");
-        assert!(screen.contains("high"), "{screen}");
-        assert!(screen.contains("skip"), "{screen}");
-        assert!(screen.contains("debian/README"), "{screen}");
-        assert!(screen.contains("space pause/resume"), "{screen}");
+    /// Feeds typed text to the view.
+    fn type_text(view: &mut View, text: &str) {
+        for c in text.chars() {
+            assert_eq!(view.update(Action::Input(c)), None);
+        }
     }
 
-    #[test]
-    fn the_footer_follows_the_focus_and_shows_the_last_message() {
-        let mut v = view();
-        v.in_files = true;
-        v.message = "file 1: low".to_owned();
-        let screen = render(&v, 110, 20);
-        assert!(screen.contains("file 1: low · q quit"), "{screen}");
-        assert!(screen.contains("s/l/n/h"), "{screen}");
-    }
+    /// The path the UI takes: paste a magnet (metadata from a local seed),
+    /// see it listed with its peer, pause it, remove it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paste_a_magnet_then_pause_and_remove_it() {
+        let (encoded, content) = torrent();
+        let metainfo = Metainfo::from_bytes(&encoded).unwrap();
+        let hash = metainfo.info_hash();
+        let seed_dir = tempfile::tempdir().unwrap();
+        std::fs::write(seed_dir.path().join("tui.bin"), &content).unwrap();
+        let seeder = Session::new(config()).unwrap();
+        let port = seeder.listen_port().unwrap();
+        seeder
+            .add_torrent(metainfo, AddTorrentOptions::new(seed_dir.path()))
+            .unwrap();
 
-    #[test]
-    fn an_empty_session_says_how_to_add_torrents() {
-        let screen = render(&View::default(), 100, 16);
-        assert!(screen.contains("dravity — 0 torrents"), "{screen}");
-        assert!(screen.contains("No torrents."), "{screen}");
-        assert!(screen.contains("q quit"), "{screen}");
-    }
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::new(config()).unwrap();
+        let mut alerts = session.subscribe();
+        let mut v = View::default();
+        let mut samples = Samples::default();
+        refresh(&session, &mut v, &mut samples).await;
+        assert!(v.torrents.is_empty());
+        assert!(v.header.listen_port.is_some());
+        assert!(!v.header.dht);
 
-    #[test]
-    fn keys_map_to_actions_by_focus() {
-        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
-        assert_eq!(action(key('q'), false), Action::Quit);
-        assert_eq!(action(key(' '), false), Action::TogglePause);
-        assert_eq!(action(key(' '), true), Action::None);
-        assert_eq!(action(key('h'), true), Action::SetPriority(Priority::High));
-        assert_eq!(action(key('s'), true), Action::SetPriority(Priority::Skip));
-        assert_eq!(action(key('h'), false), Action::None);
-        assert_eq!(
-            action(
-                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                true
-            ),
-            Action::Quit
+        // A bad line keeps the prompt open with the error.
+        v.update(Action::OpenAdd);
+        type_text(&mut v, "magnet:?xt=urn:btih:nothex");
+        let request = v.update(Action::Submit).unwrap();
+        assert!(execute(&session, &mut v, request, dir.path()).await);
+        assert!(matches!(v.prompt, Some(Prompt::Add(_))), "{v:?}");
+        assert!(v.message.contains("magnet"), "{}", v.message);
+        v.update(Action::Cancel);
+
+        let missing = dir.path().join("missing.torrent");
+        v.update(Action::OpenAdd);
+        type_text(&mut v, &missing.display().to_string());
+        let request = v.update(Action::Submit).unwrap();
+        assert!(execute(&session, &mut v, request, dir.path()).await);
+        assert!(v.prompt.is_some());
+        assert!(v.message.contains("missing.torrent"), "{}", v.message);
+        v.update(Action::Cancel);
+
+        v.update(Action::OpenAdd);
+        type_text(
+            &mut v,
+            &format!("magnet:?xt=urn:btih:{hash}&dn=tui.bin&x.pe=127.0.0.1:{port}"),
         );
-        assert_eq!(
-            action(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), false),
-            Action::SwitchFocus
-        );
+        let request = v.update(Action::Submit).unwrap();
+        assert!(execute(&session, &mut v, request, dir.path()).await);
+        assert_eq!(v.prompt, None, "{}", v.message);
+        assert_eq!(v.message, "added tui.bin");
+        assert_eq!(v.selected, Some(hash));
+
+        until(&session, &mut v, &mut samples, "finished", |v| {
+            v.torrents.len() == 1 && v.torrents[0].is_finished()
+        })
+        .await;
+        assert_eq!(std::fs::read(dir.path().join("tui.bin")).unwrap(), content);
+        assert_eq!(v.detail_of, Some(hash));
+        assert_eq!(v.files.len(), 1);
+        assert!(v.trackers.is_empty(), "the magnet has no trackers");
+
+        // The peers pane adds one address; a bad one keeps the prompt open.
+        v.update(Action::Pane(super::view::Pane::Peers));
+        v.update(Action::OpenAddPeer);
+        type_text(&mut v, "not an address");
+        let request = v.update(Action::Submit).unwrap();
+        assert!(execute(&session, &mut v, request, dir.path()).await);
+        assert!(matches!(v.prompt, Some(Prompt::AddPeer { .. })), "{v:?}");
+        assert!(v.message.contains("host:port"), "{}", v.message);
+        v.update(Action::Cancel);
+        v.update(Action::OpenAddPeer);
+        type_text(&mut v, &format!("127.0.0.1:{port}"));
+        let request = v.update(Action::Submit).unwrap();
+        assert!(execute(&session, &mut v, request, dir.path()).await);
+        assert_eq!(v.prompt, None);
+        assert_eq!(v.message, format!("connecting to 127.0.0.1:{port}"));
+        v.update(Action::Back);
+
+        // The alert log saw the metadata and the finish.
+        loop {
+            match alerts.try_recv() {
+                Ok(alert) => {
+                    v.record_alert(alert.info_hash, &alert.alert);
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        let log = v.selected_alerts().unwrap();
+        assert!(log.iter().any(|l| l == "metadata received"), "{log:?}");
+        assert!(log.iter().any(|l| l == "finished"), "{log:?}");
+        assert!(super::view::alert_text(&Alert::Finished).is_some());
+
+        let request = v.update(Action::TogglePause).unwrap();
+        assert_eq!(request, Request::Pause(hash));
+        assert!(execute(&session, &mut v, request, dir.path()).await);
+        assert_eq!(v.message, "paused");
+        refresh(&session, &mut v, &mut samples).await;
+        assert!(v.torrents[0].paused);
+        assert_eq!(v.torrents[0].state(), "paused");
+
+        assert_eq!(v.update(Action::ConfirmRemove { delete_files: true }), None);
+        let request = v.update(Action::Submit).unwrap();
+        assert!(execute(&session, &mut v, request, dir.path()).await);
+        assert_eq!(v.message, "removed tui.bin and deleted its files");
+        refresh(&session, &mut v, &mut samples).await;
+        assert!(v.torrents.is_empty());
+        assert!(!Path::new(&dir.path().join("tui.bin")).exists());
+
+        session.shutdown().await;
+        seeder.shutdown().await;
     }
 }

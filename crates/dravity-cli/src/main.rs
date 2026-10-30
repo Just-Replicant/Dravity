@@ -418,12 +418,21 @@ async fn download(
     if ui == Ui::Tui {
         let info_hash = torrent.info_hash();
         let mut finished = false;
-        let ui_result = tui::run(&session, |view| {
-            finished |= view.torrents.iter().any(|t| {
-                t.info_hash == info_hash
-                    && t.stats.is_some_and(|s| s.status == TorrentStatus::Finished)
-            });
-            finished && !seed
+        let mut several = false;
+        let ui_result = tui::run(&session, output.clone(), |view| {
+            finished |= view
+                .torrents
+                .iter()
+                .any(|t| t.info_hash == info_hash && t.is_finished());
+            // One torrent: done when it finishes. Once another was added
+            // from the screen: done when every torrent has.
+            several |= view.torrents.len() > 1;
+            let done = if several {
+                !view.torrents.is_empty() && view.torrents.iter().all(tui::TorrentRow::is_finished)
+            } else {
+                finished
+            };
+            done && !seed
         })
         .await;
         session.shutdown().await;

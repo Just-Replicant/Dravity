@@ -1,13 +1,12 @@
 # Phase 4 — Product surface: notes and decisions
 
 Scope from the roadmap (plan §8): session persistence; `dravity-http`;
-TUI/Web UI; streaming seek; file priorities; watch folder; Prometheus.
-Also picks up two Phase 3 deferrals: BEP 6 `suggest` used for picking, and
-announcing a mapped port that differs from the listen port.
+a first TUI (list, pause, file priorities); streaming seek; file
+priorities; watch folder; Prometheus. Also picks up two Phase 3
+deferrals: BEP 6 `suggest` used for picking, and announcing a mapped
+port that differs from the listen port.
 
-**Not in this phase: the Web UI.** `dravity-http` is a JSON API only; it
-serves no static files. A browser UI can be built on the API later without
-changing it (see [Deferred](#deferred)).
+`dravity-http` is a JSON API only. It serves no static files.
 
 ## Crates
 
@@ -139,10 +138,10 @@ and terminals other than an xterm-compatible pseudo-terminal.
 
 | Item | Phase |
 |---|---|
-| Web UI (static files served by `dravity-http`) | later, on top of the API |
-| PCP (RFC 6887), IPv6 pinholes | 5 |
-| uTP tail-loss probe; path MTU discovery | 5 |
-| Peer banning by other evidence (bad messages, ban lists) | 5 |
-| UPnP external-port readback (the device is not asked which port it chose) | 5 |
-| Global (session-wide) rate limits and queueing (max active torrents) | 5 |
+| Full TUI: add a magnet or `.torrent` from the screen, remove, peers, trackers, alerts | 5 — [`phase-5.md`](phase-5.md) |
+| PCP (RFC 6887), IPv6 pinholes | 6 |
+| uTP tail-loss probe; path MTU discovery | 6 |
+| Peer banning by other evidence (bad messages, ban lists) | 6 |
+| UPnP external-port readback (the device is not asked which port it chose) | 6 |
+| Global (session-wide) rate limits and queueing (max active torrents) | 6 |
 | TLS for the API | out of scope: use a reverse proxy |

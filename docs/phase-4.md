@@ -28,7 +28,9 @@ changing it (see [Deferred](#deferred)).
   of the non-padding files it overlaps, so a skipped file next to a wanted
   one still gets its shared boundary pieces (and those bytes are written,
   as in every client). Partly downloaded pieces of a skipped file are not
-  continued.
+  continued. A piece that has already been started is finished before a
+  higher-priority piece is begun, so a priority change does not preempt
+  it; that keeps the number of partial pieces small.
 - **"Finished" means every wanted piece.** `TorrentStatus::Finished` and
   `Alert::Finished` fire when nothing wanted is missing. Trackers are told
   `completed` only when *every* piece is in, once. A partial download that
@@ -65,13 +67,18 @@ changing it (see [Deferred](#deferred)).
   no TLS: put a reverse proxy in front for remote use.
 - **HTTP streaming** honours one byte range (`206`, `416` with
   `Content-Range: bytes */len`); several ranges or malformed headers are
-  ignored and the whole file is sent, as RFC 9110 allows. The `Range`
-  parser is fuzzed (`http_range`).
+  ignored and the whole file is sent, as RFC 9110 allows. `HEAD` returns
+  the same status and headers as `GET` and no body, so a player can read
+  the length before a ranged request. The `Range` parser is fuzzed
+  (`http_range`).
 - **Prometheus without a registry.** `/metrics` reads the session when
   scraped and writes the text format by hand (escaped labels, `HELP` and
-  `TYPE` lines). This avoids a global recorder and an exporter dependency,
-  and there is no state to keep in sync. The plan named `metrics` +
-  exporter; that remains an option if in-engine counters are added.
+  `TYPE` lines). Every torrent is asked at once, and the scrape stops
+  after 2 seconds; a torrent that has not answered is still listed,
+  without its live counters. This avoids a global recorder and an exporter
+  dependency, and there is no state to keep in sync. The plan named
+  `metrics` + exporter; that remains an option if in-engine counters are
+  added.
 - **Server-sent events** carry alerts as JSON (`event:` is the alert
   type). Slow clients get a `lagged` event with the number of alerts they
   missed instead of stalling the session (the broadcast channel is
@@ -118,8 +125,8 @@ curl -H "Authorization: Bearer $TOKEN" localhost:9091/metrics
   streaming with seek, pause/resume/remove with file deletion, restart
   restore, watch folder. Mapped-port selection.
 - HTTP: `tests/api.rs` with `tower::ServiceExt::oneshot` against real
-  loopback sessions (add paused, priorities, resume, peers, ranged and
-  whole streaming, `416`, metrics, pause, delete, errors, token, SSE,
+  loopback sessions (add paused, priorities, resume, peers, `HEAD`, ranged
+  and whole streaming, `416`, metrics, pause, delete, errors, token, SSE,
   graceful shutdown with an open event stream); `Range` proptests.
 - CLI: TUI rendering and key mapping, file selection parsing, `serve`
   (token, watch folder, metrics, restart restore over SIGINT).

@@ -32,7 +32,7 @@ pub struct TorrentSample {
 /// Collects a sample of every torrent of `session`.
 ///
 /// The torrents are asked at the same time, and the wait ends at
-/// [`SCRAPE_TIMEOUT`]. A torrent that has not answered is still listed,
+/// `SCRAPE_TIMEOUT` (two seconds). A torrent that has not answered is still listed,
 /// without live numbers, so one stuck task cannot stretch the scrape or
 /// hide the others.
 pub async fn collect(session: &Session) -> Vec<TorrentSample> {

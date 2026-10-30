@@ -5,18 +5,20 @@
 //! sync and no global recorder to install.
 
 use std::fmt::Write as _;
+use std::future::Future;
 use std::time::Duration;
 
 use dravity_engine::Stats;
 use dravity_session::{Session, TorrentSummary};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use crate::dto;
 
 /// `Content-Type` of the exposition.
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// How long one torrent may take to report its numbers.
-const STATS_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a scrape waits for the torrents, altogether.
+const SCRAPE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One torrent's numbers for a scrape.
 #[derive(Debug, Clone)]
@@ -28,20 +30,58 @@ pub struct TorrentSample {
 }
 
 /// Collects a sample of every torrent of `session`.
+///
+/// The torrents are asked at the same time, and the wait ends at
+/// [`SCRAPE_TIMEOUT`]. A torrent that has not answered is still listed,
+/// without live numbers, so one stuck task cannot stretch the scrape or
+/// hide the others.
 pub async fn collect(session: &Session) -> Vec<TorrentSample> {
-    let mut samples = Vec::new();
-    for summary in session.list() {
-        let stats = match session.torrent(summary.info_hash) {
-            Some(handle) => tokio::time::timeout(STATS_TIMEOUT, handle.stats())
-                .await
-                .ok()
-                .and_then(Result::ok),
-            None => None,
+    let mut samples: Vec<_> = session
+        .list()
+        .into_iter()
+        .map(|summary| TorrentSample {
+            summary,
+            stats: None,
+        })
+        .collect();
+    let pending = FuturesUnordered::new();
+    for (index, sample) in samples.iter().enumerate() {
+        let Some(handle) = session.torrent(sample.summary.info_hash) else {
+            continue;
         };
-        samples.push(TorrentSample { summary, stats });
+        pending.push(async move {
+            let stats = handle.stats().await.ok();
+            (index, stats)
+        });
+    }
+    for (index, stats) in take_ready(pending, SCRAPE_TIMEOUT).await {
+        if let Some(sample) = samples.get_mut(index) {
+            sample.stats = stats;
+        }
     }
     samples.sort_by_key(|s| s.summary.info_hash);
     samples
+}
+
+/// Items that finish within `timeout`, in completion order. The rest are
+/// dropped when the deadline passes.
+async fn take_ready<F>(mut pending: FuturesUnordered<F>, timeout: Duration) -> Vec<F::Output>
+where
+    F: Future,
+{
+    let mut ready = Vec::new();
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !pending.is_empty() {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left, pending.next()).await {
+            Ok(Some(item)) => ready.push(item),
+            _ => break,
+        }
+    }
+    ready
 }
 
 /// Renders the exposition.
@@ -182,7 +222,11 @@ pub fn escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape, render};
+    use std::time::Duration;
+
+    use futures_util::stream::FuturesUnordered;
+
+    use super::{escape, render, take_ready};
 
     #[test]
     fn label_values_are_escaped() {
@@ -204,5 +248,25 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_slow_answer_cannot_stretch_the_deadline() {
+        let pending = FuturesUnordered::new();
+        pending.push(answer(1, Duration::ZERO));
+        pending.push(answer(2, Duration::from_millis(20)));
+        pending.push(answer(3, Duration::from_secs(60)));
+        let started = std::time::Instant::now();
+        let mut got = take_ready(pending, Duration::from_secs(1)).await;
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2]);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    async fn answer(n: u32, wait: Duration) -> u32 {
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        n
     }
 }

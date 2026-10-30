@@ -31,21 +31,20 @@ pub struct CompactError {
 /// # Errors
 /// [`CompactError`] if the length is not a multiple of [`V4_LEN`].
 pub fn parse_v4(bytes: &[u8]) -> Result<Vec<SocketAddr>, CompactError> {
-    let chunks = bytes.chunks_exact(V4_LEN);
-    if !chunks.remainder().is_empty() {
+    let (chunks, rest) = bytes.as_chunks::<V4_LEN>();
+    if !rest.is_empty() {
         return Err(CompactError {
             len: bytes.len(),
             entry: V4_LEN,
         });
     }
     Ok(chunks
-        .filter_map(|c| {
-            let ip: [u8; 4] = c.get(..4)?.try_into().ok()?;
-            let port: [u8; 2] = c.get(4..)?.try_into().ok()?;
-            Some(SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::from(ip),
-                u16::from_be_bytes(port),
-            )))
+        .iter()
+        .map(|&[a, b, c, d, p0, p1]| {
+            SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(a, b, c, d),
+                u16::from_be_bytes([p0, p1]),
+            ))
         })
         .collect())
 }
@@ -55,20 +54,21 @@ pub fn parse_v4(bytes: &[u8]) -> Result<Vec<SocketAddr>, CompactError> {
 /// # Errors
 /// [`CompactError`] if the length is not a multiple of [`V6_LEN`].
 pub fn parse_v6(bytes: &[u8]) -> Result<Vec<SocketAddr>, CompactError> {
-    let chunks = bytes.chunks_exact(V6_LEN);
-    if !chunks.remainder().is_empty() {
+    let (chunks, rest) = bytes.as_chunks::<V6_LEN>();
+    if !rest.is_empty() {
         return Err(CompactError {
             len: bytes.len(),
             entry: V6_LEN,
         });
     }
     Ok(chunks
+        .iter()
         .filter_map(|c| {
-            let ip: [u8; 16] = c.get(..16)?.try_into().ok()?;
-            let port: [u8; 2] = c.get(16..)?.try_into().ok()?;
+            let (ip, port) = c.split_first_chunk::<16>()?;
+            let port = port.first_chunk::<2>()?;
             Some(SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::from(ip),
-                u16::from_be_bytes(port),
+                Ipv6Addr::from(*ip),
+                u16::from_be_bytes(*port),
                 0,
                 0,
             )))

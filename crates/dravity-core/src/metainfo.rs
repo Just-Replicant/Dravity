@@ -355,7 +355,9 @@ impl Info {
             });
         }
         let pieces = pieces_raw
-            .chunks_exact(20)
+            .as_chunks::<20>()
+            .0
+            .iter()
             .map(|c| {
                 let mut h = [0u8; 20];
                 h.copy_from_slice(c);

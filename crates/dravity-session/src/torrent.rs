@@ -449,10 +449,10 @@ impl TorrentTask {
     /// Runs until the torrent stops, then flushes storage, writes resume
     /// data and acknowledges a pending stop command.
     pub(crate) async fn run(mut self) {
-        if let Some(content) = self.content.clone() {
-            if let Some(state) = self.resumed_state(&content, None).await {
-                self.phase = Phase::Download(Box::new(state));
-            }
+        if let Some(content) = self.content.clone()
+            && let Some(state) = self.resumed_state(&content, None).await
+        {
+            self.phase = Phase::Download(Box::new(state));
         }
         let mut tick = tokio::time::interval(self.ctx.config.tick_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

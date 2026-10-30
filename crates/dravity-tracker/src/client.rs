@@ -367,10 +367,10 @@ impl TrackerClient {
     /// clone is left in place.
     fn forget_connection(&self, addr: SocketAddr, id: u64) {
         let mut endpoints = self.lock_endpoints();
-        if let Some(endpoint) = endpoints.get_mut(&addr) {
-            if endpoint.id == Some(id) {
-                endpoint.id = None;
-            }
+        if let Some(endpoint) = endpoints.get_mut(&addr)
+            && endpoint.id == Some(id)
+        {
+            endpoint.id = None;
         }
     }
 

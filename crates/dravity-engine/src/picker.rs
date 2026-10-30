@@ -544,7 +544,9 @@ impl Picker {
     }
 
     fn block_state(&mut self, block: BlockRef) -> Option<(&mut Partial, usize)> {
-        if !self.layout.is_valid_request(block) || block.offset % dravity_core::BLOCK_SIZE != 0 {
+        if !self.layout.is_valid_request(block)
+            || !block.offset.is_multiple_of(dravity_core::BLOCK_SIZE)
+        {
             return None;
         }
         let expected = self

@@ -131,17 +131,16 @@ pub fn parse_announce_response(body: &[u8]) -> Result<AnnounceResponse, TrackerE
 /// # Errors
 /// [`TrackerError::Malformed`] if the length is not a multiple of 6.
 pub fn parse_compact_v4(bytes: &[u8]) -> Result<Vec<SocketAddr>, TrackerError> {
-    let chunks = bytes.chunks_exact(6);
-    if !chunks.remainder().is_empty() {
+    let (chunks, rest) = bytes.as_chunks::<6>();
+    if !rest.is_empty() {
         return Err(TrackerError::Malformed(
             "compact peers length not a multiple of 6",
         ));
     }
     Ok(chunks
-        .filter_map(|c| {
-            let ip: [u8; 4] = c.get(..4)?.try_into().ok()?;
-            let port = u16::from_be_bytes(c.get(4..6)?.try_into().ok()?);
-            Some(SocketAddr::from((Ipv4Addr::from(ip), port)))
+        .iter()
+        .map(|&[a, b, c, d, p0, p1]| {
+            SocketAddr::from((Ipv4Addr::new(a, b, c, d), u16::from_be_bytes([p0, p1])))
         })
         .collect())
 }
@@ -151,17 +150,18 @@ pub fn parse_compact_v4(bytes: &[u8]) -> Result<Vec<SocketAddr>, TrackerError> {
 /// # Errors
 /// [`TrackerError::Malformed`] if the length is not a multiple of 18.
 pub fn parse_compact_v6(bytes: &[u8]) -> Result<Vec<SocketAddr>, TrackerError> {
-    let chunks = bytes.chunks_exact(18);
-    if !chunks.remainder().is_empty() {
+    let (chunks, rest) = bytes.as_chunks::<18>();
+    if !rest.is_empty() {
         return Err(TrackerError::Malformed(
             "compact peers6 length not a multiple of 18",
         ));
     }
     Ok(chunks
+        .iter()
         .filter_map(|c| {
-            let ip: [u8; 16] = c.get(..16)?.try_into().ok()?;
-            let port = u16::from_be_bytes(c.get(16..18)?.try_into().ok()?);
-            Some(SocketAddr::from((Ipv6Addr::from(ip), port)))
+            let (ip, port) = c.split_first_chunk::<16>()?;
+            let port = u16::from_be_bytes(*port.first_chunk::<2>()?);
+            Some(SocketAddr::from((Ipv6Addr::from(*ip), port)))
         })
         .collect())
 }

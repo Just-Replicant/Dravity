@@ -27,9 +27,8 @@ pub(crate) fn hex_decode<const N: usize>(s: &str) -> Option<[u8; N]> {
         return None;
     }
     let mut out = [0u8; N];
-    for (o, pair) in out.iter_mut().zip(s.chunks_exact(2)) {
-        let [hi, lo] = pair else { return None };
-        *o = (hex_val(*hi)? << 4) | hex_val(*lo)?;
+    for (o, &[hi, lo]) in out.iter_mut().zip(s.as_chunks::<2>().0) {
+        *o = (hex_val(hi)? << 4) | hex_val(lo)?;
     }
     Some(out)
 }

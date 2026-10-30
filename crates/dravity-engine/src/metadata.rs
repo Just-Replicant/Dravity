@@ -532,24 +532,25 @@ impl MetadataState {
                         }
                         Ok(MetadataMessage::Request { piece }) => {
                             // We have nothing to serve yet.
-                            if let Some(id) = peer.ext.ut_metadata {
-                                if let Ok(payload) = (MetadataMessage::Reject { piece }).encode() {
-                                    peer.last_sent = now;
-                                    out.push(Effect::Send {
-                                        peer: key,
-                                        message: Message::Extended { id, payload },
-                                    });
-                                }
+                            if let Some(id) = peer.ext.ut_metadata
+                                && let Ok(payload) = (MetadataMessage::Reject { piece }).encode()
+                            {
+                                peer.last_sent = now;
+                                out.push(Effect::Send {
+                                    peer: key,
+                                    message: Message::Extended { id, payload },
+                                });
                             }
                         }
                         _ => {}
                     }
-                } else if id == ext::OUR_UT_PEX && self.config.pex {
-                    if let Some(added) = ext::pex_added(&payload) {
-                        self.note_swarm(&added, true);
-                        self.add_to_pool(added);
-                        self.fill_connections(out);
-                    }
+                } else if id == ext::OUR_UT_PEX
+                    && self.config.pex
+                    && let Some(added) = ext::pex_added(&payload)
+                {
+                    self.note_swarm(&added, true);
+                    self.add_to_pool(added);
+                    self.fill_connections(out);
                 }
             }
             Message::Choke => peer.choked = true,
@@ -601,12 +602,12 @@ impl MetadataState {
         let slot = usize::try_from(index)
             .ok()
             .and_then(|i| self.pieces.get_mut(i));
-        if let Some(piece) = slot {
-            if matches!(piece, Piece::Requested { peer, .. } if *peer == key) {
-                *piece = Piece::Missing {
-                    avoid: Some((key, retry_at)),
-                };
-            }
+        if let Some(piece) = slot
+            && matches!(piece, Piece::Requested { peer, .. } if *peer == key)
+        {
+            *piece = Piece::Missing {
+                avoid: Some((key, retry_at)),
+            };
         }
     }
 
@@ -736,12 +737,12 @@ impl MetadataState {
         // only one that can serve the piece.
         let timeout = self.config.request_timeout;
         for piece in &mut self.pieces {
-            if let Piece::Requested { peer, since } = *piece {
-                if now.saturating_duration_since(since) >= timeout {
-                    *piece = Piece::Missing {
-                        avoid: Some((peer, now + timeout)),
-                    };
-                }
+            if let Piece::Requested { peer, since } = *piece
+                && now.saturating_duration_since(since) >= timeout
+            {
+                *piece = Piece::Missing {
+                    avoid: Some((peer, now + timeout)),
+                };
             }
         }
         self.abandon_stalled_size();

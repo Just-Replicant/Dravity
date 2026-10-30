@@ -43,15 +43,15 @@ struct Slot {
 impl Slot {
     fn wake(&mut self) {
         let failed = self.conn.is_closed();
-        if self.conn.readable() > 0 || self.conn.is_eof() || failed {
-            if let Some(w) = self.read_waker.take() {
-                w.wake();
-            }
+        if (self.conn.readable() > 0 || self.conn.is_eof() || failed)
+            && let Some(w) = self.read_waker.take()
+        {
+            w.wake();
         }
-        if self.conn.writable() > 0 || self.conn.is_connected() || failed {
-            if let Some(w) = self.write_waker.take() {
-                w.wake();
-            }
+        if (self.conn.writable() > 0 || self.conn.is_connected() || failed)
+            && let Some(w) = self.write_waker.take()
+        {
+            w.wake();
         }
     }
 }

@@ -47,13 +47,10 @@ pub fn allowed_fast_set(
     x.extend_from_slice(info_hash.as_bytes());
     while set.len() < k {
         let digest: [u8; 20] = Sha1::digest(&x).into();
-        for chunk in digest.chunks_exact(4) {
+        for &word in digest.as_chunks::<4>().0 {
             if set.len() >= k {
                 break;
             }
-            let Ok(word) = <[u8; 4]>::try_from(chunk) else {
-                continue;
-            };
             let index = u32::from_be_bytes(word) % piece_count;
             if !set.contains(&index) {
                 set.push(index);

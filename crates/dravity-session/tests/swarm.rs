@@ -457,10 +457,10 @@ async fn invalid_metadata_stops_instead_of_hanging() {
     let message = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let alert = alerts.recv().await.expect("alerts closed");
-            if alert.info_hash == hash {
-                if let Alert::Error { message } = alert.alert {
-                    return message;
-                }
+            if alert.info_hash == hash
+                && let Alert::Error { message } = alert.alert
+            {
+                return message;
             }
         }
     })

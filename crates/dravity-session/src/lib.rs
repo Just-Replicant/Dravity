@@ -481,13 +481,11 @@ impl Session {
         } else {
             self.spawn(info_hash, &mut entry)?
         };
-        if save {
-            if let Some(persist) = self.inner.persister() {
-                if let Some(metainfo) = entry.metainfo() {
-                    persist.save_torrent(metainfo);
-                }
-                persist.save_record(&entry.record(info_hash));
+        if save && let Some(persist) = self.inner.persister() {
+            if let Some(metainfo) = entry.metainfo() {
+                persist.save_torrent(metainfo);
             }
+            persist.save_record(&entry.record(info_hash));
         }
         catalog.insert(info_hash, entry);
         Ok(handle)
@@ -706,14 +704,15 @@ impl Session {
             stop_task(commands).await;
         }
         self.forget(&info_hash).await;
-        if delete_files && entry.storage.is_none() {
-            if let Some(metainfo) = entry.metainfo().cloned() {
-                let dir = entry.download_dir.clone();
-                tokio::task::spawn_blocking(move || files::delete_content(&dir, metainfo.info()))
-                    .await
-                    .map_err(std::io::Error::other)?
-                    .map_err(SessionError::Io)?;
-            }
+        if delete_files
+            && entry.storage.is_none()
+            && let Some(metainfo) = entry.metainfo().cloned()
+        {
+            let dir = entry.download_dir.clone();
+            tokio::task::spawn_blocking(move || files::delete_content(&dir, metainfo.info()))
+                .await
+                .map_err(std::io::Error::other)?
+                .map_err(SessionError::Io)?;
         }
         Ok(())
     }
@@ -1114,10 +1113,8 @@ impl TorrentHandle {
             });
             ours && catalog.remove(&self.info_hash).is_some()
         };
-        if removed {
-            if let Some(persist) = inner.persister() {
-                persist.remove(&self.info_hash);
-            }
+        if removed && let Some(persist) = inner.persister() {
+            persist.remove(&self.info_hash);
         }
     }
 }

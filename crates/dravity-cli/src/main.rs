@@ -479,7 +479,7 @@ async fn download(
                     let mut err = std::io::stderr().lock();
                     if tty {
                         let _ = write!(err, "\r{line}\x1b[K");
-                    } else if ticks % 10 == 0 {
+                    } else if ticks.is_multiple_of(10) {
                         let _ = writeln!(err, "{line}");
                     }
                 }

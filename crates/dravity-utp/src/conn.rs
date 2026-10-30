@@ -677,10 +677,10 @@ impl Connection {
         let mut rtt_sample = None;
         let mut take = |s: &Sent| {
             acked_bytes += s.payload.len();
-            if s.transmissions == 1 {
-                if let Some(at) = s.first_sent {
-                    rtt_sample = Some(now.duration_since(at));
-                }
+            if s.transmissions == 1
+                && let Some(at) = s.first_sent
+            {
+                rtt_sample = Some(now.duration_since(at));
             }
         };
         if cumulative {

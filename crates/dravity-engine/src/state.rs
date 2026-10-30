@@ -1144,10 +1144,10 @@ impl TorrentState {
             ext::HANDSHAKE_ID => {
                 if let Ok(hs) = ExtendedHandshake::decode(payload) {
                     peer.ext.update(&hs);
-                    if peer.incoming {
-                        if let Some(port) = hs.listen_port.filter(|&p| p != 0) {
-                            peer.reachable = Some(SocketAddr::new(peer.addr.ip(), port));
-                        }
+                    if peer.incoming
+                        && let Some(port) = hs.listen_port.filter(|&p| p != 0)
+                    {
+                        peer.reachable = Some(SocketAddr::new(peer.addr.ip(), port));
                     }
                 }
                 false
@@ -1616,12 +1616,12 @@ impl TorrentState {
             let Some(&block) = peer.upload_queue.front() else {
                 continue;
             };
-            if let Some(rate) = self.upload_rate.as_mut() {
-                if !rate.try_take(u64::from(block.length)) {
-                    // Tokens refill on the next tick. The charge is refunded
-                    // if this block is never sent.
-                    break;
-                }
+            if let Some(rate) = self.upload_rate.as_mut()
+                && !rate.try_take(u64::from(block.length))
+            {
+                // Tokens refill on the next tick. The charge is refunded
+                // if this block is never sent.
+                break;
             }
             peer.upload_queue.pop_front();
             peer.reading.insert(block);
@@ -1702,11 +1702,11 @@ impl TorrentState {
     }
 
     fn unchoke_peer(&mut self, now: Instant, key: PeerKey, out: &mut Vec<Effect>) {
-        if let Some(peer) = self.peers.get_mut(&key) {
-            if peer.am_choking {
-                peer.am_choking = false;
-                Self::send(peer, key, Message::Unchoke, now, out);
-            }
+        if let Some(peer) = self.peers.get_mut(&key)
+            && peer.am_choking
+        {
+            peer.am_choking = false;
+            Self::send(peer, key, Message::Unchoke, now, out);
         }
     }
 
@@ -1780,10 +1780,10 @@ impl TorrentState {
             .collect();
         let before = self.choker.optimistic();
         let selected = self.choker.round(now, &self.config, &candidates);
-        if let Some(key) = self.choker.optimistic().filter(|k| Some(*k) != before) {
-            if let Some(peer) = self.peers.get_mut(&key) {
-                peer.last_optimistic = now;
-            }
+        if let Some(key) = self.choker.optimistic().filter(|k| Some(*k) != before)
+            && let Some(peer) = self.peers.get_mut(&key)
+        {
+            peer.last_optimistic = now;
         }
         for candidate in &candidates {
             if selected.contains(&candidate.key) {

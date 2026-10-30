@@ -15,7 +15,7 @@
 //! | `POST` | `/api/v1/torrents/{info_hash}/pause`, `/resume` | Pause or resume |
 //! | `PUT` | `/api/v1/torrents/{info_hash}/files` | `{"priorities": ["high", "skip", …]}` |
 //! | `PUT` | `/api/v1/torrents/{info_hash}/files/{index}` | `{"priority": "low"}` |
-//! | `GET` | `/api/v1/torrents/{info_hash}/files/{index}/content` | Stream a file while it downloads (`Range` supported) |
+//! | `GET`, `HEAD` | `/api/v1/torrents/{info_hash}/files/{index}/content` | Stream a file while it downloads (`Range` supported). `HEAD` returns the same status and headers and no body |
 //! | `POST` | `/api/v1/torrents/{info_hash}/peers` | `{"peers": ["1.2.3.4:6881"]}` |
 //! | `GET` | `/api/v1/events?stats=false&info_hash=…` | Alerts as server-sent events |
 //! | `GET` | `/metrics` | Prometheus text format |
@@ -159,7 +159,7 @@ fn build(session: Session, config: HttpConfig, closing: watch::Receiver<bool>) -
         )
         .route(
             "/api/v1/torrents/{info_hash}/files/{index}/content",
-            get(routes::content),
+            get(routes::content).head(routes::content),
         )
         .route(
             "/api/v1/torrents/{info_hash}/peers",

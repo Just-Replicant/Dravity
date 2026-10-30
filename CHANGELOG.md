@@ -64,6 +64,10 @@ not part of this phase.
 - `TorrentHandle::stop` also removes the torrent from the session (and its
   saved state); `Session::shutdown` keeps the saved state.
 - CLI networking options are shared by `download` and `serve`.
+- `/metrics` queries every torrent at once and stops after 2 seconds. A
+  torrent that does not answer is still listed, without live counters.
+- `HEAD` on a file's content returns the same status and headers as `GET`
+  and an empty body.
 
 ### Phase 3 — Good citizen
 

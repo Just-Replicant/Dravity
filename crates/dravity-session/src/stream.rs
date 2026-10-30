@@ -8,6 +8,8 @@ use dravity_utp::UtpStream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
+use crate::status::Transport;
+
 /// The transport under a peer connection.
 #[derive(Debug)]
 pub(crate) enum PeerStream {
@@ -18,9 +20,14 @@ pub(crate) enum PeerStream {
 impl PeerStream {
     /// Short transport name for logs.
     pub(crate) const fn transport(&self) -> &'static str {
+        self.kind().as_str()
+    }
+
+    /// The transport.
+    pub(crate) const fn kind(&self) -> Transport {
         match self {
-            Self::Tcp(_) => "tcp",
-            Self::Utp(_) => "utp",
+            Self::Tcp(_) => Transport::Tcp,
+            Self::Utp(_) => Transport::Utp,
         }
     }
 }

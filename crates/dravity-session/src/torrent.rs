@@ -54,6 +54,7 @@ use crate::files::{self, FileProgress};
 use crate::listen::UtpSockets;
 use crate::peer::{self, PeerCommand, PeerParams};
 use crate::persist::Persister;
+use crate::status::{self, PeerStatus, TrackerLog, TrackerOutcome, TrackerStatus, Transport};
 use crate::stream::PeerStream;
 
 /// Tracker tiers (BEP 12), shared with announce tasks so a tracker that
@@ -67,6 +68,7 @@ pub(crate) enum Input {
         key: PeerKey,
         addr: SocketAddr,
         reserved: Reserved,
+        transport: Transport,
     },
     ConnectFailed {
         key: PeerKey,
@@ -81,6 +83,11 @@ pub(crate) enum Input {
         message: Message,
     },
     Engine(Event),
+    /// An announce finished: the engine's event and what each tracker said.
+    Announced {
+        event: Event,
+        outcomes: Vec<(String, TrackerOutcome)>,
+    },
 }
 
 /// A connection the listener accepted and handshook for this torrent.
@@ -119,6 +126,8 @@ pub(crate) enum Command {
     Stats(oneshot::Sender<Stats>),
     Progress(oneshot::Sender<TorrentProgress>),
     AddPeers(Vec<SocketAddr>),
+    Peers(oneshot::Sender<Vec<PeerStatus>>),
+    Trackers(oneshot::Sender<Vec<TrackerStatus>>),
     Incoming(Accepted),
     /// One priority per file (already validated against the metadata, or
     /// kept until it arrives).
@@ -255,6 +264,10 @@ pub(crate) struct TorrentTask {
     /// Verified `info` dictionary waiting to replace the metadata phase.
     metadata: Option<Bytes>,
     peers: HashMap<PeerKey, mpsc::Sender<PeerCommand>>,
+    /// Peers connected over uTP (the rest use TCP). Pruned against `peers`.
+    utp_peers: HashSet<PeerKey>,
+    /// The last announce outcome per tracker URL.
+    tracker_log: TrackerLog,
     next_key: u64,
     events_tx: mpsc::Sender<Input>,
     events_rx: mpsc::Receiver<Input>,
@@ -322,6 +335,8 @@ impl TorrentTask {
             download_dir,
             metadata: None,
             peers: HashMap::new(),
+            utp_peers: HashSet::new(),
+            tracker_log: TrackerLog::default(),
             next_key: 0,
             events_tx,
             events_rx,
@@ -365,6 +380,32 @@ impl TorrentTask {
                 None
             }
             Command::AddPeers(peers) => Some(Event::AddPeers { peers }),
+            Command::Peers(reply) => {
+                let peers = match &self.phase {
+                    Phase::Metadata(state) => state.peers(),
+                    Phase::Download(state) => state.peers(),
+                };
+                self.utp_peers.retain(|key| self.peers.contains_key(key));
+                let utp = &self.utp_peers;
+                let _ = reply.send(status::peers(peers, |p| {
+                    if utp.contains(&p.key) {
+                        Transport::Utp
+                    } else {
+                        Transport::Tcp
+                    }
+                }));
+                None
+            }
+            Command::Trackers(reply) => {
+                let tiers = self
+                    .ctx
+                    .trackers
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let _ = reply.send(self.tracker_log.list(&tiers));
+                None
+            }
             Command::Incoming(accepted) => Some(self.accept(accepted)),
             Command::SetFilePriorities(priorities) => {
                 self.file_priorities = priorities;
@@ -593,9 +634,13 @@ impl TorrentTask {
                 key,
                 addr,
                 reserved,
+                transport,
             } => {
                 if !self.peers.contains_key(&key) {
                     return None;
+                }
+                if transport == Transport::Utp {
+                    self.utp_peers.insert(key);
                 }
                 Event::PeerConnected {
                     peer: key,
@@ -608,6 +653,7 @@ impl TorrentTask {
                 Event::PeerConnectFailed { addr, retry }
             }
             Input::Disconnected { key } => {
+                self.utp_peers.remove(&key);
                 self.peers.remove(&key)?;
                 Event::PeerDisconnected { peer: key }
             }
@@ -618,6 +664,10 @@ impl TorrentTask {
                 Event::Message { peer: key, message }
             }
             Input::Engine(event) => event,
+            Input::Announced { event, outcomes } => {
+                self.tracker_log.record(Instant::now(), outcomes);
+                event
+            }
         })
     }
 
@@ -796,14 +846,15 @@ impl TorrentTask {
                 let req = self.announce_request(event, uploaded, downloaded, left);
                 if event == AnnounceEvent::Stopped {
                     // The task is about to exit: announce inline, bounded.
+                    // Nobody can read the outcome once the task exits.
                     let fut = announce_all(self.ctx.clone(), req);
                     let _ = tokio::time::timeout(self.ctx.config.stop_announce_timeout, fut).await;
                 } else {
                     let ctx = self.ctx.clone();
                     let tx = self.events_tx.clone();
                     self.background.spawn(async move {
-                        let event = announce_all(ctx, req).await;
-                        let _ = tx.send(Input::Engine(event)).await;
+                        let (event, outcomes) = announce_all(ctx, req).await;
+                        let _ = tx.send(Input::Announced { event, outcomes }).await;
                     });
                 }
             }
@@ -907,6 +958,9 @@ impl TorrentTask {
             leftover,
         } = accepted;
         let (key, rx) = self.new_peer();
+        if stream.kind() == Transport::Utp {
+            self.utp_peers.insert(key);
+        }
         tokio::spawn(peer::run_accepted(
             key,
             addr,
@@ -1127,8 +1181,12 @@ fn dht_lookup_failed(timed_out: bool, peers_empty: bool, has_nodes: bool) -> boo
 /// Announces to the torrent's trackers following BEP 12: tiers are tried
 /// concurrently, the trackers within a tier one after another until one
 /// answers, and a tracker that answered moves to the front of its tier.
-/// Success if any tier got an answer; the results are merged.
-async fn announce_all(ctx: TorrentContext, req: AnnounceRequest) -> Event {
+/// Success if any tier got an answer; the results are merged. Also returns
+/// what each tracker that was asked said, for [`TrackerLog`].
+async fn announce_all(
+    ctx: TorrentContext,
+    req: AnnounceRequest,
+) -> (Event, Vec<(String, TrackerOutcome)>) {
     let tiers: Vec<Vec<String>> = ctx
         .trackers
         .lock()
@@ -1140,10 +1198,11 @@ async fn announce_all(ctx: TorrentContext, req: AnnounceRequest) -> Event {
     if tiers.is_empty() {
         // Explicit peers can still download. Reporting a failure would retry
         // forever and surface a tracker error for a trackerless torrent.
-        return Event::Announced {
+        let event = Event::Announced {
             peers: Vec::new(),
             interval: None,
         };
+        return (event, Vec::new());
     }
     let mut set = JoinSet::new();
     for tier in tiers {
@@ -1156,18 +1215,31 @@ async fn announce_all(ctx: TorrentContext, req: AnnounceRequest) -> Event {
     }
     let mut merge = AnnounceMerge::default();
     let mut errors = Vec::new();
+    let mut outcomes = Vec::new();
     let mut any_ok = false;
     while let Some(joined) = set.join_next().await {
         let Ok((answer, tier_errors)) = joined else {
             continue;
         };
-        errors.extend(tier_errors);
+        for (url, error) in tier_errors {
+            errors.push(format!("{url}: {error}"));
+            outcomes.push((url, TrackerOutcome::Failed { error }));
+        }
         if let Some((url, response)) = answer {
             any_ok = true;
+            outcomes.push((
+                url.clone(),
+                TrackerOutcome::Ok {
+                    interval: response.interval,
+                    seeders: response.seeders,
+                    leechers: response.leechers,
+                    peers: response.peers.len(),
+                },
+            ));
             merge.observe(&url, response);
         }
     }
-    if any_ok {
+    let event = if any_ok {
         for warning in &merge.warnings {
             tracing::warn!(%warning, "tracker warning");
         }
@@ -1180,17 +1252,18 @@ async fn announce_all(ctx: TorrentContext, req: AnnounceRequest) -> Event {
         Event::AnnounceFailed {
             error: errors.join("; "),
         }
-    }
+    };
+    (event, outcomes)
 }
 
 /// Tries the trackers of one tier in order; returns the first answer and
-/// the errors of those that failed before it.
+/// the errors (by URL) of those that failed before it.
 async fn announce_tier(
     client: TrackerClient,
     tiers: Tiers,
     tier: Vec<String>,
     req: AnnounceRequest,
-) -> (Option<(String, AnnounceResponse)>, Vec<String>) {
+) -> (Option<(String, AnnounceResponse)>, Vec<(String, String)>) {
     let mut errors = Vec::new();
     for url in tier {
         match client.announce(&url, &req).await {
@@ -1202,7 +1275,7 @@ async fn announce_tier(
             Err(e) => {
                 let e = error_chain(&e);
                 tracing::debug!(%url, error = %e, "announce failed");
-                errors.push(format!("{url}: {e}"));
+                errors.push((url, e));
             }
         }
     }
@@ -1441,6 +1514,7 @@ mod tests {
         let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead = format!("http://{}/announce", dead_listener.local_addr().unwrap());
         drop(dead_listener);
+        let dead_url = dead.clone();
         let tiers = Arc::new(Mutex::new(vec![vec![dead.clone(), good.clone()]]));
         let client = TrackerClient::new(ClientConfig::default()).unwrap();
         let req = AnnounceRequest {
@@ -1457,7 +1531,8 @@ mod tests {
         let (answer, errors) =
             announce_tier(client, Arc::clone(&tiers), vec![dead, good.clone()], req).await;
         assert_eq!(answer.expect("fallback").0, good);
-        assert!(!errors.is_empty(), "the dead tracker was tried");
+        assert_eq!(errors.len(), 1, "the dead tracker was tried");
+        assert_eq!(errors[0].0, dead_url);
         assert_eq!(tiers.lock().unwrap()[0][0], good);
     }
 }

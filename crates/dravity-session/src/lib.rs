@@ -54,6 +54,13 @@
 //!   what it holds ([`persist`]) and [`Session::restore`] brings it back.
 //! * **Watch folder**: [`Session::watch`] adds `.torrent` and `.magnet`
 //!   files dropped into a directory ([`watch`]).
+//!
+//! Swarm views (Phase 5):
+//!
+//! * **Peers**: [`TorrentHandle::peers`] is a snapshot of the connected
+//!   peers ([`PeerStatus`]: address, pieces, byte totals, flags, transport).
+//! * **Trackers**: [`TorrentHandle::trackers`] lists every tracker with the
+//!   last announce outcome the torrent saw ([`TrackerStatus`]).
 
 mod catalog;
 mod codec;
@@ -64,6 +71,7 @@ mod files;
 mod listen;
 mod peer;
 pub mod persist;
+mod status;
 mod stream;
 mod torrent;
 pub mod watch;
@@ -93,6 +101,7 @@ pub use error::SessionError;
 pub use file_stream::{DEFAULT_READAHEAD, FileStream};
 pub use files::FileProgress;
 pub use listen::ListenConfig;
+pub use status::{PeerStatus, TrackerOutcome, TrackerStatus, Transport};
 pub use torrent::TorrentProgress;
 pub use watch::{WatchConfig, WatchHandle};
 
@@ -1040,6 +1049,36 @@ impl TorrentHandle {
         let (tx, rx) = oneshot::channel();
         self.commands
             .send(Command::Progress(tx))
+            .await
+            .map_err(|_| self.not_running())?;
+        rx.await.map_err(|_| self.not_running())
+    }
+
+    /// A snapshot of the connected peers, ordered by address. Byte
+    /// counters are totals since each peer connected; rates are the
+    /// difference between two snapshots.
+    ///
+    /// # Errors
+    /// [`SessionError::NotRunning`] once the torrent has stopped.
+    pub async fn peers(&self) -> Result<Vec<PeerStatus>, SessionError> {
+        let (tx, rx) = oneshot::channel();
+        self.commands
+            .send(Command::Peers(tx))
+            .await
+            .map_err(|_| self.not_running())?;
+        rx.await.map_err(|_| self.not_running())
+    }
+
+    /// Every tracker of the torrent, in announce order (BEP 12 tiers, the
+    /// tracker that last answered first in its tier), with the outcome of
+    /// its last announce. The torrent does not contact a tracker to answer.
+    ///
+    /// # Errors
+    /// [`SessionError::NotRunning`] once the torrent has stopped.
+    pub async fn trackers(&self) -> Result<Vec<TrackerStatus>, SessionError> {
+        let (tx, rx) = oneshot::channel();
+        self.commands
+            .send(Command::Trackers(tx))
             .await
             .map_err(|_| self.not_running())?;
         rx.await.map_err(|_| self.not_running())

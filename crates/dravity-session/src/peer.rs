@@ -194,6 +194,7 @@ pub(crate) async fn run(
             key,
             addr,
             reserved,
+            transport: stream.kind(),
         })
         .await
         .is_err()

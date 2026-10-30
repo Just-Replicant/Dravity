@@ -17,7 +17,8 @@
 //!
 //! Partially downloaded pieces are finished before new pieces are started,
 //! which keeps the number of partial pieces (and wasted memory and
-//! re-requests) low.
+//! re-requests) low. Raising another piece's priority does not preempt one
+//! that is already in progress.
 //!
 //! Once every wanted block is requested, [`Picker::requested_blocks`] lists
 //! blocks that are in flight so the engine can request them from a second
@@ -32,9 +33,10 @@ use crate::bitfield::Bitfield;
 /// Download priority of a piece (or, in the session, of a file).
 ///
 /// Ordered from lowest to highest. [`Priority::Skip`] pieces are not
-/// downloaded at all (unless urgent); for the others, any piece of a higher
-/// priority is started before any piece of a lower one, and rarest-first
-/// applies within one priority.
+/// downloaded at all (unless urgent); for the others, any not-yet-started
+/// piece of a higher priority is started before any piece of a lower one,
+/// and rarest-first applies within one priority. A piece already in
+/// progress is finished first, unless it is skipped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Priority {
     /// Do not download.
@@ -199,7 +201,8 @@ pub struct Picker {
     skipped: u32,
     /// Pieces that are wanted (not skipped) and missing.
     wanted_missing: u32,
-    /// Bytes of the pieces in `wanted_missing`.
+    /// Bytes still to fetch: missing pieces that are wanted by priority,
+    /// plus missing urgent pieces whose priority is skip.
     wanted_left: u64,
 }
 
@@ -313,8 +316,9 @@ impl Picker {
             && (self.priority(piece).is_wanted() || self.urgent.contains(&piece))
     }
 
-    /// Sets the priority of one piece. Pieces already started stay started;
-    /// a skipped partial piece is simply not continued.
+    /// Sets the priority of one piece. Pieces already started stay started
+    /// and are finished before a newly higher-priority piece is begun; a
+    /// skipped partial piece is simply not continued.
     pub fn set_priority(&mut self, piece: u32, priority: Priority) {
         let Some(slot) = usize::try_from(piece)
             .ok()
@@ -338,14 +342,16 @@ impl Picker {
         }
         let size = u64::from(self.layout.piece_size(piece).unwrap_or(0));
         match (old.is_wanted(), priority.is_wanted()) {
-            (true, false) => {
-                self.wanted_missing -= 1;
-                self.wanted_left = self.wanted_left.saturating_sub(size);
-            }
-            (false, true) => {
-                self.wanted_missing += 1;
-                self.wanted_left = self.wanted_left.saturating_add(size);
-            }
+            (true, false) => self.wanted_missing -= 1,
+            (false, true) => self.wanted_missing += 1,
+            _ => {}
+        }
+        // An urgent piece stays in `wanted_left` when its priority becomes
+        // skip, and is not counted twice when the priority is raised.
+        let urgent = self.urgent.contains(&piece);
+        match (old.is_wanted() || urgent, priority.is_wanted() || urgent) {
+            (true, false) => self.wanted_left = self.wanted_left.saturating_sub(size),
+            (false, true) => self.wanted_left = self.wanted_left.saturating_add(size),
             _ => {}
         }
         if self.partial.contains_key(&piece) {
@@ -372,13 +378,31 @@ impl Picker {
 
     /// Replaces the urgent list: these pieces are picked first, in order,
     /// even when skipped. Out-of-range, duplicate and verified pieces are
-    /// dropped.
+    /// dropped. Skipped pieces on this list count toward [`Self::wanted_left`].
     pub fn set_urgent(&mut self, pieces: impl IntoIterator<Item = u32>) {
-        let count = self.layout.piece_count();
+        self.adjust_urgent_left(false);
         self.urgent.clear();
+        let count = self.layout.piece_count();
         for piece in pieces {
             if piece < count && !self.have.get(piece) && !self.urgent.contains(&piece) {
                 self.urgent.push(piece);
+            }
+        }
+        self.adjust_urgent_left(true);
+    }
+
+    /// Adds or removes the bytes of urgent pieces that priority alone would
+    /// not count. Wanted pieces are already in [`Self::wanted_left`].
+    fn adjust_urgent_left(&mut self, add: bool) {
+        for &piece in &self.urgent {
+            if self.have.get(piece) || self.priority(piece).is_wanted() {
+                continue;
+            }
+            let size = u64::from(self.layout.piece_size(piece).unwrap_or(0));
+            if add {
+                self.wanted_left = self.wanted_left.saturating_add(size);
+            } else {
+                self.wanted_left = self.wanted_left.saturating_sub(size);
             }
         }
     }
@@ -479,8 +503,9 @@ impl Picker {
     }
 
     /// Like [`Self::pick`], but a new piece in `hint` (e.g. the peer's BEP 6
-    /// `suggest`s) is preferred over rarest-first when its priority is at
-    /// least that of the piece rarest-first would start.
+    /// `suggest`s, oldest first) is preferred over rarest-first when its
+    /// priority is at least that of the piece rarest-first would start.
+    /// The newest such hint wins.
     pub fn pick_with_hint(&mut self, pieces: &Bitfield, hint: &[u32]) -> Option<BlockRef> {
         if let Some(block) = self.pick_urgent(pieces) {
             return Some(block);
@@ -495,6 +520,7 @@ impl Picker {
             .copied()?;
         let chosen = hint
             .iter()
+            .rev()
             .filter(|&&p| pieces.get(p))
             .map(|&p| (self.priority(p).rank(), self.availability(p), p))
             .find(|key| key.0 <= best.0 && self.queue.contains(key))
@@ -625,14 +651,17 @@ impl Picker {
         if !self.have.set(piece) {
             return false;
         }
+        let urgent = self.urgent.contains(&piece);
         self.partial.remove(&piece);
         self.urgent.retain(|&p| p != piece);
         let priority = self.priority(piece);
         let avail = self.availability(piece);
         self.queue.remove(&(priority.rank(), avail, piece));
+        let size = u64::from(self.layout.piece_size(piece).unwrap_or(0));
         if priority.is_wanted() {
             self.wanted_missing -= 1;
-            let size = u64::from(self.layout.piece_size(piece).unwrap_or(0));
+            self.wanted_left = self.wanted_left.saturating_sub(size);
+        } else if urgent {
             self.wanted_left = self.wanted_left.saturating_sub(size);
         }
         true
@@ -662,6 +691,22 @@ mod tests {
         assert_eq!(p.pick(&all).map(|b| b.piece), Some(2));
         // The other peer does not have 2: lowest index among rarest it has.
         assert_eq!(p.pick(&some).map(|b| b.piece), Some(0));
+    }
+
+    #[test]
+    fn a_started_low_piece_finishes_before_a_high_piece_starts() {
+        let mut p = Picker::new(layout(2, 2 * BLOCK_SIZE), Bitfield::new(2));
+        let mut only_0 = Bitfield::new(2);
+        only_0.set(0);
+        p.set_priority(0, Priority::Low);
+        let first = p.pick(&only_0).unwrap();
+        assert_eq!((first.piece, first.offset), (0, 0));
+        // Raised after the low piece has a block in flight.
+        p.set_priority(1, Priority::High);
+        let all = Bitfield::full(2);
+        let next = p.pick(&all).unwrap();
+        assert_eq!((next.piece, next.offset), (0, BLOCK_SIZE));
+        assert_eq!(p.pick(&all).map(|b| b.piece), Some(1));
     }
 
     #[test]
@@ -823,6 +868,11 @@ mod tests {
         p.set_priority(4, Priority::Skip);
         p.set_urgent([4, 3, 3, 9]);
         assert_eq!(p.urgent(), &[4, 3]);
+        assert_eq!(
+            p.wanted_left(),
+            u64::from(5 * BLOCK_SIZE),
+            "the skipped urgent piece still counts"
+        );
         assert!(p.is_wanted(4), "urgent overrides skip");
         let mut only_0 = Bitfield::new(5);
         only_0.set(4);
@@ -847,6 +897,13 @@ mod tests {
         p.remove_peer_pieces(&rare);
         // Rarest-first would start 0; the hint asks for 3.
         assert_eq!(p.pick_with_hint(&all, &[3]).map(|b| b.piece), Some(3));
+        // Oldest hint first: 0 was suggested before 2, so the newest (2) wins.
+        let mut again = Picker::new(layout(4, BLOCK_SIZE), Bitfield::new(4));
+        again.add_peer_pieces(&all);
+        assert_eq!(
+            again.pick_with_hint(&all, &[0, 2]).map(|b| b.piece),
+            Some(2)
+        );
         p.set_priority(1, Priority::High);
         // A hint never beats a higher priority.
         assert_eq!(p.pick_with_hint(&all, &[2]).map(|b| b.piece), Some(1));

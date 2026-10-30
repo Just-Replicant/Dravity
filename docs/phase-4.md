@@ -76,11 +76,11 @@ changing it (see [Deferred](#deferred)).
   type). Slow clients get a `lagged` event with the number of alerts they
   missed instead of stalling the session (the broadcast channel is
   bounded). Streams end on server shutdown so graceful shutdown finishes.
-- **TUI in the CLI** with ratatui 0.29 + crossterm: torrents, the selected
+- **TUI in the CLI** with ratatui + crossterm: torrents, the selected
   torrent's files, pause/resume and priorities. Rendering is a pure
-  function of a view model, tested with `TestBackend`. ratatui 0.30 needs
-  Rust 1.86 (above the MSRV), and 0.29 pulls in the unmaintained `paste`
-  macro crate; `deny.toml` documents that exception.
+  function of a view model, tested with `TestBackend`. (It started on
+  ratatui 0.29, whose unmaintained `paste` dependency needed a `deny.toml`
+  exception; the move to Rust 1.99 and ratatui 0.30 removed both.)
 - **Mapped port.** When NAT-PMP maps a different public TCP port, trackers
   and the DHT are told that port (`Status::external_port`); otherwise the
   listen port, as before.

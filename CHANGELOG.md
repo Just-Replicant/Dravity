@@ -6,6 +6,26 @@ the roadmap phases until the first release.
 
 ## [Unreleased]
 
+### Toolchain and dependencies
+
+#### Changed
+
+- **MSRV raised from Rust 1.85 to 1.99** (latest stable; edition 2024 is
+  unchanged as the newest edition). CI's MSRV job runs 1.99 and uses
+  `actions/checkout@v7`.
+- Every dependency upgraded to its latest release, including majors:
+  ratatui 0.30, crossterm 0.29, sha1 0.11, criterion 0.8; fuzz: bytes 1.12,
+  serde 1.0.229.
+- Code adopts what the new MSRV allows: let-chains instead of nested
+  `if`/`if let`, `slice::as_chunks` for fixed-size records (compact peers,
+  hex, piece hashes, allowed fast set), `is_multiple_of`. No behavior
+  change.
+
+#### Removed
+
+- The `deny.toml` advisory exception for `paste` (ratatui 0.30 no longer
+  depends on it) and the criterion MSRV pin.
+
 ### Phase 4 — Product surface
 
 See [`docs/phase-4.md`](docs/phase-4.md) for design notes. The Web UI is

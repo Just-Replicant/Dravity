@@ -173,7 +173,9 @@ session.shutdown().await;
 
 ## Development
 
-Requires Rust **1.85+** (edition 2024). `rust-toolchain.toml` selects stable.
+Requires Rust **1.99+** (edition 2024, the latest edition). `rust-toolchain.toml`
+selects the latest stable toolchain (`rustup update stable`); CI also tests
+the MSRV, 1.99.
 
 Point `origin` at this repository over SSH:
 

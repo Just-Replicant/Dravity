@@ -223,7 +223,10 @@ async fn serve(
                             added: script
                                 .pex
                                 .iter()
-                                .map(|&addr| PexPeer { addr, flags: 0 })
+                                .map(|&addr| PexPeer {
+                                    addr,
+                                    flags: Some(0),
+                                })
                                 .collect(),
                             dropped: Vec::new(),
                         };

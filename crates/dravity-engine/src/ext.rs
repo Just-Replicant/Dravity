@@ -91,17 +91,11 @@ pub(crate) fn our_handshake(
     }
 }
 
-/// Peers to add from a received PEX message (at most
+/// Peers to add from a received PEX message, with their flags (at most
 /// [`PEX_MAX_ACCEPTED`]); `None` if the payload is malformed.
-pub(crate) fn pex_added(payload: &[u8]) -> Option<Vec<SocketAddr>> {
+pub(crate) fn pex_added(payload: &[u8]) -> Option<Vec<PexPeer>> {
     let msg = PexMessage::decode(payload).ok()?;
-    Some(
-        msg.added
-            .into_iter()
-            .take(PEX_MAX_ACCEPTED)
-            .map(|p| p.addr)
-            .collect(),
-    )
+    Some(msg.added.into_iter().take(PEX_MAX_ACCEPTED).collect())
 }
 
 /// A PEX message announcing `added` (with BEP 11 flags) and `dropped`.
@@ -109,7 +103,10 @@ pub(crate) fn pex_message(id: u8, added: &[(SocketAddr, u8)], dropped: &[SocketA
     let msg = PexMessage {
         added: added
             .iter()
-            .map(|&(addr, flags)| PexPeer { addr, flags })
+            .map(|&(addr, flags)| PexPeer {
+                addr,
+                flags: Some(flags),
+            })
             .collect(),
         dropped: dropped.to_vec(),
     };

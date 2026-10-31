@@ -16,11 +16,13 @@ use crate::ban::HashBans;
 use crate::bitfield::Bitfield;
 use crate::choker::{Candidate, Choker};
 use crate::ext::{self, PeerExtensions};
+use crate::hints::{HintBook, Joined};
 use crate::picker::{Picker, Priority, Received};
 use crate::pool::PeerPool;
 use crate::rate::TokenBucket;
 use crate::types::{
-    Alert, AnnounceEvent, Config, Effect, Event, PeerInfo, PeerKey, Stats, TorrentStatus,
+    Alert, AnnounceEvent, Config, DialHints, Effect, Event, PeerInfo, PeerKey, PeerLink, Stats,
+    TorrentStatus,
 };
 use crate::window::Window;
 
@@ -59,6 +61,8 @@ struct Peer {
     /// dialed, or an incoming peer's IP with the `p` of its extension
     /// handshake.
     reachable: Option<SocketAddr>,
+    /// Transport and encryption of the connection (for PEX flags).
+    link: PeerLink,
     has: Bitfield,
     /// `bitfield`, `have all`, and `have none` are still legal. Keep-alives,
     /// DHT `port`, and BEP 10 extended messages do not clear this: common
@@ -126,6 +130,7 @@ impl Peer {
             addr,
             incoming,
             reachable: (!incoming).then_some(addr),
+            link: PeerLink::default(),
             has: Bitfield::new(piece_count),
             bitfield_ok: true,
             am_interested: false,
@@ -241,6 +246,8 @@ pub struct TorrentState {
     status: TorrentStatus,
     peers: HashMap<PeerKey, Peer>,
     pool: PeerPool,
+    /// PEX flags and connection outcomes by address.
+    hints: HintBook,
     /// Peers holding a request for each in-flight block, with request times.
     owners: HashMap<BlockRef, Vec<(PeerKey, Instant)>>,
     check: Option<Check>,
@@ -302,6 +309,7 @@ impl TorrentState {
             status: TorrentStatus::Idle,
             peers: HashMap::new(),
             pool: PeerPool::default(),
+            hints: HintBook::default(),
             owners: HashMap::new(),
             check: None,
             next_announce: None,
@@ -399,6 +407,17 @@ impl TorrentState {
     #[must_use]
     pub const fn picker(&self) -> &Picker {
         &self.picker
+    }
+
+    /// Dial hints learned before this state existed (a magnet's
+    /// [`Handover::hints`](crate::Handover::hints)).
+    #[must_use]
+    pub fn with_dial_hints(
+        mut self,
+        hints: impl IntoIterator<Item = (SocketAddr, DialHints)>,
+    ) -> Self {
+        self.hints.extend(hints);
+        self
     }
 
     /// Addresses whose TCP handshake is already in progress.
@@ -510,12 +529,37 @@ impl TorrentState {
                 peer,
                 addr,
                 reserved,
-            } => self.on_connected(now, peer, addr, reserved, false, &mut out),
+                link,
+            } => {
+                self.hints.observe(addr, link);
+                self.on_connected(
+                    now,
+                    Joined {
+                        key: peer,
+                        addr,
+                        reserved,
+                        link,
+                        incoming: false,
+                    },
+                    &mut out,
+                );
+            }
             Event::PeerAccepted {
                 peer,
                 addr,
                 reserved,
-            } => self.on_connected(now, peer, addr, reserved, true, &mut out),
+                link,
+            } => self.on_connected(
+                now,
+                Joined {
+                    key: peer,
+                    addr,
+                    reserved,
+                    link,
+                    incoming: true,
+                },
+                &mut out,
+            ),
             Event::PeerConnectFailed { addr, retry } => {
                 self.pool.dial_done(addr);
                 if retry {
@@ -910,19 +954,19 @@ impl TorrentState {
             let Some(addr) = self.pool.next_dial(|a| Self::is_connected(peers, a)) else {
                 break;
             };
-            out.push(Effect::Connect { addr });
+            let hints = self.hints.get(addr);
+            out.push(Effect::Connect { addr, hints });
         }
     }
 
-    fn on_connected(
-        &mut self,
-        now: Instant,
-        key: PeerKey,
-        addr: SocketAddr,
-        reserved: Reserved,
-        incoming: bool,
-        out: &mut Vec<Effect>,
-    ) {
+    fn on_connected(&mut self, now: Instant, joined: Joined, out: &mut Vec<Effect>) {
+        let Joined {
+            key,
+            addr,
+            reserved,
+            link,
+            incoming,
+        } = joined;
         if !incoming {
             self.pool.dial_done(addr);
         }
@@ -940,6 +984,7 @@ impl TorrentState {
         }
         let piece_count = self.picker.layout().piece_count();
         let mut peer = Peer::new(addr, incoming, reserved, piece_count, &self.config, now);
+        peer.link = link;
         if peer.extended {
             let size = self
                 .info_bytes
@@ -1255,7 +1300,12 @@ impl TorrentState {
                     if peer.incoming
                         && let Some(port) = hs.listen_port.filter(|&p| p != 0)
                     {
-                        peer.reachable = Some(SocketAddr::new(peer.addr.ip(), port));
+                        let reachable = SocketAddr::new(peer.addr.ip(), port);
+                        peer.reachable = Some(reachable);
+                        // An incoming MSE or uTP connection shows the peer
+                        // speaks it, wherever it listens.
+                        let link = peer.link;
+                        self.hints.observe(reachable, link);
                     }
                 }
                 false
@@ -1278,7 +1328,10 @@ impl TorrentState {
             }
             ext::OUR_UT_PEX if self.config.pex => match ext::pex_added(payload) {
                 Some(added) if !added.is_empty() => {
-                    self.add_to_pool(added);
+                    for p in &added {
+                        self.hints.learn_pex(p.addr, p.flags);
+                    }
+                    self.add_to_pool(added.iter().map(|p| p.addr).collect());
                     true
                 }
                 _ => false,
@@ -1980,15 +2033,13 @@ impl TorrentState {
         }
         // Only addresses others can dial: an incoming peer's source port is
         // useless until its extension handshake names its listen port.
+        let hints = &self.hints;
         let connected: HashMap<SocketAddr, u8> = self
             .peers
             .values()
             .filter_map(|p| {
-                let mut flags = dravity_wire::PEX_REACHABLE;
-                if p.has.is_full() {
-                    flags |= dravity_wire::PEX_SEED;
-                }
-                p.reachable.map(|a| (a, flags))
+                let addr = p.reachable?;
+                Some((addr, pex_flags(p, hints.get(addr))))
             })
             .collect();
         for key in self.sorted_keys() {
@@ -2023,6 +2074,27 @@ impl TorrentState {
             Self::send(peer, key, ext::pex_message(id, &added, &dropped), now, out);
         }
     }
+}
+
+/// The BEP 11 `added.f` flags we share for a connected peer reachable at
+/// an address with `hints`.
+fn pex_flags(peer: &Peer, hints: DialHints) -> u8 {
+    let mut flags = 0;
+    // Seen on this connection, or by an earlier one of ours.
+    if peer.link.mse == Some(true) || hints.encryption == Some(true) {
+        flags |= dravity_wire::PEX_ENCRYPTION;
+    }
+    if peer.has.is_full() {
+        flags |= dravity_wire::PEX_SEED;
+    }
+    if peer.link.utp || hints.utp == Some(true) {
+        flags |= dravity_wire::PEX_UTP;
+    }
+    // Only a connection we opened proves others can open one too.
+    if !peer.incoming {
+        flags |= dravity_wire::PEX_REACHABLE;
+    }
+    flags
 }
 
 /// IPv4 address BEP 6 uses for `ip`. Mapped IPv6 addresses use the embedded

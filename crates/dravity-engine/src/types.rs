@@ -209,6 +209,60 @@ impl Default for Config {
     }
 }
 
+/// What the driver observed about a connection: shared with other peers
+/// as BEP 11 PEX flags and remembered for dialing the address again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct PeerLink {
+    /// The connection runs over uTP (BEP 29).
+    pub utp: bool,
+    /// Message Stream Encryption: `Some(true)` when the connection completed
+    /// an MSE handshake (RC4 or its plaintext method), `Some(false)` when we
+    /// offered MSE and the peer refused it, `None` when MSE was not tried.
+    pub mse: Option<bool>,
+}
+
+/// What is known about a peer before it is dialed, from BEP 11 PEX flags or
+/// an earlier connection; see [`Effect::Connect`]. `None` means unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct DialHints {
+    /// Supports Message Stream Encryption: PEX flag `0x01`, or an MSE
+    /// handshake seen (`Some(true)`) or refused (`Some(false)`).
+    pub encryption: Option<bool>,
+    /// Supports uTP: PEX flag `0x04`, or an earlier uTP connection.
+    pub utp: Option<bool>,
+}
+
+impl DialHints {
+    /// Hints from a peer's BEP 11 `added.f` flags (`None`: the sender gave
+    /// none).
+    #[must_use]
+    pub fn from_pex_flags(flags: Option<u8>) -> Self {
+        Self {
+            encryption: flags.map(|f| f & dravity_wire::PEX_ENCRYPTION != 0),
+            utp: flags.map(|f| f & dravity_wire::PEX_UTP != 0),
+        }
+    }
+
+    /// Hints from a connection we made to the peer. A uTP connection proves
+    /// uTP support; a TCP one says nothing about it.
+    #[must_use]
+    pub fn from_link(link: PeerLink) -> Self {
+        Self {
+            encryption: link.mse,
+            utp: link.utp.then_some(true),
+        }
+    }
+
+    /// `self`, with the fields it does not know taken from `other`.
+    #[must_use]
+    pub fn or(self, other: Self) -> Self {
+        Self {
+            encryption: self.encryption.or(other.encryption),
+            utp: self.utp.or(other.utp),
+        }
+    }
+}
+
 /// Something that happened, fed to [`TorrentState::update`](crate::TorrentState::update).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -228,6 +282,8 @@ pub enum Event {
         addr: SocketAddr,
         /// Reserved bytes from the peer's handshake (extension flags).
         reserved: Reserved,
+        /// Transport and encryption of the connection.
+        link: PeerLink,
     },
     /// A peer connected to us and completed its handshake for this torrent
     /// (incoming connection). The engine may refuse it with
@@ -240,6 +296,8 @@ pub enum Event {
         addr: SocketAddr,
         /// Reserved bytes from the peer's handshake (extension flags).
         reserved: Reserved,
+        /// Transport and encryption of the connection.
+        link: PeerLink,
     },
     /// An [`Effect::Connect`] attempt failed (refused, timeout, bad handshake).
     PeerConnectFailed {
@@ -370,6 +428,9 @@ pub enum Effect {
     Connect {
         /// Peer address.
         addr: SocketAddr,
+        /// What is known about the peer: which transport and encryption
+        /// to try first, or whether to dial it at all.
+        hints: DialHints,
     },
     /// Queue a message for a peer.
     Send {

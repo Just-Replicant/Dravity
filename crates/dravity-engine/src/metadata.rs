@@ -14,10 +14,12 @@ use dravity_wire::{
 };
 
 use crate::ext::{self, PeerExtensions};
+use crate::hints::{HintBook, Joined};
 use crate::pool::PeerPool;
 use crate::state::DhtSchedule;
 use crate::types::{
-    Alert, AnnounceEvent, Config, Effect, Event, PeerInfo, PeerKey, Stats, TorrentStatus,
+    Alert, AnnounceEvent, Config, DialHints, Effect, Event, PeerInfo, PeerKey, PeerLink, Stats,
+    TorrentStatus,
 };
 
 /// Metadata requests outstanding per peer.
@@ -147,6 +149,7 @@ struct MetaPeer {
     /// The peer connected to us.
     incoming: bool,
     reserved: Reserved,
+    link: PeerLink,
     ext: PeerExtensions,
     /// The raw extension handshake, replayed after the hand-over.
     handshake: Option<Bytes>,
@@ -167,6 +170,8 @@ pub struct HandoverPeer {
     pub addr: SocketAddr,
     /// Reserved bytes of the peer's handshake.
     pub reserved: Reserved,
+    /// Transport and encryption of the connection.
+    pub link: PeerLink,
     /// The peer connected to us: replay it as
     /// [`Event::PeerAccepted`](crate::Event::PeerAccepted) rather than
     /// [`Event::PeerConnected`](crate::Event::PeerConnected).
@@ -190,6 +195,9 @@ pub struct Handover {
     pub connecting: Vec<SocketAddr>,
     /// Addresses learned from DHT or PEX. A private torrent drops these.
     pub swarm: Vec<SocketAddr>,
+    /// What PEX flags and connections showed about addresses (for
+    /// [`TorrentState::with_dial_hints`](crate::TorrentState::with_dial_hints)).
+    pub hints: Vec<(SocketAddr, DialHints)>,
     /// Whether a `started` announce was sent and not yet rejected.
     pub started_announced: bool,
     /// A `started` announce was sent and the tracker has not answered yet.
@@ -250,6 +258,8 @@ pub struct MetadataState {
     banned: HashSet<SocketAddr>,
     /// Addresses learned from DHT or PEX (not from a tracker or the user).
     swarm: HashSet<SocketAddr>,
+    /// PEX flags and connection outcomes by address.
+    hints: HintBook,
     downloaded: u64,
     complete: bool,
     /// Set once a v2-only `info` is verified but some of its piece layers
@@ -282,6 +292,7 @@ impl MetadataState {
             sources: HashSet::new(),
             banned: HashSet::new(),
             swarm: HashSet::new(),
+            hints: HintBook::default(),
             downloaded: 0,
             complete: false,
             layers: None,
@@ -372,6 +383,7 @@ impl MetadataState {
                     peer: key,
                     addr: p.addr,
                     reserved: p.reserved,
+                    link: p.link,
                     incoming: p.incoming,
                     replay,
                 })
@@ -385,6 +397,7 @@ impl MetadataState {
             known,
             connecting,
             swarm,
+            hints: self.hints.entries(),
             started_announced: self.started_announced,
             started_pending: self.pending_announce == Some(AnnounceEvent::Started),
             announce_again: self.announce_again,
@@ -413,12 +426,37 @@ impl MetadataState {
                 peer,
                 addr,
                 reserved,
-            } => self.on_connected(now, peer, addr, reserved, false, &mut out),
+                link,
+            } => {
+                self.hints.observe(addr, link);
+                self.on_connected(
+                    now,
+                    Joined {
+                        key: peer,
+                        addr,
+                        reserved,
+                        link,
+                        incoming: false,
+                    },
+                    &mut out,
+                );
+            }
             Event::PeerAccepted {
                 peer,
                 addr,
                 reserved,
-            } => self.on_connected(now, peer, addr, reserved, true, &mut out),
+                link,
+            } => self.on_connected(
+                now,
+                Joined {
+                    key: peer,
+                    addr,
+                    reserved,
+                    link,
+                    incoming: true,
+                },
+                &mut out,
+            ),
             Event::PeerConnectFailed { addr, retry } => {
                 self.pool.dial_done(addr);
                 if retry {
@@ -591,19 +629,19 @@ impl MetadataState {
             let Some(addr) = self.pool.next_dial(|a| Self::is_connected(peers, a)) else {
                 break;
             };
-            out.push(Effect::Connect { addr });
+            let hints = self.hints.get(addr);
+            out.push(Effect::Connect { addr, hints });
         }
     }
 
-    fn on_connected(
-        &mut self,
-        now: Instant,
-        key: PeerKey,
-        addr: SocketAddr,
-        reserved: Reserved,
-        incoming: bool,
-        out: &mut Vec<Effect>,
-    ) {
+    fn on_connected(&mut self, now: Instant, joined: Joined, out: &mut Vec<Effect>) {
+        let Joined {
+            key,
+            addr,
+            reserved,
+            link,
+            incoming,
+        } = joined;
         if !incoming {
             self.pool.dial_done(addr);
         }
@@ -622,6 +660,7 @@ impl MetadataState {
             addr,
             incoming,
             reserved,
+            link,
             ext: PeerExtensions::default(),
             handshake: None,
             replay: Vec::new(),
@@ -704,8 +743,12 @@ impl MetadataState {
                     }
                 } else if id == ext::OUR_UT_PEX
                     && self.config.pex
-                    && let Some(added) = ext::pex_added(&payload)
+                    && let Some(pex) = ext::pex_added(&payload)
                 {
+                    for p in &pex {
+                        self.hints.learn_pex(p.addr, p.flags);
+                    }
+                    let added: Vec<SocketAddr> = pex.iter().map(|p| p.addr).collect();
                     self.note_swarm(&added, true);
                     self.add_to_pool(added);
                     self.fill_connections(out);

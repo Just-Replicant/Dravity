@@ -58,6 +58,12 @@ impl PeerStream {
         self.0.get_ref().kind()
     }
 
+    /// Whether the connection began with an MSE handshake (RC4 or the
+    /// plaintext method).
+    pub(crate) const fn uses_mse(&self) -> bool {
+        self.0.method().is_some()
+    }
+
     /// Whether the payload is RC4-encrypted (MSE). MSE with the plaintext
     /// method only hides the handshake, and does not count.
     pub(crate) const fn encrypted(&self) -> bool {

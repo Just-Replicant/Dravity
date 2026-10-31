@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use dravity_core::{BLOCK_SIZE, BlockRef, InfoHash, PieceLayout};
 use dravity_engine::{
-    Alert, AnnounceEvent, Bitfield, Config, Effect, Event, PeerKey, TorrentState, TorrentStatus,
+    Alert, AnnounceEvent, Bitfield, Config, DialHints, Effect, Event, PeerKey, PeerLink,
+    TorrentState, TorrentStatus,
 };
 use dravity_wire::{BlockRequest, ExtendedHandshake, Message, PexMessage, Reserved};
 
@@ -101,6 +102,7 @@ impl Harness {
             peer: PeerKey(peer),
             addr: addr(peer as u16),
             reserved,
+            link: PeerLink::default(),
         })
     }
 
@@ -109,6 +111,7 @@ impl Harness {
             peer: PeerKey(peer),
             addr: addr(peer as u16),
             reserved,
+            link: PeerLink::default(),
         })
     }
 
@@ -489,6 +492,7 @@ fn allowed_fast_set_follows_bep_6_for_ipv4_only() {
         peer: PeerKey(1),
         addr: at,
         reserved: fast(),
+        link: PeerLink::default(),
     });
     let mut expected = dravity_wire::allowed_fast_set(
         &InfoHash::new([0xaa; 20]),
@@ -511,6 +515,7 @@ fn allowed_fast_set_follows_bep_6_for_ipv4_only() {
         peer: PeerKey(2),
         addr: v6,
         reserved: fast(),
+        link: PeerLink::default(),
     });
     assert_eq!(sent(&fx, 2), [Message::HaveAll]);
 }
@@ -529,6 +534,7 @@ fn a_piece_completed_later_is_offered_as_allowed_fast() {
         peer: PeerKey(2),
         addr: v6,
         reserved: fast(),
+        link: PeerLink::default(),
     });
     let set = dravity_wire::allowed_fast_set(
         &InfoHash::new([0xaa; 20]),
@@ -899,15 +905,19 @@ fn the_only_sender_of_a_bad_piece_is_banned() {
         peers: vec![addr(1), SocketAddr::new(ip, 9999), addr(5)],
         interval: None,
     });
-    assert!(fx.contains(&Effect::Connect { addr: addr(5) }));
+    assert!(fx.contains(&Effect::Connect {
+        addr: addr(5),
+        hints: DialHints::default()
+    }));
     assert!(
         !fx.iter()
-            .any(|e| matches!(e, Effect::Connect { addr } if addr.ip() == ip))
+            .any(|e| matches!(e, Effect::Connect { addr, .. } if addr.ip() == ip))
     );
     let fx = h.ev(Event::PeerAccepted {
         peer: PeerKey(7),
         addr: SocketAddr::new(ip, 40_000),
         reserved: Reserved::new(),
+        link: PeerLink::default(),
     });
     assert!(disconnects(&fx, 7));
 }
@@ -995,6 +1005,7 @@ fn ipv4_mapped_address_shares_the_ban() {
         peer: PeerKey(1),
         addr: mapped,
         reserved: Reserved::new(),
+        link: PeerLink::default(),
     });
     let fx = fail_piece_zero(&mut h, &[1]);
     assert!(!disconnects(&fx, 1));
@@ -1003,6 +1014,7 @@ fn ipv4_mapped_address_shares_the_ban() {
         peer: PeerKey(2),
         addr: plain,
         reserved: Reserved::new(),
+        link: PeerLink::default(),
     });
     let fx = fail_piece_zero(&mut h, &[2]);
     assert!(fx.contains(&Effect::Alert(Alert::PeerBanned { ip: IpAddr::V4(v4) })));
@@ -1011,15 +1023,19 @@ fn ipv4_mapped_address_shares_the_ban() {
     let fx = h.ev(Event::AddPeers {
         peers: vec![plain, mapped, addr(5)],
     });
-    assert!(fx.contains(&Effect::Connect { addr: addr(5) }));
+    assert!(fx.contains(&Effect::Connect {
+        addr: addr(5),
+        hints: DialHints::default()
+    }));
     assert!(
         !fx.iter()
-            .any(|e| matches!(e, Effect::Connect { addr } if addr.ip() == IpAddr::V4(v4) || addr.ip() == mapped.ip()))
+            .any(|e| matches!(e, Effect::Connect { addr, .. } if addr.ip() == IpAddr::V4(v4) || addr.ip() == mapped.ip()))
     );
     let fx = h.ev(Event::PeerAccepted {
         peer: PeerKey(8),
         addr: SocketAddr::new(IpAddr::V6(v4.to_ipv6_mapped()), 40001),
         reserved: Reserved::new(),
+        link: PeerLink::default(),
     });
     assert!(disconnects(&fx, 8));
 }
@@ -1108,6 +1124,7 @@ fn incoming_peers_are_refused_while_idle_and_when_full() {
             peer: PeerKey(1),
             addr: addr(1),
             reserved: Reserved::new(),
+            link: PeerLink::default(),
         },
     );
     assert!(disconnects(&fx, 1), "not started");
@@ -1118,6 +1135,7 @@ fn incoming_peers_are_refused_while_idle_and_when_full() {
             peer: PeerKey(2),
             addr: addr(2),
             reserved: Reserved::new(),
+            link: PeerLink::default(),
         },
     );
     assert!(!disconnects(&fx, 2));
@@ -1127,6 +1145,7 @@ fn incoming_peers_are_refused_while_idle_and_when_full() {
             peer: PeerKey(3),
             addr: addr(3),
             reserved: Reserved::new(),
+            link: PeerLink::default(),
         },
     );
     assert!(disconnects(&fx, 3), "max_peers");
@@ -1153,11 +1172,14 @@ fn a_seed_retries_failed_dials_and_dropped_peers() {
     assert!(
         !h.advance(Duration::from_secs(14))
             .iter()
-            .any(|e| matches!(e, Effect::Connect { addr: peer } if *peer == addr(1)))
+            .any(|e| matches!(e, Effect::Connect { addr: peer, .. } if *peer == addr(1)))
     );
     assert!(
         h.advance(Duration::from_secs(1))
-            .contains(&Effect::Connect { addr: addr(1) })
+            .contains(&Effect::Connect {
+                addr: addr(1),
+                hints: DialHints::default()
+            })
     );
 
     let mut h = Harness::seed(config());
@@ -1166,7 +1188,10 @@ fn a_seed_retries_failed_dials_and_dropped_peers() {
     assert_eq!(h.t.stats().peers, 0);
     assert!(
         h.advance(h.t.config().peer_retry)
-            .contains(&Effect::Connect { addr: addr(1) })
+            .contains(&Effect::Connect {
+                addr: addr(1),
+                hints: DialHints::default()
+            })
     );
 }
 
@@ -1189,11 +1214,14 @@ fn a_retry_waiting_at_finish_is_dialed_while_seeding() {
     assert!(
         !h.advance(Duration::from_secs(19))
             .iter()
-            .any(|e| matches!(e, Effect::Connect { addr: peer } if *peer == addr(9)))
+            .any(|e| matches!(e, Effect::Connect { addr: peer, .. } if *peer == addr(9)))
     );
     assert!(
         h.advance(Duration::from_secs(1))
-            .contains(&Effect::Connect { addr: addr(9) })
+            .contains(&Effect::Connect {
+                addr: addr(9),
+                hints: DialHints::default()
+            })
     );
 }
 
@@ -1263,6 +1291,7 @@ fn hash_requests_are_served_from_piece_layers() {
         peer: PeerKey(1),
         addr: addr(1),
         reserved: fast().with_v2(true),
+        link: PeerLink::default(),
     });
     let ask = |index, length, proof_layers| HashRequest {
         pieces_root: tree.root,

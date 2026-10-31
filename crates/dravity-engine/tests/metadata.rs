@@ -14,7 +14,8 @@ use bytes::Bytes;
 use dravity_core::merkle;
 use dravity_core::{InfoHash, InfoHashV2};
 use dravity_engine::{
-    Alert, AnnounceEvent, Config, Effect, Event, MetadataState, PeerKey, TorrentStatus,
+    Alert, AnnounceEvent, Config, DialHints, Effect, Event, MetadataState, PeerKey, PeerLink,
+    TorrentStatus,
 };
 use dravity_wire::{ExtendedHandshake, HashRequest, Message, MetadataMessage, Reserved};
 
@@ -88,6 +89,7 @@ impl Harness {
             peer: PeerKey(peer),
             addr: addr(peer as u16),
             reserved: Reserved::new().with_extension_protocol(true),
+            link: PeerLink::default(),
         });
         let hs = ExtendedHandshake {
             extensions: vec![("ut_metadata".into(), THEIRS)],
@@ -296,7 +298,13 @@ fn bad_metadata_is_not_dialed_again() {
     let fx = h.ev(Event::AddPeers {
         peers: vec![addr(1)],
     });
-    assert!(!fx.contains(&Effect::Connect { addr: addr(1) }), "{fx:?}");
+    assert!(
+        !fx.contains(&Effect::Connect {
+            addr: addr(1),
+            hints: DialHints::default()
+        }),
+        "{fx:?}"
+    );
 }
 
 #[test]
@@ -346,16 +354,23 @@ fn trackers_dht_and_stop() {
         peers: vec![addr(5)],
         failed: false,
     });
-    assert!(fx.contains(&Effect::Connect { addr: addr(5) }));
+    assert!(fx.contains(&Effect::Connect {
+        addr: addr(5),
+        hints: DialHints::default()
+    }));
     let fx = h.ev(Event::Announced {
         peers: vec![addr(6)],
         interval: Some(Duration::from_secs(600)),
     });
-    assert!(fx.contains(&Effect::Connect { addr: addr(6) }));
+    assert!(fx.contains(&Effect::Connect {
+        addr: addr(6),
+        hints: DialHints::default()
+    }));
     h.ev(Event::PeerConnected {
         peer: PeerKey(5),
         addr: addr(5),
         reserved: Reserved::new(),
+        link: PeerLink::default(),
     });
     let fx = h.ev(Event::Stop);
     assert!(fx.contains(&Effect::Disconnect { peer: PeerKey(5) }));
@@ -423,6 +438,7 @@ fn accepted_peers_fetch_metadata_and_are_marked_incoming() {
         peer: PeerKey(7),
         addr: SocketAddr::from(([10, 0, 9, 1], 51_000)),
         reserved: Reserved::new().with_extension_protocol(true),
+        link: PeerLink::default(),
     });
     assert!(matches!(
         fx.first(),
@@ -686,4 +702,52 @@ fn hash_requests_are_rejected_before_the_layers_are_known() {
         peer: PeerKey(1),
         message: Message::HashReject(r)
     }));
+}
+
+#[test]
+fn dial_hints_and_links_survive_the_handover() {
+    let mut config = Config::default();
+    config.pex = true;
+    let mut h = Harness::new(config);
+    h.ev(Event::AddPeers {
+        peers: vec![addr(1)],
+    });
+    let link = PeerLink {
+        utp: true,
+        mse: Some(true),
+    };
+    h.ev(Event::PeerConnected {
+        peer: PeerKey(1),
+        addr: addr(1),
+        reserved: Reserved::new().with_extension_protocol(true),
+        link,
+    });
+    let pex = dravity_wire::PexMessage {
+        added: vec![dravity_wire::PexPeer {
+            addr: addr(7),
+            flags: Some(dravity_wire::PEX_ENCRYPTION),
+        }],
+        dropped: Vec::new(),
+    };
+    let fx = h.msg(
+        1,
+        Message::Extended {
+            id: 2,
+            payload: Bytes::from(pex.encode()),
+        },
+    );
+    let pex_hints = DialHints {
+        encryption: Some(true),
+        utp: Some(false),
+    };
+    assert!(fx.contains(&Effect::Connect {
+        addr: addr(7),
+        hints: pex_hints
+    }));
+    let handover = h.m.into_handover();
+    assert_eq!(handover.peers[0].link, link);
+    assert_eq!(
+        handover.hints,
+        vec![(addr(1), DialHints::from_link(link)), (addr(7), pex_hints)]
+    );
 }

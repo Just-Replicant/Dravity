@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use dravity_core::{BLOCK_SIZE, BlockRef, InfoHash, PieceLayout};
-use dravity_engine::{Bitfield, Config, Effect, Event, MetadataState, PeerKey, TorrentState};
+use dravity_engine::{
+    Bitfield, Config, Effect, Event, MetadataState, PeerKey, PeerLink, TorrentState,
+};
 use dravity_wire::{Message, Reserved};
 
 const PIECES: u32 = 4;
@@ -53,6 +55,7 @@ fn a_torrent_lists_its_peers_with_flags_and_byte_totals() {
             peer: PeerKey(2),
             addr: addr(2),
             reserved: Reserved::default(),
+            link: PeerLink::default(),
         },
     );
     t.update(
@@ -61,6 +64,7 @@ fn a_torrent_lists_its_peers_with_flags_and_byte_totals() {
             peer: PeerKey(1),
             addr: addr(1),
             reserved: Reserved::default(),
+            link: PeerLink::default(),
         },
     );
     t.update(
@@ -125,6 +129,7 @@ fn a_magnet_lists_its_peers_before_the_size_is_known() {
             peer: PeerKey(7),
             addr: addr(7),
             reserved: Reserved::default(),
+            link: PeerLink::default(),
         },
     );
     let peers = m.peers();

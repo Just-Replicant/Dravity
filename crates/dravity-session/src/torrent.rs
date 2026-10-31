@@ -35,8 +35,8 @@ use dravity_core::merkle::Hash;
 use dravity_core::{BlockRef, InfoHash, InfoHashV2, MetaVersion, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{
-    Alert, AnnounceEvent, Bitfield, Config, Effect, Event, MetadataState, PeerKey, Priority, Stats,
-    TorrentState, TorrentStatus,
+    Alert, AnnounceEvent, Bitfield, Config, DialHints, Effect, Event, MetadataState, PeerKey,
+    PeerLink, Priority, Stats, TorrentState, TorrentStatus,
 };
 use dravity_storage::{
     FileIo, FileStorage, ResumeData, Storage, load_resume, read_block, save_resume, verify_piece,
@@ -74,6 +74,8 @@ pub(crate) enum Input {
         transport: Transport,
         /// RC4-encrypted (MSE).
         encrypted: bool,
+        /// What the dial showed about MSE support (see [`PeerLink::mse`]).
+        mse: Option<bool>,
     },
     ConnectFailed {
         key: PeerKey,
@@ -824,6 +826,7 @@ impl TorrentTask {
                 reserved,
                 transport,
                 encrypted,
+                mse,
             } => {
                 if !self.peers.contains_key(&key) {
                     return None;
@@ -838,6 +841,10 @@ impl TorrentTask {
                     peer: key,
                     addr,
                     reserved,
+                    link: PeerLink {
+                        utp: transport == Transport::Utp,
+                        mse,
+                    },
                 }
             }
             Input::ConnectFailed { key, addr, retry } => {
@@ -862,6 +869,7 @@ impl TorrentTask {
                     peer: key,
                     addr,
                     reserved: Reserved::new(),
+                    link: PeerLink::default(),
                 }
             }
             Input::WebSeedFailed { key } => {
@@ -991,6 +999,13 @@ impl TorrentTask {
             .with_started_pending(handover.started_pending)
             .with_announce_again(handover.announce_again)
             .with_connecting(handover.connecting.iter().copied())
+            .with_dial_hints(
+                handover
+                    .hints
+                    .iter()
+                    .copied()
+                    .filter(|(addr, _)| !swarm.contains(addr)),
+            )
             .ban_peers(swarm.iter().copied());
         self.phase = Phase::Download(Box::new(state));
         self.local.push_back(Event::Start);
@@ -1006,12 +1021,14 @@ impl TorrentTask {
                     peer: peer.peer,
                     addr: peer.addr,
                     reserved: peer.reserved,
+                    link: peer.link,
                 }
             } else {
                 Event::PeerConnected {
                     peer: peer.peer,
                     addr: peer.addr,
                     reserved: peer.reserved,
+                    link: peer.link,
                 }
             });
             for message in peer.replay {
@@ -1059,7 +1076,7 @@ impl TorrentTask {
 
     async fn dispatch(&mut self, effect: Effect) {
         match effect {
-            Effect::Connect { addr } => self.connect(addr),
+            Effect::Connect { addr, hints } => self.connect(addr, hints),
             Effect::Send { peer, message } => {
                 let Some(tx) = self.peers.get(&peer) else {
                     return;
@@ -1239,6 +1256,11 @@ impl TorrentTask {
         if stream.encrypted() {
             self.encrypted_peers.insert(key);
         }
+        let link = PeerLink {
+            utp: stream.kind() == Transport::Utp,
+            // A plain incoming handshake says nothing about MSE support.
+            mse: stream.uses_mse().then_some(true),
+        };
         tokio::spawn(peer::run_accepted(
             key,
             addr,
@@ -1251,10 +1273,21 @@ impl TorrentTask {
             peer: key,
             addr,
             reserved,
+            link,
         }
     }
 
-    fn connect(&mut self, addr: SocketAddr) {
+    fn connect(&mut self, addr: SocketAddr, hints: DialHints) {
+        if self.ctx.config.encryption == EncryptionPolicy::Required
+            && hints.encryption == Some(false)
+        {
+            // PEX or an earlier dial says the peer does not do MSE: dialing
+            // it would only fail the required handshake.
+            tracing::trace!(%addr, "skipping a peer without encryption");
+            self.local
+                .push_back(Event::PeerConnectFailed { addr, retry: false });
+            return;
+        }
         let (key, rx) = self.new_peer();
         let params = PeerParams {
             key,
@@ -1266,6 +1299,7 @@ impl TorrentTask {
             utp: self.ctx.utp.for_addr(addr).cloned(),
             prefer_utp: self.ctx.config.prefer_utp,
             encryption: self.ctx.config.encryption,
+            hints,
         };
         // Peer tasks are not in `background`: dropping their command sender
         // ends them, and they must not delay shutdown.

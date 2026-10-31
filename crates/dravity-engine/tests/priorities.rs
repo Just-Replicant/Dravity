@@ -8,8 +8,8 @@ use std::time::Instant;
 use bytes::Bytes;
 use dravity_core::{BLOCK_SIZE, BlockRef, PieceLayout};
 use dravity_engine::{
-    Alert, AnnounceEvent, Bitfield, Config, Effect, Event, PeerKey, Priority, TorrentState,
-    TorrentStatus,
+    Alert, AnnounceEvent, Bitfield, Config, Effect, Event, PeerKey, PeerLink, Priority,
+    TorrentState, TorrentStatus,
 };
 use dravity_wire::{BlockRequest, Message, Reserved};
 use proptest::prelude::*;
@@ -69,6 +69,7 @@ impl Harness {
             peer: PeerKey(1),
             addr: addr(1),
             reserved,
+            link: PeerLink::default(),
         });
         self.msg(1, Message::Bitfield(Bitfield::full(PIECES).to_bytes()));
         self.msg(1, Message::Unchoke)
@@ -295,6 +296,7 @@ fn suggested_pieces_are_preferred() {
         peer: PeerKey(1),
         addr: addr(1),
         reserved,
+        link: PeerLink::default(),
     });
     h.msg(1, Message::HaveAll);
     h.msg(1, Message::Suggest { piece: 3 });
@@ -317,6 +319,7 @@ fn the_newest_suggestion_is_preferred() {
         peer: PeerKey(1),
         addr: addr(1),
         reserved,
+        link: PeerLink::default(),
     });
     h.msg(1, Message::HaveAll);
     h.msg(1, Message::Suggest { piece: 1 });

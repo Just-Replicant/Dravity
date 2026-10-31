@@ -36,8 +36,18 @@ pub const PEX_REACHABLE: u8 = 0x10;
 pub struct PexPeer {
     /// Peer endpoint.
     pub addr: SocketAddr,
-    /// `added.f` flags (`PEX_*`), `0` when absent.
-    pub flags: u8,
+    /// `added.f` flags (`PEX_*`), or `None` when the sender gave none for
+    /// this peer (no flags string, or a short one).
+    pub flags: Option<u8>,
+}
+
+impl PexPeer {
+    /// Whether the sender set `flag` (one of the `PEX_*` constants) for
+    /// this peer: `None` when it sent no flags for it.
+    #[must_use]
+    pub fn has(&self, flag: u8) -> Option<bool> {
+        self.flags.map(|f| f & flag != 0)
+    }
 }
 
 /// One `ut_pex` message.
@@ -46,7 +56,7 @@ pub struct PexPeer {
 /// use dravity_wire::{PexMessage, PexPeer};
 ///
 /// let msg = PexMessage {
-///     added: vec![PexPeer { addr: "10.0.0.1:6881".parse().unwrap(), flags: 0x10 }],
+///     added: vec![PexPeer { addr: "10.0.0.1:6881".parse().unwrap(), flags: Some(0x10) }],
 ///     dropped: vec!["[::1]:51413".parse().unwrap()],
 /// };
 /// assert_eq!(PexMessage::decode(&msg.encode()).unwrap(), msg);
@@ -61,7 +71,8 @@ pub struct PexMessage {
 
 impl PexMessage {
     /// Parses an extended-message payload. Lists are truncated to
-    /// [`MAX_PEX_ENTRIES`]; a missing or short flags string means no flags.
+    /// [`MAX_PEX_ENTRIES`]; a missing or short flags string leaves the
+    /// peers it does not cover without flags (`None`).
     ///
     /// # Errors
     /// [`ExtendedError`] when the payload is not a dictionary or a list is
@@ -100,7 +111,7 @@ impl PexMessage {
                     .enumerate()
                     .map(|(i, addr)| PexPeer {
                         addr,
-                        flags: flags.get(i).copied().unwrap_or(0),
+                        flags: flags.get(i).copied(),
                     }),
             );
         }
@@ -109,10 +120,13 @@ impl PexMessage {
         Ok(Self { added, dropped })
     }
 
-    /// Encodes the extended-message payload (canonical bencode).
+    /// Encodes the extended-message payload (canonical bencode). Each
+    /// family's flags string runs up to its last peer with flags; a peer
+    /// without flags before that one is sent as `0`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let (mut a4, mut a6, mut f4, mut f6) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut a4, mut a6) = (Vec::new(), Vec::new());
+        let (mut f4, mut f6): (Vec<Option<u8>>, Vec<Option<u8>>) = (Vec::new(), Vec::new());
         for peer in &self.added {
             compact::push(peer.addr, &mut a4, &mut a6);
             if peer.addr.is_ipv4() {
@@ -121,6 +135,11 @@ impl PexMessage {
                 f6.push(peer.flags);
             }
         }
+        let flags = |f: Vec<Option<u8>>| -> Vec<u8> {
+            let known = f.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+            f.into_iter().take(known).map(|f| f.unwrap_or(0)).collect()
+        };
+        let (f4, f6) = (flags(f4), flags(f6));
         let (mut d4, mut d6) = (Vec::new(), Vec::new());
         for addr in &self.dropped {
             compact::push(*addr, &mut d4, &mut d6);
@@ -149,10 +168,44 @@ mod tests {
         let payload = b"d5:added12:\x0a\x00\x00\x01\x1a\xe1\x0a\x00\x00\x02\x1a\xe27:added.f1:\x127:dropped6:\x01\x02\x03\x04\x00\x50e";
         let msg = PexMessage::decode(payload).unwrap();
         assert_eq!(msg.added.len(), 2);
-        assert_eq!(msg.added[0].flags, PEX_SEED | PEX_REACHABLE);
-        assert_eq!(msg.added[1].flags, 0, "short flags string means no flags");
+        assert_eq!(msg.added[0].flags, Some(PEX_SEED | PEX_REACHABLE));
+        assert_eq!(msg.added[0].has(PEX_ENCRYPTION), Some(false));
+        assert_eq!(msg.added[0].has(PEX_SEED), Some(true));
+        assert_eq!(
+            msg.added[1].flags, None,
+            "short flags string means no flags"
+        );
+        assert_eq!(msg.added[1].has(PEX_ENCRYPTION), None);
+        // The flags string stops at the last peer with flags.
+        assert_eq!(PexMessage::decode(&msg.encode()).unwrap(), msg);
         assert_eq!(msg.dropped, ["1.2.3.4:80".parse::<SocketAddr>().unwrap()]);
         assert_eq!(PexMessage::decode(b"de").unwrap(), PexMessage::default());
+    }
+
+    #[test]
+    fn encodes_unknown_flags_before_known_ones_as_zero() {
+        let peer = |n: u8, flags| PexPeer {
+            addr: SocketAddr::from(([10, 0, 0, n], 1)),
+            flags,
+        };
+        let msg = PexMessage {
+            added: vec![peer(1, None), peer(2, Some(PEX_ENCRYPTION)), peer(3, None)],
+            dropped: Vec::new(),
+        };
+        let back = PexMessage::decode(&msg.encode()).unwrap();
+        assert_eq!(
+            back.added,
+            [
+                peer(1, Some(0)),
+                peer(2, Some(PEX_ENCRYPTION)),
+                peer(3, None)
+            ]
+        );
+        let none = PexMessage {
+            added: vec![peer(1, None)],
+            dropped: Vec::new(),
+        };
+        assert_eq!(PexMessage::decode(&none.encode()).unwrap(), none);
     }
 
     #[test]
@@ -169,7 +222,7 @@ mod tests {
             added: (0..300u16)
                 .map(|p| PexPeer {
                     addr: SocketAddr::from(([10, 0, 0, 1], p + 1)),
-                    flags: 0,
+                    flags: Some(0),
                 })
                 .collect(),
             dropped: Vec::new(),

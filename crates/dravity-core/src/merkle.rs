@@ -177,6 +177,155 @@ pub fn file_hashes(data: &[u8], piece_length: u32) -> Option<FileHashes> {
     })
 }
 
+/// Largest number of base hashes asked for in one hash request (BEP 52:
+/// "length SHOULD NOT be greater than 512").
+pub const MAX_HASH_REQUEST: usize = 512;
+
+/// Base layer hashes and their uncles: the payload of a BEP 52 `hashes`
+/// message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HashProof {
+    /// The requested hashes of the base layer (padding hashes past the end
+    /// of the file included).
+    pub base: Vec<Hash>,
+    /// One sibling per layer above the subtree the base spans, from the
+    /// leaf side towards the root.
+    pub uncles: Vec<Hash>,
+}
+
+/// One hash request that fetches part of a file's piece layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerRequest {
+    /// Offset of the first hash in the piece layer.
+    pub index: usize,
+    /// Number of hashes (a power of two, at least 2).
+    pub length: usize,
+    /// Proof layers that reach the pieces root from this block.
+    pub proof_layers: u32,
+}
+
+/// Every layer of the tree whose bottom layer is `bottom` at `height`,
+/// padded to a power of two: the padded bottom first, `[root]` last.
+fn tree_layers(bottom: &[Hash], height: u32) -> Option<Vec<Vec<Hash>>> {
+    let width = bottom.len().checked_next_power_of_two()?;
+    let mut layer = bottom.to_vec();
+    layer.resize(width, pad_hash(height));
+    let mut out = vec![layer];
+    while let Some(last) = out.last().filter(|l| l.len() > 1) {
+        let next = last
+            .chunks(2)
+            .map(|pair| match pair {
+                [l, r] => hash_pair(l, r),
+                _ => [0; 32],
+            })
+            .collect();
+        out.push(next);
+    }
+    Some(out)
+}
+
+/// Hashes answering a BEP 52 hash request for `length` hashes at `index`
+/// of layer `base_layer`, from a file's piece layer `layer`, with up to
+/// `proof_layers` layers of proof (the first `log2(length) - 1` are implied
+/// by the base hashes and carry no uncle).
+///
+/// Only layers at or above the piece layer can be served from it. `None`
+/// for a lower base layer, an invalid piece length, a `length` that is not
+/// a power of two of at least 2, an `index` not a multiple of `length`, or
+/// a range outside the (padded) layer.
+#[must_use]
+pub fn layer_proof(
+    layer: &[Hash],
+    piece_length: u32,
+    base_layer: u32,
+    index: usize,
+    length: usize,
+    proof_layers: u32,
+) -> Option<HashProof> {
+    let height = piece_height(leaves_per_piece(piece_length)?);
+    let up = usize::try_from(base_layer.checked_sub(height)?).ok()?;
+    if layer.is_empty() || length < 2 || !length.is_power_of_two() || !index.is_multiple_of(length)
+    {
+        return None;
+    }
+    let levels = tree_layers(layer, height)?;
+    let base = levels
+        .get(up)?
+        .get(index..index.checked_add(length)?)?
+        .to_vec();
+    let mut wanted = proof_layers.saturating_sub(length.ilog2() - 1);
+    let mut level = up + usize::try_from(length.ilog2()).ok()?;
+    let mut pos = index / length;
+    let mut uncles = Vec::new();
+    while wanted > 0 {
+        let Some(nodes) = levels.get(level).filter(|n| n.len() > 1) else {
+            break;
+        };
+        uncles.push(*nodes.get(pos ^ 1)?);
+        pos /= 2;
+        level += 1;
+        wanted -= 1;
+    }
+    Some(HashProof { base, uncles })
+}
+
+/// Whether `base` (hashes at `index` of some layer, a power of two of them)
+/// and `uncles` (leaf side first) lead exactly to `root`.
+#[must_use]
+pub fn verify_proof(base: &[Hash], uncles: &[Hash], index: usize, root: &Hash) -> bool {
+    let length = base.len();
+    if length == 0 || !length.is_power_of_two() || !index.is_multiple_of(length) {
+        return false;
+    }
+    let mut layer = base.to_vec();
+    while layer.len() > 1 {
+        layer = layer
+            .chunks(2)
+            .map(|pair| match pair {
+                [l, r] => hash_pair(l, r),
+                _ => [0; 32],
+            })
+            .collect();
+    }
+    let Some(mut node) = layer.first().copied() else {
+        return false;
+    };
+    let mut pos = index / length;
+    for uncle in uncles {
+        node = if pos.is_multiple_of(2) {
+            hash_pair(&node, uncle)
+        } else {
+            hash_pair(uncle, &node)
+        };
+        pos /= 2;
+    }
+    pos == 0 && node == *root
+}
+
+/// The hash requests that fetch the piece layer of a file with `pieces`
+/// pieces (at least 2): blocks of at most [`MAX_HASH_REQUEST`] hashes, each
+/// with the proof layers that reach the pieces root. Blocks made only of
+/// padding are not requested.
+#[must_use]
+pub fn layer_requests(pieces: usize) -> Vec<LayerRequest> {
+    let Some(width) = pieces.checked_next_power_of_two() else {
+        return Vec::new();
+    };
+    if pieces < 2 {
+        return Vec::new();
+    }
+    let length = width.min(MAX_HASH_REQUEST);
+    let proof_layers = width.ilog2() - 1;
+    (0..pieces)
+        .step_by(length)
+        .map(|index| LayerRequest {
+            index,
+            length,
+            proof_layers,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
@@ -241,7 +390,77 @@ mod tests {
         assert_eq!(tree.root, naive_root(&data, 1));
     }
 
+    #[test]
+    fn proofs_from_a_piece_layer() {
+        let piece = 16 * 1024;
+        let data: Vec<u8> = (0usize..20 * 16 * 1024 + 5)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let tree = file_hashes(&data, piece).unwrap();
+        assert_eq!(tree.layer.len(), 21); // padded to 32
+        // The whole layer at once needs no uncles.
+        let all = layer_proof(&tree.layer, piece, 0, 0, 32, 4).unwrap();
+        assert!(all.uncles.is_empty());
+        assert_eq!(&all.base[..21], &tree.layer[..]);
+        assert!(all.base[21..].iter().all(|h| *h == [0; 32]));
+        assert!(verify_proof(&all.base, &[], 0, &tree.root));
+        // A block of 4 needs log2(32 / 4) = 3 uncles.
+        let part = layer_proof(&tree.layer, piece, 0, 8, 4, 4).unwrap();
+        assert_eq!(part.uncles.len(), 3);
+        assert!(verify_proof(&part.base, &part.uncles, 8, &tree.root));
+        assert!(!verify_proof(&part.base, &part.uncles, 12, &tree.root));
+        assert!(!verify_proof(&part.base, &part.uncles[..2], 8, &tree.root));
+        let mut bad = part.clone();
+        bad.base[1][0] ^= 1;
+        assert!(!verify_proof(&bad.base, &bad.uncles, 8, &tree.root));
+        // Too few proof layers: fewer uncles, no proof of the root.
+        let short = layer_proof(&tree.layer, piece, 0, 8, 4, 2).unwrap();
+        assert_eq!(short.uncles.len(), 1);
+        // Above the piece layer.
+        let up = layer_proof(&tree.layer, piece, 1, 0, 2, 3).unwrap();
+        assert!(verify_proof(&up.base, &up.uncles, 0, &tree.root));
+        // Leaves cannot be served from a 32 KiB piece layer; bad shapes.
+        let tree32 = file_hashes(&data, 2 * piece).unwrap();
+        assert!(layer_proof(&tree32.layer, 2 * piece, 0, 0, 2, 0).is_none());
+        assert!(layer_proof(&tree.layer, piece, 0, 2, 4, 0).is_none());
+        assert!(layer_proof(&tree.layer, piece, 0, 0, 3, 0).is_none());
+        assert!(layer_proof(&tree.layer, piece, 0, 32, 2, 0).is_none());
+        assert!(layer_proof(&tree.layer, piece, 0, 0, 64, 0).is_none());
+    }
+
+    #[test]
+    fn layer_request_plans() {
+        assert!(layer_requests(1).is_empty());
+        assert_eq!(
+            layer_requests(3),
+            [LayerRequest {
+                index: 0,
+                length: 4,
+                proof_layers: 1
+            }]
+        );
+        let big = layer_requests(1300);
+        assert_eq!(big.len(), 3);
+        assert!(big.iter().all(|r| r.length == 512 && r.proof_layers == 10));
+        assert_eq!(big[2].index, 1024);
+    }
+
     proptest! {
+        #[test]
+        fn requested_blocks_prove_the_layer(pieces in 2usize..1500, seed in any::<u8>()) {
+            let layer: Vec<Hash> = (0..pieces).map(|i| hash_leaf(&[seed, (i % 256) as u8, (i / 256) as u8])).collect();
+            let piece = 16 * 1024;
+            let root = root_from_layer(&layer, piece).unwrap();
+            let mut rebuilt = vec![[0u8; 32]; pieces];
+            for r in layer_requests(pieces) {
+                let proof = layer_proof(&layer, piece, 0, r.index, r.length, r.proof_layers).unwrap();
+                prop_assert!(verify_proof(&proof.base, &proof.uncles, r.index, &root));
+                let n = r.length.min(pieces - r.index);
+                rebuilt[r.index..r.index + n].copy_from_slice(&proof.base[..n]);
+            }
+            prop_assert_eq!(rebuilt, layer);
+        }
+
         #[test]
         fn matches_the_naive_tree(len in 1usize..300_000, shift in 0u32..3, byte in any::<u8>()) {
             let piece_length = (16 * 1024) << shift;

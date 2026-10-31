@@ -655,6 +655,16 @@ impl Info {
         out
     }
 
+    /// The known piece layer of the file(s) with pieces root `root`.
+    #[must_use]
+    pub fn piece_layer(&self, root: &Hash) -> Option<&[Hash]> {
+        self.v2
+            .iter()
+            .find(|f| f.root == *root)
+            .and_then(|f| f.layer.as_deref())
+            .filter(|l| !l.is_empty())
+    }
+
     /// Number of pieces in the piece layer of the file(s) with pieces root
     /// `root` (`None` if no file needs a layer for it).
     #[must_use]

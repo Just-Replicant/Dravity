@@ -57,6 +57,13 @@ fn torrents(key: KeyEvent) -> Action {
         KeyCode::Enter => Action::OpenDetail,
         KeyCode::Char(' ' | 'p') => Action::TogglePause,
         KeyCode::Char('a') => Action::OpenAdd,
+        KeyCode::Char('1') => Action::Pane(Pane::Files),
+        KeyCode::Char('2') => Action::Pane(Pane::Peers),
+        KeyCode::Char('3') => Action::Pane(Pane::Trackers),
+        // Shift+D deletes. Some terminals send `D`, others `d` with Shift.
+        KeyCode::Char('D') | KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Action::ConfirmRemove { delete_files: true }
+        }
         KeyCode::Char('d') => Action::ConfirmRemove {
             delete_files: false,
         },
@@ -123,6 +130,9 @@ mod tests {
         assert_eq!(action(key(' '), &v), Action::TogglePause);
         assert_eq!(action(key('p'), &v), Action::TogglePause);
         assert_eq!(action(key('a'), &v), Action::OpenAdd);
+        assert_eq!(action(key('1'), &v), Action::Pane(Pane::Files));
+        assert_eq!(action(key('2'), &v), Action::Pane(Pane::Peers));
+        assert_eq!(action(key('3'), &v), Action::Pane(Pane::Trackers));
         assert_eq!(
             action(key('d'), &v),
             Action::ConfirmRemove {
@@ -132,6 +142,11 @@ mod tests {
         assert_eq!(
             action(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT), &v),
             Action::ConfirmRemove { delete_files: true }
+        );
+        assert_eq!(
+            action(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::SHIFT), &v),
+            Action::ConfirmRemove { delete_files: true },
+            "shift+d deletes when the terminal keeps the letter lowercase"
         );
         assert_eq!(action(key('o'), &v), Action::CycleSort);
         assert_eq!(action(key('/'), &v), Action::OpenFilter);

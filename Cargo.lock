@@ -750,6 +750,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dravity-interop"
+version = "0.1.0"
+dependencies = [
+ "dravity-bencode",
+ "dravity-core",
+ "dravity-session",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "dravity-mse"
 version = "0.1.0"
 dependencies = [

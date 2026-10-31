@@ -372,6 +372,43 @@ async fn a_v2_magnet_fetches_piece_layers_and_downloads_multi_piece_files() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v2_magnet_fetches_a_piece_layer_larger_than_one_hash_request() {
+    // 520 pieces pad to 1024 hashes: two hash requests of 512, each proven
+    // with an uncle hash, over the wire between two sessions.
+    let mut files = vec![(vec!["big.bin"], content(520 * PIECE as usize - 7, 6))];
+    let torrent = make(&mut files, false, None);
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    assert_eq!(m.info().piece_layers()[0].1.len(), 520);
+    let v2 = m.info_hash_v2().unwrap();
+    let hash = m.info_hash();
+    let seed_dir = tempfile::tempdir().unwrap();
+    let (seeder, port) = seed(&torrent, &files, seed_dir.path()).await;
+
+    let leecher = Session::new(config()).unwrap();
+    let mut alerts = leecher.subscribe();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let magnet = Magnet::parse(&format!(
+        "magnet:?xt=urn:btmh:1220{v2}&x.pe=127.0.0.1:{port}"
+    ))
+    .unwrap();
+    leecher
+        .add_magnet(&magnet, AddTorrentOptions::new(leech_dir.path()))
+        .unwrap();
+    let seen = until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert!(
+        !seen
+            .iter()
+            .any(|a| matches!(a, Alert::HashFailed { .. } | Alert::Error { .. })),
+        "{seen:?}"
+    );
+    assert_files(leech_dir.path(), &files);
+    let known = leecher.metainfo(hash).unwrap();
+    assert_eq!(known.info().piece_layers(), m.info().piece_layers());
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_torrents_keep_their_piece_layers_across_a_restart() {
     let mut files = sample();
     let torrent = make(&mut files, false, Some("http://seed.invalid/files/"));

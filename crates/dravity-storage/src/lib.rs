@@ -22,7 +22,6 @@ mod pos;
 pub mod resume;
 
 use dravity_core::{BlockRef, Info, PieceLayout};
-use sha1::{Digest, Sha1};
 
 pub use error::StorageError;
 pub use file::{DEFAULT_MAX_OPEN_FILES, FileStorage};
@@ -124,7 +123,9 @@ pub fn read_block(
     }
 }
 
-/// Reads piece `piece` and compares its SHA-1 with the metainfo.
+/// Reads piece `piece` and checks it against the metainfo with
+/// [`Info::check_piece`]: SHA-1 for v1, the BEP 52 Merkle hash for v2, both
+/// for hybrid torrents.
 ///
 /// Returns `Ok(false)` on a mismatch *or* when the data cannot be read
 /// because it was never written (missing file, short file). Other errors are
@@ -134,8 +135,7 @@ pub fn read_block(
 /// [`StorageError::InvalidBlock`] for an out-of-range piece; unexpected I/O
 /// errors from the backend.
 pub fn verify_piece(storage: &dyn Storage, info: &Info, piece: u32) -> Result<bool, StorageError> {
-    let layout = info.layout();
-    let (Some(range), Some(expected)) = (layout.piece_range(piece), info.piece_hash(piece)) else {
+    let Some(range) = info.layout().piece_range(piece) else {
         return Err(StorageError::InvalidBlock(BlockRef {
             piece,
             offset: 0,
@@ -152,6 +152,5 @@ pub fn verify_piece(storage: &dyn Storage, info: &Info, piece: u32) -> Result<bo
         Err(e) if e.is_missing_data() => return Ok(false),
         Err(e) => return Err(e),
     }
-    let digest: [u8; 20] = Sha1::digest(&buf).into();
-    Ok(&digest == expected)
+    Ok(info.check_piece(piece, &buf))
 }

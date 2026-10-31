@@ -175,19 +175,42 @@ impl NetworkArgs {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("DRAVITY_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    // The UI owns the terminal. A log line on stderr is written onto that
+    // screen and covers it, so `--tui` discards logs instead of printing them.
+    init_tracing(tui_requested(&cli));
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(std::io::stderr(), "error: {e:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Whether this command draws the full-screen UI.
+fn tui_requested(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Command::Download { tui: true, .. } | Command::Serve { tui: true, .. }
+    )
+}
+
+/// Installs the process logger. `tui` throws records away; anything else
+/// goes to stderr at `warn`, unless `DRAVITY_LOG` says otherwise.
+fn init_tracing(tui: bool) {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("DRAVITY_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    if tui {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::sink)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
     }
 }
 
@@ -432,7 +455,9 @@ async fn download(
             } else {
                 finished
             };
-            done && !seed
+            // A prompt or the key list has the keyboard: finishing must not
+            // close the screen while that input is still open.
+            done && !seed && !view.holds_input()
         })
         .await;
         session.shutdown().await;

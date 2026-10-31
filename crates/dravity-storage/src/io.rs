@@ -63,6 +63,33 @@ pub trait OpenFile: Send + Sync + std::fmt::Debug {
     /// Any I/O error from the flush.
     fn sync_data(&self) -> io::Result<()>;
 
+    /// Writes each `(offset, data)` of `writes`, in any order (the ranges
+    /// do not overlap). Backends with a per-call cost (io_uring) submit them
+    /// together and merge adjacent ones; the default writes them one by
+    /// one.
+    ///
+    /// # Errors
+    /// The first I/O error; the other writes may or may not have happened.
+    fn write_batch(&self, writes: Vec<(u64, Bytes)>) -> io::Result<()> {
+        for (offset, data) in writes {
+            self.write_all_at(data, offset)?;
+        }
+        Ok(())
+    }
+
+    /// Reads each `(offset, len)` of `reads` into a new vector, returned in
+    /// the same order. Backends with a per-call cost (io_uring) submit them
+    /// together and merge adjacent ones; the default reads them one by one.
+    ///
+    /// # Errors
+    /// The first I/O error, as [`read_exact_at`](Self::read_exact_at).
+    fn read_batch(&self, reads: &[(u64, usize)]) -> io::Result<Vec<Vec<u8>>> {
+        reads
+            .iter()
+            .map(|&(offset, len)| self.read_exact_at(Vec::with_capacity(len), len, offset))
+            .collect()
+    }
+
     /// Writes borrowed `data` at `offset`. The default copies it into
     /// [`Bytes`] for [`write_all_at`](Self::write_all_at); backends that can
     /// write from a borrowed slice override it.

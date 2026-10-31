@@ -20,6 +20,9 @@ use dravity_core::Metainfo;
 use dravity_storage::{BlockingIo, FileIo, FileStorage, Storage, UringIo, verify_piece};
 use sha1::{Digest, Sha1};
 
+#[path = "common/batch.rs"]
+mod batch;
+
 /// The io_uring backend, or `None` (after saying why) when unavailable.
 fn uring() -> Option<UringIo> {
     match UringIo::start() {
@@ -256,4 +259,18 @@ fn owned_buffers_round_trip_across_files() {
             content[chunk..end]
         );
     }
+}
+
+#[test]
+fn batches_go_through_the_ring() {
+    let Some(io) = uring() else { return };
+    let (m, content) = torrent();
+    let dir = tempfile::tempdir().unwrap();
+    let storage = FileStorage::new(dir.path(), m.info())
+        .unwrap()
+        .with_io(Arc::new(io));
+    batch::batches_round_trip(&storage, &m, &content);
+    // Readable by the blocking backend too.
+    let blocking = FileStorage::new(dir.path(), m.info()).unwrap();
+    assert_eq!(blocking.read_vec(0, content.len()).unwrap(), content);
 }

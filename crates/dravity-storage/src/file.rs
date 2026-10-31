@@ -1,6 +1,6 @@
 //! Filesystem backend.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -181,12 +181,15 @@ impl FileStorage {
     }
 
     fn sync_index(&self, index: usize, file: &dyn OpenFile) -> Result<(), StorageError> {
-        let path = self
-            .files
+        file.sync_data()
+            .map_err(|e| StorageError::io(self.path_of(index), e))
+    }
+
+    fn path_of(&self, index: usize) -> PathBuf {
+        self.files
             .get(index)
             .map(|spec| spec.path.clone())
-            .unwrap_or_default();
-        file.sync_data().map_err(|e| StorageError::io(path, e))
+            .unwrap_or_default()
     }
 
     /// The parts of `offset..offset + len`, one per file it touches.
@@ -356,6 +359,73 @@ impl Storage for FileStorage {
                 .map_err(|e| StorageError::io(&spec.path, e))?;
         }
         Ok(buf)
+    }
+
+    fn write_many(&self, writes: Vec<(u64, Bytes)>) -> Result<(), StorageError> {
+        let mut by_file: BTreeMap<usize, Vec<(u64, Bytes)>> = BTreeMap::new();
+        for (offset, data) in writes {
+            for part in self.pieces(offset, data.len())? {
+                let Some((index, _)) = part.file else {
+                    continue;
+                };
+                // `pieces` covers exactly `0..data.len()`, so this is in range.
+                let chunk = data.slice(part.at..part.at + part.len);
+                by_file
+                    .entry(index)
+                    .or_default()
+                    .push((part.file_offset, chunk));
+            }
+        }
+        for (index, ops) in by_file {
+            self.handle(index, true)?
+                .write_batch(ops)
+                .map_err(|e| StorageError::io(self.path_of(index), e))?;
+        }
+        Ok(())
+    }
+
+    fn read_many(&self, reads: &[(u64, usize)]) -> Result<Vec<Bytes>, StorageError> {
+        let mut out: Vec<Option<Bytes>> = vec![None; reads.len()];
+        // Reads that lie in one file, by file: (position in `out`, file
+        // offset, length).
+        let mut by_file: BTreeMap<usize, Vec<(usize, u64, usize)>> = BTreeMap::new();
+        for (i, &(offset, len)) in reads.iter().enumerate() {
+            let parts = self.pieces(offset, len)?;
+            match parts.as_slice() {
+                [
+                    Part {
+                        file: Some((index, _)),
+                        file_offset,
+                        ..
+                    },
+                ] => by_file
+                    .entry(*index)
+                    .or_default()
+                    .push((i, *file_offset, len)),
+                // Across files or padding (rare): on its own.
+                _ => {
+                    if let Some(slot) = out.get_mut(i) {
+                        *slot = Some(Bytes::from(self.read_vec(offset, len)?));
+                    }
+                }
+            }
+        }
+        for (index, ops) in by_file {
+            let ranges: Vec<(u64, usize)> = ops.iter().map(|&(_, o, l)| (o, l)).collect();
+            let data = self
+                .handle(index, false)?
+                .read_batch(&ranges)
+                .map_err(|e| StorageError::io(self.path_of(index), e))?;
+            for ((i, _, _), buf) in ops.into_iter().zip(data) {
+                if let Some(slot) = out.get_mut(i) {
+                    *slot = Some(Bytes::from(buf));
+                }
+            }
+        }
+        out.into_iter()
+            .zip(reads)
+            .map(|(b, &(offset, len))| b.ok_or(StorageError::OutOfBounds { offset, len }))
+            .collect()
     }
 
     fn flush(&self) -> Result<(), StorageError> {

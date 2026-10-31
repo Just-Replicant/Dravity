@@ -16,8 +16,9 @@
 //! dedicated thread; see its docs for falling back when the kernel or a
 //! container refuses io_uring).
 //!
-//! [`write_block`] and [`verify_piece`] adapt piece/block addresses to stream
-//! offsets. [`resume`] stores verified pieces plus file stamps so a restart
+//! [`write_block`], [`write_blocks`], [`read_block`], [`read_blocks`] and
+//! [`verify_piece`] adapt piece/block addresses to stream offsets; the
+//! batched forms let io_uring submit many blocks per round trip. [`resume`] stores verified pieces plus file stamps so a restart
 //! can skip the hash check. All calls block; the session runs them on a
 //! blocking thread pool.
 
@@ -91,6 +92,35 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
         Ok(buf)
     }
 
+    /// Writes each `(offset, data)` of `writes` (non-overlapping ranges, in
+    /// any order). [`FileStorage`] hands each file's share to its
+    /// [`FileIo`] at once, so io_uring submits them together; the default
+    /// calls [`write_bytes`](Self::write_bytes) for each.
+    ///
+    /// # Errors
+    /// The first error, as [`write_at`](Self::write_at); some of the writes
+    /// may have happened.
+    fn write_many(&self, writes: Vec<(u64, Bytes)>) -> Result<(), StorageError> {
+        for (offset, data) in writes {
+            self.write_bytes(offset, data)?;
+        }
+        Ok(())
+    }
+
+    /// Reads each `(offset, len)` of `reads`, in order. [`FileStorage`]
+    /// hands each file's share to its [`FileIo`] at once (io_uring merges
+    /// adjacent ranges into one request); the default calls
+    /// [`read_vec`](Self::read_vec) for each.
+    ///
+    /// # Errors
+    /// The first error, as [`read_at`](Self::read_at).
+    fn read_many(&self, reads: &[(u64, usize)]) -> Result<Vec<Bytes>, StorageError> {
+        reads
+            .iter()
+            .map(|&(offset, len)| self.read_vec(offset, len).map(Bytes::from))
+            .collect()
+    }
+
     /// Flushes written data to durable storage.
     ///
     /// # Errors
@@ -133,6 +163,64 @@ pub fn write_block(
     match start {
         Some(start) if len_ok && layout.is_valid_request(block) => {
             storage.write_bytes(start + u64::from(block.offset), data)
+        }
+        _ => Err(StorageError::InvalidBlock(block)),
+    }
+}
+
+/// Writes received blocks together (see [`Storage::write_many`]), handing
+/// their data to the backend without copying it.
+///
+/// # Errors
+/// [`StorageError::InvalidBlock`] for the first block that is not valid for
+/// `layout` or has the wrong length (nothing is written then); otherwise the
+/// first error from the backend.
+pub fn write_blocks(
+    storage: &dyn Storage,
+    layout: &PieceLayout,
+    blocks: Vec<(BlockRef, Bytes)>,
+) -> Result<(), StorageError> {
+    let writes = blocks
+        .into_iter()
+        .map(|(block, data)| Ok((block_offset(layout, block, Some(data.len()))?, data)))
+        .collect::<Result<Vec<_>, StorageError>>()?;
+    storage.write_many(writes)
+}
+
+/// Reads blocks together (see [`Storage::read_many`]), e.g. the requests of
+/// one or more peers to upload; returned in the same order.
+///
+/// # Errors
+/// [`StorageError::InvalidBlock`] for the first block that is not valid for
+/// `layout`; otherwise the first error from the backend (including data
+/// never written).
+pub fn read_blocks(
+    storage: &dyn Storage,
+    layout: &PieceLayout,
+    blocks: &[BlockRef],
+) -> Result<Vec<Bytes>, StorageError> {
+    let reads = blocks
+        .iter()
+        .map(|&block| {
+            let len =
+                usize::try_from(block.length).map_err(|_| StorageError::InvalidBlock(block))?;
+            Ok((block_offset(layout, block, None)?, len))
+        })
+        .collect::<Result<Vec<_>, StorageError>>()?;
+    storage.read_many(&reads)
+}
+
+/// The stream offset of `block`, if it is valid for `layout` (and `len`,
+/// when given, is its length).
+fn block_offset(
+    layout: &PieceLayout,
+    block: BlockRef,
+    len: Option<usize>,
+) -> Result<u64, StorageError> {
+    let len_ok = len.is_none_or(|l| usize::try_from(block.length).is_ok_and(|b| b == l));
+    match layout.piece_offset(block.piece) {
+        Some(start) if len_ok && layout.is_valid_request(block) => {
+            Ok(start + u64::from(block.offset))
         }
         _ => Err(StorageError::InvalidBlock(block)),
     }

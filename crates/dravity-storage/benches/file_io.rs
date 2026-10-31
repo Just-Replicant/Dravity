@@ -1,5 +1,6 @@
 //! File storage throughput through each I/O backend: 16 KiB block writes and
-//! reads (what peers send and request) and whole-piece verification reads.
+//! reads (what peers send and request), one call per block and batched one
+//! piece (16 blocks) per call, and whole-piece verification reads.
 //!
 //! `cargo bench -p dravity-storage --features uring` adds the io_uring
 //! backend when the kernel allows it.
@@ -21,7 +22,8 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use dravity_bencode::{Dict, Value};
 use dravity_core::{BlockRef, Metainfo};
 use dravity_storage::{
-    BlockingIo, FileIo, FileStorage, Storage, read_block, verify_piece, write_block,
+    BlockingIo, FileIo, FileStorage, Storage, read_block, read_blocks, verify_piece, write_block,
+    write_blocks,
 };
 use sha1::{Digest, Sha1};
 
@@ -98,6 +100,22 @@ fn file_io(c: &mut Criterion) {
             b.iter(|| {
                 for (block, _) in &blocks {
                     black_box(read_block(&storage, layout, *block).unwrap());
+                }
+            });
+        });
+        let per_piece = PIECE / BLOCK as usize;
+        group.bench_function(format!("{name}/write_batched"), |b| {
+            b.iter(|| {
+                for batch in blocks.chunks(per_piece) {
+                    write_blocks(&storage, layout, batch.to_vec()).unwrap();
+                }
+            });
+        });
+        let refs: Vec<BlockRef> = blocks.iter().map(|(block, _)| *block).collect();
+        group.bench_function(format!("{name}/read_batched"), |b| {
+            b.iter(|| {
+                for batch in refs.chunks(per_piece) {
+                    black_box(read_blocks(&storage, layout, batch).unwrap());
                 }
             });
         });

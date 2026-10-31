@@ -18,6 +18,9 @@ use dravity_storage::{
 };
 use sha1::{Digest, Sha1};
 
+#[path = "common/batch.rs"]
+mod batch;
+
 fn bytes(b: &[u8]) -> Value<'static> {
     Value::Bytes(Cow::Owned(b.to_vec()))
 }
@@ -356,4 +359,22 @@ fn stamps_vouch_for_resume_data() {
     remove_resume(&path).unwrap();
     assert_eq!(load_resume(&path).unwrap(), None);
     assert_eq!(MemoryStorage::new(1).stamps().unwrap(), None);
+}
+
+#[test]
+fn batched_blocks_round_trip() {
+    let (m, data) = torrent(
+        &[
+            (&["a"], content(40_000, 1), false),
+            (&[".pad", "960"], vec![0; 960], true),
+            (&["b"], content(70_001, 2), false),
+        ],
+        16_384,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let file = FileStorage::new(dir.path(), m.info()).unwrap();
+    batch::batches_round_trip(&file, &m, &data);
+    assert!(!dir.path().join("root/.pad").exists());
+    let memory = MemoryStorage::new(data.len() as u64);
+    batch::batches_round_trip(&memory, &m, &data);
 }

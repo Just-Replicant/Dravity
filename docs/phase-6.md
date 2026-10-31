@@ -22,14 +22,14 @@ refused a magnet without a `btih` topic (`MagnetWithoutV1Hash`).
 
 | Crate | I/O? | Phase 6 additions |
 |---|---|---|
-| `dravity-wire` | no | BEP 52 `HashRequest` (21), `Hashes` (22), `HashReject` (23); `Reserved::v2` (reserved bit `0x10` of byte 7) |
+| `dravity-wire` | no | BEP 52 `HashRequest` (21), `Hashes` (22), `HashReject` (23); `Reserved::v2` (reserved bit `0x10` of byte 7); `PexPeer::flags` is `Option<u8>` (unknown when `added.f` is short) with `PexPeer::has` |
 | `dravity-core` | no | `merkle` (SHA-256 trees over 16 KiB leaves, piece layers, pad hashes; `layer_proof`, `verify_proof` and `layer_requests` for hash requests); v2 `file tree` parsing with the same path checks as v1; `MetaVersion` (`V1`, `V2`, `Hybrid`); `Metainfo::info_hash_v2`, `swarm_hashes`, `web_seeds`, `with_web_seeds`, `set_piece_layer`; `Info::version`, `check_piece`, `pieces_root`, `piece_layers`, `missing_piece_layers`; `Magnet::swarm_hash`; `InfoHashV2::from_info_bytes`. Fix: BEP 47 padding files may share a name |
-| `dravity-storage` | yes | `verify_piece` goes through `Info::check_piece` (SHA-1, Merkle, or both); `FileIo` under `FileStorage` (`BlockingIo` by default); `UringIo` (feature `uring`, Linux) |
+| `dravity-storage` | yes | `verify_piece` goes through `Info::check_piece` (SHA-1, Merkle, or both); `FileIo` / `OpenFile` under `FileStorage` (`BlockingIo` by default); `UringIo` (feature `uring`, Linux); `Storage::write_bytes` / `read_vec` move owned buffers; `benches/file_io.rs` |
 | `dravity-tracker` | yes | `CryptoSupport` / `AnnounceRequest::crypto`: `supportcrypto` and `requirecrypto` on HTTP announces |
-| `dravity-engine` | no | `MetadataState::new_v2` / `with_info_hash_v2`: magnet metadata is checked with SHA-256 for `btmh`, with both hashes for a hybrid link; v2 magnets then fetch missing piece layers with hash requests (`Effect::MetadataReceived` carries them); `TorrentState::with_piece_layers` answers hash requests |
+| `dravity-engine` | no | `MetadataState::new_v2` / `with_info_hash_v2`: magnet metadata is checked with SHA-256 for `btmh`, with both hashes for a hybrid link; v2 and hybrid magnets then fetch missing piece layers with hash requests (`Effect::MetadataReceived` carries them, `Config::piece_layer_timeout` bounds a hybrid's wait); `TorrentState::with_piece_layers` answers hash requests; PEX flags from what connections showed (`PeerLink` on `Event::PeerConnected` / `PeerAccepted`, `DialHints` on `Effect::Connect`, `TorrentState::with_dial_hints`, `Handover::hints`) |
 | `dravity-mse` (new) | sans-IO core, async with feature `stream` | MSE/PE: `Initiator` / `Responder` state machines, `initiate` / `respond` and `MseStream` over Tokio I/O, `Policy` |
 | `dravity-webseed` (new) | yes (feature `client`) | `plan` (sans-IO): a file's URL under a web seed and the HTTP ranges, plus zero-filled padding, that make up a byte range of the torrent. `WebSeedClient` (reqwest + rustls, on by default): strict ranged `GET`s |
-| `dravity-session` | async | v2/hybrid torrents and `btmh` magnets; a hybrid answers to, announces on (DHT and trackers) and looks up both swarm ids, also when added from a magnet; piece layers and web seeds are saved with the torrent; web seeds as virtual peers (`SessionConfig::web_seed`, `web_seed_retry`, `Transport::Web`); `SessionConfig::storage_backend` and `Session::storage_backend`; `SessionConfig::encryption`, `PeerStatus::encrypted` |
+| `dravity-session` | async | v2/hybrid torrents and `btmh` magnets; a hybrid answers to, announces on (DHT and trackers) and looks up both swarm ids, also when added from a magnet; piece layers and web seeds are saved with the torrent; web seeds as virtual peers (`SessionConfig::web_seed`, `web_seed_retry`, `Transport::Web`); `SessionConfig::storage_backend` and `Session::storage_backend`; `SessionConfig::encryption`, `PeerStatus::encrypted`; dials follow PEX flags and earlier connections (MSE or plain first, uTP or TCP first, peers that cannot encrypt skipped under `Required`) |
 | `dravity-cli` | via session | `info` prints the version, the v2 hash and web seeds; `--no-web-seeds`; `--storage-backend blocking\|io-uring` (feature `uring`); `--encryption disabled\|enabled\|required`; the peer table flags web seeds with `W` and encrypted peers with `E` |
 
 `dravity-http` is unchanged: its DTOs carry the session's info-hash,
@@ -91,8 +91,33 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   file's `pieces root` before it is accepted; a bad proof disconnects and
   bans the peer, a `hash reject` or a timeout moves the request to
   another peer. The torrent is handed over only with every layer
-  complete, so no data is ever downloaded unverifiable. Hybrid magnets
-  still verify with SHA-1 and do not fetch layers.
+  complete, so no data is ever downloaded unverifiable.
+- **Hybrid magnets fetch their layers too, before downloading.** A
+  hybrid `info` has SHA-1 piece hashes, so it could start at once and
+  fetch the layers alongside. It does not: pieces accepted on SHA-1
+  alone would have to be read back and re-checked against the Merkle
+  roots once the layers arrived (and dropped if they failed), resume
+  data would mix the two, and until then the torrent could not answer
+  hash requests. The layers are small (32 bytes per piece, a few round
+  trips), so the metadata state asks for them right after `info` is
+  verified, exactly as for a v2-only magnet, and every piece is then
+  checked with both SHA-1 and Merkle from the first block. Differences
+  from v2-only: only peers that set the v2 reserved bit are asked (a
+  v1-only peer of a hybrid swarm does not know the messages), and the
+  wait is bounded: `Config::piece_layer_timeout` (20 s by default,
+  restarted by every accepted `hashes` reply) without progress hands the
+  torrent over with the layers that are complete, and files whose layer
+  is still missing verify with SHA-1 only (`check_piece` already allows
+  that for hybrids). Those layers are not fetched later; the torrent
+  cannot serve hash requests for those files.
+- **SHA-1 pass, Merkle fail.** `Info::check_piece` requires both hashes
+  for a hybrid piece whose layer is known, so data that passes SHA-1 and
+  fails Merkle (a SHA-1 collision, or a peer serving another v2 file) is
+  a plain hash failure: the piece is discarded and re-downloaded, and the
+  peers that sent it collect strikes and are banned
+  (`Config::hash_fail_ban`), as for any bad piece. The fetched layers are
+  stored with the torrent (see Persistence), so a restart verifies and
+  serves with them.
 - **Serving hash requests.** A torrent with piece layers answers
   `hash request`s from them (layers at or above the piece layer, with
   the uncles asked for). Requests for leaf layers below the piece layer
@@ -152,12 +177,33 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   reply. `UringIo::start` probes the ring with a no-op and returns an
   error instead of panicking when the kernel, seccomp or a container
   refuses io_uring.
-- **No `unsafe`.** Each job owns a `dup` of the cached descriptor and an
-  owned buffer (tokio-uring's ownership model), at the cost of one `dup`
-  and one copy per operation. Reads, writes and `fdatasync`
-  (`FileIo::sync_data`) all go through the ring. The workspace's
-  `unsafe_code = "forbid"` holds: tokio-uring's safe, owned-buffer API is
-  enough, so the backend has no `unsafe` code at all.
+- **Long-lived files, owned buffers, no `unsafe`.** `FileIo::adopt` turns
+  an opened `std::fs::File` into an `OpenFile` that the descriptor cache
+  keeps. For io_uring, the ring thread converts it once
+  (`tokio_uring::fs::File::from_std`, no `dup`) and keeps it in a map;
+  callers hold a handle whose drop closes it on the ring (after any
+  operation still in flight). Writes take the block's `Bytes` as
+  received from the wire (`Storage::write_bytes`, `write_block`), reads
+  fill a `Vec<u8>` that is returned to the caller (`Storage::read_vec`,
+  used by `read_block`, piece checks and file streaming), both moved
+  through the ring as tokio-uring's owned buffers, so there is no `dup`
+  and no copy per operation. Reads, writes and `fdatasync`
+  (`OpenFile::sync_data`) all go through the ring. The borrowed
+  `write_at` / `read_at` remain (copy-free on the blocking backend). The
+  workspace's `unsafe_code = "forbid"` holds; the backend has no
+  `unsafe` code. Registered (fixed) buffers are not used: a block arrives
+  as `Bytes` from the wire and would have to be copied into the
+  registered pool, which is the copy this change removes.
+- **Measured.** `cargo bench -p dravity-storage --features uring --bench
+  file_io` writes, reads and verifies a 16 MiB torrent in 16 KiB blocks
+  and 256 KiB pieces. On the development box (8 vCPUs, Linux 6.12, ext4,
+  page cache warm), removing the `dup` and copy took io_uring block writes from
+  6.78 to 5.24 ms (−15 %), block reads from 4.14 to 3.04 ms (−26 %) and
+  piece verification from 3.07 to 2.65 ms (−15 %); blocking I/O did not
+  change (0.57, 0.39, 2.41 ms). Per small operation, io_uring is still
+  slower than `pread`/`pwrite` here: each one is a channel round trip to
+  the ring thread, which batching across blocks would amortize. The
+  backend stays opt-in.
 - **Selection and fallback.** `SessionConfig::storage_backend`
   (`Blocking`, `IoUring`; CLI `--storage-backend`) applies to storage the
   session creates. Asking for io_uring in a build without the feature, or
@@ -208,7 +254,31 @@ which for a v2-only torrent is the truncated v2 hash (see below).
 - **Trackers.** HTTP announces carry `supportcrypto=1` under `Enabled`
   and also `requirecrypto=1` under `Required`
   (`dravity_tracker::CryptoSupport`), as the MSE spec describes; UDP
-  trackers have no such field. PEX encryption flags are not sent.
+  trackers have no such field.
+- **PEX flags (BEP 11).** `added.f` now says what this client knows:
+  `0x01` when the peer completed an MSE handshake with us (or PEX told us
+  so and nothing contradicted it), `0x02` for seeds, `0x04` for uTP
+  connections, `0x10` only for peers we dialed (an incoming peer's
+  address is not known to accept connections). Received flags are kept
+  per address in a bounded book (`2 × MAX_POOL` entries) as tri-state
+  hints: what our own connections observed overrides PEX, PEX only fills
+  gaps. A short `added.f` leaves the remaining peers unknown rather than
+  "no features". Dialing follows the hints:
+  - `Required`: a peer flagged without `0x01` (or that refused MSE
+    before) is not dialed; flagged or unknown peers are. BEP 11 has no
+    "unknown" bit, so a peer whose PEX entry has flags but not `0x01`
+    counts as not encrypting; this can skip a peer whose sender simply
+    never tried MSE, which is the price of not failing a handshake per
+    PEX peer.
+  - `Enabled`: MSE first, plain as the fallback, except for peers known
+    not to encrypt, which get a plain handshake first with MSE as the
+    fallback.
+  - uTP first for peers flagged `0x04` (or last reached over uTP) when a
+    uTP socket exists, TCP first for peers flagged without it, otherwise
+    `prefer_utp`; the other transport stays the fallback.
+  - What a dial learns is recorded: MSE completed (`Some(true)`), MSE
+    failed and plain worked (`Some(false)`), or not tried (unknown). The
+    hints survive a magnet's hand-over.
 
 ## Tests
 
@@ -233,12 +303,24 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   hash requests (bad proofs ban, rejects move on), small files needing
   none, requests rejected during metadata exchange, and a 600-piece
   layer fetched as two 512-hash blocks whose uncle hash is checked (a
-  forged uncle disconnects the peer).
+  forged uncle disconnects the peer); hybrid magnets asking only peers
+  with the v2 bit, banning forged proofs, falling back to SHA-1 after
+  `piece_layer_timeout`, while v2-only magnets keep waiting.
   `tests/seeding.rs` serves hash requests from piece layers.
+  `tests/engine.rs`: PEX flags for each kind of connection, and dial
+  hints learned from PEX and overridden by connections; `tests/metadata.rs`:
+  hints and links surviving the hand-over; `hints.rs` unit tests (bounds,
+  precedence).
+- Wire: PEX flags unknown past a short `added.f`, encoded as zero before
+  known ones. Fuzz `wire_pex` checks that only a suffix is unknown.
+- Core: a hybrid piece that passes SHA-1 but not Merkle is rejected.
 - Storage: `tests/uring.rs` (feature `uring`) writes, reads and verifies
   through io_uring from many threads and checks that an unusable ring is
-  an error, not a panic, and flushes through the ring; each test prints
-  a note and passes when the kernel refuses io_uring.
+  an error, not a panic, and flushes through the ring, closes files the
+  descriptor cache evicts (counted in `/proc/self/fd`), and moves owned
+  buffers across file boundaries; each test prints a note and passes
+  when the kernel refuses io_uring. `benches/file_io.rs` compares both
+  backends.
 - MSE: RFC 6229 RC4 output, the 1024-byte drop, the prime (768 bits,
   Fermat-probable, safe), DH agreement and weak keys; a reference
   implementation of both sides written from the spec text (with PadC,
@@ -255,7 +337,10 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   its `ws`); a v2 magnet with multi-piece files fetching its piece layers
   and downloading; a v2 magnet whose 520-piece layer takes two hash
   requests with uncle proofs; a hybrid announcing both ids to a tracker; a hybrid
-  magnet answering its v2 id once the metadata arrives;
+  magnet answering its v2 id once the metadata arrives; a hybrid `btih`
+  magnet with multi-piece files fetching its piece layers, keeping them
+  across a restart and serving them to a v2-only magnet; a peer whose
+  data passes SHA-1 but not Merkle banned;
   piece layers surviving a restart; v2-only and hybrid torrents
   downloaded from a web seed alone; a broken web seed retried without
   stopping a download from a peer; web seeds turned off.
@@ -263,6 +348,10 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   otherwise), torrents moving between io_uring and blocking sessions.
   `tests/encryption.rs`: two sessions under all nine policy pairs over
   TCP (who connects, encrypted or not, data intact) and MSE over uTP.
+  `tests/pex.rs`: three sessions where the middle one shares the seed
+  over PEX: `Required` dials it encrypted when flagged `0x01` and skips
+  it when flagged plain; `Enabled` dials a plain peer in plaintext.
+  `peer.rs` unit tests for the dial order.
 - CLI: `info` on a v1 and a v2 torrent with a web seed; peer flags `W`
   and `E`; a download with `--storage-backend io-uring`; an unknown
   backend refused; two CLI processes (default `--encryption enabled`).
@@ -277,9 +366,8 @@ against BEP 52's reference layout only.
 
 | Item | Why |
 |---|---|
-| Piece layers for hybrid magnets | they verify with SHA-1; fetching the layers too would only let them answer v2-only peers' hash requests |
-| io_uring without the per-operation `dup` and copy | needs registered buffers and files; one 16 KiB copy is cheap next to the hashing |
-| PEX encryption flags (`added.f` bit `0x01`) | peers learned over PEX are dialed with MSE first anyway under `Enabled` |
+| Fetching a hybrid's missing layers after a `piece_layer_timeout` fallback | the files verify with SHA-1; only matters for answering v2-only peers |
+| io_uring batched submissions (one ring round trip for many blocks) | the per-operation channel round trip now dominates, but batching changes the `Storage` API |
 
 Out of scope for Phase 6 and unchanged from earlier phases: creating
 empty files up front (storage creates a file when its data arrives) and

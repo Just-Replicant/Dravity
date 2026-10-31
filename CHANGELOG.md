@@ -61,6 +61,20 @@ See [`docs/phase-6.md`](docs/phase-6.md) for design notes.
   `EncryptionPolicy::Required`).
 - Fuzz targets `webseed_plan` and `mse_handshake`; `metainfo_parse` checks
   v2 hashes and `check_piece`.
+- Hybrid magnets fetch their piece layers with BEP 52 hash requests (from
+  peers with the v2 reserved bit) before downloading, so every piece is
+  checked with SHA-1 and Merkle and the layers are saved and served;
+  `Config::piece_layer_timeout` bounds the wait, then files without a
+  layer verify with SHA-1 only.
+- PEX flags (BEP 11) describe each peer: `0x01` once it completed MSE,
+  `0x02` seed, `0x04` uTP, `0x10` only for peers we dialed. Received flags
+  and our own connections steer dialing (`dravity_engine::DialHints`,
+  `PeerLink`, `TorrentState::with_dial_hints`, `Handover::hints`):
+  `Required` skips peers known not to encrypt, `Enabled` tries plain first
+  for them, and uTP-flagged peers are dialed over uTP first.
+- `Storage::write_bytes` and `read_vec` (owned buffers),
+  `dravity_storage::OpenFile`, and a `file_io` Criterion bench comparing
+  the storage backends.
 
 #### Changed
 
@@ -80,6 +94,15 @@ See [`docs/phase-6.md`](docs/phase-6.md) for design notes.
 - **Breaking:** `AnnounceRequest` has a new `crypto` field.
 - **Breaking:** a v2-only magnet with files larger than one piece no longer
   stops with a missing piece layers error; it fetches the layers.
+- The io_uring backend keeps each file open on the ring (no `dup` per
+  operation) and moves owned buffers through it (no copy per block):
+  about 15 % faster writes and piece checks and 25 % faster reads in the
+  bench. **Breaking:** `FileIo` is now `name` + `adopt`, returning an
+  `OpenFile`; `write_block` takes `Bytes`.
+- **Breaking:** `PexPeer::flags` is `Option<u8>`; `Event::PeerConnected`
+  and `PeerAccepted` have a `link` field, `Effect::Connect` a `hints`
+  field, `HandoverPeer` a `link` field and `Handover` a `hints` field.
+- Incoming peers are no longer flagged reachable (`0x10`) in PEX.
 
 #### Fixed
 

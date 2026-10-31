@@ -600,6 +600,63 @@ fn v2_magnets_fetch_piece_layers_with_hash_requests() {
 }
 
 #[test]
+fn large_piece_layers_are_fetched_in_blocks_with_uncle_proofs() {
+    // 600 pieces pad to 1024: two blocks of 512 hashes, each needing one
+    // uncle hash to reach the pieces root.
+    let (info, tree) = v2_info(600 * 16_384);
+    assert_eq!(tree.layer.len(), 600);
+    let v2 = InfoHashV2::from_info_bytes(&info);
+    let mut h = Harness::with(MetadataState::new_v2(v2, Config::default()));
+    h.peer(1, Some(info.len() as u64));
+    let fx = h.msg(1, data(0, &info));
+    let asked = hash_requests(&fx);
+    let wanted: Vec<_> = asked
+        .iter()
+        .map(|(_, r)| (r.base_layer, r.index, r.length, r.proof_layers))
+        .collect();
+    assert_eq!(wanted, vec![(0, 0, 512, 9), (0, 512, 512, 9)]);
+
+    // Each answer carries 512 base hashes and exactly one uncle.
+    let good = answer(&tree, asked[0].1);
+    let Message::Hashes { hashes, .. } = &good else {
+        panic!("expected hashes");
+    };
+    assert_eq!(hashes.len(), 513 * 32);
+
+    // A tampered uncle fails the proof even though every base hash is right.
+    let mut forged = hashes.to_vec();
+    let last = forged.len() - 1;
+    forged[last] ^= 1;
+    let fx = h.msg(
+        1,
+        Message::Hashes {
+            request: asked[0].1,
+            hashes: forged.into(),
+        },
+    );
+    assert!(fx.contains(&Effect::Disconnect { peer: PeerKey(1) }));
+
+    // A second peer answers both blocks and completes the layer.
+    let fx = h.peer(2, Some(info.len() as u64));
+    let asked = hash_requests(&fx);
+    assert_eq!(asked.len(), 2);
+    let mut done = None;
+    for (peer, r) in asked {
+        assert_eq!(peer, 2);
+        let fx = h.msg(2, answer(&tree, r));
+        assert!(!fx.contains(&Effect::Disconnect { peer: PeerKey(2) }));
+        done = done.or_else(|| {
+            fx.iter().find_map(|e| match e {
+                Effect::MetadataReceived { piece_layers, .. } => Some(piece_layers.clone()),
+                _ => None,
+            })
+        });
+    }
+    assert_eq!(done, Some(vec![(tree.root, tree.layer.clone())]));
+    assert!(h.m.is_complete());
+}
+
+#[test]
 fn small_v2_files_need_no_hash_requests() {
     let (info, tree) = v2_info(10_000);
     assert!(tree.layer.is_empty());

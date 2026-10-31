@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use dravity_core::{Magnet, Metainfo};
 use dravity_engine::{Alert, Priority, TorrentStatus};
-use dravity_session::{AddTorrentOptions, ListenConfig, Session, SessionConfig};
+use dravity_session::{AddTorrentOptions, ListenConfig, Session, SessionConfig, StorageBackend};
 use tokio::sync::broadcast::error::RecvError;
 
 /// A portable BitTorrent client.
@@ -148,6 +148,29 @@ struct NetworkArgs {
     /// Never download from HTTP web seeds (BEP 19 `url-list`, magnet `ws`).
     #[arg(long)]
     no_web_seeds: bool,
+    /// How torrent data is read and written. `io-uring` needs a build with
+    /// the `uring` feature on Linux; without it, or where the kernel refuses
+    /// io_uring, blocking I/O is used and a warning is logged.
+    #[arg(long, value_enum, default_value_t = Backend::Blocking, value_name = "BACKEND")]
+    storage_backend: Backend,
+}
+
+/// `--storage-backend` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Backend {
+    /// Positional reads and writes on a thread pool.
+    Blocking,
+    /// io_uring (`tokio-uring`) on a dedicated thread.
+    IoUring,
+}
+
+impl From<Backend> for StorageBackend {
+    fn from(backend: Backend) -> Self {
+        match backend {
+            Backend::Blocking => Self::Blocking,
+            Backend::IoUring => Self::IoUring,
+        }
+    }
 }
 
 impl NetworkArgs {
@@ -176,6 +199,7 @@ impl NetworkArgs {
         if self.no_web_seeds {
             config.web_seed = None;
         }
+        config.storage_backend = self.storage_backend.into();
         config
     }
 }

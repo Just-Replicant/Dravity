@@ -10,6 +10,38 @@ use dravity_webseed::WebSeedConfig;
 
 use crate::listen::ListenConfig;
 
+/// How torrent data reaches the disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum StorageBackend {
+    /// `pread`/`pwrite` on the session's blocking thread pool.
+    #[default]
+    Blocking,
+    /// io_uring through `tokio-uring` on a dedicated thread (Linux, crate
+    /// feature `uring`). Falls back to [`Blocking`](Self::Blocking), with a
+    /// warning, when the feature is off or the kernel or a container
+    /// refuses io_uring; [`Session::storage_backend`](crate::Session::storage_backend)
+    /// reports the one in use.
+    IoUring,
+}
+
+impl StorageBackend {
+    /// Short name (`blocking`, `io_uring`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocking => "blocking",
+            Self::IoUring => "io_uring",
+        }
+    }
+}
+
+impl std::fmt::Display for StorageBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Session-wide settings. [`SessionConfig::default`] is a reasonable start.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -72,6 +104,9 @@ pub struct SessionConfig {
     /// Wait this long before trying a web seed again after it failed;
     /// doubles with every failure in a row, up to 32 times as long.
     pub web_seed_retry: Duration,
+    /// How file data is read and written for torrents whose storage the
+    /// session creates (not for [`AddTorrentOptions::with_storage`](crate::AddTorrentOptions::with_storage)).
+    pub storage_backend: StorageBackend,
 }
 
 impl Default for SessionConfig {
@@ -98,6 +133,7 @@ impl Default for SessionConfig {
             state_dir: None,
             web_seed: Some(WebSeedConfig::default()),
             web_seed_retry: Duration::from_secs(30),
+            storage_backend: StorageBackend::Blocking,
         }
     }
 }

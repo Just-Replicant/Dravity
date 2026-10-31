@@ -39,7 +39,7 @@ use dravity_engine::{
     TorrentState, TorrentStatus,
 };
 use dravity_storage::{
-    FileStorage, ResumeData, Storage, load_resume, read_block, save_resume, verify_piece,
+    FileIo, FileStorage, ResumeData, Storage, load_resume, read_block, save_resume, verify_piece,
     write_block,
 };
 use dravity_tracker::{AnnounceRequest, AnnounceResponse, TrackerClient};
@@ -168,6 +168,8 @@ pub(crate) struct TorrentContext {
     pub(crate) tracker: TrackerClient,
     /// HTTP client for web seeds, unless they are disabled.
     pub(crate) web_seed: Option<WebSeedClient>,
+    /// File I/O for storage the session creates.
+    pub(crate) file_io: Arc<dyn FileIo>,
     pub(crate) dht: Option<Dht>,
     pub(crate) peer_id: PeerId,
     pub(crate) config: Arc<SessionConfig>,
@@ -932,7 +934,7 @@ impl TorrentTask {
         }
         let metainfo = Arc::new(metainfo);
         let storage: Arc<dyn Storage> = match FileStorage::new(&dir, metainfo.info()) {
-            Ok(storage) => Arc::new(storage),
+            Ok(storage) => Arc::new(storage.with_io(Arc::clone(&self.ctx.file_io))),
             Err(e) => return self.fail(format!("setting up storage: {e}")),
         };
         self.file_priorities = files::normalize(metainfo.info(), &self.file_priorities)

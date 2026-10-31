@@ -306,6 +306,53 @@ fn info_describes_magnet() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("error: parsing the magnet link"));
 }
 
+/// `--storage-backend io-uring` downloads the same bytes, with io_uring
+/// when this build and kernel have it and blocking I/O otherwise.
+#[test]
+fn download_with_the_io_uring_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = content();
+    let (torrent, hash) = write_torrent(dir.path(), &data);
+    let peer = seeder(data.clone(), hash);
+    let out_dir = dir.path().join("out");
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .arg("--output")
+        .arg(&out_dir)
+        .arg("--peer")
+        .arg(peer.to_string())
+        .args([
+            "--no-dht",
+            "--no-port-mapping",
+            "--storage-backend",
+            "io-uring",
+            "--quiet",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(out_dir.join("hello.bin")).unwrap(), data);
+}
+
+#[test]
+fn rejects_unknown_storage_backend() {
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .args(["download", "x.torrent", "--storage-backend", "mmap"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("blocking") && stderr.contains("io-uring"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn rejects_bad_rate() {
     let out = Command::new(env!("CARGO_BIN_EXE_dravity"))

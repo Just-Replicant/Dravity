@@ -15,6 +15,10 @@ publish.workspace = true
 name = "dravity"
 path = "src/main.rs"
 
+[features]
+# io_uring file I/O (`--storage-backend io-uring`), Linux only; off by default.
+uring = ["dravity-session/uring"]
+
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["env"] }

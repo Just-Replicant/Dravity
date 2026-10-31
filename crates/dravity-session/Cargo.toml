@@ -11,6 +11,10 @@ keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
 
+[features]
+# io_uring file I/O (`StorageBackend::IoUring`), Linux only; off by default.
+uring = ["dravity-storage/uring"]
+
 [dependencies]
 bytes.workspace = true
 dravity-bencode.workspace = true

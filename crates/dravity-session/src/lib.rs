@@ -96,14 +96,14 @@ use dravity_core::{InfoHash, Magnet, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{Alert, Priority, Stats};
 use dravity_portmap::{Mapping, PortMapper};
-use dravity_storage::{FileStorage, Storage};
+use dravity_storage::{BlockingIo, FileIo, FileStorage, Storage};
 use dravity_tracker::TrackerClient;
 use dravity_webseed::WebSeedClient;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub use codec::{CodecError, PeerCodec};
-pub use config::SessionConfig;
+pub use config::{SessionConfig, StorageBackend};
 pub use dravity_portmap::{
     Mapped as PortMapped, Method as PortMapMethod, PortMapConfig, Protocol as PortMapProtocol,
     Status as PortMapStatus,
@@ -234,6 +234,9 @@ struct Inner {
     peer_id: PeerId,
     tracker: TrackerClient,
     web_seed: Option<WebSeedClient>,
+    /// The storage backend in use (after any fallback) and its I/O.
+    storage_backend: StorageBackend,
+    file_io: Arc<dyn FileIo>,
     dht: Option<Dht>,
     alerts: broadcast::Sender<SessionAlert>,
     /// Running torrents, by info-hash, for the listener.
@@ -276,6 +279,29 @@ impl Inner {
     }
 }
 
+/// The I/O for `wanted`, falling back to blocking I/O (with a warning) when
+/// io_uring is not compiled in or not allowed here.
+fn storage_io(wanted: StorageBackend) -> (StorageBackend, Arc<dyn FileIo>) {
+    match wanted {
+        StorageBackend::IoUring => {
+            #[cfg(all(feature = "uring", target_os = "linux"))]
+            match dravity_storage::UringIo::start() {
+                Ok(io) => return (StorageBackend::IoUring, Arc::new(io)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "io_uring is unavailable; using blocking file I/O");
+                }
+            }
+            #[cfg(not(all(feature = "uring", target_os = "linux")))]
+            tracing::warn!(
+                "this build has no io_uring support (feature `uring`, Linux); \
+                 using blocking file I/O"
+            );
+            (StorageBackend::Blocking, Arc::new(BlockingIo))
+        }
+        _ => (StorageBackend::Blocking, Arc::new(BlockingIo)),
+    }
+}
+
 /// A BitTorrent session. Cheap to clone; all clones share the torrents.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -301,6 +327,7 @@ impl Session {
             .collect();
         let peer_id = PeerId::with_prefix(&config.peer_id_prefix, &suffix);
         let tracker = TrackerClient::new(config.tracker.clone())?;
+        let (storage_backend, file_io) = storage_io(config.storage_backend);
         let web_seed = config
             .web_seed
             .as_ref()
@@ -322,6 +349,8 @@ impl Session {
                 peer_id,
                 tracker,
                 web_seed,
+                storage_backend,
+                file_io,
                 dht,
                 alerts,
                 torrents: Arc::new(Mutex::new(HashMap::new())),
@@ -341,6 +370,14 @@ impl Session {
     #[must_use]
     pub fn config(&self) -> &SessionConfig {
         &self.inner.config
+    }
+
+    /// The storage backend in use: [`SessionConfig::storage_backend`], or
+    /// [`StorageBackend::Blocking`] when io_uring was asked for but is not
+    /// available.
+    #[must_use]
+    pub fn storage_backend(&self) -> StorageBackend {
+        self.inner.storage_backend
     }
 
     /// The TCP port the session accepts peers on, if it listens.
@@ -544,7 +581,10 @@ impl Session {
             EntrySource::Torrent(metainfo) => {
                 let storage: Arc<dyn Storage> = match &entry.storage {
                     Some(storage) => Arc::clone(storage),
-                    None => Arc::new(FileStorage::new(&entry.download_dir, metainfo.info())?),
+                    None => Arc::new(
+                        FileStorage::new(&entry.download_dir, metainfo.info())?
+                            .with_io(Arc::clone(&self.inner.file_io)),
+                    ),
                 };
                 // A hybrid torrent is also known by its truncated v2 hash:
                 // peers of the v2 swarm connect with that one.
@@ -580,6 +620,7 @@ impl Session {
             trackers: prepare_tiers(trackers),
             tracker: self.inner.tracker.clone(),
             web_seed: self.inner.web_seed.clone(),
+            file_io: Arc::clone(&self.inner.file_io),
             dht: self.inner.dht.clone(),
             peer_id: self.inner.peer_id,
             config: Arc::clone(&self.inner.config),

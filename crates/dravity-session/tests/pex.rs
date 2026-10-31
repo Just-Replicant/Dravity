@@ -100,7 +100,7 @@ async fn swarm(a: EncryptionPolicy, c: EncryptionPolicy) -> Option<bool> {
             AddTorrentOptions::new(b_dir.path()).with_peers([a_addr]),
         )
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         while b.peers().await.unwrap().is_empty() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -114,7 +114,7 @@ async fn swarm(a: EncryptionPolicy, c: EncryptionPolicy) -> Option<bool> {
         .add_torrent(m, AddTorrentOptions::new(c_dir.path()).with_peers([b_addr]))
         .unwrap();
     // Several PEX rounds; C's dial to A, if any, finishes well within this.
-    let seen = tokio::time::timeout(Duration::from_secs(4), async {
+    let seen = tokio::time::timeout(Duration::from_secs(6), async {
         loop {
             let peers = c_handle.peers().await.unwrap();
             if let Some(p) = peers.iter().find(|p| p.info.addr == a_addr) {

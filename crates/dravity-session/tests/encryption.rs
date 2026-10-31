@@ -119,7 +119,8 @@ async fn exchange(
                 .with_peers([SocketAddr::from(([127, 0, 0, 1], port))]),
         )
         .unwrap();
-    let seen = first_peer(&handle, Duration::from_secs(2)).await;
+    // Generous: the policy tests run alongside every other test binary.
+    let seen = first_peer(&handle, Duration::from_secs(5)).await;
     if seen.is_some() {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {

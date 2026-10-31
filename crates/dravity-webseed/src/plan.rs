@@ -123,6 +123,45 @@ pub fn plan_range(
     Ok(out)
 }
 
+/// The host and port a web seed URL connects to (`http` defaults to 80,
+/// `https` to 443). `None` for other schemes or a URL without a host.
+///
+/// ```
+/// use dravity_webseed::plan::host_port;
+///
+/// assert_eq!(host_port("https://user@Example.org/x"), Some(("Example.org".into(), 443)));
+/// assert_eq!(host_port("http://[::1]:8080/a?b"), Some(("::1".into(), 8080)));
+/// assert_eq!(host_port("ftp://h/"), None);
+/// ```
+#[must_use]
+pub fn host_port(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let default = match scheme.to_ascii_lowercase().as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let (host, port) = if let Some(v6) = host_port.strip_prefix('[') {
+        let (host, after) = v6.split_once(']')?;
+        (host, after.strip_prefix(':'))
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (host_port, None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = match port {
+        None | Some("") => default,
+        Some(p) => p.parse().ok()?,
+    };
+    Some((host.to_owned(), port))
+}
+
 /// Percent-encodes everything but RFC 3986 unreserved characters.
 fn encode(component: &str) -> String {
     let mut out = String::with_capacity(component.len());
@@ -139,6 +178,17 @@ fn encode(component: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_and_port() {
+        assert_eq!(host_port("http://h"), Some(("h".into(), 80)));
+        assert_eq!(host_port("HTTP://h:81"), Some(("h".into(), 81)));
+        assert_eq!(host_port("http://h:/x"), Some(("h".into(), 80)));
+        assert_eq!(host_port("http://:80/"), None);
+        assert_eq!(host_port("http://h:99999/"), None);
+        assert_eq!(host_port("http://[::1/"), None);
+        assert_eq!(host_port("no scheme"), None);
+    }
 
     #[test]
     fn encodes_reserved_bytes() {

@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use bytes::Bytes;
-use dravity_core::merkle::{self, Hash, LayerRequest};
+use dravity_core::merkle::Hash;
 use dravity_core::{InfoHash, InfoHashV2, MetaVersion, Metainfo};
 use dravity_wire::{
     ExtendedHandshake, HashRequest, METADATA_PIECE_LEN, Message, MetadataMessage, Reserved,
@@ -15,6 +15,7 @@ use dravity_wire::{
 
 use crate::ext::{self, PeerExtensions};
 use crate::hints::{HintBook, Joined};
+use crate::layers::{Answer, LayerSet, Piece};
 use crate::pool::PeerPool;
 use crate::state::DhtSchedule;
 use crate::types::{
@@ -32,49 +33,6 @@ const UNKNOWN_LEFT: u64 = 16 * 1024;
 /// Most availability messages remembered per peer for the hand-over.
 const MAX_REPLAY: usize = 100_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Piece {
-    /// Not downloaded. `avoid` is a peer that just failed this piece; other
-    /// peers may take it immediately, and that peer only after the instant.
-    Missing {
-        avoid: Option<(PeerKey, Instant)>,
-    },
-    Requested {
-        peer: PeerKey,
-        since: Instant,
-    },
-    Have,
-}
-
-impl Piece {
-    const fn is_have(self) -> bool {
-        matches!(self, Self::Have)
-    }
-
-    const fn is_requested(self) -> bool {
-        matches!(self, Self::Requested { .. })
-    }
-
-    /// Whether `key` may be asked for this piece at `now`.
-    fn can_ask(self, key: PeerKey, now: Instant) -> bool {
-        match self {
-            Self::Missing { avoid: None } => true,
-            Self::Missing {
-                avoid: Some((peer, at)),
-            } => peer != key || now >= at,
-            _ => false,
-        }
-    }
-}
-
-/// One hash request of a piece-layer fetch.
-#[derive(Debug, Clone)]
-struct LayerBlock {
-    root: Hash,
-    request: LayerRequest,
-    state: Piece,
-}
-
 /// The piece layers a verified v2 or hybrid `info` still needs (BEP 52).
 #[derive(Debug)]
 struct LayerFetch {
@@ -90,11 +48,8 @@ struct LayerFetch {
     last_progress: Instant,
     /// When a v2-only fetch next reports itself stalled.
     stall_alert_at: Option<Instant>,
-    /// Layer above the leaves that holds one hash per piece.
-    base_layer: u32,
-    blocks: Vec<LayerBlock>,
-    /// Layers being assembled, by root (one hash per piece).
-    layers: Vec<(Hash, Vec<Hash>)>,
+    /// The layers still missing.
+    set: LayerSet,
 }
 
 impl LayerFetch {
@@ -103,58 +58,21 @@ impl LayerFetch {
     fn for_info(info: &Bytes, now: Instant, config: &Config) -> Option<Self> {
         let metainfo = Metainfo::from_info_bytes(info, Vec::new()).ok()?;
         let info_dict = metainfo.info();
-        let per_piece = merkle::leaves_per_piece(info_dict.piece_length())?;
-        let mut blocks = Vec::new();
-        let mut layers = Vec::new();
+        let mut roots = Vec::new();
         for root in info_dict.missing_piece_layers() {
             let pieces = usize::try_from(info_dict.piece_layer_len(&root)?).ok()?;
-            for request in merkle::layer_requests(pieces) {
-                blocks.push(LayerBlock {
-                    root,
-                    request,
-                    state: Piece::Missing { avoid: None },
-                });
-            }
-            layers.push((root, vec![[0; 32]; pieces]));
+            roots.push((root, pieces));
         }
+        let set = LayerSet::new(info_dict.piece_length(), roots)?;
         let hybrid = info_dict.version() == MetaVersion::Hybrid;
-        (!blocks.is_empty()).then(|| Self {
+        Some(Self {
             info: info.clone(),
             hybrid,
             deadline: hybrid.then(|| now + config.piece_layer_timeout),
             last_progress: now,
             stall_alert_at: (!hybrid).then(|| now + config.piece_layer_stall_alert),
-            base_layer: per_piece.trailing_zeros(),
-            blocks,
-            layers,
+            set,
         })
-    }
-
-    fn wire(&self, block: &LayerBlock) -> Option<HashRequest> {
-        Some(HashRequest {
-            pieces_root: block.root,
-            base_layer: self.base_layer,
-            index: u32::try_from(block.request.index).ok()?,
-            length: u32::try_from(block.request.length).ok()?,
-            proof_layers: block.request.proof_layers,
-        })
-    }
-
-    /// The block `request` answers, if it is outstanding with `key`.
-    fn find(&self, key: PeerKey, request: &HashRequest) -> Option<usize> {
-        self.blocks.iter().position(|b| {
-            matches!(b.state, Piece::Requested { peer, .. } if peer == key)
-                && self.wire(b).is_some_and(|w| {
-                    w.pieces_root == request.pieces_root
-                        && w.base_layer == request.base_layer
-                        && w.index == request.index
-                        && w.length == request.length
-                })
-        })
-    }
-
-    fn is_done(&self) -> bool {
-        self.blocks.iter().all(|b| b.state.is_have())
     }
 
     /// Whether `peer` may be asked: every peer of a v2-only swarm speaks
@@ -163,31 +81,9 @@ impl LayerFetch {
         !self.hybrid || reserved.v2()
     }
 
-    /// Layers with at least one block still missing.
-    fn missing_layers(&self) -> u32 {
-        let missing = self.layers.iter().filter(|(root, _)| {
-            self.blocks
-                .iter()
-                .any(|b| b.root == *root && !b.state.is_have())
-        });
-        u32::try_from(missing.count()).unwrap_or(u32::MAX)
-    }
-
-    /// The layers whose every block arrived (all of them once
-    /// [`Self::is_done`]).
+    /// The verified `info` and the layers whose every block arrived.
     fn into_complete(self) -> (Bytes, Vec<(Hash, Vec<Hash>)>) {
-        let blocks = self.blocks;
-        let layers = self
-            .layers
-            .into_iter()
-            .filter(|(root, _)| {
-                blocks
-                    .iter()
-                    .filter(|b| b.root == *root)
-                    .all(|b| b.state.is_have())
-            })
-            .collect();
-        (self.info, layers)
+        (self.info, self.set.into_complete())
     }
 }
 
@@ -733,11 +629,7 @@ impl MetadataState {
             }
         }
         if let Some(fetch) = &mut self.layers {
-            for block in &mut fetch.blocks {
-                if matches!(block.state, Piece::Requested { peer, .. } if peer == key) {
-                    block.state = Piece::Missing { avoid: None };
-                }
-            }
+            fetch.set.release(key);
         }
         Some(peer.addr)
     }
@@ -828,13 +720,8 @@ impl MetadataState {
             }
             Message::HashReject(request) => {
                 let retry_at = now + self.config.request_timeout;
-                if let Some(fetch) = &mut self.layers
-                    && let Some(i) = fetch.find(key, &request)
-                    && let Some(block) = fetch.blocks.get_mut(i)
-                {
-                    block.state = Piece::Missing {
-                        avoid: Some((key, retry_at)),
-                    };
+                if let Some(fetch) = &mut self.layers {
+                    fetch.set.on_reject(key, &request, retry_at);
                 }
             }
             // Anything else is irrelevant before the download.
@@ -1015,43 +902,18 @@ impl MetadataState {
         let Some(fetch) = &mut self.layers else {
             return;
         };
-        let Some(i) = fetch.find(key, request) else {
-            return;
-        };
-        let Some(block) = fetch.blocks.get(i).cloned() else {
-            return;
-        };
-        let (chunks, rest) = hashes.as_chunks::<32>();
-        let length = block.request.length;
-        let valid = rest.is_empty()
-            && chunks.len() >= length
-            && chunks
-                .get(..length)
-                .zip(chunks.get(length..))
-                .is_some_and(|(base, uncles)| {
-                    merkle::verify_proof(base, uncles, block.request.index, &block.root)
-                });
-        if !valid {
-            if let Some(b) = fetch.blocks.get_mut(i) {
-                b.state = Piece::Missing { avoid: None };
+        match fetch.set.on_hashes(key, request, hashes) {
+            Answer::Unexpected => return,
+            Answer::Invalid => {
+                if let Some(addr) = self.remove_peer(key) {
+                    self.banned.insert(addr);
+                    self.swarm.remove(&addr);
+                }
+                out.push(Effect::Disconnect { peer: key });
+                self.fill_hash_requests(now, out);
+                return;
             }
-            if let Some(addr) = self.remove_peer(key) {
-                self.banned.insert(addr);
-                self.swarm.remove(&addr);
-            }
-            out.push(Effect::Disconnect { peer: key });
-            self.fill_hash_requests(now, out);
-            return;
-        }
-        if let Some((_, layer)) = fetch.layers.iter_mut().find(|(r, _)| *r == block.root) {
-            let start = block.request.index;
-            let n = length.min(layer.len().saturating_sub(start));
-            if let (Some(dst), Some(src)) = (layer.get_mut(start..start + n), chunks.get(..n)) {
-                dst.copy_from_slice(src);
-            }
-        }
-        if let Some(b) = fetch.blocks.get_mut(i) {
-            b.state = Piece::Have;
+            Answer::Accepted { .. } => {}
         }
         fetch.last_progress = now;
         if fetch.hybrid {
@@ -1062,7 +924,7 @@ impl MetadataState {
         self.downloaded = self
             .downloaded
             .saturating_add(u64::try_from(hashes.len()).unwrap_or(0));
-        if fetch.is_done()
+        if fetch.set.is_done()
             && let Some(done) = self.layers.take()
         {
             let (info, layers) = done.into_complete();
@@ -1090,31 +952,7 @@ impl MetadataState {
             if !fetch.can_ask(peer.reserved) {
                 continue;
             }
-            let mut outstanding = fetch
-                .blocks
-                .iter()
-                .filter(|b| matches!(b.state, Piece::Requested { peer, .. } if peer == key))
-                .count();
-            for i in 0..fetch.blocks.len() {
-                if outstanding >= PIPELINE {
-                    break;
-                }
-                let Some(block) = fetch.blocks.get(i) else {
-                    break;
-                };
-                if !block.state.can_ask(key, now) {
-                    continue;
-                }
-                let Some(request) = fetch.wire(block) else {
-                    continue;
-                };
-                if let Some(b) = fetch.blocks.get_mut(i) {
-                    b.state = Piece::Requested {
-                        peer: key,
-                        since: now,
-                    };
-                }
-                outstanding += 1;
+            for request in fetch.set.assign(key, now, PIPELINE) {
                 peer.last_sent = now;
                 out.push(Effect::Send {
                     peer: key,
@@ -1186,8 +1024,10 @@ impl MetadataState {
         // skipped until `request_timeout` has passed again, unless it is the
         // only one that can serve the piece.
         let timeout = self.config.request_timeout;
-        let blocks = self.layers.iter_mut().flat_map(|f| &mut f.blocks);
-        for piece in self.pieces.iter_mut().chain(blocks.map(|b| &mut b.state)) {
+        if let Some(fetch) = &mut self.layers {
+            fetch.set.expire(now, timeout);
+        }
+        for piece in &mut self.pieces {
             if let Piece::Requested { peer, since } = *piece
                 && now.saturating_duration_since(since) >= timeout
             {
@@ -1215,7 +1055,7 @@ impl MetadataState {
             // to check its pieces.
             fetch.stall_alert_at = Some(now + self.config.piece_layer_stall_alert);
             out.push(Effect::Alert(Alert::PieceLayersStalled {
-                missing_layers: fetch.missing_layers(),
+                missing_layers: fetch.set.missing_layers(),
                 silent: now.saturating_duration_since(fetch.last_progress),
             }));
         }

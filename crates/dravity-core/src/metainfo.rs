@@ -687,6 +687,17 @@ impl Info {
             .map(|f| f.pieces)
     }
 
+    /// The pieces of every file with pieces root `root` (several files can
+    /// share a root when their contents are identical), in stream order.
+    #[must_use]
+    pub fn pieces_with_root(&self, root: &Hash) -> Vec<std::ops::Range<u32>> {
+        self.v2
+            .iter()
+            .filter(|f| f.root == *root)
+            .map(|f| f.first_piece..f.first_piece.saturating_add(f.pieces))
+            .collect()
+    }
+
     fn set_piece_layer(&mut self, root: &Hash, layer: Vec<Hash>) -> Result<(), MetainfoError> {
         let piece_length = self.piece_length();
         let invalid = || MetainfoError::InvalidPieceLayer(crate::encoding::hex_encode(root));

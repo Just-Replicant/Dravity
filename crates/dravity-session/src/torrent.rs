@@ -395,6 +395,10 @@ impl TorrentTask {
                     .with_info_hash(ctx.info_hash)
                     .with_info_bytes(info)
                     .with_piece_layers(metainfo.info().piece_length(), owned_layers(&metainfo))
+                    .with_missing_piece_layers(
+                        metainfo.info().piece_length(),
+                        missing_layers(&metainfo),
+                    )
                     .with_priorities(&pieces);
                 (
                     Phase::Download(Box::new(state)),
@@ -815,10 +819,13 @@ impl TorrentTask {
         let info = info
             .cloned()
             .unwrap_or_else(|| Bytes::copy_from_slice(content.metainfo.info_bytes()));
-        Some(state.with_info_bytes(info).with_piece_layers(
-            content.metainfo.info().piece_length(),
-            owned_layers(&content.metainfo),
-        ))
+        let piece_length = content.metainfo.info().piece_length();
+        Some(
+            state
+                .with_info_bytes(info)
+                .with_piece_layers(piece_length, owned_layers(&content.metainfo))
+                .with_missing_piece_layers(piece_length, missing_layers(&content.metainfo)),
+        )
     }
 
     /// Maps peer-task inputs to engine events, keeping the peer map in sync.
@@ -984,6 +991,7 @@ impl TorrentTask {
             .with_info_hash(self.ctx.info_hash)
             .with_info_bytes(info)
             .with_piece_layers(info_meta.piece_length(), owned_layers(&content.metainfo))
+            .with_missing_piece_layers(info_meta.piece_length(), missing_layers(&content.metainfo))
             .with_priorities(&self.piece_priorities(&content)),
         };
         self.content = Some(content);
@@ -1055,8 +1063,36 @@ impl TorrentTask {
         }
     }
 
-    /// A magnet's metadata arrived: the catalog (and the state directory)
-    /// now hold the torrent, so a resume or restart does not fetch it again.
+    /// A hybrid that started on SHA-1 alone got a missing piece layer from
+    /// a peer: from now on the file's pieces are checked against the Merkle
+    /// tree too. The layer is persisted with the metainfo, and the pieces
+    /// already accepted on SHA-1 alone are checked again.
+    fn install_piece_layer(&mut self, root: Hash, layer: Vec<Hash>) {
+        let Some(content) = &mut self.content else {
+            return;
+        };
+        let mut metainfo = Metainfo::clone(&content.metainfo);
+        // The engine checked the layer against its root; this checks again.
+        if let Err(e) = metainfo.set_piece_layer(&root, layer) {
+            tracing::warn!(error = %e, "ignoring a piece layer");
+            return;
+        }
+        let pieces = metainfo.info().pieces_with_root(&root);
+        tracing::info!(
+            missing = metainfo.info().missing_piece_layers().len(),
+            "piece layer received; re-checking its file"
+        );
+        let metainfo = Arc::new(metainfo);
+        content.metainfo = Arc::clone(&metainfo);
+        self.record_metadata(&metainfo);
+        for pieces in pieces {
+            self.local.push_back(Event::RecheckPieces { pieces });
+        }
+    }
+
+    /// A magnet's metadata (or a hybrid's late piece layer) arrived: the
+    /// catalog (and the state directory) now hold the torrent, so a resume
+    /// or restart does not fetch it again.
     fn record_metadata(&self, metainfo: &Arc<Metainfo>) {
         // A hybrid magnet: peers of the other swarm can connect right away.
         self.ctx
@@ -1130,6 +1166,7 @@ impl TorrentTask {
             Effect::MetadataReceived { info, piece_layers } => {
                 self.metadata = Some((info, piece_layers));
             }
+            Effect::PieceLayerReceived { root, layer } => self.install_piece_layer(root, layer),
             Effect::Alert(alert) => self.alert(alert),
             other => tracing::warn!(?other, "unhandled engine effect"),
         }
@@ -1740,6 +1777,16 @@ fn error_chain(e: &dyn std::error::Error) -> String {
         source = inner.source();
     }
     text
+}
+
+/// The pieces roots (with their piece counts) whose layer `metainfo` still
+/// lacks, to fetch in the background.
+fn missing_layers(metainfo: &Metainfo) -> Vec<(Hash, u32)> {
+    let info = metainfo.info();
+    info.missing_piece_layers()
+        .into_iter()
+        .filter_map(|root| Some((root, info.piece_layer_len(&root)?)))
+        .collect()
 }
 
 /// The piece layers of `metainfo`, owned, for serving BEP 52 hash requests.

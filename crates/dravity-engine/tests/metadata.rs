@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dravity_core::merkle;
-use dravity_core::{InfoHash, InfoHashV2};
+use dravity_core::{InfoHash, InfoHashV2, PieceLayout};
 use dravity_engine::{
-    Alert, AnnounceEvent, Config, DialHints, Effect, Event, MetadataState, PeerKey, PeerLink,
-    TorrentStatus,
+    Alert, AnnounceEvent, Bitfield, Config, DialHints, Effect, Event, MetadataState, PeerKey,
+    PeerLink, TorrentState, TorrentStatus,
 };
 use dravity_wire::{ExtendedHandshake, HashRequest, Message, MetadataMessage, Reserved};
 
@@ -914,4 +914,163 @@ fn a_stalled_v2_magnet_says_so_and_keeps_asking() {
     assert_eq!(received(&fx), Some(info));
     h.now += quiet * 2;
     assert_eq!(stalled(&h.ev(Event::Tick)), None);
+}
+
+/// A seeding hybrid torrent (all 6 pieces of `hybrid_info`) that started
+/// without its piece layer.
+fn seeding_hybrid(tree: &merkle::FileHashes, now: Instant) -> TorrentState {
+    let layout = PieceLayout::new(16_384, 5 * 16_384 + 100).unwrap();
+    let mut have = Bitfield::new(6);
+    for p in 0..6 {
+        have.set(p);
+    }
+    let mut config = Config::default();
+    config.check_existing = false;
+    config.seed = true;
+    config.check_concurrency = 2;
+    let mut t = TorrentState::with_have(layout, have, config)
+        .with_missing_piece_layers(16_384, [(tree.root, 6)]);
+    assert_eq!(t.missing_piece_layers(), 1);
+    t.update(now, Event::Start);
+    assert_eq!(t.status(), TorrentStatus::Finished);
+    t
+}
+
+fn connect(t: &mut TorrentState, now: Instant, peer: u64, reserved: Reserved) -> Vec<Effect> {
+    t.update(
+        now,
+        Event::PeerConnected {
+            peer: PeerKey(peer),
+            addr: addr(peer as u16),
+            reserved,
+            link: PeerLink::default(),
+        },
+    )
+}
+
+fn msg(t: &mut TorrentState, now: Instant, peer: u64, message: Message) -> Vec<Effect> {
+    t.update(
+        now,
+        Event::Message {
+            peer: PeerKey(peer),
+            message,
+        },
+    )
+}
+
+fn hashed(fx: &[Effect]) -> Vec<u32> {
+    fx.iter()
+        .filter_map(|e| match e {
+            Effect::HashPiece { piece } => Some(*piece),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_hybrid_keeps_fetching_its_layers_after_the_timeout() {
+    let (_, tree) = hybrid_info(5 * 16_384 + 100);
+    let mut now = Instant::now();
+    let mut t = seeding_hybrid(&tree, now);
+
+    // A peer without BEP 52 is never asked.
+    let fx = connect(
+        &mut t,
+        now,
+        1,
+        Reserved::new().with_extension_protocol(true),
+    );
+    assert!(hash_requests(&fx).is_empty());
+
+    // A v2 peer that connects later is; a forged proof bans it.
+    let fx = connect(&mut t, now, 2, v2_peer());
+    let (peer, r) = hash_requests(&fx)[0];
+    assert_eq!((peer, r.pieces_root), (2, tree.root));
+    let mut bad = tree.clone();
+    bad.layer[3][0] ^= 1;
+    let fx = msg(&mut t, now, 2, answer(&bad, r));
+    assert!(fx.contains(&Effect::Disconnect { peer: PeerKey(2) }));
+    assert!(
+        !fx.iter()
+            .any(|e| matches!(e, Effect::PieceLayerReceived { .. }))
+    );
+
+    // A peer that never answers loses the request after `request_timeout`.
+    let fx = connect(&mut t, now, 3, v2_peer());
+    assert_eq!(hash_requests(&fx).len(), 1);
+    let fx = connect(&mut t, now, 4, v2_peer());
+    assert!(hash_requests(&fx).is_empty(), "only one block to ask for");
+    now += t.config().request_timeout;
+    let fx = t.update(now, Event::Tick);
+    let asked = hash_requests(&fx);
+    assert_eq!(asked.len(), 1);
+    let (peer, r) = asked[0];
+    assert_eq!(peer, 4);
+
+    // A valid answer: reported, and served to peers from then on.
+    let fx = msg(&mut t, now, 4, answer(&tree, r));
+    assert!(fx.contains(&Effect::PieceLayerReceived {
+        root: tree.root,
+        layer: tree.layer.clone(),
+    }));
+    assert_eq!(t.missing_piece_layers(), 0);
+    let fx = msg(&mut t, now, 3, Message::HashRequest(r));
+    assert!(
+        fx.iter().any(|e| matches!(
+            e,
+            Effect::Send {
+                peer: PeerKey(3),
+                message: Message::Hashes { .. }
+            }
+        )),
+        "{fx:?}"
+    );
+    now += t.config().request_timeout;
+    let fx = t.update(now, Event::Tick);
+    assert!(hash_requests(&fx).is_empty(), "nothing left to fetch");
+}
+
+#[test]
+fn a_hybrid_rechecks_its_pieces_once_a_layer_arrives() {
+    let (_, tree) = hybrid_info(5 * 16_384 + 100);
+    let now = Instant::now();
+    let mut t = seeding_hybrid(&tree, now);
+    let left = t.stats().bytes_have;
+
+    // `check_concurrency` (2) pieces at a time.
+    let fx = t.update(now, Event::RecheckPieces { pieces: 0..6 });
+    assert_eq!(hashed(&fx), vec![0, 1]);
+    let fx = t.update(now, Event::RecheckPieces { pieces: 0..6 });
+    assert!(hashed(&fx).is_empty(), "already queued");
+    let fx = t.update(now, Event::PieceHashed { piece: 0, ok: true });
+    assert_eq!(hashed(&fx), vec![2]);
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Alert(_))));
+
+    // A piece the Merkle tree refutes is downloaded again, and the
+    // finished torrent goes back to downloading.
+    let fx = t.update(
+        now,
+        Event::PieceHashed {
+            piece: 1,
+            ok: false,
+        },
+    );
+    assert!(fx.contains(&Effect::Alert(Alert::HashFailed { piece: 1 })));
+    assert!(fx.contains(&Effect::Alert(Alert::StateChanged(
+        TorrentStatus::Downloading
+    ))));
+    assert_eq!(hashed(&fx), vec![3]);
+    assert!(!t.have().get(1));
+    assert_eq!(t.stats().bytes_have, left - 16_384);
+    assert_eq!(t.status(), TorrentStatus::Downloading);
+    for piece in [2, 3, 4] {
+        let fx = t.update(now, Event::PieceHashed { piece, ok: true });
+        assert!(
+            !fx.iter()
+                .any(|e| matches!(e, Effect::Alert(Alert::HashFailed { .. })))
+        );
+    }
+    let fx = t.update(now, Event::PieceHashed { piece: 5, ok: true });
+    assert!(hashed(&fx).is_empty());
+    assert_eq!(t.picker().wanted_left(), 16_384);
 }

@@ -1083,3 +1083,157 @@ async fn a_failing_web_seed_is_never_dialed_as_a_peer() {
     assert_eq!(other.load(Ordering::Relaxed), 0);
     session.shutdown().await;
 }
+
+/// Waits until `session` knows every piece layer of `hash`.
+async fn until_layers_known(session: &Session, hash: InfoHash) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !session
+            .metainfo(hash)
+            .is_some_and(|m| m.info().missing_piece_layers().is_empty())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the piece layer never arrived");
+}
+
+/// A hybrid `.torrent` of one 4-piece file served by a raw peer that never
+/// answers hash requests, and the same torrent without its piece layer.
+fn hybrid_without_layers(files: &mut [File]) -> (Metainfo, Metainfo) {
+    let full = Metainfo::from_bytes(&make(files, true, None)).unwrap();
+    let bare = Metainfo::from_info_bytes(full.info_bytes(), Vec::new()).unwrap();
+    assert_eq!(bare.info().version(), MetaVersion::Hybrid);
+    assert_eq!(bare.info().missing_piece_layers().len(), 1);
+    (full, bare)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hybrid_that_started_on_sha1_gets_its_layer_later_and_keeps_it() {
+    // The leecher downloads on SHA-1 alone from a peer that ignores hash
+    // requests. A peer that knows the layer shows up later: the leecher
+    // fetches it in the background, checks its pieces again (all good),
+    // persists it and serves it.
+    let len = 3 * PIECE as usize + 100;
+    let data = content(len, 3);
+    let mut files = vec![(vec!["one.bin"], data.clone())];
+    let (full, bare) = hybrid_without_layers(&mut files);
+    let hash = full.info_hash();
+    let raw = raw_seeder(hash, data).await;
+
+    let state = tempfile::tempdir().unwrap();
+    let mut c = config();
+    c.state_dir = Some(state.path().to_path_buf());
+    c.engine.request_timeout = Duration::from_secs(1);
+    let leecher = Session::new(c.clone()).unwrap();
+    let mut alerts = leecher.subscribe();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = leecher
+        .add_torrent(bare, AddTorrentOptions::new(dir.path()).with_peers([raw]))
+        .unwrap();
+    until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    let known = leecher.metainfo(hash).unwrap();
+    assert_eq!(known.info().missing_piece_layers().len(), 1);
+
+    // A leecher that has the `.torrent` (and so the layer) but no data.
+    let other = Session::new(config()).unwrap();
+    let mut other_alerts = other.subscribe();
+    let other_dir = tempfile::tempdir().unwrap();
+    let port = leecher.listen_port().unwrap();
+    other
+        .add_torrent(
+            full.clone(),
+            AddTorrentOptions::new(other_dir.path()).with_peers([local(port)]),
+        )
+        .unwrap();
+    until_layers_known(&leecher, hash).await;
+    let known = leecher.metainfo(hash).unwrap();
+    assert_eq!(known.info().piece_layers(), full.info().piece_layers());
+    // It downloads everything from the leecher, which still has it all.
+    until(&mut other_alerts, hash, |a| *a == Alert::Finished).await;
+    assert_files(other_dir.path(), &files);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(handle.stats().await.unwrap().pieces_have, 4);
+    let mut seen = Vec::new();
+    while let Ok(a) = alerts.try_recv() {
+        seen.push(a.alert);
+    }
+    assert!(
+        !seen.iter().any(|a| matches!(a, Alert::HashFailed { .. })),
+        "{seen:?}"
+    );
+    other.shutdown().await;
+    leecher.shutdown().await;
+
+    // The layer survives a restart.
+    let restarted = Session::new(c).unwrap();
+    let report = restarted.restore().await.unwrap();
+    assert_eq!(report.restored, [hash], "{report:?}");
+    let restored = restarted.metainfo(hash).unwrap();
+    assert!(restored.info().missing_piece_layers().is_empty());
+    restarted.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pieces_a_late_layer_refutes_are_downloaded_again() {
+    // SHA-1 vouches for `served`, the v2 tree describes other bytes. On
+    // SHA-1 alone the leecher accepts everything; once the layer arrives
+    // every piece fails the re-check and is wanted again.
+    let len = 3 * PIECE as usize + 100;
+    let served = content(len, 7);
+    let mut honest = vec![(vec!["one.bin"], served.clone())];
+    let mut other = vec![(vec!["one.bin"], content(len, 8))];
+    let honest = Value::decode(&make(&mut honest, true, None))
+        .unwrap()
+        .into_owned();
+    let Value::Dict(mut forged) = Value::decode(&make(&mut other, true, None))
+        .unwrap()
+        .into_owned()
+    else {
+        unreachable!()
+    };
+    let pieces = honest.get(b"info").unwrap().get(b"pieces").unwrap().clone();
+    let Some(Value::Dict(info)) = forged.get_mut(&b"info"[..]) else {
+        unreachable!()
+    };
+    info.insert(Cow::Borrowed(&b"pieces"[..]), pieces);
+    let full = Metainfo::from_bytes(&Value::Dict(forged).to_vec()).unwrap();
+    let bare = Metainfo::from_info_bytes(full.info_bytes(), Vec::new()).unwrap();
+    let hash = full.info_hash();
+    let raw = raw_seeder(hash, served).await;
+
+    let mut c = config();
+    c.engine.request_timeout = Duration::from_secs(1);
+    let leecher = Session::new(c).unwrap();
+    let mut alerts = leecher.subscribe();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = leecher
+        .add_torrent(bare, AddTorrentOptions::new(dir.path()).with_peers([raw]))
+        .unwrap();
+    until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+
+    let peer = Session::new(config()).unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    let port = leecher.listen_port().unwrap();
+    peer.add_torrent(
+        full,
+        AddTorrentOptions::new(peer_dir.path()).with_peers([local(port)]),
+    )
+    .unwrap();
+    let failed = std::cell::RefCell::new(std::collections::BTreeSet::new());
+    let seen = until(&mut alerts, hash, |a| {
+        if let Alert::HashFailed { piece } = a {
+            failed.borrow_mut().insert(*piece);
+        }
+        failed.borrow().len() == 4
+    })
+    .await;
+    assert!(
+        seen.contains(&Alert::StateChanged(TorrentStatus::Downloading)),
+        "{seen:?}"
+    );
+    until_layers_known(&leecher, hash).await;
+    assert_eq!(handle.stats().await.unwrap().pieces_have, 0);
+    peer.shutdown().await;
+    leecher.shutdown().await;
+}

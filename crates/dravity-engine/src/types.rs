@@ -352,6 +352,14 @@ pub enum Event {
         /// Whether the SHA-1 matched.
         ok: bool,
     },
+    /// The driver installed a piece layer from
+    /// [`Effect::PieceLayerReceived`]: hash the verified pieces in `pieces`
+    /// again (each with [`Effect::HashPiece`], now against the Merkle tree
+    /// too). A piece that fails is downloaded again.
+    RecheckPieces {
+        /// The file's pieces (those not verified yet are skipped).
+        pieces: std::ops::Range<u32>,
+    },
     /// A block from [`Effect::ReadBlock`] was read from storage.
     BlockRead {
         /// The peer that asked for it.
@@ -498,6 +506,17 @@ pub enum Effect {
         /// pieces root, each verified against its root. Empty unless the
         /// magnet link is v2-only and has files larger than a piece.
         piece_layers: Vec<(Hash, Vec<Hash>)>,
+    },
+    /// A hybrid torrent that started on SHA-1 alone fetched a missing piece
+    /// layer from peers, verified against its pieces root. The driver adds
+    /// it to the metainfo (and persists it), then replies with
+    /// [`Event::RecheckPieces`] for the file's pieces. The engine already
+    /// serves the layer to peers' hash requests.
+    PieceLayerReceived {
+        /// The file's pieces root.
+        root: Hash,
+        /// One hash per piece of the file.
+        layer: Vec<Hash>,
     },
     /// Notify the application.
     Alert(Alert),

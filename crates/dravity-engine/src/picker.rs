@@ -666,6 +666,24 @@ impl Picker {
         }
         true
     }
+
+    /// Forgets a verified `piece` that failed a later check (a hybrid's
+    /// Merkle re-verification): it is wanted again by its priority. Returns
+    /// `true` if it was set.
+    pub fn mark_missing(&mut self, piece: u32) -> bool {
+        if !self.have.clear(piece) {
+            return false;
+        }
+        let priority = self.priority(piece);
+        let size = u64::from(self.layout.piece_size(piece).unwrap_or(0));
+        if priority.is_wanted() {
+            self.wanted_missing += 1;
+            self.wanted_left = self.wanted_left.saturating_add(size);
+            let avail = self.availability(piece);
+            self.queue.insert((priority.rank(), avail, piece));
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -921,5 +939,18 @@ mod tests {
         assert!("urgent".parse::<Priority>().is_err());
         assert!(Priority::High > Priority::Normal && Priority::Low > Priority::Skip);
         assert_eq!(Priority::default(), Priority::Normal);
+    }
+
+    #[test]
+    fn a_piece_marked_missing_is_wanted_again() {
+        let mut picker = Picker::new(layout(3, BLOCK_SIZE), Bitfield::new(3));
+        assert!(picker.mark_have(1));
+        let left = picker.wanted_left();
+        assert!(picker.mark_missing(1));
+        assert!(!picker.mark_missing(1));
+        assert!(!picker.have().get(1));
+        assert_eq!(picker.wanted_left(), left + u64::from(BLOCK_SIZE));
+        assert!(picker.mark_have(1));
+        assert_eq!(picker.wanted_left(), left);
     }
 }

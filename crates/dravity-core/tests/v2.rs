@@ -366,6 +366,10 @@ fn a_v2_magnet_needs_its_piece_layers() {
     let missing = bare.info().missing_piece_layers();
     assert_eq!(missing.len(), 1);
     assert_eq!(bare.info().piece_layer_len(&missing[0]), Some(4));
+    let pieces = bare.info().pieces_with_root(&missing[0]);
+    assert_eq!(pieces.len(), 1);
+    assert_eq!(pieces[0].end - pieces[0].start, 4);
+    assert!(bare.info().pieces_with_root(&[7; 32]).is_empty());
     assert!(!every_piece_checks(&bare, &stream));
     // Files of one piece verify with their root alone.
     let r = bare.info().layout().piece_range(0).unwrap();

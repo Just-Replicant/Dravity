@@ -84,6 +84,7 @@ mod bitfield;
 mod choker;
 mod ext;
 mod hints;
+mod layers;
 mod metadata;
 pub mod picker;
 mod pool;

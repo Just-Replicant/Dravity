@@ -337,6 +337,7 @@ dependencies = [
  "dravity-storage",
  "dravity-tracker",
  "dravity-utp",
+ "dravity-webseed",
  "dravity-wire",
  "fastrand",
  "futures-util",
@@ -388,6 +389,9 @@ name = "dravity-webseed"
 version = "0.1.0"
 dependencies = [
  "dravity-core",
+ "reqwest",
+ "rustls",
+ "rustls-platform-verifier",
  "thiserror",
 ]
 

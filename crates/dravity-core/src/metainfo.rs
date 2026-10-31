@@ -1,5 +1,13 @@
-//! `.torrent` (metainfo) parsing for BitTorrent v1 (BEP 3) and the v1 part of
+//! `.torrent` (metainfo) parsing for BitTorrent v1 (BEP 3), v2 (BEP 52) and
 //! hybrid torrents.
+//!
+//! A v2 torrent describes its files in a `file tree` and verifies them with
+//! per-file SHA-256 Merkle trees ([`crate::merkle`]). Dravity maps every
+//! torrent onto one content stream: a v2-only torrent gets the same
+//! piece-aligned layout a hybrid torrent spells out with BEP 47 padding
+//! files, so piece arithmetic, storage and the engine do not care which
+//! version they handle. [`Info::check_piece`] verifies a piece with every
+//! hash the torrent has.
 //!
 //! The parser is strict where it matters for safety and integrity (the `info`
 //! dictionary, piece hashes, file paths and lengths) and lenient for optional
@@ -13,9 +21,13 @@ use std::path::PathBuf;
 use dravity_bencode::{RawValue, Value};
 use serde::Deserialize;
 
-use crate::info_hash::InfoHash;
+use sha1::{Digest, Sha1};
+
+use crate::info_hash::{InfoHash, InfoHashV2};
 use crate::layout::{FileLayout, FileSlice, LayoutError, PieceLayout};
+use crate::merkle::{self, Hash};
 use crate::path::{PathError, SafePath, validate_component};
+use crate::v2::{self, MetaVersion, TreeFile, V2File};
 
 /// Errors produced while parsing metainfo.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -28,12 +40,28 @@ pub enum MetainfoError {
     /// The `info` value is not a dictionary.
     #[error("`info` is not a dictionary")]
     InfoNotDict,
-    /// `pieces` is missing from a v1/hybrid torrent.
+    /// Neither v1 `pieces` nor a v2 `file tree` (with `meta version` 2) is
+    /// present.
     #[error("`pieces` is missing")]
     MissingPieces,
-    /// The torrent is v2-only (BEP 52), which is not supported yet.
-    #[error("v2-only torrents are not supported yet")]
-    UnsupportedV2Only,
+    /// `meta version` is 2 but there is no `file tree`.
+    #[error("`meta version` is 2 but `file tree` is missing")]
+    MissingFileTree,
+    /// A `file tree` node is malformed (not a dictionary, a bad `length`, a
+    /// missing or malformed `pieces root`).
+    #[error("malformed file tree entry {0:?}")]
+    InvalidFileTree(String),
+    /// The v1 file list and the v2 file tree of a hybrid torrent disagree,
+    /// or a file is not piece-aligned.
+    #[error("hybrid torrent's v1 and v2 parts disagree: {0}")]
+    HybridMismatch(String),
+    /// A file larger than one piece has no entry in `piece layers`.
+    #[error("missing piece layer for pieces root {0}")]
+    MissingPieceLayer(String),
+    /// A piece layer does not hash to its pieces root, or has the wrong
+    /// number of hashes.
+    #[error("piece layer for pieces root {0} does not match")]
+    InvalidPieceLayer(String),
     /// `pieces` length is not a multiple of 20.
     #[error("`pieces` length {0} is not a multiple of 20")]
     InvalidPiecesLength(usize),
@@ -95,7 +123,10 @@ pub enum MetainfoError {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Metainfo {
     info_hash: InfoHash,
+    info_hash_v1: Option<InfoHash>,
+    info_hash_v2: Option<InfoHashV2>,
     info_bytes: Vec<u8>,
+    web_seeds: Vec<String>,
     info: Info,
     announce: Option<String>,
     announce_list: Vec<Vec<String>>,
@@ -108,6 +139,8 @@ impl fmt::Debug for Metainfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Metainfo")
             .field("info_hash", &self.info_hash)
+            .field("info_hash_v2", &self.info_hash_v2)
+            .field("web_seeds", &self.web_seeds)
             .field("info", &self.info)
             .field("announce", &self.announce)
             .field("announce_list", &self.announce_list)
@@ -121,8 +154,9 @@ impl fmt::Debug for Metainfo {
 impl Metainfo {
     /// Parses and validates a `.torrent` file.
     ///
-    /// The info-hash is the SHA-1 of the `info` dictionary's bytes exactly as
-    /// they appear in `bytes`.
+    /// Info-hashes are computed over the `info` dictionary's bytes exactly as
+    /// they appear in `bytes`. For v2 and hybrid torrents every file larger
+    /// than one piece must have a valid entry in `piece layers`.
     ///
     /// # Errors
     /// Returns a [`MetainfoError`] describing the first problem found.
@@ -132,10 +166,25 @@ impl Metainfo {
         if info_bytes.first() != Some(&b'd') {
             return Err(MetainfoError::InfoNotDict);
         }
-        let info = Info::from_raw(raw.info.deserialize()?)?;
+        let mut info = Info::from_raw(raw.info.deserialize()?)?;
+        let layers = raw.piece_layers.as_ref().and_then(Value::as_dict);
+        for root in info.missing_piece_layers() {
+            let hex = crate::encoding::hex_encode(&root);
+            let bytes = layers
+                .and_then(|d| d.get(&root[..]))
+                .ok_or_else(|| MetainfoError::MissingPieceLayer(hex.clone()))?
+                .as_bytes()
+                .ok_or_else(|| MetainfoError::InvalidPieceLayer(hex.clone()))?;
+            let layer = v2::split_layer(bytes).ok_or(MetainfoError::InvalidPieceLayer(hex))?;
+            info.set_piece_layer(&root, layer)?;
+        }
+        let (info_hash, info_hash_v1, info_hash_v2) = hashes(info_bytes, info.version());
         Ok(Self {
-            info_hash: InfoHash::from_info_bytes(info_bytes),
+            info_hash,
+            info_hash_v1,
+            info_hash_v2,
             info_bytes: info_bytes.to_vec(),
+            web_seeds: raw.url_list.as_ref().map(url_list).unwrap_or_default(),
             info,
             announce: raw.announce.map(|t| t.0).filter(|s| !s.is_empty()),
             announce_list: raw.announce_list.as_ref().map(tiers).unwrap_or_default(),
@@ -149,8 +198,11 @@ impl Metainfo {
     /// peers with BEP 9 for a magnet link. `trackers` become the
     /// `announce-list` tiers (empty tiers and URLs are dropped).
     ///
-    /// The info-hash is computed from `info`; callers fetching metadata for a
-    /// known hash must compare it.
+    /// The info-hashes are computed from `info`; callers fetching metadata
+    /// for a known hash must compare it. A v2 torrent built this way has no
+    /// piece layers yet ([`Info::missing_piece_layers`]); add them with
+    /// [`Metainfo::set_piece_layer`] before downloading files larger than
+    /// one piece.
     ///
     /// ```
     /// use dravity_core::{InfoHash, Metainfo};
@@ -180,9 +232,13 @@ impl Metainfo {
             })
             .filter(|tier| !tier.is_empty())
             .collect();
+        let (info_hash, info_hash_v1, info_hash_v2) = hashes(info, parsed.version());
         Ok(Self {
-            info_hash: InfoHash::from_info_bytes(info),
+            info_hash,
+            info_hash_v1,
+            info_hash_v2,
             info_bytes: info.to_vec(),
+            web_seeds: Vec::new(),
             info: parsed,
             announce: None,
             announce_list,
@@ -192,10 +248,65 @@ impl Metainfo {
         })
     }
 
-    /// The v1 info-hash.
+    /// The 20-byte swarm id used in handshakes, with trackers and in the
+    /// DHT: the v1 info-hash, or for a v2-only torrent the truncated v2
+    /// info-hash (BEP 52).
     #[must_use]
     pub const fn info_hash(&self) -> InfoHash {
         self.info_hash
+    }
+
+    /// The v1 info-hash (SHA-1 of `info`), for v1 and hybrid torrents.
+    #[must_use]
+    pub const fn info_hash_v1(&self) -> Option<InfoHash> {
+        self.info_hash_v1
+    }
+
+    /// The v2 info-hash (SHA-256 of `info`), for v2 and hybrid torrents.
+    #[must_use]
+    pub const fn info_hash_v2(&self) -> Option<InfoHashV2> {
+        self.info_hash_v2
+    }
+
+    /// Every 20-byte swarm id the torrent is known by: [`Self::info_hash`]
+    /// first, then the truncated v2 hash of a hybrid torrent.
+    #[must_use]
+    pub fn swarm_hashes(&self) -> Vec<InfoHash> {
+        let mut out = vec![self.info_hash];
+        if let Some(v2) = self.info_hash_v2.map(|h| h.truncated())
+            && v2 != self.info_hash
+        {
+            out.push(v2);
+        }
+        out
+    }
+
+    /// Web seed URLs (BEP 19 `url-list`), in order, duplicates removed.
+    #[must_use]
+    pub fn web_seeds(&self) -> &[String] {
+        &self.web_seeds
+    }
+
+    /// Adds web seeds (e.g. a magnet link's `ws` parameters), keeping the
+    /// order and dropping duplicates and empty URLs.
+    #[must_use]
+    pub fn with_web_seeds(mut self, seeds: impl IntoIterator<Item = String>) -> Self {
+        for seed in seeds {
+            if !seed.is_empty() && !self.web_seeds.contains(&seed) {
+                self.web_seeds.push(seed);
+            }
+        }
+        self
+    }
+
+    /// Supplies the piece layer of the file(s) whose pieces root is `root`,
+    /// e.g. hashes received from peers for a v2 magnet link.
+    ///
+    /// # Errors
+    /// [`MetainfoError::InvalidPieceLayer`] if no file needs this layer, or
+    /// it does not hash to `root`.
+    pub fn set_piece_layer(&mut self, root: &Hash, layer: Vec<Hash>) -> Result<(), MetainfoError> {
+        self.info.set_piece_layer(root, layer)
     }
 
     /// The exact bencoded `info` dictionary (served to peers via BEP 9).
@@ -297,17 +408,13 @@ pub struct Info {
     source: Option<String>,
     layout: PieceLayout,
     file_layout: FileLayout,
+    version: MetaVersion,
+    /// v2 hashes of the non-empty files, in stream order.
+    v2: Vec<V2File>,
 }
 
 impl Info {
     fn from_raw(raw: RawInfo<'_>) -> Result<Self, MetainfoError> {
-        if raw.pieces.is_none() && raw.meta_version == Some(2) {
-            return Err(MetainfoError::UnsupportedV2Only);
-        }
-        let pieces_raw = raw.pieces.ok_or(MetainfoError::MissingPieces)?;
-        if pieces_raw.len() % 20 != 0 {
-            return Err(MetainfoError::InvalidPiecesLength(pieces_raw.len()));
-        }
         let piece_length = u32::try_from(raw.piece_length)
             .ok()
             .filter(|&l| l > 0)
@@ -318,6 +425,30 @@ impl Info {
             path: name.clone(),
             source,
         })?;
+        let private = match raw.private {
+            None | Some(0) => false,
+            Some(1) => true,
+            Some(other) => return Err(MetainfoError::InvalidPrivate(other)),
+        };
+        let source = raw.source.map(|t| t.0);
+
+        // The file tree only counts with `meta version` 2 (BEP 52); a v1
+        // torrent carrying stray keys stays v1.
+        let tree = match raw.meta_version {
+            Some(2) => Some(v2::parse_tree(
+                raw.file_tree
+                    .as_ref()
+                    .ok_or(MetainfoError::MissingFileTree)?,
+            )?),
+            _ => None,
+        };
+        let Some(pieces_raw) = raw.pieces else {
+            let tree = tree.ok_or(MetainfoError::MissingPieces)?;
+            return Self::v2_only(name, piece_length, &tree, private, source);
+        };
+        if pieces_raw.len() % 20 != 0 {
+            return Err(MetainfoError::InvalidPiecesLength(pieces_raw.len()));
+        }
 
         let (multi_file, specs) = match (raw.length, raw.files) {
             (Some(_), Some(_)) => return Err(MetainfoError::AmbiguousMode),
@@ -365,20 +496,234 @@ impl Info {
             })
             .collect();
 
-        Ok(Self {
+        let mut info = Self {
             name,
             pieces,
             files,
             multi_file,
-            private: match raw.private {
-                None | Some(0) => false,
-                Some(1) => true,
-                Some(other) => return Err(MetainfoError::InvalidPrivate(other)),
-            },
-            source: raw.source.map(|t| t.0),
+            private,
+            source,
             layout,
             file_layout,
-        })
+            version: MetaVersion::V1,
+            v2: Vec::new(),
+        };
+        if let Some(tree) = tree {
+            info.v2 = info.place_v2(&tree)?;
+            info.version = MetaVersion::Hybrid;
+        }
+        Ok(info)
+    }
+
+    /// A v2-only torrent: the files of the tree, each followed by padding up
+    /// to the next piece boundary (except the last file with data), exactly
+    /// the stream a hybrid torrent would describe.
+    fn v2_only(
+        name: String,
+        piece_length: u32,
+        tree: &[TreeFile],
+        private: bool,
+        source: Option<String>,
+    ) -> Result<Self, MetainfoError> {
+        if merkle::leaves_per_piece(piece_length).is_none() {
+            return Err(MetainfoError::InvalidPieceLength(piece_length.into()));
+        }
+        let multi_file = !matches!(tree, [only] if only.path == [name.as_str()]);
+        let last_data = tree.iter().rposition(|f| f.length > 0);
+        let piece = u64::from(piece_length);
+        let mut specs = Vec::with_capacity(tree.len() * 2);
+        for (i, f) in tree.iter().enumerate() {
+            specs.push((f.path.clone(), f.length, false));
+            let rem = f.length % piece;
+            if rem != 0 && Some(i) != last_data {
+                let pad = piece - rem;
+                specs.push((vec![".pad".to_owned(), pad.to_string()], pad, true));
+            }
+        }
+        let files = build_files(specs)?;
+        let file_layout = FileLayout::new(files.iter().map(FileEntry::length))?;
+        let layout = PieceLayout::new(piece_length, file_layout.total_length())?;
+        let mut info = Self {
+            name,
+            pieces: Vec::new(),
+            files,
+            multi_file,
+            private,
+            source,
+            layout,
+            file_layout,
+            version: MetaVersion::V2,
+            v2: Vec::new(),
+        };
+        info.v2 = info.place_v2(tree)?;
+        Ok(info)
+    }
+
+    /// Pairs the tree's non-empty files with this info's non-empty real
+    /// files, which must be the same paths and lengths in the same order,
+    /// each starting on a piece boundary.
+    fn place_v2(&self, tree: &[TreeFile]) -> Result<Vec<V2File>, MetainfoError> {
+        let piece_length = self.piece_length();
+        if merkle::leaves_per_piece(piece_length).is_none() {
+            return Err(MetainfoError::InvalidPieceLength(piece_length.into()));
+        }
+        let piece = u64::from(piece_length);
+        let mismatch = |what: String| MetainfoError::HybridMismatch(what);
+        let mut ours = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.padding && f.length > 0);
+        let mut out = Vec::new();
+        for t in tree.iter().filter(|t| t.length > 0) {
+            let joined = t.path.join("/");
+            let (index, file) = ours
+                .next()
+                .ok_or_else(|| mismatch(format!("{joined:?} is only in the file tree")))?;
+            if file.path.components() != t.path.as_slice() || file.length != t.length {
+                return Err(mismatch(format!(
+                    "file tree has {joined:?} where the file list has {:?}",
+                    file.path.to_string()
+                )));
+            }
+            if file.offset % piece != 0 {
+                return Err(mismatch(format!("{joined:?} does not start a piece")));
+            }
+            let root = t.root.ok_or(MetainfoError::InvalidFileTree(joined))?;
+            let first_piece =
+                u32::try_from(file.offset / piece).map_err(|_| LayoutError::TooManyPieces)?;
+            let pieces = u32::try_from(file.length.div_ceil(piece))
+                .map_err(|_| LayoutError::TooManyPieces)?;
+            out.push(V2File {
+                file: index,
+                offset: file.offset,
+                length: file.length,
+                root,
+                first_piece,
+                pieces,
+                layer: (pieces <= 1).then(Vec::new),
+            });
+        }
+        if let Some((_, extra)) = ours.next() {
+            return Err(mismatch(format!(
+                "{:?} is only in the file list",
+                extra.path.to_string()
+            )));
+        }
+        Ok(out)
+    }
+
+    /// Which hashes the torrent carries.
+    #[must_use]
+    pub const fn version(&self) -> MetaVersion {
+        self.version
+    }
+
+    /// The v2 pieces root of file `index` (`None` for v1 torrents, padding
+    /// and empty files).
+    #[must_use]
+    pub fn pieces_root(&self, index: usize) -> Option<&Hash> {
+        self.v2.iter().find(|f| f.file == index).map(|f| &f.root)
+    }
+
+    /// Pieces roots of files whose piece layer is needed but not known yet
+    /// (deduplicated, in stream order). Always empty for a v1 torrent or
+    /// one parsed from a `.torrent` file.
+    #[must_use]
+    pub fn missing_piece_layers(&self) -> Vec<Hash> {
+        let mut out: Vec<Hash> = Vec::new();
+        for f in self.v2.iter().filter(|f| f.layer.is_none()) {
+            if !out.contains(&f.root) {
+                out.push(f.root);
+            }
+        }
+        out
+    }
+
+    /// The known piece layers by pieces root (deduplicated, in stream
+    /// order), for writing a `.torrent` file's `piece layers`.
+    #[must_use]
+    pub fn piece_layers(&self) -> Vec<(Hash, &[Hash])> {
+        let mut out: Vec<(Hash, &[Hash])> = Vec::new();
+        for f in &self.v2 {
+            if let Some(layer) = f.layer.as_deref().filter(|l| !l.is_empty())
+                && !out.iter().any(|(r, _)| *r == f.root)
+            {
+                out.push((f.root, layer));
+            }
+        }
+        out
+    }
+
+    /// Number of pieces in the piece layer of the file(s) with pieces root
+    /// `root` (`None` if no file needs a layer for it).
+    #[must_use]
+    pub fn piece_layer_len(&self, root: &Hash) -> Option<u32> {
+        self.v2
+            .iter()
+            .find(|f| f.root == *root && f.needs_layer())
+            .map(|f| f.pieces)
+    }
+
+    fn set_piece_layer(&mut self, root: &Hash, layer: Vec<Hash>) -> Result<(), MetainfoError> {
+        let piece_length = self.piece_length();
+        let invalid = || MetainfoError::InvalidPieceLayer(crate::encoding::hex_encode(root));
+        let mut matched = false;
+        for f in self
+            .v2
+            .iter_mut()
+            .filter(|f| f.root == *root && f.needs_layer())
+        {
+            if !f.accepts_layer(&layer, piece_length) {
+                return Err(invalid());
+            }
+            f.layer = Some(layer.clone());
+            matched = true;
+        }
+        if matched { Ok(()) } else { Err(invalid()) }
+    }
+
+    /// The v2 file that piece `index` belongs to.
+    fn v2_file(&self, index: u32) -> Option<&V2File> {
+        let at = self.v2.partition_point(|f| f.first_piece <= index);
+        let f = self.v2.get(at.checked_sub(1)?)?;
+        (index - f.first_piece < f.pieces).then_some(f)
+    }
+
+    /// Verifies `data`, the whole of piece `index` as stored in the content
+    /// stream (padding included), with every hash the torrent has: SHA-1
+    /// for v1, the Merkle piece hash (or the file's root) for v2, both for
+    /// hybrid torrents. A v2 piece whose layer is not known yet fails, unless
+    /// a hybrid's SHA-1 vouches for it.
+    #[must_use]
+    pub fn check_piece(&self, index: u32, data: &[u8]) -> bool {
+        let Some(range) = self.layout.piece_range(index) else {
+            return false;
+        };
+        if u64::try_from(data.len()).ok() != Some(range.end - range.start) {
+            return false;
+        }
+        if self.version.has_v1() {
+            let digest: [u8; 20] = Sha1::digest(data).into();
+            if self.piece_hash(index) != Some(&digest) {
+                return false;
+            }
+        }
+        if !self.version.has_v2() {
+            return true;
+        }
+        let Some(file) = self.v2_file(index) else {
+            // Only a hybrid can have a piece outside every v2 file (a run
+            // of padding), and its SHA-1 already matched.
+            return self.version == MetaVersion::Hybrid;
+        };
+        if file.layer.is_none() && self.version == MetaVersion::Hybrid {
+            return true;
+        }
+        let end = range.end.min(file.offset + file.length);
+        let len = usize::try_from(end.saturating_sub(range.start)).unwrap_or(usize::MAX);
+        data.get(..len)
+            .is_some_and(|d| file.check(index, d, self.piece_length()))
     }
 
     /// Suggested name: the file name (single-file) or root directory (multi-file).
@@ -429,13 +774,13 @@ impl Info {
         self.layout.total_length()
     }
 
-    /// SHA-1 of piece `index`.
+    /// SHA-1 of piece `index` (`None` for a v2-only torrent).
     #[must_use]
     pub fn piece_hash(&self, index: u32) -> Option<&[u8; 20]> {
         self.pieces.get(usize::try_from(index).ok()?)
     }
 
-    /// All piece hashes.
+    /// All v1 piece hashes (empty for a v2-only torrent).
     #[must_use]
     pub fn piece_hashes(&self) -> &[[u8; 20]] {
         &self.pieces
@@ -510,6 +855,36 @@ fn build_files(specs: Vec<(Vec<String>, u64, bool)>) -> Result<Vec<FileEntry>, M
     Ok(files)
 }
 
+/// The swarm id, v1 hash and v2 hash for `info` bytes of `version`.
+fn hashes(info: &[u8], version: MetaVersion) -> (InfoHash, Option<InfoHash>, Option<InfoHashV2>) {
+    let v1 = version.has_v1().then(|| InfoHash::from_info_bytes(info));
+    let v2 = version.has_v2().then(|| InfoHashV2::from_info_bytes(info));
+    let swarm = v1
+        .or(v2.map(|h| h.truncated()))
+        .unwrap_or_else(|| InfoHash::from_info_bytes(info));
+    (swarm, v1, v2)
+}
+
+/// Leniently interprets `url-list` (BEP 19): one URL or a list of them;
+/// non-strings, empty strings and duplicates are dropped.
+fn url_list(v: &Value<'_>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let items: Vec<&Value<'_>> = match v {
+        Value::List(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    for url in items
+        .into_iter()
+        .filter_map(Value::as_bytes)
+        .map(|b| String::from_utf8_lossy(b).trim().to_owned())
+    {
+        if !url.is_empty() && !out.contains(&url) {
+            out.push(url);
+        }
+    }
+    out
+}
+
 /// Leniently interprets `announce-list`: keeps tiers that are lists, and the
 /// byte-string URLs inside them; drops everything else and empty tiers.
 fn tiers(v: &Value<'_>) -> Vec<Vec<String>> {
@@ -562,6 +937,10 @@ struct RawTorrent<'a> {
     created_by: Option<Text>,
     #[serde(rename = "creation date", borrow)]
     creation_date: Option<Value<'a>>,
+    #[serde(rename = "piece layers", borrow)]
+    piece_layers: Option<Value<'a>>,
+    #[serde(rename = "url-list", borrow)]
+    url_list: Option<Value<'a>>,
 }
 
 #[derive(Deserialize)]
@@ -579,6 +958,8 @@ struct RawInfo<'a> {
     source: Option<Text>,
     #[serde(rename = "meta version")]
     meta_version: Option<i64>,
+    #[serde(rename = "file tree", borrow)]
+    file_tree: Option<Value<'a>>,
 }
 
 #[derive(Deserialize)]

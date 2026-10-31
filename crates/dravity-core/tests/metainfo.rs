@@ -416,7 +416,7 @@ fn rejects_structural_problems() {
                 "meta version",
                 Some(int(2)),
             ),
-            MetainfoError::UnsupportedV2Only,
+            MetainfoError::MissingFileTree,
         ),
         (
             with(base.clone(), "private", Some(int(2))),
@@ -467,10 +467,11 @@ fn zero_length_torrent_has_no_pieces() {
 }
 
 #[test]
-fn hybrid_torrent_parses_v1_part() {
-    let info = with(single_info("h", 10, 16384), "meta version", Some(int(2)));
-    let info = with(info, "file tree", Some(dict(vec![("h", dict(vec![]))])));
-    assert_eq!(parse(info).unwrap().info().total_length(), 10);
+fn a_file_tree_without_meta_version_2_is_ignored() {
+    let info = with(single_info("h", 10, 16384), "file tree", Some(int(5)));
+    let m = parse(info).unwrap();
+    assert_eq!(m.info().version(), dravity_core::MetaVersion::V1);
+    assert_eq!(m.info_hash_v2(), None);
 }
 
 proptest! {

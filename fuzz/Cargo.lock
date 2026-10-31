@@ -254,6 +254,7 @@ dependencies = [
  "dravity-bencode",
  "serde",
  "sha1",
+ "sha2",
  "thiserror",
 ]
 
@@ -352,7 +353,6 @@ dependencies = [
  "dravity-bencode",
  "dravity-core",
  "rustix",
- "sha1",
  "thiserror",
 ]
 

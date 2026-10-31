@@ -19,7 +19,7 @@ use crate::ext::{self, PeerExtensions};
 use crate::hints::{HintBook, Joined};
 use crate::layers::{Answer, LayerSet};
 use crate::picker::{Picker, Priority, Received};
-use crate::pool::PeerPool;
+use crate::pool::{PeerPool, new_duplicate_wins};
 use crate::rate::TokenBucket;
 use crate::types::{
     Alert, AnnounceEvent, Config, DialHints, Effect, Event, PeerInfo, PeerKey, PeerLink, Stats,
@@ -982,6 +982,15 @@ impl TorrentState {
         peers.values().any(|p| p.addr == addr)
     }
 
+    /// The connection to `addr` that a new one the other way replaces
+    /// (see [`new_duplicate_wins`]).
+    fn duplicate_to_replace(&self, addr: SocketAddr, incoming: bool) -> Option<PeerKey> {
+        let (&old, peer) = self.peers.iter().find(|(_, p)| p.addr == addr)?;
+        (peer.incoming != incoming
+            && new_duplicate_wins(self.config.listen_port, addr.port(), incoming) == Some(true))
+        .then_some(old)
+    }
+
     fn add_to_pool(&mut self, peers: Vec<SocketAddr>) {
         // Peers given while checking are kept for when downloading starts.
         if !(self.is_active() || self.status == TorrentStatus::Checking) {
@@ -1045,11 +1054,16 @@ impl TorrentState {
         }
         // Peers may connect while checking: a magnet's metadata fetch hands
         // its connections over before the data check ends.
-        if self.swarm_ban.contains(&addr)
+        let refused = self.swarm_ban.contains(&addr)
             || self.bans.is_banned(addr.ip())
             || !(self.is_active() || self.status == TorrentStatus::Checking)
+            || self.peers.contains_key(&key);
+        if !refused && let Some(old) = self.duplicate_to_replace(addr, incoming) {
+            self.remove_peer(old);
+            out.push(Effect::Disconnect { peer: old });
+        }
+        if refused
             || self.peers.len() >= self.config.max_peers
-            || self.peers.contains_key(&key)
             || Self::is_connected(&self.peers, addr)
         {
             out.push(Effect::Disconnect { peer: key });

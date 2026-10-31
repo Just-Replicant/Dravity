@@ -16,7 +16,7 @@ use dravity_wire::{
 use crate::ext::{self, PeerExtensions};
 use crate::hints::{HintBook, Joined};
 use crate::layers::{Answer, LayerSet, Piece};
-use crate::pool::PeerPool;
+use crate::pool::{PeerPool, new_duplicate_wins};
 use crate::state::DhtSchedule;
 use crate::types::{
     Alert, AnnounceEvent, Config, DialHints, Effect, Event, PeerInfo, PeerKey, PeerLink, Stats,
@@ -530,6 +530,15 @@ impl MetadataState {
         });
     }
 
+    /// The connection to `addr` that a new one the other way replaces
+    /// (see [`new_duplicate_wins`]).
+    fn duplicate_to_replace(&self, addr: SocketAddr, incoming: bool) -> Option<PeerKey> {
+        let (&old, peer) = self.peers.iter().find(|(_, p)| p.addr == addr)?;
+        (peer.incoming != incoming
+            && new_duplicate_wins(self.config.listen_port, addr.port(), incoming) == Some(true))
+        .then_some(old)
+    }
+
     fn is_connected(peers: &HashMap<PeerKey, MetaPeer>, addr: SocketAddr) -> bool {
         peers.values().any(|p| p.addr == addr)
     }
@@ -589,10 +598,14 @@ impl MetadataState {
         if !incoming {
             self.pool.dial_done(addr);
         }
-        if self.banned.contains(&addr)
+        let refused = self.banned.contains(&addr)
             || self.status != TorrentStatus::FetchingMetadata
+            || self.peers.contains_key(&key);
+        if !refused && let Some(old) = self.duplicate_to_replace(addr, incoming) {
+            self.disconnect(old, out);
+        }
+        if refused
             || self.peers.len() >= self.config.max_peers
-            || self.peers.contains_key(&key)
             || Self::is_connected(&self.peers, addr)
         {
             out.push(Effect::Disconnect { peer: key });

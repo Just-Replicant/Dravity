@@ -140,3 +140,66 @@ fn a_magnet_lists_its_peers_before_the_size_is_known() {
     m.update(now, Event::PeerDisconnected { peer: PeerKey(7) });
     assert!(m.peers().is_empty());
 }
+
+fn joined(peer: u64, addr: SocketAddr, incoming: bool) -> Event {
+    let (peer, reserved, link) = (PeerKey(peer), Reserved::default(), PeerLink::default());
+    if incoming {
+        Event::PeerAccepted {
+            peer,
+            addr,
+            reserved,
+            link,
+        }
+    } else {
+        Event::PeerConnected {
+            peer,
+            addr,
+            reserved,
+            link,
+        }
+    }
+}
+
+fn disconnected(effects: &[Effect]) -> Vec<PeerKey> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Disconnect { peer } => Some(*peer),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Both sides dialed each other to the same address (uTP): the connection
+/// the lower listen port opened survives on both ends, whichever came
+/// first, as libtorrent decides.
+#[test]
+fn simultaneous_connections_keep_the_one_the_lower_listen_port_opened() {
+    let now = Instant::now();
+    let them = addr(0); // port 7000
+    for (our_port, first_incoming, want_kept_incoming) in [
+        (6000, true, false), // ours wins: our late dial replaces theirs
+        (6000, false, false),
+        (8000, false, true), // theirs wins: their late dial replaces ours
+        (8000, true, true),
+    ] {
+        let mut c = config();
+        c.listen_port = Some(our_port);
+        let mut t = TorrentState::new(layout(), c.clone());
+        t.update(now, Event::Start);
+        assert!(disconnected(&t.update(now, joined(1, them, first_incoming))).is_empty());
+        let fx = t.update(now, joined(2, them, !first_incoming));
+        let new_kept = want_kept_incoming != first_incoming;
+        let dropped = if new_kept { PeerKey(1) } else { PeerKey(2) };
+        assert_eq!(disconnected(&fx), [dropped], "port {our_port}");
+        let peers = t.peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].incoming, want_kept_incoming, "port {our_port}");
+
+        let mut m = MetadataState::new(InfoHash::new([5; 20]), c);
+        m.update(now, Event::Start);
+        assert!(disconnected(&m.update(now, joined(1, them, first_incoming))).is_empty());
+        let fx = m.update(now, joined(2, them, !first_incoming));
+        assert_eq!(disconnected(&fx), [dropped], "metadata, port {our_port}");
+    }
+}

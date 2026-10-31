@@ -294,6 +294,7 @@ async fn a_hybrid_torrent_answers_to_both_swarm_ids() {
             .unwrap()
             .unwrap();
         assert_eq!(theirs.info_hash, id, "replies with the id we asked for");
+        assert!(theirs.reserved.v2(), "advertises BEP 52 support");
     }
     session.shutdown().await;
 }
@@ -330,10 +331,13 @@ async fn a_v2_magnet_link_fetches_metadata_and_downloads() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_v2_magnet_without_piece_layers_stops_with_an_error() {
+async fn a_v2_magnet_fetches_piece_layers_and_downloads_multi_piece_files() {
+    // `video.bin` spans 5 pieces and `tail.bin` 2: their piece layers are
+    // not in the metadata and come from the seed with BEP 52 hash requests.
     let mut files = sample();
     let torrent = make(&mut files, false, None);
     let m = Metainfo::from_bytes(&torrent).unwrap();
+    assert_eq!(m.info().piece_layers().len(), 2);
     let v2 = m.info_hash_v2().unwrap();
     let hash = m.info_hash();
     let seed_dir = tempfile::tempdir().unwrap();
@@ -346,14 +350,23 @@ async fn a_v2_magnet_without_piece_layers_stops_with_an_error() {
         "magnet:?xt=urn:btmh:1220{v2}&x.pe=127.0.0.1:{port}"
     ))
     .unwrap();
-    leecher
+    let handle = leecher
         .add_magnet(&magnet, AddTorrentOptions::new(leech_dir.path()))
         .unwrap();
-    let seen = until(&mut alerts, hash, |a| matches!(a, Alert::Error { .. })).await;
-    let Some(Alert::Error { message }) = seen.last() else {
-        unreachable!()
-    };
-    assert!(message.contains("piece layers"), "{message}");
+    let seen = until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert!(seen.contains(&Alert::MetadataReceived), "{seen:?}");
+    assert!(
+        !seen
+            .iter()
+            .any(|a| matches!(a, Alert::HashFailed { .. } | Alert::Error { .. })),
+        "{seen:?}"
+    );
+    assert_files(leech_dir.path(), &files);
+    let known = leecher.metainfo(hash).unwrap();
+    assert!(known.info().missing_piece_layers().is_empty());
+    assert_eq!(known.info().piece_layers(), m.info().piece_layers());
+    let stats = handle.stats().await.unwrap();
+    assert_eq!(stats.pieces_have, stats.piece_count);
     leecher.shutdown().await;
     seeder.shutdown().await;
 }

@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
+use dravity_core::merkle::Hash;
 use dravity_core::{BlockRef, InfoHash, InfoHashV2, MetaVersion, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{
@@ -232,6 +233,9 @@ pub(crate) enum Source {
     Magnet(MagnetStart),
 }
 
+/// Piece layers by pieces root (BEP 52).
+type PieceLayers = Vec<(Hash, Vec<Hash>)>;
+
 /// One web seed of a torrent.
 #[derive(Debug)]
 struct WebSeed {
@@ -302,7 +306,7 @@ pub(crate) struct TorrentTask {
     /// arrives.
     magnet: Option<MagnetStart>,
     /// Verified `info` dictionary waiting to replace the metadata phase.
-    metadata: Option<Bytes>,
+    metadata: Option<(Bytes, PieceLayers)>,
     peers: HashMap<PeerKey, mpsc::Sender<PeerCommand>>,
     /// Peers connected over uTP (the rest use TCP). Pruned against `peers`.
     utp_peers: HashSet<PeerKey>,
@@ -361,6 +365,7 @@ impl TorrentTask {
                 let state = TorrentState::new(*metainfo.info().layout(), config)
                     .with_info_hash(ctx.info_hash)
                     .with_info_bytes(info)
+                    .with_piece_layers(metainfo.info().piece_length(), owned_layers(&metainfo))
                     .with_priorities(&pieces);
                 (
                     Phase::Download(Box::new(state)),
@@ -774,7 +779,10 @@ impl TorrentTask {
         let info = info
             .cloned()
             .unwrap_or_else(|| Bytes::copy_from_slice(content.metainfo.info_bytes()));
-        Some(state.with_info_bytes(info))
+        Some(state.with_info_bytes(info).with_piece_layers(
+            content.metainfo.info().piece_length(),
+            owned_layers(&content.metainfo),
+        ))
     }
 
     /// Maps peer-task inputs to engine events, keeping the peer map in sync.
@@ -851,8 +859,8 @@ impl TorrentTask {
         for effect in effects {
             self.dispatch(effect).await;
         }
-        if let Some(info) = self.metadata.take() {
-            self.start_download(info).await;
+        if let Some((info, layers)) = self.metadata.take() {
+            self.start_download(info, layers).await;
         }
         self.wake_waiters();
     }
@@ -872,7 +880,7 @@ impl TorrentTask {
     }
 
     /// Switches a magnet link from the metadata phase to downloading.
-    async fn start_download(&mut self, info: Bytes) {
+    async fn start_download(&mut self, info: Bytes, layers: PieceLayers) {
         let Phase::Metadata(_) = self.phase else {
             return;
         };
@@ -886,21 +894,22 @@ impl TorrentTask {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        let metainfo = match Metainfo::from_info_bytes(&info, tiers) {
+        let mut metainfo = match Metainfo::from_info_bytes(&info, tiers) {
             Ok(metainfo) => metainfo.with_web_seeds(start.web_seeds),
             Err(e) => return self.fail(format!("invalid metadata: {e}")),
         };
+        // Layers fetched with BEP 52 hash requests (already checked against
+        // their roots by the engine; `set_piece_layer` checks again).
+        for (root, layer) in layers {
+            if let Err(e) = metainfo.set_piece_layer(&root, layer) {
+                return self.fail(format!("invalid piece layer: {e}"));
+            }
+        }
         if metainfo.info().version() == MetaVersion::V2
             && !metainfo.info().missing_piece_layers().is_empty()
         {
-            // Hash requests (BEP 52) are not spoken yet: without the piece
-            // layers the larger files of a v2-only torrent cannot be
-            // verified, and a hybrid would fall back to SHA-1.
-            return self.fail(
-                "v2-only torrent: piece layers are not in the metadata and \
-                 fetching them from peers is not supported; add the .torrent file"
-                    .to_owned(),
-            );
+            // The engine only hands over a v2-only torrent with every layer.
+            return self.fail("v2-only torrent: piece layers are missing".to_owned());
         }
         let metainfo = Arc::new(metainfo);
         let storage: Arc<dyn Storage> = match FileStorage::new(&dir, metainfo.info()) {
@@ -924,6 +933,7 @@ impl TorrentTask {
             )
             .with_info_hash(self.ctx.info_hash)
             .with_info_bytes(info)
+            .with_piece_layers(info_meta.piece_length(), owned_layers(&content.metainfo))
             .with_priorities(&self.piece_priorities(&content)),
         };
         self.content = Some(content);
@@ -1051,7 +1061,9 @@ impl TorrentTask {
                 }
             }
             Effect::DhtLookup => self.dht_lookup(),
-            Effect::MetadataReceived { info } => self.metadata = Some(info),
+            Effect::MetadataReceived { info, piece_layers } => {
+                self.metadata = Some((info, piece_layers));
+            }
             Effect::Alert(alert) => self.alert(alert),
             other => tracing::warn!(?other, "unhandled engine effect"),
         }
@@ -1615,6 +1627,16 @@ fn error_chain(e: &dyn std::error::Error) -> String {
         source = inner.source();
     }
     text
+}
+
+/// The piece layers of `metainfo`, owned, for serving BEP 52 hash requests.
+fn owned_layers(metainfo: &Metainfo) -> PieceLayers {
+    metainfo
+        .info()
+        .piece_layers()
+        .into_iter()
+        .map(|(root, layer)| (root, layer.to_vec()))
+        .collect()
 }
 
 #[cfg(test)]

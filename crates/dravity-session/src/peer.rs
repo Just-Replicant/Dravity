@@ -70,11 +70,12 @@ impl HandshakeError {
     }
 }
 
-/// Extensions we advertise: BEP 10 (metadata exchange, PEX) and, when
-/// enabled, the fast extension (BEP 6).
+/// Extensions we advertise: BEP 10 (metadata exchange, PEX), BEP 52 (v2:
+/// hash requests) and, when enabled, the fast extension (BEP 6).
 pub(crate) fn our_reserved(fast: bool) -> Reserved {
     Reserved::new()
         .with_extension_protocol(true)
+        .with_v2(true)
         .with_fast(fast)
 }
 

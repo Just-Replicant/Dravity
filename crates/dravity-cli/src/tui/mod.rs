@@ -47,13 +47,15 @@ enum UiEvent {
     Resize,
 }
 
-/// One torrent's answer to a refresh.
+/// One torrent's answer to a refresh. The instant is when that answer
+/// arrived, so a rate is the gap between two replies rather than the end of
+/// the whole frame (a slow torrent would otherwise inflate the others).
 #[derive(Debug)]
 enum Reply {
-    Stats(InfoHash, Stats),
+    Stats(InfoHash, Stats, Instant),
     /// The selected torrent's detail.
     Progress(TorrentProgress),
-    Peers(Vec<PeerStatus>),
+    Peers(Vec<PeerStatus>, Instant),
     Trackers(Vec<TrackerStatus>),
 }
 
@@ -106,11 +108,22 @@ async fn refresh(session: &Session, view: &mut View, samples: &mut Samples) {
             let h = handle.clone();
             set.spawn(async move { h.progress().await.ok().map(Reply::Progress) });
             let h = handle.clone();
-            set.spawn(async move { h.peers().await.ok().map(Reply::Peers) });
+            set.spawn(async move {
+                h.peers()
+                    .await
+                    .ok()
+                    .map(|p| Reply::Peers(p, Instant::now()))
+            });
             let h = handle.clone();
             set.spawn(async move { h.trackers().await.ok().map(Reply::Trackers) });
         }
-        set.spawn(async move { handle.stats().await.ok().map(|s| Reply::Stats(ih, s)) });
+        set.spawn(async move {
+            handle
+                .stats()
+                .await
+                .ok()
+                .map(|s| Reply::Stats(ih, s, Instant::now()))
+        });
     }
     let deadline = tokio::time::Instant::now() + REFRESH;
     let mut stats = HashMap::new();
@@ -119,11 +132,11 @@ async fn refresh(session: &Session, view: &mut View, samples: &mut Samples) {
     let mut trackers = None;
     while let Ok(Some(joined)) = tokio::time::timeout_at(deadline, set.join_next()).await {
         match joined.ok().flatten() {
-            Some(Reply::Stats(ih, s)) => {
-                stats.insert(ih, s);
+            Some(Reply::Stats(ih, s, at)) => {
+                stats.insert(ih, (s, at));
             }
             Some(Reply::Progress(p)) => progress = Some(p),
-            Some(Reply::Peers(p)) => peers = Some(p),
+            Some(Reply::Peers(p, at)) => peers = Some((p, at)),
             Some(Reply::Trackers(t)) => trackers = Some(t),
             None => {}
         }
@@ -131,7 +144,6 @@ async fn refresh(session: &Session, view: &mut View, samples: &mut Samples) {
     // Whatever did not answer in time is dropped (and aborted) here.
     drop(set);
 
-    let now = Instant::now();
     let previous: HashMap<InfoHash, TorrentRow> = view
         .torrents
         .drain(..)
@@ -150,10 +162,10 @@ async fn refresh(session: &Session, view: &mut View, samples: &mut Samples) {
                 down_rate: 0,
                 up_rate: 0,
             };
-            if let Some(s) = stats.get(&ih) {
+            if let Some((s, at)) = stats.get(&ih) {
                 (row.down_rate, row.up_rate) =
-                    rates(samples.torrents.get(&ih), now, s.downloaded, s.uploaded);
-                samples.torrents.insert(ih, (now, s.downloaded, s.uploaded));
+                    rates(samples.torrents.get(&ih), *at, s.downloaded, s.uploaded);
+                samples.torrents.insert(ih, (*at, s.downloaded, s.uploaded));
                 row.stats = Some(s.into());
             } else if summary.running
                 && let Some(old) = previous.get(&ih)
@@ -185,22 +197,33 @@ async fn refresh(session: &Session, view: &mut View, samples: &mut Samples) {
             .map(Into::into)
             .collect();
     }
-    if let (Some(peers), Some(ih)) = (peers, selected) {
+    if let (Some((peers, at)), Some(ih)) = (peers, selected) {
         view.peers = peers
             .iter()
             .map(|p| {
                 let mut row = PeerRow::from(p);
                 let key = (ih, row.addr);
                 (row.down_rate, row.up_rate) =
-                    rates(samples.peers.get(&key), now, row.downloaded, row.uploaded);
+                    rates(samples.peers.get(&key), at, row.downloaded, row.uploaded);
                 samples
                     .peers
-                    .insert(key, (now, row.downloaded, row.uploaded));
+                    .insert(key, (at, row.downloaded, row.uploaded));
                 row
             })
             .collect();
-        let shown: Vec<_> = view.peers.iter().map(|p| (ih, p.addr)).collect();
-        samples.peers.retain(|key, _| shown.contains(key));
+        // Drop peers that disconnected from this torrent. Samples for other
+        // torrents stay, so switching back does not zero their rates.
+        samples.peers.retain(|(key_ih, addr), _| {
+            if *key_ih == ih {
+                view.peers.iter().any(|p| p.addr == *addr)
+            } else {
+                summaries.iter().any(|s| s.info_hash == *key_ih)
+            }
+        });
+    } else {
+        samples
+            .peers
+            .retain(|(key_ih, _), _| summaries.iter().any(|s| s.info_hash == *key_ih));
     }
     if let Some(trackers) = trackers {
         view.trackers = trackers.iter().map(TrackerRow::from).collect();
@@ -213,6 +236,8 @@ async fn refresh(session: &Session, view: &mut View, samples: &mut Samples) {
     view.selected_tracker = view
         .selected_tracker
         .min(view.trackers.len().saturating_sub(1));
+    view.alerts
+        .retain(|ih, _| summaries.iter().any(|s| s.info_hash == *ih));
 }
 
 /// Adds the add prompt's line to the session: a `magnet:` link, or a path
@@ -330,7 +355,7 @@ fn click(view: &mut View, screen: Rect, mouse: MouseEvent) {
 
 /// Reads terminal events on a thread (they block) until the UI drops the
 /// receiver.
-fn spawn_input(tx: mpsc::Sender<UiEvent>) {
+fn spawn_input(tx: mpsc::Sender<UiEvent>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         loop {
             match event::poll(Duration::from_millis(100)) {
@@ -351,7 +376,47 @@ fn spawn_input(tx: mpsc::Sender<UiEvent>) {
                 Err(_) => return,
             }
         }
-    });
+    })
+}
+
+/// The input thread plus its event queue. Dropping it closes the queue,
+/// waits for the thread to leave the terminal, then restores the screen,
+/// including when the UI task panics.
+struct InputLoop {
+    events: Option<mpsc::Receiver<UiEvent>>,
+    input: Option<std::thread::JoinHandle<()>>,
+}
+
+impl InputLoop {
+    fn start() -> Self {
+        let (tx, events) = mpsc::channel(16);
+        let input = spawn_input(tx);
+        // Keys still work without mouse reporting.
+        let _ = crossterm::execute!(std::io::stdout(), event::EnableMouseCapture);
+        Self {
+            events: Some(events),
+            input: Some(input),
+        }
+    }
+
+    async fn recv(&mut self) -> Option<UiEvent> {
+        match self.events.as_mut() {
+            Some(events) => events.recv().await,
+            None => None,
+        }
+    }
+}
+
+impl Drop for InputLoop {
+    fn drop(&mut self) {
+        // Close the queue before joining, or a full channel blocks the thread
+        // on send and the join never returns.
+        self.events.take();
+        if let Some(handle) = self.input.take() {
+            let _ = handle.join();
+        }
+        restore();
+    }
 }
 
 /// Puts the terminal back, mouse reporting included.
@@ -373,10 +438,7 @@ pub(crate) async fn run(
         anyhow::bail!("--tui needs a terminal");
     }
     let mut terminal = ratatui::try_init().context("starting the terminal UI")?;
-    // Keys still work without mouse reporting.
-    let _ = crossterm::execute!(std::io::stdout(), event::EnableMouseCapture);
-    let (tx, mut events) = mpsc::channel(16);
-    spawn_input(tx);
+    let mut input = InputLoop::start();
     let mut alerts = session.subscribe();
     let mut view = View::default();
     let mut samples = Samples::default();
@@ -390,7 +452,7 @@ pub(crate) async fn run(
                     break Ok(());
                 }
             }
-            event = events.recv() => match event {
+            event = input.recv() => match event {
                 None => break Ok(()),
                 Some(UiEvent::Resize) => {}
                 Some(UiEvent::Mouse(mouse)) => {
@@ -426,7 +488,9 @@ pub(crate) async fn run(
             break Err(e.into());
         }
     };
-    restore();
+    // Join the input thread and restore the terminal before the caller
+    // shuts the session down.
+    drop(input);
     result
 }
 

@@ -1,6 +1,8 @@
 //! BEP 52 end to end: v2-only and hybrid torrents between two sessions over
 //! loopback, v2 magnet links, both swarm ids of a hybrid torrent, and v2
-//! torrents surviving a restart.
+//! torrents surviving a restart. Also BEP 19 web seeds (a loopback HTTP
+//! server), whose padding-aware ranges are easiest to show on these
+//! piece-aligned multi-file torrents.
 
 #![allow(
     clippy::unwrap_used,
@@ -13,7 +15,9 @@
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -25,7 +29,7 @@ use dravity_session::{AddTorrentOptions, ListenConfig, Session, SessionAlert, Se
 use dravity_wire::Handshake;
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
 const PIECE: u32 = 32 * 1024;
@@ -383,5 +387,173 @@ async fn v2_torrents_keep_their_piece_layers_across_a_restart() {
     assert!(restored.info().missing_piece_layers().is_empty());
     assert_eq!(restored.web_seeds(), m.web_seeds());
     until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    session.shutdown().await;
+}
+
+/// A tiny HTTP server for `root`: `GET /<path>` with a `Range` header gets
+/// `206` and those bytes, without one the whole file; anything missing (or
+/// everything, with `broken`) gets `404`. Counts requests.
+async fn http_server(root: PathBuf, broken: bool) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&hits);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let root = root.clone();
+            let count = Arc::clone(&count);
+            tokio::spawn(async move {
+                // Keep-alive: answer requests until the client hangs up.
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                loop {
+                    let end = loop {
+                        if let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    };
+                    let text = String::from_utf8_lossy(&req[..end]).to_string();
+                    req.drain(..end);
+                    count.fetch_add(1, Ordering::Relaxed);
+                    let path = text.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                    let file = std::fs::read(root.join(path.trim_start_matches('/')));
+                    let (status, body) = match file {
+                        Ok(data) if !broken => {
+                            let range = text.lines().find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("range: bytes=")
+                                    .map(str::to_owned)
+                            });
+                            match range {
+                                Some(r) => {
+                                    let (a, b) = r.trim().split_once('-').unwrap();
+                                    let (a, b): (usize, usize) =
+                                        (a.parse().unwrap(), b.parse().unwrap());
+                                    ("206 Partial Content", data[a..=b].to_vec())
+                                }
+                                None => ("200 OK", data),
+                            }
+                        }
+                        _ => ("404 Not Found", Vec::new()),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    if sock.write_all(head.as_bytes()).await.is_err()
+                        || sock.write_all(&body).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, hits)
+}
+
+async fn download_from_web_seed(hybrid: bool) {
+    let mut files = sample();
+    let served = tempfile::tempdir().unwrap();
+    write_files(served.path(), &files);
+    let (addr, hits) = http_server(served.path().to_path_buf(), false).await;
+    let torrent = make(&mut files, hybrid, Some(&format!("http://{addr}/")));
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    assert_eq!(m.web_seeds(), [format!("http://{addr}/")]);
+    let hash = m.info_hash();
+
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(config()).unwrap();
+    let mut alerts = session.subscribe();
+    let handle = session
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    let seen = until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert!(
+        !seen.iter().any(|a| matches!(a, Alert::HashFailed { .. })),
+        "{seen:?}"
+    );
+    assert_files(dir.path(), &files);
+    assert!(hits.load(Ordering::Relaxed) > 0);
+    let stats = handle.stats().await.unwrap();
+    assert_eq!(stats.pieces_have, stats.piece_count);
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v2_only_torrent_downloads_from_a_web_seed_alone() {
+    download_from_web_seed(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hybrid_torrent_downloads_from_a_web_seed_alone() {
+    download_from_web_seed(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_web_seed_does_not_stop_a_download_from_peers() {
+    let mut files = sample();
+    let (addr, hits) = http_server(PathBuf::from("/nonexistent"), true).await;
+    let torrent = make(&mut files, true, Some(&format!("http://{addr}/")));
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    let hash = m.info_hash();
+    let seed_dir = tempfile::tempdir().unwrap();
+    let (seeder, port) = seed(&torrent, &files, seed_dir.path()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = config();
+    c.web_seed_retry = Duration::from_millis(20);
+    let leecher = Session::new(c).unwrap();
+    let mut alerts = leecher.subscribe();
+    let handle = leecher
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    // The seed fails, is retried after its back-off, and fails again.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while hits.load(Ordering::Relaxed) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the web seed is retried");
+    assert_eq!(handle.stats().await.unwrap().pieces_have, 0);
+
+    handle.add_peers([local(port)]).await.unwrap();
+    let seen = until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert!(
+        !seen.iter().any(|a| matches!(a, Alert::HashFailed { .. })),
+        "{seen:?}"
+    );
+    assert_files(dir.path(), &files);
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_seeds_can_be_turned_off() {
+    let mut files = small();
+    let served = tempfile::tempdir().unwrap();
+    write_files(served.path(), &files);
+    let (addr, hits) = http_server(served.path().to_path_buf(), false).await;
+    let torrent = make(&mut files, false, Some(&format!("http://{addr}/")));
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    let mut c = config();
+    c.web_seed = None;
+    let session = Session::new(c).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = session
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+    let stats = handle.stats().await.unwrap();
+    assert_eq!(stats.pieces_have, 0);
     session.shutdown().await;
 }

@@ -6,6 +6,7 @@ use std::time::Duration;
 use dravity_dht::DhtConfig;
 use dravity_portmap::PortMapConfig;
 use dravity_tracker::ClientConfig;
+use dravity_webseed::WebSeedConfig;
 
 use crate::listen::ListenConfig;
 
@@ -65,6 +66,12 @@ pub struct SessionConfig {
     /// [`crate::Session::restore`] can bring them back after a restart.
     /// `None` keeps nothing.
     pub state_dir: Option<PathBuf>,
+    /// HTTP settings for web seeds (BEP 19: a torrent's `url-list`, a
+    /// magnet link's `ws`). `None` never contacts web seeds.
+    pub web_seed: Option<WebSeedConfig>,
+    /// Wait this long before trying a web seed again after it failed;
+    /// doubles with every failure in a row, up to 32 times as long.
+    pub web_seed_retry: Duration,
 }
 
 impl Default for SessionConfig {
@@ -89,6 +96,8 @@ impl Default for SessionConfig {
             dht_lookup_timeout: Duration::from_secs(30),
             resume_dir: None,
             state_dir: None,
+            web_seed: Some(WebSeedConfig::default()),
+            web_seed_retry: Duration::from_secs(30),
         }
     }
 }

@@ -84,6 +84,7 @@ mod status;
 mod stream;
 mod torrent;
 pub mod watch;
+mod web_seed;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -97,6 +98,7 @@ use dravity_engine::{Alert, Priority, Stats};
 use dravity_portmap::{Mapping, PortMapper};
 use dravity_storage::{FileStorage, Storage};
 use dravity_tracker::TrackerClient;
+use dravity_webseed::WebSeedClient;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
@@ -106,6 +108,7 @@ pub use dravity_portmap::{
     Mapped as PortMapped, Method as PortMapMethod, PortMapConfig, Protocol as PortMapProtocol,
     Status as PortMapStatus,
 };
+pub use dravity_webseed::WebSeedConfig;
 pub use error::SessionError;
 pub use file_stream::{DEFAULT_READAHEAD, FileStream};
 pub use files::FileProgress;
@@ -228,6 +231,7 @@ struct Inner {
     config: Arc<SessionConfig>,
     peer_id: PeerId,
     tracker: TrackerClient,
+    web_seed: Option<WebSeedClient>,
     dht: Option<Dht>,
     alerts: broadcast::Sender<SessionAlert>,
     /// Running torrents, by info-hash, for the listener.
@@ -285,8 +289,8 @@ impl Session {
     /// once the first torrent is added.
     ///
     /// # Errors
-    /// [`SessionError::Tracker`] if the tracker HTTP/TLS client cannot be
-    /// built; [`SessionError::Listen`] if no listening socket can be bound;
+    /// [`SessionError::Tracker`] or [`SessionError::WebSeed`] if the
+    /// tracker or web seed HTTP/TLS client cannot be built; [`SessionError::Listen`] if no listening socket can be bound;
     /// [`SessionError::Dht`] if the DHT socket cannot be bound.
     pub fn new(config: SessionConfig) -> Result<Self, SessionError> {
         let suffix: Vec<u8> = std::iter::repeat_with(fastrand::alphanumeric)
@@ -295,6 +299,11 @@ impl Session {
             .collect();
         let peer_id = PeerId::with_prefix(&config.peer_id_prefix, &suffix);
         let tracker = TrackerClient::new(config.tracker.clone())?;
+        let web_seed = config
+            .web_seed
+            .as_ref()
+            .map(WebSeedClient::new)
+            .transpose()?;
         let listener = config
             .listen
             .as_ref()
@@ -310,6 +319,7 @@ impl Session {
                 config: Arc::new(config),
                 peer_id,
                 tracker,
+                web_seed,
                 dht,
                 alerts,
                 torrents: Arc::new(Mutex::new(HashMap::new())),
@@ -566,6 +576,7 @@ impl Session {
             info_hash,
             trackers: prepare_tiers(trackers),
             tracker: self.inner.tracker.clone(),
+            web_seed: self.inner.web_seed.clone(),
             dht: self.inner.dht.clone(),
             peer_id: self.inner.peer_id,
             config: Arc::clone(&self.inner.config),

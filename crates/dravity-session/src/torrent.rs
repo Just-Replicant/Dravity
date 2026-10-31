@@ -42,6 +42,7 @@ use dravity_storage::{
     write_block,
 };
 use dravity_tracker::{AnnounceRequest, AnnounceResponse, TrackerClient};
+use dravity_webseed::WebSeedClient;
 use dravity_wire::{Message, Reserved};
 use futures_util::StreamExt;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
@@ -56,6 +57,7 @@ use crate::peer::{self, PeerCommand, PeerParams};
 use crate::persist::Persister;
 use crate::status::{self, PeerStatus, TrackerLog, TrackerOutcome, TrackerStatus, Transport};
 use crate::stream::PeerStream;
+use crate::web_seed::{self, WebSeedParams};
 
 /// Tracker tiers (BEP 12), shared with announce tasks so a tracker that
 /// answered moves to the front of its tier.
@@ -76,6 +78,16 @@ pub(crate) enum Input {
         retry: bool,
     },
     Disconnected {
+        key: PeerKey,
+    },
+    /// A web seed resolved its host and serves the torrent (it then sends
+    /// its bitfield and an unchoke like any peer).
+    WebSeedReady {
+        key: PeerKey,
+        addr: SocketAddr,
+    },
+    /// A web seed could not start (its host did not resolve).
+    WebSeedFailed {
         key: PeerKey,
     },
     Message {
@@ -153,6 +165,8 @@ pub(crate) struct TorrentContext {
     pub(crate) info_hash: InfoHash,
     pub(crate) trackers: Tiers,
     pub(crate) tracker: TrackerClient,
+    /// HTTP client for web seeds, unless they are disabled.
+    pub(crate) web_seed: Option<WebSeedClient>,
     pub(crate) dht: Option<Dht>,
     pub(crate) peer_id: PeerId,
     pub(crate) config: Arc<SessionConfig>,
@@ -218,6 +232,18 @@ pub(crate) enum Source {
     Magnet(MagnetStart),
 }
 
+/// One web seed of a torrent.
+#[derive(Debug)]
+struct WebSeed {
+    url: String,
+    /// The peer slot while a task runs for it.
+    key: Option<PeerKey>,
+    /// Not started again before this.
+    retry_at: Instant,
+    /// Failures in a row (reset when data arrives).
+    failures: u32,
+}
+
 /// What a magnet link's task needs once its metadata arrives.
 #[derive(Debug, Clone)]
 pub(crate) struct MagnetStart {
@@ -280,6 +306,10 @@ pub(crate) struct TorrentTask {
     peers: HashMap<PeerKey, mpsc::Sender<PeerCommand>>,
     /// Peers connected over uTP (the rest use TCP). Pruned against `peers`.
     utp_peers: HashSet<PeerKey>,
+    /// The torrent's web seeds (BEP 19) and their peer slots.
+    web_seeds: Vec<WebSeed>,
+    /// Web seeds the engine knows as peers.
+    web_peers: HashSet<PeerKey>,
     /// The last announce outcome per tracker URL.
     tracker_log: TrackerLog,
     next_key: u64,
@@ -352,7 +382,7 @@ impl TorrentTask {
         };
         let (events_tx, events_rx) = mpsc::channel(ctx.config.event_queue.max(1));
         let hash_slots = Arc::new(Semaphore::new(ctx.config.hash_workers.max(1)));
-        Self {
+        let mut task = Self {
             ctx,
             phase,
             content,
@@ -360,6 +390,8 @@ impl TorrentTask {
             metadata: None,
             peers: HashMap::new(),
             utp_peers: HashSet::new(),
+            web_seeds: Vec::new(),
+            web_peers: HashSet::new(),
             tracker_log: TrackerLog::default(),
             next_key: 0,
             events_tx,
@@ -372,6 +404,94 @@ impl TorrentTask {
             file_priorities,
             waiters: HashMap::new(),
             streams: BTreeMap::new(),
+        };
+        task.load_web_seeds();
+        task
+    }
+
+    /// Takes the web seeds of the content (once it is known).
+    fn load_web_seeds(&mut self) {
+        let Some(content) = &self.content else {
+            return;
+        };
+        if self.ctx.web_seed.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        self.web_seeds = content
+            .metainfo
+            .web_seeds()
+            .iter()
+            .map(|url| WebSeed {
+                url: url.clone(),
+                key: None,
+                retry_at: now,
+                failures: 0,
+            })
+            .collect();
+    }
+
+    /// Starts web seeds that are due while the torrent downloads, and
+    /// closes them once it does not (finished, checking, paused…): a web
+    /// seed only ever gives, and holding its slot helps nobody.
+    fn maintain_web_seeds(&mut self) {
+        if self.web_seeds.is_empty() {
+            return;
+        }
+        let (Some(client), Some(content)) = (self.ctx.web_seed.clone(), self.content.clone())
+        else {
+            return;
+        };
+        let downloading = matches!(self.phase, Phase::Download(_))
+            && self.phase.status() == TorrentStatus::Downloading;
+        if !downloading {
+            let open: Vec<PeerKey> = self
+                .web_seeds
+                .iter_mut()
+                .filter_map(|s| s.key.take())
+                .collect();
+            for key in open {
+                self.peers.remove(&key);
+                if self.web_peers.remove(&key) {
+                    self.local.push_back(Event::PeerDisconnected { peer: key });
+                }
+            }
+            return;
+        }
+        let now = Instant::now();
+        for i in 0..self.web_seeds.len() {
+            let due = self
+                .web_seeds
+                .get(i)
+                .is_some_and(|s| s.key.is_none() && s.retry_at <= now);
+            if !due {
+                continue;
+            }
+            let (key, rx) = self.new_peer();
+            let Some(seed) = self.web_seeds.get_mut(i) else {
+                continue;
+            };
+            seed.key = Some(key);
+            let params = WebSeedParams {
+                key,
+                url: seed.url.clone(),
+                metainfo: Arc::clone(&content.metainfo),
+                client: client.clone(),
+            };
+            tokio::spawn(web_seed::run(params, self.events_tx.clone(), rx));
+        }
+    }
+
+    /// A web seed's connection ended without us closing it: try the URL
+    /// again after a back-off that doubles with each failure in a row.
+    fn web_seed_gone(&mut self, key: PeerKey) {
+        self.web_peers.remove(&key);
+        let base = self.ctx.config.web_seed_retry;
+        if let Some(seed) = self.web_seeds.iter_mut().find(|s| s.key == Some(key)) {
+            seed.key = None;
+            seed.failures = seed.failures.saturating_add(1);
+            let factor = 1u32 << seed.failures.saturating_sub(1).min(5);
+            seed.retry_at = Instant::now() + base.saturating_mul(factor);
         }
     }
 
@@ -411,8 +531,11 @@ impl TorrentTask {
                 };
                 self.utp_peers.retain(|key| self.peers.contains_key(key));
                 let utp = &self.utp_peers;
+                let web = &self.web_peers;
                 let _ = reply.send(status::peers(peers, |p| {
-                    if utp.contains(&p.key) {
+                    if web.contains(&p.key) {
+                        Transport::Web
+                    } else if utp.contains(&p.key) {
                         Transport::Utp
                     } else {
                         Transport::Tcp
@@ -551,7 +674,10 @@ impl TorrentTask {
                     Some(event) => event,
                     None => continue,
                 },
-                _ = tick.tick() => Event::Tick,
+                _ = tick.tick() => {
+                    self.maintain_web_seeds();
+                    Event::Tick
+                }
                 // Reap finished background work so the set does not grow.
                 Some(_) = self.background.join_next(), if !self.background.is_empty() => continue,
                 () = await_port_change(&mut self.ctx.port_map) => {
@@ -678,12 +804,37 @@ impl TorrentTask {
             }
             Input::Disconnected { key } => {
                 self.utp_peers.remove(&key);
+                self.web_seed_gone(key);
                 self.peers.remove(&key)?;
                 Event::PeerDisconnected { peer: key }
+            }
+            Input::WebSeedReady { key, addr } => {
+                if !self.peers.contains_key(&key) {
+                    return None;
+                }
+                self.web_peers.insert(key);
+                // An "incoming" peer: never dialed back, never shared over
+                // PEX. No extension bits: it only answers requests.
+                Event::PeerAccepted {
+                    peer: key,
+                    addr,
+                    reserved: Reserved::new(),
+                }
+            }
+            Input::WebSeedFailed { key } => {
+                self.peers.remove(&key);
+                self.web_seed_gone(key);
+                return None;
             }
             Input::Message { key, message } => {
                 if !self.peers.contains_key(&key) {
                     return None;
+                }
+                if matches!(message, Message::Piece { .. })
+                    && self.web_peers.contains(&key)
+                    && let Some(seed) = self.web_seeds.iter_mut().find(|s| s.key == Some(key))
+                {
+                    seed.failures = 0;
                 }
                 Event::Message { peer: key, message }
             }
@@ -776,6 +927,7 @@ impl TorrentTask {
             .with_priorities(&self.piece_priorities(&content)),
         };
         self.content = Some(content);
+        self.load_web_seeds();
         // Swap in a throwaway (allocation-free) metadata state to take the
         // real one by value.
         let placeholder = MetadataState::new(self.ctx.info_hash, Config::default());
@@ -866,11 +1018,13 @@ impl TorrentTask {
                 if tx.try_send(PeerCommand::Send(message)).is_err() {
                     // Full (too slow) or closed: drop the peer.
                     self.peers.remove(&peer);
+                    self.web_seed_gone(peer);
                     self.local.push_back(Event::PeerDisconnected { peer });
                 }
             }
             Effect::Disconnect { peer } => {
                 self.peers.remove(&peer);
+                self.web_seed_gone(peer);
             }
             Effect::WriteBlock { block, data } => self.write(block, data),
             Effect::HashPiece { piece } => self.hash(piece),

@@ -29,6 +29,9 @@ pub enum SessionError {
     /// returns such a link.
     #[error("magnet link has no info-hash")]
     MagnetWithoutInfoHash,
+    /// The web seed HTTP/TLS client could not be built.
+    #[error(transparent)]
+    WebSeed(#[from] dravity_webseed::WebSeedError),
     /// The torrent is not in the session.
     #[error("torrent {0} is not in the session")]
     Unknown(InfoHash),

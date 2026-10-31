@@ -21,6 +21,7 @@ dravity-portmap.workspace = true
 dravity-storage.workspace = true
 dravity-tracker.workspace = true
 dravity-utp.workspace = true
+dravity-webseed.workspace = true
 dravity-wire.workspace = true
 fastrand.workspace = true
 futures-util.workspace = true

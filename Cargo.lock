@@ -754,6 +754,7 @@ dependencies = [
  "dravity-storage",
  "dravity-tracker",
  "dravity-utp",
+ "dravity-webseed",
  "dravity-wire",
  "fastrand",
  "futures-util",

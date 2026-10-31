@@ -15,15 +15,18 @@ pub enum Transport {
     Tcp,
     /// uTP (BEP 29).
     Utp,
+    /// An HTTP(S) web seed (BEP 19).
+    Web,
 }
 
 impl Transport {
-    /// Short lowercase name (`tcp`, `utp`).
+    /// Short lowercase name (`tcp`, `utp`, `web`).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Tcp => "tcp",
             Self::Utp => "utp",
+            Self::Web => "web",
         }
     }
 }
@@ -34,7 +37,7 @@ impl Transport {
 pub struct PeerStatus {
     /// Address, pieces, byte totals and choke/interest flags.
     pub info: PeerInfo,
-    /// TCP or uTP.
+    /// TCP, uTP, or a web seed.
     pub transport: Transport,
 }
 

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use dravity_dht::DhtConfig;
+use dravity_mse::Policy;
 use dravity_portmap::PortMapConfig;
 use dravity_tracker::ClientConfig;
 use dravity_webseed::WebSeedConfig;
@@ -107,6 +108,14 @@ pub struct SessionConfig {
     /// How file data is read and written for torrents whose storage the
     /// session creates (not for [`AddTorrentOptions::with_storage`](crate::AddTorrentOptions::with_storage)).
     pub storage_backend: StorageBackend,
+    /// Message Stream Encryption (MSE/PE) for peer connections over TCP and
+    /// uTP. [`Enabled`](Policy::Enabled) (the default) accepts encrypted
+    /// and plain incoming connections and dials encrypted first, redialing
+    /// in plaintext if the peer does not speak MSE;
+    /// [`Required`](Policy::Required) only makes and accepts RC4-encrypted
+    /// connections; [`Disabled`](Policy::Disabled) never encrypts. MSE is
+    /// obfuscation against traffic shaping, not authenticated security.
+    pub encryption: Policy,
 }
 
 impl Default for SessionConfig {
@@ -134,6 +143,7 @@ impl Default for SessionConfig {
             web_seed: Some(WebSeedConfig::default()),
             web_seed_retry: Duration::from_secs(30),
             storage_backend: StorageBackend::Blocking,
+            encryption: Policy::Enabled,
         }
     }
 }

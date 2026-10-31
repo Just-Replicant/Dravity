@@ -39,6 +39,8 @@ pub struct PeerStatus {
     pub info: PeerInfo,
     /// TCP, uTP, or a web seed.
     pub transport: Transport,
+    /// Whether the connection is RC4-encrypted (MSE).
+    pub encrypted: bool,
 }
 
 /// The last answer one tracker gave.
@@ -116,16 +118,21 @@ impl TrackerLog {
     }
 }
 
-/// Joins the engine's peer list with the transports the owner knows.
+/// Joins the engine's peer list with what the owner knows about each
+/// connection: its transport and whether it is encrypted.
 pub(crate) fn peers(
     infos: Vec<PeerInfo>,
-    transport: impl Fn(&PeerInfo) -> Transport,
+    connection: impl Fn(&PeerInfo) -> (Transport, bool),
 ) -> Vec<PeerStatus> {
     infos
         .into_iter()
-        .map(|info| PeerStatus {
-            transport: transport(&info),
-            info,
+        .map(|info| {
+            let (transport, encrypted) = connection(&info);
+            PeerStatus {
+                transport,
+                encrypted,
+                info,
+            }
         })
         .collect()
 }

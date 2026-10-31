@@ -72,6 +72,8 @@ pub(crate) enum Input {
         addr: SocketAddr,
         reserved: Reserved,
         transport: Transport,
+        /// RC4-encrypted (MSE).
+        encrypted: bool,
     },
     ConnectFailed {
         key: PeerKey,
@@ -331,6 +333,8 @@ pub(crate) struct TorrentTask {
     peers: HashMap<PeerKey, mpsc::Sender<PeerCommand>>,
     /// Peers connected over uTP (the rest use TCP). Pruned against `peers`.
     utp_peers: HashSet<PeerKey>,
+    /// Peers whose connection is RC4-encrypted (MSE).
+    encrypted_peers: HashSet<PeerKey>,
     /// The torrent's web seeds (BEP 19) and their peer slots.
     web_seeds: Vec<WebSeed>,
     /// Web seeds the engine knows as peers.
@@ -416,6 +420,7 @@ impl TorrentTask {
             metadata: None,
             peers: HashMap::new(),
             utp_peers: HashSet::new(),
+            encrypted_peers: HashSet::new(),
             web_seeds: Vec::new(),
             web_peers: HashSet::new(),
             tracker_log: TrackerLog::default(),
@@ -556,16 +561,20 @@ impl TorrentTask {
                     Phase::Download(state) => state.peers(),
                 };
                 self.utp_peers.retain(|key| self.peers.contains_key(key));
+                self.encrypted_peers
+                    .retain(|key| self.peers.contains_key(key));
                 let utp = &self.utp_peers;
                 let web = &self.web_peers;
+                let encrypted = &self.encrypted_peers;
                 let _ = reply.send(status::peers(peers, |p| {
-                    if web.contains(&p.key) {
+                    let transport = if web.contains(&p.key) {
                         Transport::Web
                     } else if utp.contains(&p.key) {
                         Transport::Utp
                     } else {
                         Transport::Tcp
-                    }
+                    };
+                    (transport, encrypted.contains(&p.key))
                 }));
                 None
             }
@@ -814,12 +823,16 @@ impl TorrentTask {
                 addr,
                 reserved,
                 transport,
+                encrypted,
             } => {
                 if !self.peers.contains_key(&key) {
                     return None;
                 }
                 if transport == Transport::Utp {
                     self.utp_peers.insert(key);
+                }
+                if encrypted {
+                    self.encrypted_peers.insert(key);
                 }
                 Event::PeerConnected {
                     peer: key,
@@ -833,6 +846,7 @@ impl TorrentTask {
             }
             Input::Disconnected { key } => {
                 self.utp_peers.remove(&key);
+                self.encrypted_peers.remove(&key);
                 self.web_seed_gone(key);
                 self.peers.remove(&key)?;
                 Event::PeerDisconnected { peer: key }
@@ -1222,6 +1236,9 @@ impl TorrentTask {
         if stream.kind() == Transport::Utp {
             self.utp_peers.insert(key);
         }
+        if stream.encrypted() {
+            self.encrypted_peers.insert(key);
+        }
         tokio::spawn(peer::run_accepted(
             key,
             addr,
@@ -1248,6 +1265,7 @@ impl TorrentTask {
             connect_timeout: self.ctx.config.connect_timeout,
             utp: self.ctx.utp.for_addr(addr).cloned(),
             prefer_utp: self.ctx.config.prefer_utp,
+            encryption: self.ctx.config.encryption,
         };
         // Peer tasks are not in `background`: dropping their command sender
         // ends them, and they must not delay shutdown.

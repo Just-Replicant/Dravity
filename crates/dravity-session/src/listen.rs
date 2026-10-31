@@ -3,7 +3,10 @@
 //! The session binds one TCP socket per address family (IPv6 with
 //! `IPV6_V6ONLY`, so both families can share a port on every platform),
 //! and with uTP enabled a UDP socket on the same port for each. One accept
-//! task per socket reads the remote handshake, routes the connection
+//! task per socket tells a plain BitTorrent handshake from an MSE one (and
+//! runs the MSE handshake, finding the torrent from its obfuscated hash, as
+//! [`SessionConfig::encryption`](crate::SessionConfig::encryption) allows),
+//! reads the remote handshake, routes the connection
 //! to the torrent named by its info-hash, answers with our handshake and
 //! hands the stream to that torrent's task, which runs it like a dialed
 //! peer. Unknown info-hashes, connections from ourselves and handshakes that
@@ -18,6 +21,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use dravity_core::{InfoHash, PeerId};
+use dravity_mse::{MseError, Policy};
 use dravity_utp::UtpSocket;
 use dravity_wire::{Handshake, Reserved};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -27,7 +31,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::peer::HandshakeError;
-use crate::stream::PeerStream;
+use crate::stream::{PeerStream, RawStream};
 use crate::torrent::{Accepted, Command};
 
 /// Where to accept incoming peer connections.
@@ -225,6 +229,7 @@ pub(crate) struct Acceptor {
     pub(crate) our_id: PeerId,
     pub(crate) reserved: Reserved,
     pub(crate) handshake_timeout: Duration,
+    pub(crate) encryption: Policy,
     pub(crate) pending: Arc<Semaphore>,
 }
 
@@ -271,13 +276,13 @@ async fn accept_utp(socket: Arc<UtpSocket>, acceptor: Acceptor, stop: Cancellati
         let Ok((stream, addr)) = accepted else {
             return;
         };
-        handle(PeerStream::Utp(stream), addr, &acceptor);
+        handle(RawStream::Utp(stream), addr, &acceptor);
     }
 }
 
 /// Handshakes and routes one accepted connection in its own task, within
 /// the pending-handshake budget.
-fn handle(stream: PeerStream, addr: SocketAddr, acceptor: &Acceptor) {
+fn handle(stream: RawStream, addr: SocketAddr, acceptor: &Acceptor) {
     let Ok(permit) = Arc::clone(&acceptor.pending).try_acquire_owned() else {
         tracing::debug!(%addr, "too many incoming handshakes; closing");
         return;
@@ -285,7 +290,7 @@ fn handle(stream: PeerStream, addr: SocketAddr, acceptor: &Acceptor) {
     let acceptor = acceptor.clone();
     tokio::spawn(async move {
         let _permit = permit;
-        let transport = stream.transport();
+        let transport = stream.kind().as_str();
         if let Err(e) = route(stream, addr, &acceptor).await {
             tracing::debug!(%addr, transport, error = %e, "incoming connection dropped");
         }
@@ -311,31 +316,42 @@ async fn accept_loop(listener: TcpListener, acceptor: Acceptor, stop: Cancellati
         if let Err(e) = stream.set_nodelay(true) {
             tracing::debug!(%addr, error = %e, "set_nodelay failed");
         }
-        handle(PeerStream::Tcp(stream), addr, &acceptor);
+        handle(RawStream::Tcp(stream), addr, &acceptor);
     }
 }
 
 /// Handshakes an accepted connection and hands it to its torrent.
 async fn route(
-    mut stream: PeerStream,
+    stream: RawStream,
     addr: SocketAddr,
     acceptor: &Acceptor,
 ) -> Result<(), HandshakeError> {
-    let lookup = |hash: &InfoHash| {
-        acceptor
-            .registry
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(hash)
-            .filter(|tx| !tx.is_closed())
-            .cloned()
-    };
-    let (theirs, leftover, torrent) = tokio::time::timeout(
-        acceptor.handshake_timeout,
-        accept_handshake(&mut stream, acceptor.our_id, acceptor.reserved, lookup),
-    )
-    .await
-    .map_err(|_| HandshakeError::Timeout)??;
+    let (stream, theirs, leftover, torrent) =
+        tokio::time::timeout(acceptor.handshake_timeout, async {
+            let (mut stream, skey) = decrypt(stream, acceptor).await?;
+            let lookup = |hash: &InfoHash| {
+                if skey.is_some_and(|skey| skey != *hash) {
+                    // The BitTorrent handshake must name the torrent the
+                    // MSE handshake was for.
+                    return None;
+                }
+                acceptor
+                    .registry
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(hash)
+                    .filter(|tx| !tx.is_closed())
+                    .cloned()
+            };
+            let (theirs, leftover, torrent) =
+                accept_handshake(&mut stream, acceptor.our_id, acceptor.reserved, lookup).await?;
+            Ok::<_, HandshakeError>((stream, theirs, leftover, torrent))
+        })
+        .await
+        .map_err(|_| HandshakeError::Timeout)??;
+    if stream.encrypted() {
+        tracing::trace!(%addr, "incoming connection is encrypted");
+    }
     let accepted = Accepted {
         stream,
         addr,
@@ -346,6 +362,50 @@ async fn route(
     torrent
         .try_send(Command::Incoming(accepted))
         .map_err(|_| HandshakeError::Busy)
+}
+
+/// Tells a plain BitTorrent handshake from an MSE one by its first bytes
+/// and, for MSE, runs the responder side. Returns the stream (with the
+/// bytes read so far still to be read) and, for MSE, the torrent it named.
+async fn decrypt(
+    mut raw: RawStream,
+    acceptor: &Acceptor,
+) -> Result<(PeerStream, Option<InfoHash>), HandshakeError> {
+    if acceptor.encryption == Policy::Disabled {
+        return Ok((PeerStream::plain(raw), None));
+    }
+    let mut first = Vec::with_capacity(64);
+    let plaintext = loop {
+        if let Some(plaintext) = dravity_mse::is_plaintext_handshake(&first) {
+            break plaintext;
+        }
+        if raw.read_buf(&mut first).await? == 0 {
+            return Err(HandshakeError::Eof);
+        }
+    };
+    if plaintext {
+        if !acceptor.encryption.allows_plaintext_handshake() {
+            return Err(HandshakeError::EncryptionRequired);
+        }
+        return Ok((PeerStream::plain(raw).with_prefix(first), None));
+    }
+    let lookup = |req2: &[u8; 20]| {
+        acceptor
+            .registry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(_, tx)| !tx.is_closed())
+            .map(|(hash, _)| *hash.as_bytes())
+            .find(|hash| dravity_mse::req2_hash(hash) == *req2)
+    };
+    let (stream, skey) = dravity_mse::respond(raw, &first, acceptor.encryption.methods(), lookup)
+        .await
+        .map_err(|e| match e {
+            MseError::UnknownTorrent => HandshakeError::WrongInfoHash,
+            e => e.into(),
+        })?;
+    Ok((PeerStream::mse(stream), Some(InfoHash::new(skey))))
 }
 
 /// Reads the remote handshake, finds its torrent with `lookup`, then sends

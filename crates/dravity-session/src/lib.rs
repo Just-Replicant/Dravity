@@ -104,6 +104,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub use codec::{CodecError, PeerCodec};
 pub use config::{SessionConfig, StorageBackend};
+pub use dravity_mse::Policy as EncryptionPolicy;
 pub use dravity_portmap::{
     Mapped as PortMapped, Method as PortMapMethod, PortMapConfig, Protocol as PortMapProtocol,
     Status as PortMapStatus,
@@ -404,6 +405,7 @@ impl Session {
             our_id: self.inner.peer_id,
             reserved: peer::our_reserved(config.engine.fast_extension),
             handshake_timeout: config.connect_timeout.max(Duration::from_secs(1)),
+            encryption: config.encryption,
             pending: Arc::new(Semaphore::new(
                 config.listen.as_ref().map_or(1, |l| l.max_pending.max(1)),
             )),

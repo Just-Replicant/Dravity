@@ -341,6 +341,7 @@ dependencies = [
  "rc4",
  "sha1",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -362,6 +363,7 @@ dependencies = [
  "dravity-core",
  "dravity-dht",
  "dravity-engine",
+ "dravity-mse",
  "dravity-portmap",
  "dravity-storage",
  "dravity-tracker",

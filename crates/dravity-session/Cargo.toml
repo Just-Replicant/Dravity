@@ -21,6 +21,7 @@ dravity-bencode.workspace = true
 dravity-core.workspace = true
 dravity-dht.workspace = true
 dravity-engine.workspace = true
+dravity-mse.workspace = true
 dravity-portmap.workspace = true
 dravity-storage.workspace = true
 dravity-tracker.workspace = true

@@ -22,8 +22,8 @@ use dravity_core::{InfoHash, Magnet, Metainfo, PeerId};
 use dravity_dht::{Dht, Testnet};
 use dravity_engine::{Alert, Bitfield, TorrentStatus};
 use dravity_session::{
-    AddTorrentOptions, ListenConfig, PeerCodec, Session, SessionAlert, SessionConfig,
-    TrackerOutcome, Transport,
+    AddTorrentOptions, EncryptionPolicy, ListenConfig, PeerCodec, Session, SessionAlert,
+    SessionConfig, TrackerOutcome, Transport,
 };
 use dravity_wire::{
     ExtendedHandshake, Handshake, METADATA_PIECE_LEN, Message, MetadataMessage, PexMessage,
@@ -944,7 +944,10 @@ async fn dials_fall_back_to_utp_when_tcp_is_refused() {
     .unwrap();
     let addr = peer.local_addr();
     let dir = tempfile::tempdir().unwrap();
-    let session = Session::new(config()).unwrap();
+    // The test peer reads a plain handshake.
+    let mut c = config();
+    c.encryption = EncryptionPolicy::Disabled;
+    let session = Session::new(c).unwrap();
     let _handle = session
         .add_torrent(
             metainfo,

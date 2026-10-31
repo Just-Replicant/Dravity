@@ -425,6 +425,8 @@ dependencies = [
  "rustls",
  "rustls-platform-verifier",
  "thiserror",
+ "tokio",
+ "url",
 ]
 
 [[package]]

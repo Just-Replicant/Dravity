@@ -1284,7 +1284,7 @@ impl TorrentTask {
                     content.storage.as_ref(),
                     content.metainfo.info().layout(),
                     block,
-                    &data,
+                    data,
                 )
             })
             .await;

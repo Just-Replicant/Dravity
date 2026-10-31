@@ -12,6 +12,7 @@ categories = ["filesystem", "network-programming"]
 publish.workspace = true
 
 [dependencies]
+bytes.workspace = true
 dravity-bencode.workspace = true
 dravity-core.workspace = true
 thiserror.workspace = true
@@ -28,7 +29,6 @@ tokio-uring = { workspace = true, optional = true }
 uring = ["dep:tokio", "dep:tokio-uring"]
 
 [dev-dependencies]
-bytes.workspace = true
 criterion.workspace = true
 sha1.workspace = true
 tempfile.workspace = true

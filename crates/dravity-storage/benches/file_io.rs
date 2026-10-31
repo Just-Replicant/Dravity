@@ -90,7 +90,7 @@ fn file_io(c: &mut Criterion) {
         group.bench_function(format!("{name}/write_blocks"), |b| {
             b.iter(|| {
                 for (block, data) in &blocks {
-                    write_block(&storage, layout, *block, data).unwrap();
+                    write_block(&storage, layout, *block, data.clone()).unwrap();
                 }
             });
         });

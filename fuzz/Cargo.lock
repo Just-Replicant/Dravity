@@ -383,6 +383,7 @@ dependencies = [
 name = "dravity-storage"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "dravity-bencode",
  "dravity-core",
  "rustix",

@@ -14,6 +14,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use dravity_bencode::{Dict, Value};
 use dravity_core::Metainfo;
 use dravity_storage::{BlockingIo, FileIo, FileStorage, Storage, UringIo, verify_piece};
@@ -177,11 +178,82 @@ fn uring_flushes_through_the_ring() {
         .write(true)
         .open(&path)
         .unwrap();
-    io.write_all_at(&file, b"durable", 3).unwrap();
-    io.sync_data(&file).unwrap();
+    let file = io.adopt(file).unwrap();
+    file.write_all_at(Bytes::from_static(b"durable"), 3)
+        .unwrap();
+    file.sync_data().unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"\0\0\0durable");
+    // Reads append to the buffer they are given and hand it back.
+    let back = file.read_exact_at(b"x".to_vec(), 4, 5).unwrap();
+    assert_eq!(back, b"xrabl");
+    let mut slice = [0; 3];
+    file.read_slice_at(&mut slice, 0).unwrap();
+    assert_eq!(slice, [0; 3]);
     // A read-only descriptor still flushes, as with `File::sync_data`.
-    let read_only = std::fs::File::open(&path).unwrap();
-    io.sync_data(&read_only).unwrap();
-    BlockingIo.sync_data(&read_only).unwrap();
+    let read_only = io.adopt(std::fs::File::open(&path).unwrap()).unwrap();
+    read_only.sync_data().unwrap();
+    let blocking = BlockingIo
+        .adopt(std::fs::File::open(&path).unwrap())
+        .unwrap();
+    blocking.sync_data().unwrap();
+}
+
+#[test]
+fn uring_closes_files_when_the_cache_drops_them() {
+    let Some(io) = uring() else { return };
+    let (m, content) = torrent();
+    let dir = tempfile::tempdir().unwrap();
+    // One open file at a time: every switch between the two files evicts
+    // (flushes and closes) the other on the ring.
+    let storage = FileStorage::new(dir.path(), m.info())
+        .unwrap()
+        .with_io(Arc::new(io))
+        .with_max_open_files(1);
+    let fds = || std::fs::read_dir("/proc/self/fd").map(Iterator::count).ok();
+    let before = fds();
+    for _ in 0..50 {
+        storage
+            .write_bytes(0, Bytes::copy_from_slice(&content))
+            .unwrap();
+        assert_eq!(storage.open_files(), 1);
+    }
+    assert_eq!(storage.read_vec(0, content.len()).unwrap(), content);
+    drop(storage);
+    // Closing happens on the ring thread right after the drop.
+    let mut after = fds();
+    for _ in 0..100 {
+        if after <= before {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        after = fds();
+    }
+    assert!(
+        after <= before,
+        "descriptors leaked: {before:?} -> {after:?}"
+    );
+}
+
+#[test]
+fn owned_buffers_round_trip_across_files() {
+    let Some(io) = uring() else { return };
+    let (m, content) = torrent();
+    let dir = tempfile::tempdir().unwrap();
+    let storage = FileStorage::new(dir.path(), m.info())
+        .unwrap()
+        .with_io(Arc::new(io));
+    let data = Bytes::copy_from_slice(&content);
+    for chunk in (0..content.len()).step_by(7_777) {
+        let end = (chunk + 7_777).min(content.len());
+        storage
+            .write_bytes(chunk as u64, data.slice(chunk..end))
+            .unwrap();
+    }
+    for chunk in (0..content.len()).step_by(9_999) {
+        let end = (chunk + 9_999).min(content.len());
+        assert_eq!(
+            storage.read_vec(chunk as u64, end - chunk).unwrap(),
+            content[chunk..end]
+        );
+    }
 }

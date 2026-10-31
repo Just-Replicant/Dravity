@@ -9,7 +9,8 @@
 //!   positional reads/writes (no seek per block).
 //! * [`MemoryStorage`] — a byte buffer, for tests and small torrents.
 //!
-//! [`FileStorage`] performs its reads and writes through a [`FileIo`]:
+//! [`FileStorage`] performs its reads and writes through a [`FileIo`], which
+//! adopts each file the storage opens as an [`OpenFile`]:
 //! [`BlockingIo`] (`pread`/`pwrite`, the default) or, with the `uring`
 //! feature on Linux, `UringIo` (io_uring through `tokio-uring` on a
 //! dedicated thread; see its docs for falling back when the kernel or a
@@ -30,11 +31,12 @@ pub mod resume;
 #[cfg(all(feature = "uring", target_os = "linux"))]
 mod uring;
 
+use bytes::Bytes;
 use dravity_core::{BlockRef, Info, PieceLayout};
 
 pub use error::StorageError;
 pub use file::{DEFAULT_MAX_OPEN_FILES, FileStorage};
-pub use io::{BlockingIo, FileIo};
+pub use io::{BlockingIo, FileIo, OpenFile};
 pub use memory::MemoryStorage;
 pub use resume::{FileStamp, ResumeData, ResumeError, load_resume, remove_resume, save_resume};
 #[cfg(all(feature = "uring", target_os = "linux"))]
@@ -67,6 +69,28 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     /// or an I/O error (including data that was never written to disk).
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StorageError>;
 
+    /// Writes owned `data` at content offset `offset`. Backends that hand
+    /// buffers to the kernel (io_uring) move it there instead of copying;
+    /// the default borrows it for [`write_at`](Self::write_at).
+    ///
+    /// # Errors
+    /// As [`write_at`](Self::write_at).
+    fn write_bytes(&self, offset: u64, data: Bytes) -> Result<(), StorageError> {
+        self.write_at(offset, &data)
+    }
+
+    /// Reads `len` bytes from content offset `offset` into a new vector.
+    /// Backends that need owned buffers fill it in place; the default
+    /// zero-fills it for [`read_at`](Self::read_at).
+    ///
+    /// # Errors
+    /// As [`read_at`](Self::read_at).
+    fn read_vec(&self, offset: u64, len: usize) -> Result<Vec<u8>, StorageError> {
+        let mut buf = vec![0; len];
+        self.read_at(offset, &mut buf)?;
+        Ok(buf)
+    }
+
     /// Flushes written data to durable storage.
     ///
     /// # Errors
@@ -92,7 +116,8 @@ pub(crate) fn check_range(offset: u64, len: usize, total: u64) -> Result<(), Sto
     }
 }
 
-/// Writes one received block.
+/// Writes one received block, handing `data` to the backend without
+/// copying it.
 ///
 /// # Errors
 /// [`StorageError::InvalidBlock`] if `block` is not valid for `layout` or
@@ -101,13 +126,13 @@ pub fn write_block(
     storage: &dyn Storage,
     layout: &PieceLayout,
     block: BlockRef,
-    data: &[u8],
+    data: Bytes,
 ) -> Result<(), StorageError> {
     let len_ok = usize::try_from(block.length).is_ok_and(|l| l == data.len());
     let start = layout.piece_offset(block.piece);
     match start {
         Some(start) if len_ok && layout.is_valid_request(block) => {
-            storage.write_at(start + u64::from(block.offset), data)
+            storage.write_bytes(start + u64::from(block.offset), data)
         }
         _ => Err(StorageError::InvalidBlock(block)),
     }
@@ -127,9 +152,7 @@ pub fn read_block(
     let len = usize::try_from(block.length);
     match (start, len) {
         (Some(start), Ok(len)) if layout.is_valid_request(block) => {
-            let mut buf = vec![0u8; len];
-            storage.read_at(start + u64::from(block.offset), &mut buf)?;
-            Ok(buf)
+            storage.read_vec(start + u64::from(block.offset), len)
         }
         _ => Err(StorageError::InvalidBlock(block)),
     }
@@ -158,11 +181,9 @@ pub fn verify_piece(storage: &dyn Storage, info: &Info, piece: u32) -> Result<bo
         offset: range.start,
         len: usize::MAX,
     })?;
-    let mut buf = vec![0u8; len];
-    match storage.read_at(range.start, &mut buf) {
-        Ok(()) => {}
-        Err(e) if e.is_missing_data() => return Ok(false),
-        Err(e) => return Err(e),
+    match storage.read_vec(range.start, len) {
+        Ok(buf) => Ok(info.check_piece(piece, &buf)),
+        Err(e) if e.is_missing_data() => Ok(false),
+        Err(e) => Err(e),
     }
-    Ok(info.check_piece(piece, &buf))
 }

@@ -49,7 +49,6 @@ use futures_util::StreamExt;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use crate::SessionAlert;
 use crate::catalog::{Catalog, EntrySource};
 use crate::config::SessionConfig;
 use crate::files::{self, FileProgress};
@@ -59,6 +58,7 @@ use crate::persist::Persister;
 use crate::status::{self, PeerStatus, TrackerLog, TrackerOutcome, TrackerStatus, Transport};
 use crate::stream::PeerStream;
 use crate::web_seed::{self, WebSeedParams};
+use crate::{EncryptionPolicy, SessionAlert};
 
 /// Tracker tiers (BEP 12), shared with announce tasks so a tracker that
 /// answered moves to the front of its tier.
@@ -1400,6 +1400,7 @@ impl TorrentTask {
             },
             num_want: Some(self.ctx.config.num_want),
             key: self.ctx.tracker_key,
+            crypto: crypto_support(self.ctx.config.encryption),
         }
     }
 }
@@ -1710,6 +1711,17 @@ fn owned_layers(metainfo: &Metainfo) -> PieceLayers {
         .collect()
 }
 
+/// What the trackers hear about encryption under `policy` (MSE's
+/// `supportcrypto` / `requirecrypto`).
+fn crypto_support(policy: EncryptionPolicy) -> dravity_tracker::CryptoSupport {
+    match policy {
+        EncryptionPolicy::Disabled => dravity_tracker::CryptoSupport::None,
+        EncryptionPolicy::Required => dravity_tracker::CryptoSupport::Required,
+        // `Enabled`, and any later mode that still accepts encryption.
+        _ => dravity_tracker::CryptoSupport::Supported,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -1718,9 +1730,27 @@ mod tests {
     use dravity_tracker::AnnounceResponse;
 
     use super::{
-        AnnounceMerge, announce_port, announce_tier, dht_lookup_failed, error_chain, prepare_tiers,
-        promote,
+        AnnounceMerge, announce_port, announce_tier, crypto_support, dht_lookup_failed,
+        error_chain, prepare_tiers, promote,
     };
+
+    #[test]
+    fn trackers_hear_the_encryption_policy() {
+        use crate::EncryptionPolicy;
+        use dravity_tracker::CryptoSupport;
+        assert_eq!(
+            crypto_support(EncryptionPolicy::Disabled),
+            CryptoSupport::None
+        );
+        assert_eq!(
+            crypto_support(EncryptionPolicy::Enabled),
+            CryptoSupport::Supported
+        );
+        assert_eq!(
+            crypto_support(EncryptionPolicy::Required),
+            CryptoSupport::Required
+        );
+    }
 
     #[test]
     fn the_mapped_port_is_announced_before_the_listen_port() {
@@ -1841,6 +1871,7 @@ mod tests {
             event: AnnounceEvent::Started,
             num_want: Some(1),
             key: 7,
+            crypto: dravity_tracker::CryptoSupport::None,
         };
         let (answer, errors) = announce_tier(
             client,

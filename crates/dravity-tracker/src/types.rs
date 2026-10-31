@@ -43,6 +43,21 @@ impl AnnounceEvent {
     }
 }
 
+/// What an announce tells HTTP trackers about connection encryption: the
+/// `supportcrypto` and `requirecrypto` parameters of the Message Stream
+/// Encryption specification. UDP trackers (BEP 15) have no such field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum CryptoSupport {
+    /// Nothing is sent: plain connections only, or no opinion.
+    #[default]
+    None,
+    /// `supportcrypto=1`: encrypted and plain connections are accepted.
+    Supported,
+    /// `supportcrypto=1&requirecrypto=1`: only encrypted connections are
+    /// accepted, so the tracker may return only peers that support them.
+    Required,
+}
+
 /// Parameters of an announce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnnounceRequest {
@@ -64,6 +79,8 @@ pub struct AnnounceRequest {
     pub num_want: Option<u32>,
     /// Random key identifying this client across IP changes.
     pub key: u32,
+    /// Connection encryption advertised to HTTP trackers.
+    pub crypto: CryptoSupport,
 }
 
 /// A successful announce.

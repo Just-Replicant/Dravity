@@ -131,6 +131,60 @@ fn info_describes_torrent() {
     assert!(text.contains(&hash.to_string()), "{text}");
     assert!(text.contains("pieces:     4 x 16.0 KiB"), "{text}");
     assert!(text.contains("udp://127.0.0.1:9/announce"), "{text}");
+    assert!(text.contains("version:    v1"), "{text}");
+    assert!(!text.contains("v2 hash"), "{text}");
+}
+
+#[test]
+fn info_describes_a_v2_torrent_with_a_web_seed() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = content();
+    let piece = 64 * 1024;
+    let root = dravity_core::merkle::file_hashes(&data, piece)
+        .unwrap()
+        .root;
+    let mut file = Dict::new();
+    file.insert(
+        Cow::Borrowed(&b""[..]),
+        dict(vec![
+            ("length", Value::Int(data.len() as i64)),
+            ("pieces root", bytes(&root)),
+        ]),
+    );
+    let mut tree = Dict::new();
+    tree.insert(Cow::Borrowed(&b"hello.bin"[..]), Value::Dict(file));
+    let encoded = dict(vec![
+        (
+            "info",
+            dict(vec![
+                ("file tree", Value::Dict(tree)),
+                ("meta version", Value::Int(2)),
+                ("name", bytes(b"hello.bin")),
+                ("piece length", Value::Int(i64::from(piece))),
+            ]),
+        ),
+        ("url-list", bytes(b"http://seed.example/files/")),
+    ])
+    .to_vec();
+    let m = Metainfo::from_bytes(&encoded).unwrap();
+    let path = dir.path().join("v2.torrent");
+    std::fs::write(&path, &encoded).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("info")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("version:    v2"), "{text}");
+    assert!(
+        text.contains(&format!("v2 hash:    {}", m.info_hash_v2().unwrap())),
+        "{text}"
+    );
+    assert!(
+        text.contains("web seed:   http://seed.example/files/"),
+        "{text}"
+    );
 }
 
 #[test]

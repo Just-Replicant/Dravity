@@ -156,6 +156,8 @@ pub(crate) struct PeerRow {
     pub(crate) peer_interested: bool,
     pub(crate) incoming: bool,
     pub(crate) utp: bool,
+    /// An HTTP web seed (BEP 19), not a BitTorrent peer.
+    pub(crate) web: bool,
 }
 
 impl From<&PeerStatus> for PeerRow {
@@ -175,13 +177,15 @@ impl From<&PeerStatus> for PeerRow {
             peer_interested: i.peer_interested,
             incoming: i.incoming,
             utp: p.transport == Transport::Utp,
+            web: p.transport == Transport::Web,
         }
     }
 }
 
 impl PeerRow {
     /// Fixed-position flags: `C` we choke them, `c` they choke us, `I` we
-    /// are interested, `i` they are interested, `<` incoming, `U` uTP;
+    /// are interested, `i` they are interested, `<` incoming, `U` uTP,
+    /// `W` web seed;
     /// `.` when unset.
     pub(crate) fn flags(&self) -> String {
         [
@@ -191,6 +195,7 @@ impl PeerRow {
             (self.peer_interested, 'i'),
             (self.incoming, '<'),
             (self.utp, 'U'),
+            (self.web, 'W'),
         ]
         .iter()
         .map(|&(on, c)| if on { c } else { '.' })
@@ -931,8 +936,18 @@ pub(crate) mod tests {
             peer_interested: false,
             incoming: true,
             utp: true,
+            web: false,
         };
-        assert_eq!(peer.flags(), "C.I.<U");
+        assert_eq!(peer.flags(), "C.I.<U.");
+        assert_eq!(
+            PeerRow {
+                utp: false,
+                web: true,
+                ..peer
+            }
+            .flags(),
+            "C.I.<.W"
+        );
         assert_eq!(peer.have(), "25.0%");
         assert_eq!(
             PeerRow {

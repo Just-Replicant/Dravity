@@ -145,6 +145,9 @@ struct NetworkArgs {
     /// Do not use the DHT for peer discovery.
     #[arg(long)]
     no_dht: bool,
+    /// Never download from HTTP web seeds (BEP 19 `url-list`, magnet `ws`).
+    #[arg(long)]
+    no_web_seeds: bool,
 }
 
 impl NetworkArgs {
@@ -169,6 +172,9 @@ impl NetworkArgs {
         config.engine.download_rate_limit = self.download_limit.filter(|&r| r > 0);
         if self.no_dht {
             config.dht = None;
+        }
+        if self.no_web_seeds {
+            config.web_seed = None;
         }
         config
     }
@@ -369,6 +375,15 @@ fn info(m: &Metainfo) -> Result<()> {
     let mut out = std::io::stdout().lock();
     writeln!(out, "name:       {}", i.name())?;
     writeln!(out, "info-hash:  {}", m.info_hash())?;
+    let version = match (i.version().has_v1(), i.version().has_v2()) {
+        (true, true) => "hybrid (v1 + v2)",
+        (false, true) => "v2",
+        _ => "v1",
+    };
+    writeln!(out, "version:    {version}")?;
+    if let Some(v2) = m.info_hash_v2() {
+        writeln!(out, "v2 hash:    {v2}")?;
+    }
     writeln!(
         out,
         "size:       {} ({} bytes)",
@@ -388,6 +403,9 @@ fn info(m: &Metainfo) -> Result<()> {
     )?;
     for (tier, urls) in m.trackers().iter().enumerate() {
         writeln!(out, "tracker:    [{tier}] {}", urls.join(" "))?;
+    }
+    for url in m.web_seeds() {
+        writeln!(out, "web seed:   {url}")?;
     }
     writeln!(
         out,

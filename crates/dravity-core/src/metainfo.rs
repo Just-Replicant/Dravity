@@ -480,11 +480,16 @@ fn build_files(specs: Vec<(Vec<String>, u64, bool)>) -> Result<Vec<FileEntry>, M
             source,
         })?;
         let comps = path.components();
-        for i in 1..comps.len() {
-            dirs.insert(comps.get(..i).unwrap_or_default().to_vec());
-        }
-        if !seen.insert(comps.to_vec()) {
-            return Err(MetainfoError::DuplicatePath(joined));
+        // BEP 47 padding files are never written, and creators reuse their
+        // names (`.pad/16384` again and again), so only real files must be
+        // unique.
+        if !padding {
+            for i in 1..comps.len() {
+                dirs.insert(comps.get(..i).unwrap_or_default().to_vec());
+            }
+            if !seen.insert(comps.to_vec()) {
+                return Err(MetainfoError::DuplicatePath(joined));
+            }
         }
         files.push(FileEntry {
             path,
@@ -496,7 +501,10 @@ fn build_files(specs: Vec<(Vec<String>, u64, bool)>) -> Result<Vec<FileEntry>, M
             .checked_add(length)
             .ok_or(LayoutError::LengthOverflow)?;
     }
-    if let Some(f) = files.iter().find(|f| dirs.contains(f.path.components())) {
+    if let Some(f) = files
+        .iter()
+        .find(|f| !f.padding && dirs.contains(f.path.components()))
+    {
         return Err(MetainfoError::PathConflict(f.path.to_string()));
     }
     Ok(files)

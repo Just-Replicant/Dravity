@@ -193,6 +193,32 @@ fn multi_file_torrent_with_metadata() {
 }
 
 #[test]
+fn padding_files_may_share_a_name() {
+    let pad = |len| {
+        dict(vec![
+            ("attr", b("p")),
+            ("length", int(len)),
+            ("path", list(vec![b(".pad"), b("6")])),
+        ])
+    };
+    let files = vec![
+        file(&["a"], 10),
+        pad(6),
+        file(&["b"], 10),
+        pad(6),
+        file(&["c"], 1),
+    ];
+    let m = Metainfo::from_bytes(&torrent(multi_info("t", files, 33, 16))).unwrap();
+    assert_eq!(m.info().files().len(), 5);
+    // Real files still may not repeat.
+    let files = vec![file(&["a"], 10), pad(6), file(&["a"], 10)];
+    assert!(matches!(
+        Metainfo::from_bytes(&torrent(multi_info("t", files, 26, 16))),
+        Err(MetainfoError::DuplicatePath(_))
+    ));
+}
+
+#[test]
 fn info_hash_covers_original_bytes_not_reencoding() {
     // `name` before `length`: unsorted, so canonical re-encoding would differ.
     let mut info = b"d4:name1:a6:lengthi3e12:piece lengthi16384e6:pieces20:".to_vec();

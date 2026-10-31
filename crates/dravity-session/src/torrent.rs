@@ -89,7 +89,6 @@ pub(crate) enum Input {
     /// its bitfield and an unchoke like any peer).
     WebSeedReady {
         key: PeerKey,
-        addr: SocketAddr,
     },
     /// A web seed could not start (its host did not resolve).
     WebSeedFailed {
@@ -265,6 +264,9 @@ type PieceLayers = Vec<(Hash, Vec<Hash>)>;
 #[derive(Debug)]
 struct WebSeed {
     url: String,
+    /// The synthetic peer address it is reported under
+    /// ([`dravity_engine::web_seed_addr`]), unique per URL.
+    addr: SocketAddr,
     /// The peer slot while a task runs for it.
     key: Option<PeerKey>,
     /// Not started again before this.
@@ -455,8 +457,10 @@ impl TorrentTask {
             .metainfo
             .web_seeds()
             .iter()
-            .map(|url| WebSeed {
+            .zip(0u32..)
+            .map(|(url, index)| WebSeed {
                 url: url.clone(),
+                addr: dravity_engine::web_seed_addr(index),
                 key: None,
                 retry_at: now,
                 failures: 0,
@@ -858,13 +862,16 @@ impl TorrentTask {
                 self.peers.remove(&key)?;
                 Event::PeerDisconnected { peer: key }
             }
-            Input::WebSeedReady { key, addr } => {
+            Input::WebSeedReady { key } => {
                 if !self.peers.contains_key(&key) {
                     return None;
                 }
+                let addr = self.web_seeds.iter().find(|s| s.key == Some(key))?.addr;
                 self.web_peers.insert(key);
-                // An "incoming" peer: never dialed back, never shared over
-                // PEX. No extension bits: it only answers requests.
+                // An "incoming" peer at a synthetic, unroutable address:
+                // never dialed, retried or shared over PEX (the engine
+                // ignores `100::/64`). The web seed layer does its own
+                // back-off. No extension bits: it only answers requests.
                 Event::PeerAccepted {
                     peer: key,
                     addr,

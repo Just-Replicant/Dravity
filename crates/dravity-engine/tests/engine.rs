@@ -9,7 +9,7 @@ use bytes::Bytes;
 use dravity_core::{BLOCK_SIZE, BlockRef, PieceLayout};
 use dravity_engine::{
     Alert, AnnounceEvent, Bitfield, Config, DialHints, Effect, Event, PeerKey, PeerLink,
-    TorrentState, TorrentStatus,
+    TorrentState, TorrentStatus, is_web_seed_addr, web_seed_addr,
 };
 use dravity_wire::{BlockRequest, Message, MetadataMessage, PexMessage, PexPeer, Reserved};
 use proptest::prelude::*;
@@ -1618,4 +1618,79 @@ proptest! {
             prop_assert!(s.unchoked <= s.peers);
         }
     }
+}
+
+#[test]
+fn web_seeds_are_never_dialed_retried_or_shared() {
+    let mut c = config();
+    c.max_peers = 10;
+    let mut h = Harness::new(c);
+    h.ev(Event::Start);
+    // The CDN's own address is also a real BitTorrent peer.
+    let cdn = SocketAddr::from(([198, 51, 100, 7], 80));
+    h.ev(Event::AddPeers {
+        peers: vec![cdn, addr(1)],
+    });
+    // Two web seeds on that CDN: distinct synthetic addresses.
+    for (key, index) in [(20, 0), (21, 1)] {
+        let fx = h.ev(Event::PeerAccepted {
+            peer: PeerKey(key),
+            addr: web_seed_addr(index),
+            reserved: Reserved::new(),
+            link: PeerLink::default(),
+        });
+        assert!(!fx.contains(&Effect::Disconnect { peer: PeerKey(key) }));
+        h.msg(key, Message::HaveAll);
+    }
+    // The real peer at the CDN's address is not mistaken for either.
+    let fx = h.ev(Event::PeerConnected {
+        peer: PeerKey(30),
+        addr: cdn,
+        reserved: extended(),
+        link: PeerLink::default(),
+    });
+    assert!(!fx.contains(&Effect::Disconnect { peer: PeerKey(30) }));
+    assert_eq!(h.t.peers().len(), 3);
+
+    // A PEX peer advertising web seed addresses gets them ignored.
+    connect(&mut h, 1, extended());
+    h.msg(1, ext_handshake("6:ut_pexi7e"));
+    let bogus = PexMessage {
+        added: vec![PexPeer {
+            addr: web_seed_addr(5),
+            flags: Some(0x10),
+        }],
+        dropped: Vec::new(),
+    };
+    let fx = h.msg(
+        1,
+        Message::Extended {
+            id: 1,
+            payload: Bytes::from(bogus.encode()),
+        },
+    );
+    let dials = |fx: &[Effect]| {
+        fx.iter()
+            .filter_map(|e| match e {
+                Effect::Connect { addr, .. } => Some(*addr),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(dials(&fx).iter().all(|a| !is_web_seed_addr(*a)), "{fx:?}");
+
+    // Our PEX never lists them.
+    let fx = h.advance(h.t.config().pex_interval);
+    let (_id, payload) = only_extended(&fx, 1);
+    let msg = PexMessage::decode(&payload).unwrap();
+    assert!(
+        msg.added.iter().all(|p| !is_web_seed_addr(p.addr)),
+        "{msg:?}"
+    );
+    assert!(msg.added.iter().any(|p| p.addr == cdn), "{msg:?}");
+
+    // A web seed that drops is not dialed back.
+    h.ev(Event::PeerDisconnected { peer: PeerKey(20) });
+    let fx = h.advance(h.t.config().peer_retry * 3);
+    assert!(dials(&fx).iter().all(|a| !is_web_seed_addr(*a)), "{fx:?}");
 }

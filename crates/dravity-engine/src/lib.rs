@@ -90,6 +90,7 @@ mod pool;
 mod rate;
 mod state;
 mod types;
+mod web_seed;
 mod window;
 
 pub use bitfield::Bitfield;
@@ -101,3 +102,4 @@ pub use types::{
     Alert, AnnounceEvent, Config, DialHints, Effect, Event, PeerInfo, PeerKey, PeerLink, Stats,
     TorrentStatus,
 };
+pub use web_seed::{is_web_seed_addr, web_seed_addr};

@@ -16,15 +16,15 @@
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use dravity_bencode::{Dict, Value};
 use dravity_core::merkle;
 use dravity_core::{InfoHash, Magnet, MetaVersion, Metainfo, PeerId};
-use dravity_engine::{Alert, Bitfield, TorrentStatus};
+use dravity_engine::{Alert, Bitfield, TorrentStatus, is_web_seed_addr};
 use dravity_session::{
     AddTorrentOptions, ListenConfig, PeerCodec, Session, SessionAlert, SessionConfig,
 };
@@ -631,6 +631,19 @@ async fn v2_torrents_keep_their_piece_layers_across_a_restart() {
 /// `206` and those bytes, without one the whole file; anything missing (or
 /// everything, with `broken`) gets `404`. Counts requests.
 async fn http_server(root: PathBuf, broken: bool) -> (SocketAddr, Arc<AtomicUsize>) {
+    let (addr, hits, _) = http_server_with(root, broken, Duration::ZERO).await;
+    (addr, hits)
+}
+
+/// [`http_server`] that waits `delay` before each answer and also logs the
+/// requested paths.
+async fn http_server_with(
+    root: PathBuf,
+    broken: bool,
+    delay: Duration,
+) -> (SocketAddr, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let paths = Arc::clone(&log);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let hits = Arc::new(AtomicUsize::new(0));
@@ -642,6 +655,7 @@ async fn http_server(root: PathBuf, broken: bool) -> (SocketAddr, Arc<AtomicUsiz
             };
             let root = root.clone();
             let count = Arc::clone(&count);
+            let paths = Arc::clone(&paths);
             tokio::spawn(async move {
                 // Keep-alive: answer requests until the client hangs up.
                 let mut req = Vec::new();
@@ -660,6 +674,8 @@ async fn http_server(root: PathBuf, broken: bool) -> (SocketAddr, Arc<AtomicUsiz
                     req.drain(..end);
                     count.fetch_add(1, Ordering::Relaxed);
                     let path = text.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                    paths.lock().unwrap().push(path.clone());
+                    tokio::time::sleep(delay).await;
                     let file = std::fs::read(root.join(path.trim_start_matches('/')));
                     let (status, body, range_header) = match file {
                         Ok(data) if !broken => {
@@ -698,7 +714,7 @@ async fn http_server(root: PathBuf, broken: bool) -> (SocketAddr, Arc<AtomicUsiz
             });
         }
     });
-    (addr, hits)
+    (addr, hits, log)
 }
 
 async fn download_from_web_seed(hybrid: bool) {
@@ -823,10 +839,10 @@ fn unescape(s: &str) -> Vec<u8> {
 async fn recording_tracker(
     only: InfoHash,
     peer: SocketAddr,
-) -> (String, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/announce", listener.local_addr().unwrap());
-    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&seen);
     let SocketAddr::V4(v4) = peer else {
         panic!("IPv4 only")
@@ -950,4 +966,123 @@ async fn a_hybrid_magnet_answers_to_its_v2_id_once_the_metadata_arrives() {
     assert_eq!(theirs.info_hash, ids[1]);
     leecher.shutdown().await;
     seeder.shutdown().await;
+}
+
+/// A torrent whose `url-list` is `urls`.
+fn with_url_list(torrent: &[u8], urls: &[String]) -> Metainfo {
+    let Value::Dict(mut t) = Value::decode(torrent).unwrap().into_owned() else {
+        unreachable!()
+    };
+    let list = urls.iter().map(|u| bstr(u.as_bytes())).collect();
+    t.insert(Cow::Borrowed(&b"url-list"[..]), Value::List(list));
+    Metainfo::from_bytes(&Value::Dict(t).to_vec()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_web_seeds_on_one_host_both_serve() {
+    // `http://cdn/a/` and `http://cdn/b/` share an IP and port; each gets
+    // its own synthetic peer address, so both run at once.
+    let mut files = sample();
+    let served = tempfile::tempdir().unwrap();
+    write_files(&served.path().join("a"), &files);
+    write_files(&served.path().join("b"), &files);
+    let (addr, _, log) = http_server_with(
+        served.path().to_path_buf(),
+        false,
+        Duration::from_millis(50),
+    )
+    .await;
+    let urls = [format!("http://{addr}/a/"), format!("http://{addr}/b/")];
+    let m = with_url_list(&make(&mut files, false, None), &urls);
+    assert_eq!(m.web_seeds(), urls);
+    let hash = m.info_hash();
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(config()).unwrap();
+    let mut alerts = session.subscribe();
+    let handle = session
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    let web = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let web: Vec<SocketAddr> = handle
+                .peers()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|p| p.transport == dravity_session::Transport::Web)
+                .map(|p| p.info.addr)
+                .collect();
+            if web.len() == 2 {
+                return web;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both web seeds connected at once");
+    assert_ne!(web[0], web[1]);
+    assert!(
+        web.iter().all(|a| is_web_seed_addr(*a) && *a != addr),
+        "{web:?}"
+    );
+    until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert_files(dir.path(), &files);
+    let log = log.lock().unwrap().clone();
+    assert!(log.iter().any(|p| p.starts_with("/a/")), "{log:?}");
+    assert!(log.iter().any(|p| p.starts_with("/b/")), "{log:?}");
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_web_seed_is_never_dialed_as_a_peer() {
+    // The web seed's server answers every HTTP request with 503. Any other
+    // connection would be a BitTorrent dial to the web server's port.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = listener.local_addr().unwrap();
+    let http = Arc::new(AtomicUsize::new(0));
+    let other = Arc::new(AtomicUsize::new(0));
+    let (h, o) = (Arc::clone(&http), Arc::clone(&other));
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let (h, o) = (Arc::clone(&h), Arc::clone(&o));
+            tokio::spawn(async move {
+                let mut first = [0u8; 4];
+                if sock.read_exact(&mut first).await.is_err() {
+                    return;
+                }
+                if &first == b"GET " {
+                    h.fetch_add(1, Ordering::Relaxed);
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 503 Busy\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                } else {
+                    o.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    let mut files = sample();
+    let m =
+        Metainfo::from_bytes(&make(&mut files, false, Some(&format!("http://{server}/")))).unwrap();
+    let mut c = config();
+    c.web_seed_retry = Duration::from_millis(100);
+    c.engine.peer_retry = Duration::from_millis(100);
+    let session = Session::new(c).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    session
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while http.load(Ordering::Relaxed) < 3 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the web seed is retried by its own back-off");
+    // Several peer retry periods later, still no BitTorrent dial.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(other.load(Ordering::Relaxed), 0);
+    session.shutdown().await;
 }

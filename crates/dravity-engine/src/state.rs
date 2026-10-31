@@ -24,6 +24,7 @@ use crate::types::{
     Alert, AnnounceEvent, Config, DialHints, Effect, Event, PeerInfo, PeerKey, PeerLink, Stats,
     TorrentStatus,
 };
+use crate::web_seed::is_web_seed_addr;
 use crate::window::Window;
 
 /// Most peers that may hold a request for the same block (endgame and
@@ -2038,7 +2039,9 @@ impl TorrentState {
             .peers
             .values()
             .filter_map(|p| {
-                let addr = p.reachable?;
+                // Web seeds are never shared (they have no reachable
+                // address anyway).
+                let addr = p.reachable.filter(|a| !is_web_seed_addr(*a))?;
                 Some((addr, pex_flags(p, hints.get(addr))))
             })
             .collect();

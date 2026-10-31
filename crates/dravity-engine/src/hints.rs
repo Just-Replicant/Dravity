@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 
 use crate::pool::MAX_POOL;
 use crate::types::{DialHints, PeerKey, PeerLink};
+use crate::web_seed::is_web_seed_addr;
 use dravity_wire::Reserved;
 
 /// Most addresses remembered (twice the dial pool, so hints outlive a
@@ -51,7 +52,7 @@ impl HintBook {
     }
 
     fn merge(&mut self, addr: SocketAddr, new: DialHints, authoritative: bool) {
-        if new == DialHints::default() {
+        if new == DialHints::default() || is_web_seed_addr(addr) {
             return;
         }
         if let Some(old) = self.map.get_mut(&addr) {

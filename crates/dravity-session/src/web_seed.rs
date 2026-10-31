@@ -1,7 +1,9 @@
 //! Web seeds (BEP 19) as peers.
 //!
 //! A web seed task looks like a peer task to the torrent owner: it reports
-//! itself connected (as an incoming peer, so it is never shared over PEX)
+//! itself connected (the owner presents it as an incoming peer at a
+//! synthetic address, see [`dravity_engine::web_seed_addr`], so it is never
+//! dialed, retried or shared over PEX)
 //! with every piece and unchoked, takes `request` and `cancel` commands, and
 //! answers requests with `piece` messages. Contiguous requests are fetched
 //! with one HTTP range (up to [`MAX_BATCH`] bytes) while further commands
@@ -9,7 +11,6 @@
 //! again later. Data is verified like every other piece.
 
 use std::collections::VecDeque;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -45,15 +46,15 @@ pub(crate) async fn run(
     mut commands: mpsc::Receiver<PeerCommand>,
 ) {
     let key = params.key;
-    let Some(addr) = resolve(&params.url).await else {
+    if !resolves(&params.url).await {
         tracing::debug!(url = %params.url, "web seed host did not resolve");
         let _ = events.send(Input::WebSeedFailed { key }).await;
         return;
-    };
+    }
     let info = params.metainfo.info();
     let all = Message::Bitfield(full_bitfield(info.piece_count()));
     let hello = [
-        Input::WebSeedReady { key, addr },
+        Input::WebSeedReady { key },
         Input::Message { key, message: all },
         Input::Message {
             key,
@@ -207,13 +208,16 @@ fn full_bitfield(pieces: u32) -> Bytes {
     Bytes::from(bits)
 }
 
-/// The web seed's address: its first resolved socket address.
-async fn resolve(url: &str) -> Option<SocketAddr> {
-    let (host, port) = dravity_webseed::plan::host_port(url)?;
+/// Whether the web seed's host resolves at all (a cheap check before the
+/// task reports itself; the HTTP client decides which addresses it may
+/// actually use).
+async fn resolves(url: &str) -> bool {
+    let Some((host, port)) = dravity_webseed::plan::host_port(url) else {
+        return false;
+    };
     tokio::net::lookup_host((host.as_str(), port))
         .await
-        .ok()?
-        .next()
+        .is_ok_and(|mut addrs| addrs.next().is_some())
 }
 
 #[cfg(test)]

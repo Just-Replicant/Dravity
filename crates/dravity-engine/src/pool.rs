@@ -10,6 +10,8 @@ use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
+use crate::web_seed::is_web_seed_addr;
+
 /// Upper bound on queued plus waiting peer addresses.
 pub(crate) const MAX_POOL: usize = 2_000;
 
@@ -47,6 +49,7 @@ impl PeerPool {
             // Only drop the retry entry once we have room to queue it.
             self.retry.retain(|(_, waiting)| *waiting != addr);
             if addr.port() == 0
+                || is_web_seed_addr(addr)
                 || connected(addr)
                 || self.connecting.contains(&addr)
                 || !queued.insert(addr)
@@ -66,6 +69,7 @@ impl PeerPool {
         connected: impl Fn(SocketAddr) -> bool,
     ) {
         if addr.port() == 0
+            || is_web_seed_addr(addr)
             || connected(addr)
             || self.connecting.contains(&addr)
             || self.queue.contains(&addr)

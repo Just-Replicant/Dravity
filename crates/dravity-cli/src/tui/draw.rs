@@ -14,7 +14,7 @@ pub(crate) const ALERT_LINES: u16 = 4;
 
 /// The full key list `?` shows in place of the footer.
 const HELP: [&str; 6] = [
-    "torrents: a add · enter detail · space/p pause or resume · d remove · D remove and delete files",
+    "torrents: a add · 1/2/3 or enter detail · space/p pause or resume · d remove · D remove and delete files",
     "          o sort (added, name, progress, down rate) · / filter by name · tab files pane",
     "detail:   1 files · 2 peers · 3 trackers · tab next pane · esc back · ↑↓/j k move",
     "files:    s skip · l low · n normal · h high   peers: a add a peer (host:port)",
@@ -213,7 +213,8 @@ fn draw_torrents(frame: &mut Frame<'_>, view: &View, area: Rect) {
         rows,
         [
             Constraint::Fill(1),
-            Constraint::Length(17),
+            // "fetching metadata" is 18 columns; a shorter width clips it.
+            Constraint::Length(18),
             Constraint::Length(6),
             Constraint::Length(10),
             Constraint::Length(12),

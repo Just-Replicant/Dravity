@@ -6,6 +6,53 @@ the roadmap phases until the first release.
 
 ## [Unreleased]
 
+### Phase 6 — v2/hybrid torrents and web seeds
+
+See [`docs/phase-6.md`](docs/phase-6.md) for design notes.
+
+#### Added
+
+- BEP 52: `dravity_core::merkle` (SHA-256 trees over 16 KiB leaves, piece
+  layers, padded subtrees); v2-only and hybrid `.torrent` parsing
+  (`file tree`, `piece layers`) with `MetaVersion`, `Metainfo::info_hash_v2`,
+  `swarm_hashes`, `set_piece_layer`, `Info::version`, `check_piece`,
+  `pieces_root`, `piece_layers`, `missing_piece_layers`, and
+  `InfoHashV2::from_info_bytes`. New `MetainfoError` variants
+  `MissingFileTree`, `InvalidFileTree`, `HybridMismatch`,
+  `MissingPieceLayer`, `InvalidPieceLayer`.
+- `Magnet::swarm_hash`; `MetadataState::new_v2` and `with_info_hash_v2`
+  check magnet metadata with SHA-256 (both hashes for hybrid links).
+- The session downloads and seeds v2 and hybrid torrents and `btmh`
+  magnet links. A hybrid torrent accepts peers, and looks up and
+  announces on the DHT, under both swarm ids. Saved torrents keep their
+  piece layers and web seeds.
+- Web seeds (BEP 19): `Metainfo::web_seeds` / `with_web_seeds` (`url-list`,
+  magnet `ws`), the new `dravity-webseed` crate (sans-IO range planning,
+  HTTP(S) client), and web seeds as virtual peers in the session
+  (`SessionConfig::web_seed`, `web_seed_retry`, `Transport::Web`,
+  re-exported `WebSeedConfig`, `SessionError::WebSeed`).
+- CLI: `info` prints the metainfo version, v2 hash and web seeds;
+  `--no-web-seeds`; the TUI peer flags mark web seeds with `W`.
+- Fuzz target `webseed_plan`; `metainfo_parse` checks v2 hashes and
+  `check_piece`.
+
+#### Changed
+
+- **Breaking:** `SessionError::MagnetWithoutV1Hash` is now
+  `MagnetWithoutInfoHash` (raised only when a magnet has neither a `btih`
+  nor a `btmh` topic).
+- **Breaking:** `MetainfoError::UnsupportedV2Only` is removed: v2-only
+  torrents load.
+- Storage verifies pieces through `Info::check_piece` (SHA-1, Merkle or
+  both) and no longer depends on `sha1` directly.
+- A v2-only torrent's session key (`info_hash()`) is its v2 hash
+  truncated to 20 bytes, as in the handshake, trackers and the DHT.
+
+#### Fixed
+
+- BEP 47 padding files may share a name (e.g. several `.pad/16384`), as
+  real hybrid torrents have; they were rejected as duplicate paths.
+
 ### Phase 5 — Full terminal UI
 
 See [`docs/phase-5.md`](docs/phase-5.md) for design notes.

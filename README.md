@@ -6,10 +6,12 @@ dispatch effects. CLI and HTTP send commands and read alerts. Tokio is the
 default runtime. See [`docs/rust-torrent-plan.md`](docs/rust-torrent-plan.md)
 for the full architecture, comparison with existing clients, and roadmap.
 
-> **Status: Phase 5 (full terminal UI) complete.**
-> Dravity downloads and seeds v1 `.torrent` files and magnet links
-> (metadata over BEP 9/10), finding peers through HTTP/UDP trackers (BEP 12
-> tiers), the mainline DHT and PEX. It accepts incoming peers over TCP and
+> **Status: Phase 6 (v2/hybrid torrents, web seeds) complete.**
+> Dravity downloads and seeds v1, v2 and hybrid `.torrent` files (BEP 52,
+> SHA-256 Merkle verification) and magnet links (`btih` and `btmh`,
+> metadata over BEP 9/10), finding peers through HTTP/UDP trackers (BEP 12
+> tiers), the mainline DHT and PEX, and downloading from HTTP(S) web seeds
+> (BEP 19). It accepts incoming peers over TCP and
 > uTP (BEP 29, LEDBAT) on IPv4 and IPv6, maps its port with NAT-PMP or UPnP,
 > chokes tit-for-tat, speaks the fast extension (BEP 6), bans peers that
 > send corrupt data and refuses hostile paths. Phase 4 adds file
@@ -17,26 +19,28 @@ for the full architecture, comparison with existing clients, and roadmap.
 > session with a watch folder, an HTTP API with Prometheus metrics
 > (`dravity-http`), `dravity serve` and a terminal UI. Phase 5 makes that
 > UI a full client: add magnets and `.torrent` files, remove, peers,
-> trackers, alerts, sort and filter. See
-> [`docs/phase-1.md`](docs/phase-1.md) to [`docs/phase-5.md`](docs/phase-5.md).
+> trackers, alerts, sort and filter. Phase 6 adds v2/hybrid torrents and
+> web seeds. See [`docs/phase-1.md`](docs/phase-1.md) to
+> [`docs/phase-6.md`](docs/phase-6.md).
 
 ## Workspace
 
 | Crate | Status | What it does |
 |---|---|---|
 | [`dravity-bencode`](crates/dravity-bencode) | ✅ Phase 0 | Zero-copy bencode `Value`, serde `Deserializer`/`Serializer`, `RawValue` for exact byte capture, depth and item caps |
-| [`dravity-core`](crates/dravity-core) | ✅ Phase 3 | `InfoHash` (v1, v2 type), `PeerId`, `.torrent` parsing (`Metainfo`, also from fetched `info` bytes), magnet links, compact peers, piece/block/file math, per-platform path-safety checks |
+| [`dravity-core`](crates/dravity-core) | ✅ Phase 6 | `InfoHash` (v1, v2), `PeerId`, `.torrent` parsing for v1, v2 and hybrid (`Metainfo`, also from fetched `info` bytes), BEP 52 Merkle trees and piece checks, web seed lists, magnet links, compact peers, piece/block/file math, per-platform path-safety checks |
 | [`dravity-wire`](crates/dravity-wire) | ✅ Phase 3 | Handshake + reserved bits, BEP 3/5/6 messages and allowed fast set, BEP 10 extended handshake, BEP 9 `ut_metadata`, BEP 11 `ut_pex`, streaming zero-copy decoder |
-| [`dravity-engine`](crates/dravity-engine) | ✅ Phase 5 | Sans-IO `TorrentState::update(now, Event) -> Vec<Effect>`: rarest-first picker with piece priorities and urgent pieces, peer snapshots, AIMD request window, endgame + block stealing, rate limits, choker (tit-for-tat + optimistic unchoke), seeding, BEP 6, bans, PEX, metadata serving, data check, tracker/DHT scheduling; `MetadataState` for magnets |
-| [`dravity-storage`](crates/dravity-storage) | ✅ Phase 3 | `Storage` trait; filesystem backend (LRU FD cache, positional I/O, files opened without following symlinks) and memory backend; block reads; piece verification; fastresume data with file stamps |
+| [`dravity-engine`](crates/dravity-engine) | ✅ Phase 6 | Sans-IO `TorrentState::update(now, Event) -> Vec<Effect>`: rarest-first picker with piece priorities and urgent pieces, peer snapshots, AIMD request window, endgame + block stealing, rate limits, choker (tit-for-tat + optimistic unchoke), seeding, BEP 6, bans, PEX, metadata serving, data check, tracker/DHT scheduling; `MetadataState` for magnets (v1, v2 and hybrid metadata checks) |
+| [`dravity-storage`](crates/dravity-storage) | ✅ Phase 6 | `Storage` trait; filesystem backend (LRU FD cache, positional I/O, files opened without following symlinks) and memory backend; block reads; piece verification (SHA-1, SHA-256 Merkle, or both); fastresume data with file stamps |
 | [`dravity-tracker`](crates/dravity-tracker) | ✅ Phase 2 | HTTP (BEP 3/7/23) and UDP (BEP 15, cached connection ids) announce: sans-IO codecs + async client (rustls) |
 | [`dravity-dht`](crates/dravity-dht) | ✅ Phase 2 | Mainline DHT (BEP 5) peer lookups and announces, wrapping [`mainline`](https://crates.io/crates/mainline) |
-| [`dravity-session`](crates/dravity-session) | ✅ Phase 5 | The only I/O driver: per-torrent owner task on Tokio, peer tasks, TCP/uTP listener (IPv4 + IPv6), disk/hash offload, uploads, magnets, DHT, port mapping, fastresume, BEP 12 tiers, alerts; file priorities, streaming `FileStream`, pause/resume/remove, persisted state + restore, watch folder; peer and tracker reads |
+| [`dravity-session`](crates/dravity-session) | ✅ Phase 6 | The only I/O driver: per-torrent owner task on Tokio, peer tasks, TCP/uTP listener (IPv4 + IPv6), disk/hash offload, uploads, magnets, DHT, port mapping, fastresume, BEP 12 tiers, alerts; file priorities, streaming `FileStream`, pause/resume/remove, persisted state + restore, watch folder; peer and tracker reads; v2/hybrid torrents (both swarms of a hybrid), web seeds as virtual peers |
 | [`dravity-http`](crates/dravity-http) | ✅ Phase 4 | axum JSON API over the session: torrents, files, priorities, streaming with `Range`, server-sent alerts, Prometheus `/metrics`, bearer token |
-| [`dravity-cli`](crates/dravity-cli) | ✅ Phase 5 | `dravity download` / `info` / `serve` for files and magnet links, seeding, file selection, a full ratatui `--tui` client (add, remove, peers, trackers, alerts); renders alerts, never drives I/O |
+| [`dravity-cli`](crates/dravity-cli) | ✅ Phase 6 | `dravity download` / `info` / `serve` for files and magnet links, seeding, file selection, a full ratatui `--tui` client (add, remove, peers, trackers, alerts); renders alerts, never drives I/O |
 | [`dravity-utp`](crates/dravity-utp) | ✅ Phase 3 | uTP (BEP 29): packet codec, sans-IO connection with LEDBAT congestion control, Tokio socket and streams |
 | [`dravity-portmap`](crates/dravity-portmap) | ✅ Phase 4 | Router port mapping: NAT-PMP (RFC 6886) and UPnP IGD codecs, `PortMapper` that maps, renews and removes and reports the external port |
-| v2/hybrid torrents, … | ⏳ Phase 6+ | See the roadmap |
+| [`dravity-webseed`](crates/dravity-webseed) | ✅ Phase 6 | Web seeds (BEP 19): sans-IO plan of file URLs and HTTP ranges (padding as zeros), strict ranged HTTP(S) client (rustls) |
+| io_uring backend, protocol encryption, BEP 52 hash requests | ⏳ Later | See [`docs/phase-6.md`](docs/phase-6.md#deferred) and the roadmap |
 
 ## Phase 0 checklist
 
@@ -108,6 +112,19 @@ for the full architecture, comparison with existing clients, and roadmap.
 - [x] Fix: sessions serve BEP 9 metadata for torrents added from a file
 - [x] Tests: engine peer snapshots, loopback peer transports and tracker outcomes, TUI draw/key/update tests on `TestBackend`, a loopback paste-a-magnet → pause → remove test
 
+## Phase 6 checklist
+
+- [x] BEP 52 Merkle trees (`dravity_core::merkle`): 16 KiB SHA-256 leaves, piece layers, padded subtrees
+- [x] v2-only and hybrid `.torrent` parsing: `file tree` with v1 path checks, `piece layers` checked against pieces roots, hybrid halves must agree; v2 files mapped onto one piece-aligned stream
+- [x] Piece verification by version (`Info::check_piece`): SHA-1, Merkle, or both for hybrids
+- [x] `btmh` magnets: SHA-256 (or both) metadata checks; v2-only swarms keyed by the truncated v2 hash
+- [x] Hybrid torrents join both swarms: listener, DHT lookups and announces under both ids
+- [x] Piece layers and web seeds saved with the session's torrents
+- [x] Web seeds (BEP 19, `url-list` and magnet `ws`) as virtual peers with batched range requests, back-off and `--no-web-seeds`; new `dravity-webseed` crate
+- [x] Fix: BEP 47 padding files may share a name (real hybrid torrents)
+- [x] CLI `info` shows the version, v2 hash and web seeds; `W` peer flag
+- [x] Tests: Merkle proptest against a naive tree, v2/hybrid fixtures and hostile trees, engine v2 metadata, loopback v2/hybrid sessions, v2 magnets, restart, loopback web seed downloads; fuzz targets `metainfo_parse` (v2 checks) and `webseed_plan`
+
 ## Command line
 
 ```sh
@@ -117,6 +134,8 @@ cargo run --release -p dravity-cli -- download example.torrent --output download
 cargo run --release -p dravity-cli -- download 'magnet:?xt=urn:btih:…&tr=…' --output downloads
 # extra peers, e.g. for a LAN seeder
 cargo run --release -p dravity-cli -- download example.torrent --peer 192.168.1.20:6881
+# never use the torrent's HTTP web seeds
+cargo run --release -p dravity-cli -- download example.torrent --no-web-seeds
 # no DHT, at most 2 MiB/s
 cargo run --release -p dravity-cli -- download example.torrent --no-dht --download-limit 2M
 # keep seeding after the download (Ctrl-C to stop), uploads capped at 500 KiB/s

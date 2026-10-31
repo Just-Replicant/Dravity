@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use dravity_core::InfoHash;
+use dravity_core::{InfoHash, InfoHashV2};
 use dravity_engine::{
     Alert, AnnounceEvent, Config, Effect, Event, MetadataState, PeerKey, TorrentStatus,
 };
@@ -42,12 +42,29 @@ struct Harness {
 
 impl Harness {
     fn new(config: Config) -> Self {
+        Self::with(MetadataState::new(
+            InfoHash::from_info_bytes(&info()),
+            config,
+        ))
+    }
+
+    fn with(m: MetadataState) -> Self {
         let mut h = Self {
-            m: MetadataState::new(InfoHash::from_info_bytes(&info()), config),
+            m,
             now: Instant::now(),
         };
         h.ev(Event::Start);
         h
+    }
+
+    /// Feeds all three pieces of `content` from one peer.
+    fn fetch(&mut self, content: &[u8]) -> Vec<Effect> {
+        self.peer(1, Some(content.len() as u64));
+        let mut fx = Vec::new();
+        for piece in 0..3 {
+            fx.extend(self.msg(1, data(piece, content)));
+        }
+        fx
     }
 
     fn ev(&mut self, e: Event) -> Vec<Effect> {
@@ -446,4 +463,35 @@ fn accepted_peers_fetch_metadata_and_are_marked_incoming() {
         .map(|p| (p.peer, p.incoming))
         .collect();
     assert_eq!(incoming, [(PeerKey(1), false), (PeerKey(7), true)]);
+}
+
+#[test]
+fn v2_magnets_verify_with_sha256() {
+    let content = info();
+    let v2 = InfoHashV2::from_info_bytes(&content);
+    let mut h = Harness::with(MetadataState::new_v2(v2, Config::default()));
+    assert_eq!(h.m.info_hash(), v2.truncated());
+    assert_eq!(received(&h.fetch(&content)), Some(content.clone()));
+
+    // A wrong v2 hash rejects metadata whose truncated hash we asked for.
+    let mut h = Harness::with(MetadataState::new_v2(
+        InfoHashV2::new([3; 32]),
+        Config::default(),
+    ));
+    assert_eq!(received(&h.fetch(&content)), None);
+    assert!(!h.m.is_complete());
+}
+
+#[test]
+fn hybrid_magnets_check_both_hashes() {
+    let content = info();
+    let v1 = InfoHash::from_info_bytes(&content);
+    let good = MetadataState::new(v1, Config::default())
+        .with_info_hash_v2(InfoHashV2::from_info_bytes(&content));
+    assert_eq!(
+        received(&Harness::with(good).fetch(&content)),
+        Some(content.clone())
+    );
+    let bad = MetadataState::new(v1, Config::default()).with_info_hash_v2(InfoHashV2::new([4; 32]));
+    assert_eq!(received(&Harness::with(bad).fetch(&content)), None);
 }

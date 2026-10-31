@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use bytes::Bytes;
-use dravity_core::InfoHash;
+use dravity_core::{InfoHash, InfoHashV2};
 use dravity_wire::{
     ExtendedHandshake, METADATA_PIECE_LEN, Message, MetadataMessage, Reserved, metadata_piece_count,
 };
@@ -143,6 +143,10 @@ pub struct Handover {
 #[derive(Debug)]
 pub struct MetadataState {
     info_hash: InfoHash,
+    /// `info_hash` is a v1 hash: the metadata's SHA-1 must match it.
+    check_v1: bool,
+    /// The metadata's SHA-256 must match this v2 hash (BEP 52).
+    info_hash_v2: Option<InfoHashV2>,
     config: Config,
     status: TorrentStatus,
     peers: HashMap<PeerKey, MetaPeer>,
@@ -172,11 +176,13 @@ pub struct MetadataState {
 }
 
 impl MetadataState {
-    /// A fetcher for `info_hash`.
+    /// A fetcher for the v1 `info_hash`.
     #[must_use]
     pub fn new(info_hash: InfoHash, config: Config) -> Self {
         Self {
             info_hash,
+            check_v1: true,
+            info_hash_v2: None,
             config,
             status: TorrentStatus::Idle,
             peers: HashMap::new(),
@@ -710,8 +716,42 @@ impl MetadataState {
         }
     }
 
+    /// A fetcher for a v2-only magnet link (`xt=urn:btmh:`): peers are
+    /// asked for the truncated hash and the metadata must have SHA-256
+    /// `info_hash`.
+    #[must_use]
+    pub fn new_v2(info_hash: InfoHashV2, config: Config) -> Self {
+        let mut state = Self::new(info_hash.truncated(), config);
+        state.check_v1 = false;
+        state.info_hash_v2 = Some(info_hash);
+        state
+    }
+
+    /// Also requires the metadata to match the v2 hash `info_hash` (a magnet
+    /// link with both `btih` and `btmh`).
+    #[must_use]
+    pub const fn with_info_hash_v2(mut self, info_hash: InfoHashV2) -> Self {
+        self.info_hash_v2 = Some(info_hash);
+        self
+    }
+
+    /// The 20-byte id peers are asked for (the truncated hash of a v2-only
+    /// magnet).
+    #[must_use]
+    pub const fn info_hash(&self) -> InfoHash {
+        self.info_hash
+    }
+
+    /// Whether the downloaded `info` bytes match every hash we know.
+    fn matches(&self, info: &[u8]) -> bool {
+        (!self.check_v1 || InfoHash::from_info_bytes(info) == self.info_hash)
+            && self
+                .info_hash_v2
+                .is_none_or(|v2| InfoHashV2::from_info_bytes(info) == v2)
+    }
+
     fn verify(&mut self, out: &mut Vec<Effect>) {
-        if InfoHash::from_info_bytes(&self.buffer) == self.info_hash {
+        if self.matches(&self.buffer) {
             self.complete = true;
             out.push(Effect::MetadataReceived {
                 info: Bytes::from(std::mem::take(&mut self.buffer)),

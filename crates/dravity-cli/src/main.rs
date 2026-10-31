@@ -17,7 +17,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use dravity_core::{Magnet, Metainfo};
 use dravity_engine::{Alert, Priority, TorrentStatus};
-use dravity_session::{AddTorrentOptions, ListenConfig, Session, SessionConfig, StorageBackend};
+use dravity_session::{
+    AddTorrentOptions, EncryptionPolicy, ListenConfig, Session, SessionConfig, StorageBackend,
+};
 use tokio::sync::broadcast::error::RecvError;
 
 /// A portable BitTorrent client.
@@ -153,6 +155,32 @@ struct NetworkArgs {
     /// io_uring, blocking I/O is used and a warning is logged.
     #[arg(long, value_enum, default_value_t = Backend::Blocking, value_name = "BACKEND")]
     storage_backend: Backend,
+    /// Peer connection encryption (MSE/PE): `enabled` accepts both and dials
+    /// encrypted first, falling back to plaintext; `required` only makes and
+    /// accepts RC4-encrypted connections; `disabled` never encrypts.
+    #[arg(long, value_enum, default_value_t = Encryption::Enabled, value_name = "POLICY")]
+    encryption: Encryption,
+}
+
+/// `--encryption` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Encryption {
+    /// Plain BitTorrent connections only.
+    Disabled,
+    /// Encrypt when the peer can; plaintext otherwise.
+    Enabled,
+    /// RC4-encrypted connections only.
+    Required,
+}
+
+impl From<Encryption> for EncryptionPolicy {
+    fn from(encryption: Encryption) -> Self {
+        match encryption {
+            Encryption::Disabled => Self::Disabled,
+            Encryption::Enabled => Self::Enabled,
+            Encryption::Required => Self::Required,
+        }
+    }
 }
 
 /// `--storage-backend` values.
@@ -200,6 +228,7 @@ impl NetworkArgs {
             config.web_seed = None;
         }
         config.storage_backend = self.storage_backend.into();
+        config.encryption = self.encryption.into();
         config
     }
 }

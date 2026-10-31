@@ -57,7 +57,9 @@ fn write_torrent(dir: &Path, content: &[u8]) -> (std::path::PathBuf, InfoHash) {
     (path, Metainfo::from_bytes(&encoded).unwrap().info_hash())
 }
 
-/// A blocking single-connection seeder on a background thread.
+/// A blocking single-connection seeder on a background thread. It speaks
+/// the plain handshake only, without checking it: dial it with
+/// `--encryption disabled`.
 fn seeder(content: Vec<u8>, info_hash: InfoHash) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -202,6 +204,8 @@ fn download_from_explicit_peer() {
         .arg(&out_dir)
         .arg("--peer")
         .arg(peer.to_string())
+        // The test seeder only speaks the plain handshake.
+        .args(["--encryption", "disabled"])
         .args([
             "--no-dht",
             "--no-port-mapping",
@@ -243,6 +247,8 @@ fn resume_dir_and_no_resume() {
         .arg(&out_dir)
         .arg("--peer")
         .arg(peer.to_string())
+        // The test seeder only speaks the plain handshake.
+        .args(["--encryption", "disabled"])
         .arg("--resume-dir")
         .arg(&resume_dir)
         .args(["--no-dht", "--no-port-mapping", "--quiet"])
@@ -269,6 +275,8 @@ fn resume_dir_and_no_resume() {
         .arg(&out_dir)
         .arg("--peer")
         .arg(peer.to_string())
+        // The test seeder only speaks the plain handshake.
+        .args(["--encryption", "disabled"])
         .args(["--no-dht", "--no-port-mapping", "--no-resume", "--quiet"])
         .output()
         .unwrap();
@@ -322,6 +330,8 @@ fn download_with_the_io_uring_backend() {
         .arg(&out_dir)
         .arg("--peer")
         .arg(peer.to_string())
+        // The test seeder only speaks the plain handshake.
+        .args(["--encryption", "disabled"])
         .args([
             "--no-dht",
             "--no-port-mapping",

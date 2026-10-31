@@ -158,6 +158,8 @@ pub(crate) struct PeerRow {
     pub(crate) utp: bool,
     /// An HTTP web seed (BEP 19), not a BitTorrent peer.
     pub(crate) web: bool,
+    /// RC4-encrypted (MSE).
+    pub(crate) encrypted: bool,
 }
 
 impl From<&PeerStatus> for PeerRow {
@@ -178,6 +180,7 @@ impl From<&PeerStatus> for PeerRow {
             incoming: i.incoming,
             utp: p.transport == Transport::Utp,
             web: p.transport == Transport::Web,
+            encrypted: p.encrypted,
         }
     }
 }
@@ -185,8 +188,7 @@ impl From<&PeerStatus> for PeerRow {
 impl PeerRow {
     /// Fixed-position flags: `C` we choke them, `c` they choke us, `I` we
     /// are interested, `i` they are interested, `<` incoming, `U` uTP,
-    /// `W` web seed;
-    /// `.` when unset.
+    /// `W` web seed, `E` encrypted (MSE); `.` when unset.
     pub(crate) fn flags(&self) -> String {
         [
             (self.am_choking, 'C'),
@@ -196,6 +198,7 @@ impl PeerRow {
             (self.incoming, '<'),
             (self.utp, 'U'),
             (self.web, 'W'),
+            (self.encrypted, 'E'),
         ]
         .iter()
         .map(|&(on, c)| if on { c } else { '.' })
@@ -937,16 +940,18 @@ pub(crate) mod tests {
             incoming: true,
             utp: true,
             web: false,
+            encrypted: true,
         };
-        assert_eq!(peer.flags(), "C.I.<U.");
+        assert_eq!(peer.flags(), "C.I.<U.E");
         assert_eq!(
             PeerRow {
                 utp: false,
                 web: true,
+                encrypted: false,
                 ..peer
             }
             .flags(),
-            "C.I.<.W"
+            "C.I.<.W."
         );
         assert_eq!(peer.have(), "25.0%");
         assert_eq!(

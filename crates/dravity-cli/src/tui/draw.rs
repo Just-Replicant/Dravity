@@ -18,7 +18,7 @@ const HELP: [&str; 6] = [
     "          o sort (added, name, progress, down rate) · / filter by name · tab files pane",
     "detail:   1 files · 2 peers · 3 trackers · tab next pane · esc back · ↑↓/j k move",
     "files:    s skip · l low · n normal · h high   peers: a add a peer (host:port)",
-    "peer flags: C we choke them · c they choke us · I we want · i they want · < incoming · U uTP · W web seed",
+    "peer flags: C we choke them · c they choke us · I we want · i they want · < incoming · U uTP · W web seed · E encrypted",
     "q quit · ctrl-c quit from anywhere · mouse: click a torrent or file row · any key closes this",
 ];
 
@@ -354,7 +354,7 @@ fn draw_peers(frame: &mut Frame<'_>, view: &View, area: Rect) {
             Constraint::Length(7),
             Constraint::Length(12),
             Constraint::Length(12),
-            Constraint::Length(7),
+            Constraint::Length(8),
         ],
     )
     .header(bold_row(["Address", "Has", "Down", "Up", "Flags"]))
@@ -669,6 +669,7 @@ mod tests {
             incoming: false,
             utp: true,
             web: false,
+            encrypted: false,
         }];
         let screen = render(&v, 110, 30);
         assert!(screen.contains("10.0.0.2:6881"), "{screen}");

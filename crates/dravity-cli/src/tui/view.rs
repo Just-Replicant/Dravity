@@ -476,6 +476,11 @@ impl View {
         })
     }
 
+    /// A prompt or the key list is taking keys, so the UI should stay up.
+    pub(crate) fn holds_input(&self) -> bool {
+        self.prompt.is_some() || self.help
+    }
+
     /// Recent alerts of the selected torrent.
     pub(crate) fn selected_alerts(&self) -> Option<&VecDeque<String>> {
         self.selected_row()
@@ -866,6 +871,20 @@ pub(crate) mod tests {
                 text: "10.0.0.2:6881".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn a_prompt_or_the_key_list_holds_input() {
+        let mut v = View::default();
+        assert!(!v.holds_input());
+        v.update(Action::OpenAdd);
+        assert!(v.holds_input());
+        v.update(Action::Cancel);
+        assert!(!v.holds_input());
+        v.update(Action::Help);
+        assert!(v.holds_input());
+        v.update(Action::DismissHelp);
+        assert!(!v.holds_input());
     }
 
     #[test]

@@ -18,6 +18,12 @@
 //! An extension chain follows the header: each entry is the next
 //! extension's type, the entry's length and its bytes. Selective ACK
 //! (type 1) is understood; other extensions are skipped.
+//!
+//! BEP 29 asks for a selective ACK of a non-zero multiple of 4 bytes, and
+//! that is what we send. libtorrent sends whatever length covers its
+//! out-of-order packets (3 or 6 bytes, say), so any length is accepted:
+//! refusing those packets dropped the data they carried, which stalled
+//! uploads to qBittorrent until the connection timed out.
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -79,9 +85,6 @@ pub enum PacketError {
     /// Unknown packet type.
     #[error("unknown uTP packet type {0}")]
     Type(u8),
-    /// A selective ACK whose length is not a non-zero multiple of 4.
-    #[error("invalid selective ack length {0}")]
-    SackLength(usize),
 }
 
 /// One uTP packet.
@@ -234,9 +237,7 @@ impl Packet {
             let len = usize::from(*len);
             let body = tail.get(..len).ok_or(PacketError::Truncated)?;
             if next == EXT_SACK {
-                if len == 0 || len % 4 != 0 {
-                    return Err(PacketError::SackLength(len));
-                }
+                // Any length (see the module docs); empty means none.
                 sack = body.to_vec();
             }
             next = *kind;
@@ -292,6 +293,27 @@ mod tests {
     }
 
     #[test]
+    fn sacks_of_any_length_are_read() {
+        // libtorrent's: three bytes after a data packet's header.
+        let mut bytes = Packet::new(PacketType::Data, 3).encode().to_vec();
+        bytes[1] = EXT_SACK;
+        bytes[18..20].copy_from_slice(&100u16.to_be_bytes());
+        bytes.extend_from_slice(&[0, 3, 0, 0, 0b1111_1110, b'h', b'i']);
+        let p = Packet::decode(&bytes).unwrap();
+        assert_eq!(&p.payload[..], b"hi");
+        assert!(!p.sack_has(118) && p.sack_has(119) && p.sack_has(125));
+        assert!(!p.sack_has(126), "past the three bytes");
+        // Six bytes, and an empty one (no selective ACK at all).
+        for (len, sack) in [(6u8, vec![1, 0, 0, 0, 0, 1]), (0, vec![])] {
+            let mut bytes = Packet::new(PacketType::State, 3).encode().to_vec();
+            bytes[1] = EXT_SACK;
+            bytes.extend_from_slice(&[0, len]);
+            bytes.extend_from_slice(&sack);
+            assert_eq!(Packet::decode(&bytes).unwrap().sack, sack);
+        }
+    }
+
+    #[test]
     fn unknown_extensions_are_skipped_and_bad_ones_refused() {
         let mut bytes = Packet::new(PacketType::Data, 3).encode().to_vec();
         bytes[1] = 9; // unknown extension of 2 bytes, then payload
@@ -302,8 +324,8 @@ mod tests {
 
         let mut bad = Packet::new(PacketType::Data, 3).encode().to_vec();
         bad[1] = EXT_SACK;
-        bad.extend_from_slice(&[0, 3, 1, 2, 3]);
-        assert_eq!(Packet::decode(&bad), Err(PacketError::SackLength(3)));
+        bad.extend_from_slice(&[0, 3, 1, 2]);
+        assert_eq!(Packet::decode(&bad), Err(PacketError::Truncated));
         bad.truncate(HEADER_LEN + 1);
         assert_eq!(Packet::decode(&bad), Err(PacketError::Truncated));
         assert_eq!(Packet::decode(&[0x41; 5]), Err(PacketError::Truncated));

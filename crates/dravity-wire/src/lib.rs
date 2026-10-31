@@ -2,7 +2,8 @@
 //!
 //! * [`Handshake`] / [`Reserved`] — the 68-byte handshake and extension flags.
 //! * [`Message`] / [`MessageDecoder`] — BEP 3 messages, BEP 5 `port`, BEP 6
-//!   fast messages, and BEP 10 extended frames, with streaming zero-copy
+//!   fast messages, BEP 10 extended frames, and BEP 52 hash requests
+//!   ([`HashRequest`]), with streaming zero-copy
 //!   decoding and bounded frame sizes.
 //! * [`ExtendedHandshake`] — the bencode payload of extended message 0.
 //! * [`MetadataMessage`] — BEP 9 `ut_metadata` (metadata for magnet links).
@@ -26,8 +27,8 @@ pub use extended::{ExtendedError, ExtendedHandshake};
 pub use fast::{DEFAULT_ALLOWED_FAST, allowed_fast_set};
 pub use handshake::{HANDSHAKE_LEN, Handshake, PROTOCOL, Reserved};
 pub use message::{
-    BlockRequest, DEFAULT_MAX_FRAME_LEN, Message, MessageDecoder, MessageId, bitfield_bit,
-    check_bitfield,
+    BlockRequest, DEFAULT_MAX_FRAME_LEN, HashRequest, Message, MessageDecoder, MessageId,
+    bitfield_bit, check_bitfield,
 };
 pub use metadata::{METADATA_PIECE_LEN, MetadataMessage, UT_METADATA, metadata_piece_count};
 pub use pex::{

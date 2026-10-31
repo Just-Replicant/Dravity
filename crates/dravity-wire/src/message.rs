@@ -6,8 +6,8 @@
 //!
 //! ## Extending
 //!
-//! The decoder dispatches on [`MessageId`]. BEP 6 (ids 13–17) and BEP 10
-//! (id 20) are named variants. Any other id decodes to [`Message::Unknown`].
+//! The decoder dispatches on [`MessageId`]. BEP 6 (ids 13–17), BEP 10
+//! (id 20) and BEP 52 (ids 21–23) are named variants. Any other id decodes to [`Message::Unknown`].
 //! Both enums are `#[non_exhaustive]`, so further messages can be added
 //! without breaking the codec's structure.
 
@@ -56,6 +56,12 @@ pub enum MessageId {
     AllowedFast = 17,
     /// `extended` (BEP 10)
     Extended = 20,
+    /// `hash request` (BEP 52)
+    HashRequest = 21,
+    /// `hashes` (BEP 52)
+    Hashes = 22,
+    /// `hash reject` (BEP 52)
+    HashReject = 23,
 }
 
 impl TryFrom<u8> for MessageId {
@@ -79,6 +85,9 @@ impl TryFrom<u8> for MessageId {
             16 => Self::Reject,
             17 => Self::AllowedFast,
             20 => Self::Extended,
+            21 => Self::HashRequest,
+            22 => Self::Hashes,
+            23 => Self::HashReject,
             other => return Err(other),
         })
     }
@@ -101,6 +110,71 @@ impl From<dravity_core::BlockRef> for BlockRequest {
             piece: b.piece,
             offset: b.offset,
             length: b.length,
+        }
+    }
+}
+
+/// The payload of a BEP 52 `hash request` and `hash reject`, and the header
+/// of `hashes`: which hashes of one file's Merkle tree, plus how many layers
+/// of proof towards its root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HashRequest {
+    /// The file's `pieces root`.
+    pub pieces_root: [u8; 32],
+    /// Layers above the leaves (0 = 16 KiB leaf hashes).
+    pub base_layer: u32,
+    /// Offset of the first hash in the base layer (a multiple of `length`).
+    pub index: u32,
+    /// Number of base layer hashes (a power of two, at least 2).
+    pub length: u32,
+    /// Ancestor layers of proof asked for.
+    pub proof_layers: u32,
+}
+
+impl HashRequest {
+    /// Encoded size: a 32-byte root and four `u32`s.
+    pub const LEN: usize = 48;
+
+    /// Whether `index` and `length` follow BEP 52: `length` a power of two
+    /// of at least 2 and at most `max_length`, `index` a multiple of it.
+    #[must_use]
+    pub const fn is_well_formed(&self, max_length: u32) -> bool {
+        self.length >= 2
+            && self.length <= max_length
+            && self.length.is_power_of_two()
+            && self.index.is_multiple_of(self.length)
+    }
+
+    /// Hashes a `hashes` reply carries: `length` base hashes plus one uncle
+    /// for each proof layer above the subtree the base hashes span (the
+    /// first `log2(length) - 1` proof layers are implied by the base).
+    #[must_use]
+    pub const fn reply_hashes(&self) -> u64 {
+        let implied = if self.length == 0 {
+            0
+        } else {
+            self.length.ilog2().saturating_sub(1)
+        };
+        self.length as u64 + self.proof_layers.saturating_sub(implied) as u64
+    }
+
+    fn put(&self, dst: &mut BytesMut) {
+        dst.put_slice(&self.pieces_root);
+        dst.put_u32(self.base_layer);
+        dst.put_u32(self.index);
+        dst.put_u32(self.length);
+        dst.put_u32(self.proof_layers);
+    }
+
+    fn get(frame: &mut Bytes) -> Self {
+        let mut pieces_root = [0; 32];
+        frame.copy_to_slice(&mut pieces_root);
+        Self {
+            pieces_root,
+            base_layer: frame.get_u32(),
+            index: frame.get_u32(),
+            length: frame.get_u32(),
+            proof_layers: frame.get_u32(),
         }
     }
 }
@@ -166,6 +240,19 @@ pub enum Message {
         /// Payload after the extended id.
         payload: Bytes,
     },
+    /// Ask for hashes of a file's Merkle tree (BEP 52).
+    HashRequest(HashRequest),
+    /// Hashes answering a [`Message::HashRequest`] (BEP 52): the base layer
+    /// hashes, then the uncle hashes from the leaf side to the root, 32
+    /// bytes each.
+    Hashes {
+        /// The request this answers.
+        request: HashRequest,
+        /// Concatenated SHA-256 hashes.
+        hashes: Bytes,
+    },
+    /// The sender will not serve a [`Message::HashRequest`] (BEP 52).
+    HashReject(HashRequest),
     /// A message with an id this crate does not (yet) understand.
     /// Never produced for ids listed in [`MessageId`].
     Unknown {
@@ -198,6 +285,9 @@ impl Message {
             Self::Reject(_) => MessageId::Reject,
             Self::AllowedFast { .. } => MessageId::AllowedFast,
             Self::Extended { .. } => MessageId::Extended,
+            Self::HashRequest(_) => MessageId::HashRequest,
+            Self::Hashes { .. } => MessageId::Hashes,
+            Self::HashReject(_) => MessageId::HashReject,
             Self::Unknown { id, .. } => return Some(*id),
         };
         Some(id as u8)
@@ -219,6 +309,8 @@ impl Message {
             Self::Piece { data, .. } => 8 + data.len(),
             Self::Port(_) => 2,
             Self::Extended { payload, .. } => 1 + payload.len(),
+            Self::HashRequest(_) | Self::HashReject(_) => HashRequest::LEN,
+            Self::Hashes { hashes, .. } => HashRequest::LEN + hashes.len(),
         }
     }
 
@@ -280,6 +372,11 @@ impl Message {
             Self::Extended { id, payload } => {
                 dst.put_u8(*id);
                 dst.put_slice(payload);
+            }
+            Self::HashRequest(r) | Self::HashReject(r) => r.put(dst),
+            Self::Hashes { request, hashes } => {
+                request.put(dst);
+                dst.put_slice(hashes);
             }
         }
         Ok(())
@@ -376,6 +473,24 @@ impl Message {
                 Self::Extended {
                     id: frame.get_u8(),
                     payload: frame,
+                }
+            }
+            MessageId::HashRequest => {
+                need(HashRequest::LEN)?;
+                Self::HashRequest(HashRequest::get(&mut frame))
+            }
+            MessageId::HashReject => {
+                need(HashRequest::LEN)?;
+                Self::HashReject(HashRequest::get(&mut frame))
+            }
+            MessageId::Hashes => {
+                if len < HashRequest::LEN || !(len - HashRequest::LEN).is_multiple_of(32) {
+                    return Err(WireError::InvalidPayloadLength { id, len });
+                }
+                let request = HashRequest::get(&mut frame);
+                Self::Hashes {
+                    request,
+                    hashes: frame,
                 }
             }
         })
@@ -561,10 +676,10 @@ mod tests {
         );
         assert_eq!(
             enc(&Message::Unknown {
-                id: 21,
+                id: 30,
                 payload: Bytes::from_static(b"\x00d")
             }),
-            [0, 0, 0, 3, 21, 0, b'd']
+            [0, 0, 0, 3, 30, 0, b'd']
         );
     }
 
@@ -655,6 +770,66 @@ mod tests {
         assert_eq!(bitfield_bit(&[0x80], 0), Some(true));
         assert_eq!(bitfield_bit(&[0x80], 1), Some(false));
         assert_eq!(bitfield_bit(&[0x80], 8), None);
+    }
+
+    #[test]
+    fn hash_messages() {
+        let r = HashRequest {
+            pieces_root: [7; 32],
+            base_layer: 1,
+            index: 4,
+            length: 4,
+            proof_layers: 3,
+        };
+        let mut head = vec![0, 0, 0, 49, 21];
+        head.extend_from_slice(&[7; 32]);
+        head.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 3]);
+        assert_eq!(enc(&Message::HashRequest(r)), head);
+        let mut reject = head.clone();
+        reject[4] = 23;
+        assert_eq!(enc(&Message::HashReject(r)), reject);
+        let hashes = Message::Hashes {
+            request: r,
+            hashes: Bytes::from(vec![1; 64]),
+        };
+        let mut bytes = BytesMut::new();
+        hashes.encode(&mut bytes).unwrap();
+        assert_eq!(&bytes[..5], [0, 0, 0, 113, 22]);
+        let back = MessageDecoder::new().decode(&mut bytes).unwrap().unwrap();
+        assert_eq!(back, hashes);
+        for m in [Message::HashRequest(r), Message::HashReject(r)] {
+            let mut b = BytesMut::new();
+            m.encode(&mut b).unwrap();
+            assert_eq!(MessageDecoder::new().decode(&mut b).unwrap().unwrap(), m);
+        }
+        // Hashes must be whole 32-byte hashes after the 48-byte header.
+        let mut bad = BytesMut::from(&[0u8, 0, 0, 50, 22][..]);
+        bad.extend_from_slice(&[0; 49]);
+        assert!(MessageDecoder::new().decode(&mut bad).is_err());
+        let mut short = BytesMut::from(&[0u8, 0, 0, 2, 21, 0][..]);
+        assert!(MessageDecoder::new().decode(&mut short).is_err());
+    }
+
+    #[test]
+    fn hash_request_rules() {
+        let r = |index, length, proof_layers| HashRequest {
+            pieces_root: [0; 32],
+            base_layer: 0,
+            index,
+            length,
+            proof_layers,
+        };
+        assert!(r(0, 2, 0).is_well_formed(512));
+        assert!(r(8, 4, 0).is_well_formed(512));
+        assert!(!r(2, 4, 0).is_well_formed(512));
+        assert!(!r(0, 3, 0).is_well_formed(512));
+        assert!(!r(0, 1, 0).is_well_formed(512));
+        assert!(!r(0, 1024, 0).is_well_formed(512));
+        // log2(8) - 1 = 2 proof layers are implied by 8 base hashes.
+        assert_eq!(r(0, 8, 0).reply_hashes(), 8);
+        assert_eq!(r(0, 8, 2).reply_hashes(), 8);
+        assert_eq!(r(0, 8, 5).reply_hashes(), 11);
+        assert_eq!(r(0, 2, 3).reply_hashes(), 5);
     }
 
     #[test]

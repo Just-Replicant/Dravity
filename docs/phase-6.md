@@ -2,15 +2,13 @@
 
 Scope from the roadmap (plan §8): "BEP 52 v2/hybrid + Merkle; web seeds
 (BEP 19); optional io_uring backend; protocol encryption if required."
-This phase covers the two protocol items. Dravity now downloads and seeds
-v2-only and hybrid torrents, fetches their metadata from `btmh` magnet
-links, joins both swarms of a hybrid torrent, and downloads from HTTP(S)
-web seeds. The engine stays sans-IO; the session is still the only I/O
+This phase covers all four. Dravity now downloads and seeds v2-only and
+hybrid torrents, fetches their metadata and piece layers from `btmh`
+magnet links (BEP 52 hash requests), joins both swarms of a hybrid
+torrent (DHT, trackers and listener), downloads from HTTP(S) web seeds,
+can do its file I/O through io_uring, and encrypts peer connections with
+MSE/PE. The engine stays sans-IO; the session is still the only I/O
 driver (plan §4).
-
-**Not in this phase:** the optional io_uring backend and MSE/PE protocol
-encryption (see [Deferred](#deferred) for the reasons), and BEP 52's
-`hash request` / `hashes` / `hash reject` messages.
 
 ## Where Phase 5 left off
 
@@ -24,12 +22,14 @@ refused a magnet without a `btih` topic (`MagnetWithoutV1Hash`).
 
 | Crate | I/O? | Phase 6 additions |
 |---|---|---|
-| `dravity-core` | no | `merkle` (SHA-256 trees over 16 KiB leaves, piece layers, pad hashes); v2 `file tree` parsing with the same path checks as v1; `MetaVersion` (`V1`, `V2`, `Hybrid`); `Metainfo::info_hash_v2`, `swarm_hashes`, `web_seeds`, `with_web_seeds`, `set_piece_layer`; `Info::version`, `check_piece`, `pieces_root`, `piece_layers`, `missing_piece_layers`; `Magnet::swarm_hash`; `InfoHashV2::from_info_bytes`. Fix: BEP 47 padding files may share a name |
-| `dravity-storage` | yes | `verify_piece` goes through `Info::check_piece` (SHA-1, Merkle, or both) |
-| `dravity-engine` | no | `MetadataState::new_v2` / `with_info_hash_v2`: magnet metadata is checked with SHA-256 for `btmh`, with both hashes for a hybrid link |
+| `dravity-wire` | no | BEP 52 `HashRequest` (21), `Hashes` (22), `HashReject` (23); `Reserved::v2` (reserved bit `0x10` of byte 7) |
+| `dravity-core` | no | `merkle` (SHA-256 trees over 16 KiB leaves, piece layers, pad hashes; `layer_proof`, `verify_proof` and `layer_requests` for hash requests); v2 `file tree` parsing with the same path checks as v1; `MetaVersion` (`V1`, `V2`, `Hybrid`); `Metainfo::info_hash_v2`, `swarm_hashes`, `web_seeds`, `with_web_seeds`, `set_piece_layer`; `Info::version`, `check_piece`, `pieces_root`, `piece_layers`, `missing_piece_layers`; `Magnet::swarm_hash`; `InfoHashV2::from_info_bytes`. Fix: BEP 47 padding files may share a name |
+| `dravity-storage` | yes | `verify_piece` goes through `Info::check_piece` (SHA-1, Merkle, or both); `FileIo` under `FileStorage` (`BlockingIo` by default); `UringIo` (feature `uring`, Linux) |
+| `dravity-engine` | no | `MetadataState::new_v2` / `with_info_hash_v2`: magnet metadata is checked with SHA-256 for `btmh`, with both hashes for a hybrid link; v2 magnets then fetch missing piece layers with hash requests (`Effect::MetadataReceived` carries them); `TorrentState::with_piece_layers` answers hash requests |
+| `dravity-mse` (new) | sans-IO core, async with feature `stream` | MSE/PE: `Initiator` / `Responder` state machines, `initiate` / `respond` and `MseStream` over Tokio I/O, `Policy` |
 | `dravity-webseed` (new) | yes (feature `client`) | `plan` (sans-IO): a file's URL under a web seed and the HTTP ranges, plus zero-filled padding, that make up a byte range of the torrent. `WebSeedClient` (reqwest + rustls, on by default): strict ranged `GET`s |
-| `dravity-session` | async | v2/hybrid torrents and `btmh` magnets; a hybrid answers to, announces on and looks up both swarm ids; piece layers and web seeds are saved with the torrent; web seeds as virtual peers (`SessionConfig::web_seed`, `web_seed_retry`, `Transport::Web`) |
-| `dravity-cli` | via session | `info` prints the version, the v2 hash and web seeds; `--no-web-seeds`; the peer table flags web seeds with `W` |
+| `dravity-session` | async | v2/hybrid torrents and `btmh` magnets; a hybrid answers to, announces on (DHT and trackers) and looks up both swarm ids, also when added from a magnet; piece layers and web seeds are saved with the torrent; web seeds as virtual peers (`SessionConfig::web_seed`, `web_seed_retry`, `Transport::Web`); `SessionConfig::storage_backend` and `Session::storage_backend`; `SessionConfig::encryption`, `PeerStatus::encrypted` |
+| `dravity-cli` | via session | `info` prints the version, the v2 hash and web seeds; `--no-web-seeds`; `--storage-backend blocking\|io-uring` (feature `uring`); `--encryption disabled\|enabled\|required`; the peer table flags web seeds with `W` and encrypted peers with `E` |
 
 `dravity-http` is unchanged: its DTOs carry the session's info-hash,
 which for a v2-only torrent is the truncated v2 hash (see below).
@@ -70,18 +70,34 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   every id the torrent is known by (two for a hybrid).
 - **Hybrid swarms.** The listener registers both ids for a hybrid
   torrent, and answers each handshake with the id the peer asked for.
-  The DHT is searched and announced for both. Trackers get the primary
-  id only (see Deferred).
+  The DHT is searched and announced for both. Each tracker announce for
+  the primary id is followed, on the tracker URL that answered, by one
+  for the second id; its peers are merged, and its failure is only
+  logged (the primary announce decides the tier order and the alert). A
+  hybrid added from a magnet registers its second id with the listener
+  as soon as the metadata arrives, without a restart.
 - **Magnets.** `Magnet::swarm_hash` picks the v1 hash, or the truncated
   v2 hash for a `btmh`-only link. The metadata state checks the received
   `info` bytes with SHA-1, SHA-256 or both, according to the topics the
   link carried. `MagnetWithoutV1Hash` is now `MagnetWithoutInfoHash`.
 - **v2 magnets and piece layers.** BEP 9 carries only `info`, not
   `piece layers`. Files no larger than one piece need nothing more (their
-  pieces root is the piece hash). For bigger files a v2-only magnet needs
-  the BEP 52 hash request messages, which Dravity does not speak yet: the
-  torrent stops with an error naming the missing piece layers instead of
-  downloading data it cannot verify. Hybrid magnets fall back to SHA-1.
+  pieces root is the piece hash). For bigger files the metadata state,
+  once `info` is verified, asks peers for each missing layer with BEP 52
+  `hash request`s (at most 512 hashes each, with the uncle hashes up to
+  the pieces root, two outstanding per peer, any peer that set the v2
+  reserved bit or not). Each `hashes` reply is checked against the
+  file's `pieces root` before it is accepted; a bad proof disconnects and
+  bans the peer, a `hash reject` or a timeout moves the request to
+  another peer. The torrent is handed over only with every layer
+  complete, so no data is ever downloaded unverifiable. Hybrid magnets
+  still verify with SHA-1 and do not fetch layers.
+- **Serving hash requests.** A torrent with piece layers answers
+  `hash request`s from them (layers at or above the piece layer, with
+  the uncles asked for). Requests for leaf layers below the piece layer
+  (Dravity keeps only piece layers), malformed requests and unknown
+  roots get a `hash reject`, which BEP 52 allows. During metadata
+  exchange every request is rejected. Dravity sets the v2 reserved bit.
 - **Persistence.** The session writes `piece layers` and `url-list` next
   to `info` in its saved `.torrent`, so a v2 torrent restores without a
   peer, and keeps its web seeds.
@@ -120,6 +136,72 @@ which for a v2-only torrent is the truncated v2 hash (see below).
 - **Sources.** The torrent's `url-list` (a string or a list) and a
   magnet's `ws` parameters, which are kept once the metadata arrives.
 
+### io_uring storage backend
+
+- **Behind a trait, off by default.** `FileStorage` does its positional
+  reads and writes through `Arc<dyn FileIo>`. `BlockingIo` (`pread` /
+  `pwrite` on the hashing and storage thread pool) is the default, so path
+  safety, the descriptor cache, `sync` and fastresume are shared by both
+  backends and the default build does not change.
+- **tokio-uring on its own thread.** `UringIo` (crate feature `uring`,
+  Linux only) starts a `tokio-uring` runtime on a dedicated `dravity-uring`
+  thread; callers on any thread send jobs over a channel and wait for the
+  reply. `UringIo::start` probes the ring with a no-op and returns an
+  error instead of panicking when the kernel, seccomp or a container
+  refuses io_uring.
+- **No `unsafe`.** Each job owns a `dup` of the cached descriptor and an
+  owned buffer (tokio-uring's ownership model), at the cost of one `dup`
+  and one copy per operation. `fsync` stays on the blocking path. The
+  workspace's `unsafe_code = "forbid"` holds.
+- **Selection and fallback.** `SessionConfig::storage_backend`
+  (`Blocking`, `IoUring`; CLI `--storage-backend`) applies to storage the
+  session creates. Asking for io_uring in a build without the feature, or
+  where the ring cannot start, logs a warning and uses blocking I/O;
+  `Session::storage_backend` reports the backend in use. The feature
+  chains `dravity-cli/uring` → `dravity-session/uring` →
+  `dravity-storage/uring`.
+
+### Message Stream Encryption (MSE/PE)
+
+- **The specification, with maintained crypto.** `dravity-mse` follows the
+  frozen MSE spec: Diffie-Hellman over its 768-bit prime with generator 2
+  and 160-bit private keys from `getrandom` (`num-bigint`), SHA-1
+  (`sha1`) for `req1`/`req2`/`req3` and `keyA`/`keyB`, RC4 (`rc4`) with
+  the first 1024 bytes of keystream dropped, random PadA/PadB of 0–512
+  bytes, `crypto_provide` / `crypto_select` (plaintext `0x01`, RC4
+  `0x02`). Public keys outside `1 < Y < P - 1` are refused. PadC and PadD
+  are sent empty (as the spec suggests) but parsed up to 512 bytes; IA is
+  sent empty and accepted up to 65535 bytes.
+- **Sans-IO first.** `Initiator` and `Responder` are byte-in/byte-out state
+  machines (fuzzed by `mse_handshake`). `initiate` / `respond` drive them
+  over any Tokio stream, writing and reading at once so neither side
+  stalls on a full send buffer; `MseStream` then encrypts and decrypts
+  transparently. An initiator that gets a plain BitTorrent handshake back
+  fails at once (`PlaintextPeer`).
+- **Policies** (`SessionConfig::encryption`, CLI `--encryption`), the
+  spec's three client modes:
+  - `Enabled` (default): incoming connections may be plain or MSE; outgoing
+    ones offer RC4 and plaintext (the responder picks RC4) and are redialed
+    with a plain handshake on the same transport if the peer accepts the
+    connection but fails MSE. A dial that cannot connect at all is not
+    redialed.
+  - `Required`: RC4-encrypted MSE only, both ways; plain incoming
+    handshakes are dropped.
+  - `Disabled`: plain handshakes only; an MSE key exchange arriving is
+    simply not a BitTorrent handshake.
+- **Incoming detection and SKEY.** The listener reads the first bytes: a
+  plain handshake starts with `\x13BitTorrent protocol`, anything else is
+  an MSE public key. The responder finds the torrent by comparing the
+  de-obfuscated `HASH('req2', SKEY)` with every running torrent's id
+  (both ids of a hybrid), and the BitTorrent handshake inside must name
+  the same torrent. TCP and uTP are handled alike.
+- **What it is not.** MSE is obfuscation against passive traffic shaping:
+  RC4 and 768-bit DH are weak by current standards and the peer is not
+  authenticated. `PeerStatus::encrypted` (TUI flag `E`) marks
+  RC4-encrypted connections; MSE with the plaintext method only hides the
+  handshake. Tracker `supportcrypto`/`requirecrypto` parameters and PEX
+  encryption flags are not sent.
+
 ## Tests
 
 - Core: `merkle` known values, padding and invalid lengths, a proptest
@@ -133,8 +215,25 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   files sharing a name, `file tree` without `meta version` ignored.
 - Storage: the existing tests, plus v2/hybrid verification through the
   session tests below (storage only delegates to `check_piece`).
+- Wire: hash request / hashes / hash reject round trips and their size
+  rules; the v2 reserved bit.
+- Core: `layer_proof` / `verify_proof` for every base layer, index and
+  proof depth, including a proptest; `layer_requests` covering a layer.
 - Engine: `tests/metadata.rs` checks v2 magnets with SHA-256 and hybrid
-  magnets against both hashes.
+  magnets against both hashes; a v2 magnet fetching its piece layers with
+  hash requests (bad proofs ban, rejects move on), small files needing
+  none, and requests rejected during metadata exchange.
+  `tests/seeding.rs` serves hash requests from piece layers.
+- Storage: `tests/uring.rs` (feature `uring`) writes, reads and verifies
+  through io_uring from many threads and checks that an unusable ring is
+  an error, not a panic; each test prints a note and passes when the
+  kernel refuses io_uring.
+- MSE: RFC 6229 RC4 output, the 1024-byte drop, the prime (768 bits,
+  Fermat-probable, safe), DH agreement and weak keys; a reference
+  implementation of both sides written from the spec text (with PadC,
+  PadD and IA, which Dravity never sends) talking to Dravity's responder
+  and initiator; method negotiation, unknown torrents, lost sync, plain
+  replies; async streams over 64-byte pipes in both directions.
 - Web seed: `tests/plan.rs` (URLs, ranges split at files, padding as
   zeros, proptest that a plan covers the range exactly), `tests/client.rs`
   against a loopback HTTP server (ranges, servers without `Range`
@@ -142,13 +241,21 @@ which for a v2-only torrent is the truncated v2 hash (see below).
 - Session, `tests/v2.rs` over loopback: v2-only and hybrid torrents moving
   between two sessions; a hybrid answering handshakes for both ids; a v2
   magnet with small files fetching metadata and downloading (and keeping
-  its `ws`); a v2 magnet without piece layers stopping with an error;
+  its `ws`); a v2 magnet with multi-piece files fetching its piece layers
+  and downloading; a hybrid announcing both ids to a tracker; a hybrid
+  magnet answering its v2 id once the metadata arrives;
   piece layers surviving a restart; v2-only and hybrid torrents
   downloaded from a web seed alone; a broken web seed retried without
   stopping a download from a peer; web seeds turned off.
-- CLI: `info` on a v1 and a v2 torrent with a web seed; peer flags `W`.
+  `tests/storage_backend.rs`: io_uring used when available (blocking
+  otherwise), torrents moving between io_uring and blocking sessions.
+  `tests/encryption.rs`: two sessions under all nine policy pairs over
+  TCP (who connects, encrypted or not, data intact) and MSE over uTP.
+- CLI: `info` on a v1 and a v2 torrent with a web seed; peer flags `W`
+  and `E`; a download with `--storage-backend io-uring`; an unknown
+  backend refused; two CLI processes (default `--encryption enabled`).
 - Fuzz: `metainfo_parse` also checks pieces through `check_piece` and the
-  v2 hashes; new `webseed_plan`.
+  v2 hashes; new `webseed_plan` and `mse_handshake`.
 
 Not covered: interop against other clients' v2/hybrid torrents and real
 HTTP servers (plan §9, Docker interop) — checked by construction
@@ -158,10 +265,9 @@ against BEP 52's reference layout only.
 
 | Item | When |
 |---|---|
-| BEP 52 `hash request` / `hashes` / `hash reject`, and the v2 reserved bit | next: lets v2-only magnets with files larger than one piece download, and serves layers to v2 peers |
-| Announce a hybrid's second id to trackers | with tracker requests per swarm id |
-| Hybrid added from a magnet: listener alias for its v2 id before a restart | registered on the next start (from the saved torrent) |
-| Optional io_uring backend | optional in the plan; `unsafe_code` is forbidden and the container/kernel support is uncertain — needs its own crate and decision |
-| MSE/PE protocol encryption | "if required": peers accept plaintext by default; adds an encrypted peer flag then |
+| Hash requests for leaf layers (below the piece layer) | rejected: Dravity keeps piece layers only; would need per-file leaf hashes |
+| Piece layers for hybrid magnets | they verify with SHA-1; fetching layers would let them serve v2-only peers' hash requests |
+| io_uring without the per-operation `dup` and copy, and io_uring `fsync` | needs registered buffers/files, i.e. `unsafe` or a different crate |
+| MSE tracker parameters (`supportcrypto`, `requirecrypto`) and PEX encryption flags | none needed for interop; a `Required` client may dial some plain peers in vain |
 | Create empty files (v1 and v2) | pre-existing: storage creates files when data arrives |
 | BEP 17 (`httpseeds`, Hoffman-style) | not planned; BEP 19 covers the common case |

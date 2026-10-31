@@ -6,7 +6,7 @@ the roadmap phases until the first release.
 
 ## [Unreleased]
 
-### Phase 6 — v2/hybrid torrents and web seeds
+### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 
 See [`docs/phase-6.md`](docs/phase-6.md) for design notes.
 
@@ -33,8 +33,30 @@ See [`docs/phase-6.md`](docs/phase-6.md) for design notes.
   re-exported `WebSeedConfig`, `SessionError::WebSeed`).
 - CLI: `info` prints the metainfo version, v2 hash and web seeds;
   `--no-web-seeds`; the TUI peer flags mark web seeds with `W`.
-- Fuzz target `webseed_plan`; `metainfo_parse` checks v2 hashes and
-  `check_piece`.
+- BEP 52 hash requests: `Message::HashRequest`, `Hashes` and `HashReject`
+  (`dravity_wire::HashRequest`), `Reserved::v2` / `with_v2`;
+  `merkle::layer_proof`, `verify_proof`, `layer_requests`, `HashProof`,
+  `LayerRequest`, `MAX_HASH_REQUEST`; `Info::piece_layer`. v2-only
+  magnets with files larger than one piece fetch and verify their piece
+  layers from peers (`Effect::MetadataReceived` now carries them);
+  torrents answer hash requests from their piece layers
+  (`TorrentState::with_piece_layers`). Dravity sets the v2 reserved bit.
+- Hybrid torrents announce their second id to the tracker that answered
+  and merge its peers; a hybrid added from a magnet accepts peers on its
+  second id as soon as the metadata arrives.
+- Optional io_uring file I/O: `dravity_storage::FileIo`, `BlockingIo`,
+  `FileStorage::with_io`, and with the `uring` feature (Linux) `UringIo`
+  (`tokio-uring` on a dedicated thread). `SessionConfig::storage_backend`
+  (`StorageBackend::{Blocking, IoUring}`) with a logged fallback to
+  blocking I/O, `Session::storage_backend`; CLI `--storage-backend` and
+  `uring` features on `dravity-session` and `dravity-cli`.
+- Message Stream Encryption: the new `dravity-mse` crate (sans-IO
+  `Initiator` / `Responder`, async `initiate` / `respond`, `MseStream`,
+  `Policy`); `SessionConfig::encryption` (`EncryptionPolicy`, default
+  `Enabled`) for TCP and uTP, incoming and outgoing;
+  `PeerStatus::encrypted`; CLI `--encryption` and the `E` peer flag.
+- Fuzz targets `webseed_plan` and `mse_handshake`; `metainfo_parse` checks
+  v2 hashes and `check_piece`.
 
 #### Changed
 
@@ -47,6 +69,12 @@ See [`docs/phase-6.md`](docs/phase-6.md) for design notes.
   both) and no longer depends on `sha1` directly.
 - A v2-only torrent's session key (`info_hash()`) is its v2 hash
   truncated to 20 bytes, as in the handshake, trackers and the DHT.
+- Outgoing peer connections try MSE first by default and fall back to a
+  plain handshake; set `SessionConfig::encryption` to
+  `EncryptionPolicy::Disabled` (CLI `--encryption disabled`) for the old
+  behaviour.
+- **Breaking:** a v2-only magnet with files larger than one piece no longer
+  stops with a missing piece layers error; it fetches the layers.
 
 #### Fixed
 

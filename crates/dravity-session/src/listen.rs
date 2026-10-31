@@ -202,22 +202,52 @@ fn bind_one(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
     Ok(socket.into())
 }
 
+/// Where an incoming handshake for one info-hash goes.
+#[derive(Debug, Clone)]
+pub(crate) struct Route {
+    /// The torrent's command channel.
+    pub(crate) tx: mpsc::Sender<Command>,
+    /// The torrent has a v2 info-hash (v2 or hybrid, BEP 52), so our reply
+    /// sets the v2 reserved bit. libtorrent drops a plaintext connection
+    /// that sets it for a v1-only torrent.
+    pub(crate) v2: bool,
+}
+
+impl Route {
+    pub(crate) const fn new(tx: mpsc::Sender<Command>, v2: bool) -> Self {
+        Self { tx, v2 }
+    }
+
+    /// Whether the torrent behind it still runs.
+    pub(crate) fn is_live(&self) -> bool {
+        !self.tx.is_closed()
+    }
+}
+
 /// Torrents incoming connections can be routed to.
-pub(crate) type Registry = Arc<Mutex<HashMap<InfoHash, mpsc::Sender<Command>>>>;
+pub(crate) type Registry = Arc<Mutex<HashMap<InfoHash, Route>>>;
 
 /// Routes incoming handshakes for each of `aliases` other than `primary`
 /// (a hybrid torrent's second swarm id) to `tx`. Never takes over a hash a
-/// running torrent answers to.
+/// running torrent answers to. `v2` says whether the torrent has a v2
+/// info-hash; it also updates `primary`'s route (a magnet learns it with
+/// the metadata).
 pub(crate) fn register_aliases(
     registry: &Registry,
     primary: InfoHash,
     aliases: &[InfoHash],
     tx: &mpsc::Sender<Command>,
+    v2: bool,
 ) {
     let mut registry = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(route) = registry.get_mut(&primary)
+        && route.tx.same_channel(tx)
+    {
+        route.v2 |= v2;
+    }
     for alias in aliases.iter().copied().filter(|h| *h != primary) {
-        if registry.get(&alias).is_none_or(mpsc::Sender::is_closed) {
-            registry.insert(alias, tx.clone());
+        if registry.get(&alias).is_none_or(|r| !r.is_live()) {
+            registry.insert(alias, Route::new(tx.clone(), v2));
         }
     }
 }
@@ -227,6 +257,8 @@ pub(crate) fn register_aliases(
 pub(crate) struct Acceptor {
     pub(crate) registry: Registry,
     pub(crate) our_id: PeerId,
+    /// Our reserved bits, without the v2 bit (set per torrent, see
+    /// [`Route::v2`]).
     pub(crate) reserved: Reserved,
     pub(crate) handshake_timeout: Duration,
     pub(crate) encryption: Policy,
@@ -340,11 +372,11 @@ async fn route(
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .get(hash)
-                    .filter(|tx| !tx.is_closed())
-                    .cloned()
+                    .filter(|route| route.is_live())
+                    .map(|route| (route.tx.clone(), acceptor.reserved.with_v2(route.v2)))
             };
             let (theirs, leftover, torrent) =
-                accept_handshake(&mut stream, acceptor.our_id, acceptor.reserved, lookup).await?;
+                accept_handshake(&mut stream, acceptor.our_id, lookup).await?;
             Ok::<_, HandshakeError>((stream, theirs, leftover, torrent))
         })
         .await
@@ -395,7 +427,7 @@ async fn decrypt(
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .filter(|(_, tx)| !tx.is_closed())
+            .filter(|(_, route)| route.is_live())
             .map(|(hash, _)| *hash.as_bytes())
             .find(|hash| dravity_mse::req2_hash(hash) == *req2)
     };
@@ -408,13 +440,13 @@ async fn decrypt(
     Ok((PeerStream::mse(stream), Some(InfoHash::new(skey))))
 }
 
-/// Reads the remote handshake, finds its torrent with `lookup`, then sends
-/// ours. Returns the remote handshake, bytes after it and the torrent.
+/// Reads the remote handshake, finds its torrent and our reserved bits for
+/// it with `lookup`, then sends ours. Returns the remote handshake, bytes
+/// after it and the torrent.
 pub(crate) async fn accept_handshake<S, T>(
     stream: &mut S,
     our_id: PeerId,
-    reserved: Reserved,
-    lookup: impl Fn(&InfoHash) -> Option<T>,
+    lookup: impl Fn(&InfoHash) -> Option<(T, Reserved)>,
 ) -> Result<(Handshake, BytesMut, T), HandshakeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -428,7 +460,7 @@ where
             return Err(HandshakeError::Eof);
         }
     };
-    let torrent = lookup(&theirs.info_hash).ok_or(HandshakeError::WrongInfoHash)?;
+    let (torrent, reserved) = lookup(&theirs.info_hash).ok_or(HandshakeError::WrongInfoHash)?;
     if theirs.peer_id == our_id {
         return Err(HandshakeError::SelfConnection);
     }
@@ -450,7 +482,8 @@ mod tests {
     async fn accept_handshake_routes_known_torrents_only() {
         let ours = PeerId::new([1; 20]);
         let known = InfoHash::new([2; 20]);
-        let lookup = |h: &InfoHash| (*h == known).then_some(7u8);
+        let v2 = Reserved::new().with_v2(true);
+        let lookup = |h: &InfoHash| (*h == known).then_some((7u8, v2));
 
         let (mut a, mut b) = tokio::io::duplex(1024);
         let mut hello = Handshake::new(known, PeerId::new([3; 20]))
@@ -458,22 +491,24 @@ mod tests {
             .to_vec();
         hello.extend_from_slice(&[0, 0, 0, 1, 2]); // interested, coalesced
         b.write_all(&hello).await.unwrap();
-        let (hs, rest, torrent) = accept_handshake(&mut a, ours, Reserved::new(), lookup)
-            .await
-            .unwrap();
+        let (hs, rest, torrent) = accept_handshake(&mut a, ours, lookup).await.unwrap();
         assert_eq!((hs.peer_id, torrent), (PeerId::new([3; 20]), 7));
         assert_eq!(&rest[..], &[0, 0, 0, 1, 2]);
         let mut reply = BytesMut::new();
-        while Handshake::decode(&mut reply).unwrap().is_none() {
+        let reply = loop {
+            if let Some(hs) = Handshake::decode(&mut reply).unwrap() {
+                break hs;
+            }
             b.read_buf(&mut reply).await.unwrap();
-        }
+        };
+        assert_eq!(reply.reserved, v2, "the torrent's reserved bits");
 
         let (mut a, mut b) = tokio::io::duplex(1024);
         b.write_all(&Handshake::new(InfoHash::new([9; 20]), PeerId::new([3; 20])).to_bytes())
             .await
             .unwrap();
         assert!(matches!(
-            accept_handshake(&mut a, ours, Reserved::new(), lookup).await,
+            accept_handshake(&mut a, ours, lookup).await,
             Err(HandshakeError::WrongInfoHash)
         ));
 
@@ -482,7 +517,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            accept_handshake(&mut a, ours, Reserved::new(), lookup).await,
+            accept_handshake(&mut a, ours, lookup).await,
             Err(HandshakeError::SelfConnection)
         ));
     }

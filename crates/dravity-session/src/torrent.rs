@@ -215,9 +215,10 @@ impl TorrentContext {
         announce_port(mapped, self.listen_port, self.config.announce_port)
     }
 
-    /// Reserved bits of our handshake.
-    pub(crate) fn reserved(&self) -> Reserved {
-        peer::our_reserved(self.config.engine.fast_extension)
+    /// Reserved bits of our handshake; `v2` if the torrent has a v2
+    /// info-hash.
+    pub(crate) fn reserved(&self, v2: bool) -> Reserved {
+        peer::our_reserved(self.config.engine.fast_extension, v2)
     }
 
     /// Where this torrent's resume data lives, if resume is enabled.
@@ -250,9 +251,9 @@ pub(crate) struct Aliases {
 }
 
 impl Aliases {
-    fn register(&self, primary: InfoHash, hashes: &[InfoHash]) {
+    fn register(&self, primary: InfoHash, hashes: &[InfoHash], v2: bool) {
         if let Some(tx) = self.tx.upgrade() {
-            listen::register_aliases(&self.registry, primary, hashes, &tx);
+            listen::register_aliases(&self.registry, primary, hashes, &tx, v2);
         }
     }
 }
@@ -1114,9 +1115,11 @@ impl TorrentTask {
     /// or restart does not fetch it again.
     fn record_metadata(&self, metainfo: &Arc<Metainfo>) {
         // A hybrid magnet: peers of the other swarm can connect right away.
-        self.ctx
-            .aliases
-            .register(self.ctx.info_hash, &metainfo.swarm_hashes());
+        self.ctx.aliases.register(
+            self.ctx.info_hash,
+            &metainfo.swarm_hashes(),
+            metainfo.info_hash_v2().is_some(),
+        );
         let record = {
             let mut catalog = self
                 .ctx
@@ -1188,6 +1191,19 @@ impl TorrentTask {
             Effect::PieceLayerReceived { root, layer } => self.install_piece_layer(root, layer),
             Effect::Alert(alert) => self.alert(alert),
             other => tracing::warn!(?other, "unhandled engine effect"),
+        }
+    }
+
+    /// Whether the torrent has a v2 info-hash: its metadata says so, or
+    /// (before the metadata) its magnet link has a `btmh`. A `btih`-only
+    /// magnet does not claim v2 until the metadata shows a hybrid.
+    fn has_v2(&self) -> bool {
+        match &self.content {
+            Some(content) => content.metainfo.info_hash_v2().is_some(),
+            None => self
+                .magnet
+                .as_ref()
+                .is_some_and(|m| m.info_hash_v2.is_some()),
         }
     }
 
@@ -1357,7 +1373,7 @@ impl TorrentTask {
             addr,
             info_hash: self.ctx.info_hash,
             our_id: self.ctx.peer_id,
-            reserved: self.ctx.reserved(),
+            reserved: self.ctx.reserved(self.has_v2()),
             connect_timeout: self.ctx.config.connect_timeout,
             utp: self.ctx.utp.for_addr(addr).cloned(),
             prefer_utp: self.ctx.config.prefer_utp,

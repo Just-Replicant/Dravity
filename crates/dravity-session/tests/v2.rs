@@ -463,6 +463,10 @@ async fn raw_seeder(info_hash: InfoHash, stream: Vec<u8>) -> SocketAddr {
                 if sock.read_exact(&mut buf).await.is_err() {
                     return;
                 }
+                let theirs = Handshake::decode(&mut BytesMut::from(&buf[..]))
+                    .unwrap()
+                    .unwrap();
+                assert!(theirs.reserved.v2(), "a v2 swarm is dialed with the v2 bit");
                 let ours = Handshake::new(info_hash, PeerId::new(*b"-TS0001-rawseedrawse"))
                     .with_reserved(Reserved::new().with_v2(true));
                 if sock.write_all(&ours.to_bytes()).await.is_err() {

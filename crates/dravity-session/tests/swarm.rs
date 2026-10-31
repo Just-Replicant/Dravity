@@ -148,6 +148,7 @@ async fn serve(
         .unwrap()
         .unwrap();
     assert_eq!(theirs.info_hash, info_hash);
+    assert!(!theirs.reserved.v2(), "no v2 bit when dialing a v1 swarm");
     let extended = theirs.reserved.extension_protocol();
     let ours = Handshake::new(info_hash, PeerId::new(*b"-TS0001-seedseedseed"))
         .with_reserved(Reserved::new().with_extension_protocol(true));
@@ -828,6 +829,9 @@ async fn incoming_connections_for_unknown_torrents_are_closed() {
     assert_eq!(theirs.info_hash, handle.info_hash());
     assert_eq!(theirs.peer_id, session.peer_id());
     assert!(theirs.reserved.fast());
+    // A v1-only torrent does not claim BEP 52 (libtorrent drops such a
+    // plaintext connection).
+    assert!(!theirs.reserved.v2(), "no v2 bit for a v1 torrent");
     session.shutdown().await;
 }
 

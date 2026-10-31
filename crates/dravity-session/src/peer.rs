@@ -81,12 +81,16 @@ impl HandshakeError {
     }
 }
 
-/// Extensions we advertise: BEP 10 (metadata exchange, PEX), BEP 52 (v2:
-/// hash requests) and, when enabled, the fast extension (BEP 6).
-pub(crate) fn our_reserved(fast: bool) -> Reserved {
+/// Extensions we advertise: BEP 10 (metadata exchange, PEX), when enabled
+/// the fast extension (BEP 6) and, for a torrent with a v2 info-hash, BEP
+/// 52 (v2: hash requests).
+///
+/// The v2 bit is per torrent, as libtorrent sets it: libtorrent 2.x drops
+/// a plaintext connection whose handshake sets it for a v1-only torrent.
+pub(crate) fn our_reserved(fast: bool, v2: bool) -> Reserved {
     Reserved::new()
         .with_extension_protocol(true)
-        .with_v2(true)
+        .with_v2(v2)
         .with_fast(fast)
 }
 
@@ -494,7 +498,7 @@ mod tests {
             addr,
             info_hash: hash,
             our_id: PeerId::new([7; 20]),
-            reserved: our_reserved(true),
+            reserved: our_reserved(true, true),
             connect_timeout: Duration::from_secs(5),
             utp: None,
             prefer_utp: false,

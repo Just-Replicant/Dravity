@@ -119,7 +119,7 @@ pub use torrent::TorrentProgress;
 pub use watch::{WatchConfig, WatchHandle};
 
 use crate::catalog::{Catalog, Entry, EntrySource};
-use crate::listen::{Acceptor, Bound, Registry, UtpSockets};
+use crate::listen::{Acceptor, Bound, Registry, Route, UtpSockets};
 use crate::persist::{Persister, TorrentRecord};
 use crate::torrent::{
     Aliases, Command, MagnetStart, Source, TorrentContext, TorrentTask, prepare_tiers,
@@ -403,7 +403,7 @@ impl Session {
         let acceptor = Acceptor {
             registry: Arc::clone(&self.inner.torrents),
             our_id: self.inner.peer_id,
-            reserved: peer::our_reserved(config.engine.fast_extension),
+            reserved: peer::our_reserved(config.engine.fast_extension, false),
             handshake_timeout: config.connect_timeout.max(Duration::from_secs(1)),
             encryption: config.encryption,
             pending: Arc::new(Semaphore::new(
@@ -579,6 +579,7 @@ impl Session {
     /// Starts a task for `entry`. Called with the catalog locked.
     fn spawn(&self, info_hash: InfoHash, entry: &mut Entry) -> Result<TorrentHandle, SessionError> {
         let mut aliases = Vec::new();
+        let v2;
         let (source, trackers, mut peers) = match &entry.source {
             EntrySource::Torrent(metainfo) => {
                 let storage: Arc<dyn Storage> = match &entry.storage {
@@ -591,6 +592,7 @@ impl Session {
                 // A hybrid torrent is also known by its truncated v2 hash:
                 // peers of the v2 swarm connect with that one.
                 aliases = metainfo.swarm_hashes();
+                v2 = metainfo.info_hash_v2().is_some();
                 let source = Source::Torrent {
                     metainfo: Arc::clone(metainfo),
                     storage,
@@ -605,6 +607,7 @@ impl Session {
                     .iter()
                     .filter_map(|p| p.parse::<SocketAddr>().ok())
                     .collect();
+                v2 = magnet.info_hash_v2.is_some();
                 let source = Source::Magnet(MagnetStart {
                     download_dir: entry.download_dir.clone(),
                     v1: magnet.info_hash.is_some(),
@@ -655,9 +658,9 @@ impl Session {
                 .torrents
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            registry.insert(info_hash, tx.clone());
+            registry.insert(info_hash, Route::new(tx.clone(), v2));
         }
-        listen::register_aliases(&self.inner.torrents, info_hash, &aliases, &tx);
+        listen::register_aliases(&self.inner.torrents, info_hash, &aliases, &tx, v2);
         entry.commands = Some(tx.clone());
         Ok(TorrentHandle {
             info_hash,
@@ -676,7 +679,8 @@ impl Session {
             .unwrap_or_else(PoisonError::into_inner);
         let commands = torrents
             .get(&info_hash)
-            .filter(|tx| !tx.is_closed())?
+            .filter(|route| route.is_live())?
+            .tx
             .clone();
         Some(TorrentHandle {
             info_hash,

@@ -39,8 +39,8 @@ use dravity_engine::{
     PeerLink, Priority, Stats, TorrentState, TorrentStatus,
 };
 use dravity_storage::{
-    FileIo, FileStorage, ResumeData, Storage, load_resume, read_block, save_resume, verify_piece,
-    write_block,
+    FileIo, FileStorage, ResumeData, Storage, load_resume, read_block, read_blocks, save_resume,
+    verify_piece, write_block, write_blocks,
 };
 use dravity_tracker::{AnnounceRequest, AnnounceResponse, TrackerClient};
 use dravity_webseed::WebSeedClient;
@@ -352,6 +352,10 @@ pub(crate) struct TorrentTask {
     /// Events produced synchronously during dispatch, handled next.
     local: VecDeque<Event>,
     hash_slots: Arc<Semaphore>,
+    /// Block writes and upload reads waiting to go to storage together
+    /// (see [`MAX_IO_BATCH`]).
+    pending_writes: Vec<(BlockRef, Bytes)>,
+    pending_reads: Vec<(PeerKey, BlockRef)>,
     /// Announce and DHT tasks. Aborted on stop; they must not delay it.
     background: JoinSet<()>,
     /// Block writes and piece hashes. Drained on stop, before resume data
@@ -438,6 +442,8 @@ impl TorrentTask {
             commands,
             local: VecDeque::new(),
             hash_slots,
+            pending_writes: Vec::new(),
+            pending_reads: Vec::new(),
             background: JoinSet::new(),
             disk: JoinSet::new(),
             file_priorities,
@@ -702,6 +708,14 @@ impl TorrentTask {
                 self.handle(event).await;
                 continue;
             }
+            // Blocks go to storage together: once no more input is ready, or
+            // a batch is full.
+            if self.events_rx.is_empty()
+                || self.pending_writes.len() >= MAX_IO_BATCH
+                || self.pending_reads.len() >= MAX_IO_BATCH
+            {
+                self.flush_io();
+            }
             let event = tokio::select! {
                 command = self.commands.recv() => match command {
                     Some(Command::Stop(ack)) => {
@@ -725,6 +739,7 @@ impl TorrentTask {
                 }
                 // Reap finished background work so the set does not grow.
                 Some(_) = self.background.join_next(), if !self.background.is_empty() => continue,
+                Some(_) = self.disk.join_next(), if !self.disk.is_empty() => continue,
                 () = await_port_change(&mut self.ctx.port_map) => {
                     let port = self.ctx.announce_port();
                     if port == announced_port {
@@ -737,6 +752,7 @@ impl TorrentTask {
             };
             self.handle(event).await;
         }
+        self.flush_io();
         self.peers.clear();
         self.background.shutdown().await;
         // Unblock disk tasks waiting to report, then let the writes finish.
@@ -1351,72 +1367,62 @@ impl TorrentTask {
     }
 
     fn write(&mut self, block: BlockRef, data: Bytes) {
-        let Some(content) = self.content.clone() else {
+        if self.content.is_none() {
             tracing::warn!(?block, "block write before metadata");
             return;
-        };
-        let tx = self.events_tx.clone();
-        self.disk.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                write_block(
-                    content.storage.as_ref(),
-                    content.metainfo.info().layout(),
-                    block,
-                    data,
-                )
-            })
-            .await;
-            let event = match result {
-                Ok(Ok(())) => Event::BlockWritten { block },
-                Ok(Err(e)) => Event::WriteFailed {
-                    block,
-                    error: e.to_string(),
-                },
-                Err(e) => Event::WriteFailed {
-                    block,
-                    error: e.to_string(),
-                },
-            };
-            let _ = tx.send(Input::Engine(event)).await;
-        });
+        }
+        self.pending_writes.push((block, data));
     }
 
-    /// Reads a block a peer asked for. Reads share the disk set with writes
-    /// so a stop waits for them too.
+    /// Queues a block a peer asked for.
     fn read(&mut self, peer: PeerKey, block: BlockRef) {
-        let Some(content) = self.content.clone() else {
+        if self.content.is_none() {
             tracing::warn!(?block, "block read before metadata");
             return;
+        }
+        self.pending_reads.push((peer, block));
+    }
+
+    /// Sends the queued block writes and reads to storage, each as one
+    /// batch (io_uring submits a batch at once and merges adjacent blocks).
+    /// Reads share the disk set with writes so a stop waits for them too.
+    fn flush_io(&mut self) {
+        let Some(content) = self.content.clone() else {
+            self.pending_writes.clear();
+            self.pending_reads.clear();
+            return;
         };
-        let tx = self.events_tx.clone();
-        self.disk.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                read_block(
-                    content.storage.as_ref(),
-                    content.metainfo.info().layout(),
-                    block,
-                )
-            })
-            .await;
-            let event = match result {
-                Ok(Ok(data)) => Event::BlockRead {
-                    peer,
-                    block,
-                    data: Bytes::from(data),
-                },
-                Ok(Err(e)) => Event::ReadFailed {
-                    peer,
-                    block,
-                    error: e.to_string(),
-                },
-                Err(e) => Event::ReadFailed {
-                    peer,
-                    block,
-                    error: e.to_string(),
-                },
-            };
-            let _ = tx.send(Input::Engine(event)).await;
-        });
+        if !self.pending_writes.is_empty() {
+            let writes = std::mem::take(&mut self.pending_writes);
+            let content = content.clone();
+            let tx = self.events_tx.clone();
+            self.disk.spawn(async move {
+                let events = tokio::task::spawn_blocking(move || write_batch(&content, writes))
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "block writes panicked");
+                        Vec::new()
+                    });
+                for event in events {
+                    let _ = tx.send(Input::Engine(event)).await;
+                }
+            });
+        }
+        if !self.pending_reads.is_empty() {
+            let reads = std::mem::take(&mut self.pending_reads);
+            let tx = self.events_tx.clone();
+            self.disk.spawn(async move {
+                let events = tokio::task::spawn_blocking(move || read_batch(&content, reads))
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "block reads panicked");
+                        Vec::new()
+                    });
+                for event in events {
+                    let _ = tx.send(Input::Engine(event)).await;
+                }
+            });
+        }
     }
 
     fn hash(&mut self, piece: u32) {
@@ -1779,6 +1785,67 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     text
 }
 
+/// Most block writes (or upload reads) sent to storage as one batch.
+const MAX_IO_BATCH: usize = 64;
+
+/// Writes `writes` as one batch. If the batch fails, each block is tried
+/// on its own so only the blocks that really failed are reported.
+fn write_batch(content: &Content, writes: Vec<(BlockRef, Bytes)>) -> Vec<Event> {
+    let layout = content.metainfo.info().layout();
+    let storage = content.storage.as_ref();
+    let blocks: Vec<BlockRef> = writes.iter().map(|(block, _)| *block).collect();
+    if writes.len() > 1 && write_blocks(storage, layout, writes.clone()).is_ok() {
+        return blocks
+            .into_iter()
+            .map(|block| Event::BlockWritten { block })
+            .collect();
+    }
+    writes
+        .into_iter()
+        .map(
+            |(block, data)| match write_block(storage, layout, block, data) {
+                Ok(()) => Event::BlockWritten { block },
+                Err(e) => Event::WriteFailed {
+                    block,
+                    error: e.to_string(),
+                },
+            },
+        )
+        .collect()
+}
+
+/// Reads `reads` as one batch. If the batch fails, each block is read on
+/// its own so only the blocks that really failed are reported.
+fn read_batch(content: &Content, reads: Vec<(PeerKey, BlockRef)>) -> Vec<Event> {
+    let layout = content.metainfo.info().layout();
+    let storage = content.storage.as_ref();
+    let blocks: Vec<BlockRef> = reads.iter().map(|(_, block)| *block).collect();
+    if reads.len() > 1
+        && let Ok(data) = read_blocks(storage, layout, &blocks)
+    {
+        return reads
+            .into_iter()
+            .zip(data)
+            .map(|((peer, block), data)| Event::BlockRead { peer, block, data })
+            .collect();
+    }
+    reads
+        .into_iter()
+        .map(|(peer, block)| match read_block(storage, layout, block) {
+            Ok(data) => Event::BlockRead {
+                peer,
+                block,
+                data: Bytes::from(data),
+            },
+            Err(e) => Event::ReadFailed {
+                peer,
+                block,
+                error: e.to_string(),
+            },
+        })
+        .collect()
+}
+
 /// The pieces roots (with their piece counts) whose layer `metainfo` still
 /// lacks, to fetch in the background.
 fn missing_layers(metainfo: &Metainfo) -> Vec<(Hash, u32)> {
@@ -1821,6 +1888,63 @@ mod tests {
         AnnounceMerge, announce_port, announce_tier, crypto_support, dht_lookup_failed,
         error_chain, prepare_tiers, promote,
     };
+
+    #[test]
+    fn a_failed_batch_reports_only_the_blocks_that_failed() {
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+        use dravity_core::{BlockRef, Metainfo};
+        use dravity_engine::{Event, PeerKey};
+        use dravity_storage::MemoryStorage;
+
+        use super::{Content, read_batch, write_batch};
+
+        let pieces = vec![0u8; 40];
+        let mut info = b"d6:lengthi40000e4:name1:a12:piece lengthi32768e6:pieces40:".to_vec();
+        info.extend_from_slice(&pieces);
+        info.push(b'e');
+        let metainfo = Metainfo::from_info_bytes(&info, Vec::new()).unwrap();
+        let content = Content {
+            metainfo: Arc::new(metainfo),
+            storage: Arc::new(MemoryStorage::new(40_000)),
+        };
+        let good = BlockRef {
+            piece: 0,
+            offset: 0,
+            length: 16_384,
+        };
+        let bad = BlockRef {
+            piece: 1,
+            offset: 16_384,
+            length: 16_384,
+        };
+        let data = Bytes::from(vec![7u8; 16_384]);
+        let events = write_batch(&content, vec![(good, data.clone()), (bad, data.clone())]);
+        assert_eq!(events[0], Event::BlockWritten { block: good });
+        assert!(matches!(events[1], Event::WriteFailed { block, .. } if block == bad));
+
+        let events = read_batch(&content, vec![(PeerKey(1), good), (PeerKey(2), bad)]);
+        assert_eq!(
+            events[0],
+            Event::BlockRead {
+                peer: PeerKey(1),
+                block: good,
+                data,
+            }
+        );
+        assert!(matches!(
+            events[1],
+            Event::ReadFailed {
+                peer: PeerKey(2),
+                ..
+            }
+        ));
+        assert_eq!(
+            write_batch(&content, vec![(good, Bytes::from(vec![1u8; 16_384]))]),
+            vec![Event::BlockWritten { block: good }]
+        );
+    }
 
     #[test]
     fn trackers_hear_the_encryption_policy() {

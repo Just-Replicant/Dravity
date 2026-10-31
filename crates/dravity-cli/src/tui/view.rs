@@ -662,6 +662,13 @@ pub(crate) fn alert_text(alert: &Alert) -> Option<String> {
         Alert::HashFailed { piece } => format!("piece {piece} failed the hash check"),
         Alert::TrackerError { message } => format!("tracker: {message}"),
         Alert::PeerBanned { ip } => format!("banned {ip}"),
+        Alert::PieceLayersStalled {
+            missing_layers,
+            silent,
+        } => format!(
+            "waiting for piece layers of {missing_layers} file(s): no peer sent any for {}s",
+            silent.as_secs()
+        ),
         Alert::Error { message } => format!("error: {message}"),
         _ => return None,
     })

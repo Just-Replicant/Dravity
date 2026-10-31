@@ -872,3 +872,46 @@ fn dial_hints_and_links_survive_the_handover() {
         vec![(addr(1), DialHints::from_link(link)), (addr(7), pex_hints)]
     );
 }
+
+#[test]
+fn a_stalled_v2_magnet_says_so_and_keeps_asking() {
+    let (info, tree) = v2_info(5 * 16_384 + 100);
+    let config = Config::default();
+    let quiet = config.piece_layer_stall_alert;
+    let mut h = Harness::with(MetadataState::new_v2(
+        InfoHashV2::from_info_bytes(&info),
+        config,
+    ));
+    h.peer(1, Some(info.len() as u64));
+    let fx = h.msg(1, data(0, &info));
+    let (_, r) = hash_requests(&fx)[0];
+    h.msg(1, Message::HashReject(r));
+    let stalled = |fx: &[Effect]| {
+        fx.iter().find_map(|e| match e {
+            Effect::Alert(Alert::PieceLayersStalled {
+                missing_layers,
+                silent,
+            }) => Some((*missing_layers, *silent)),
+            _ => None,
+        })
+    };
+    h.now += quiet - Duration::from_secs(1);
+    assert_eq!(stalled(&h.ev(Event::Tick)), None);
+    h.now += Duration::from_secs(1);
+    let fx = h.ev(Event::Tick);
+    assert_eq!(stalled(&fx), Some((1, quiet)));
+    assert!(!h.m.is_complete());
+    // Once per period of silence, not on every tick.
+    h.now += Duration::from_secs(1);
+    assert_eq!(stalled(&h.ev(Event::Tick)), None);
+    h.now += quiet;
+    assert_eq!(stalled(&h.ev(Event::Tick)).map(|s| s.0), Some(1));
+    // Still asking: a newly connected peer gets the request and completes.
+    let fx = h.peer(2, Some(info.len() as u64));
+    let (peer, r) = hash_requests(&fx)[0];
+    assert_eq!(peer, 2);
+    let fx = h.msg(2, answer(&tree, r));
+    assert_eq!(received(&fx), Some(info));
+    h.now += quiet * 2;
+    assert_eq!(stalled(&h.ev(Event::Tick)), None);
+}

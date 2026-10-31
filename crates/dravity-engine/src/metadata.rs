@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use dravity_core::merkle::{self, Hash, LayerRequest};
@@ -86,6 +86,10 @@ struct LayerFetch {
     hybrid: bool,
     /// When a hybrid stops waiting (pushed back by every answer).
     deadline: Option<Instant>,
+    /// When the last valid `hashes` arrived (or the fetch started).
+    last_progress: Instant,
+    /// When a v2-only fetch next reports itself stalled.
+    stall_alert_at: Option<Instant>,
     /// Layer above the leaves that holds one hash per piece.
     base_layer: u32,
     blocks: Vec<LayerBlock>,
@@ -96,7 +100,7 @@ struct LayerFetch {
 impl LayerFetch {
     /// What `info` still needs, or `None` when it needs nothing (or is not
     /// a v2 or hybrid torrent whose layers can be fetched).
-    fn for_info(info: &Bytes, now: Instant, timeout: Duration) -> Option<Self> {
+    fn for_info(info: &Bytes, now: Instant, config: &Config) -> Option<Self> {
         let metainfo = Metainfo::from_info_bytes(info, Vec::new()).ok()?;
         let info_dict = metainfo.info();
         let per_piece = merkle::leaves_per_piece(info_dict.piece_length())?;
@@ -117,7 +121,9 @@ impl LayerFetch {
         (!blocks.is_empty()).then(|| Self {
             info: info.clone(),
             hybrid,
-            deadline: hybrid.then(|| now + timeout),
+            deadline: hybrid.then(|| now + config.piece_layer_timeout),
+            last_progress: now,
+            stall_alert_at: (!hybrid).then(|| now + config.piece_layer_stall_alert),
             base_layer: per_piece.trailing_zeros(),
             blocks,
             layers,
@@ -155,6 +161,16 @@ impl LayerFetch {
     /// BEP 52, a hybrid's peers only if they say so in the handshake.
     fn can_ask(&self, reserved: Reserved) -> bool {
         !self.hybrid || reserved.v2()
+    }
+
+    /// Layers with at least one block still missing.
+    fn missing_layers(&self) -> u32 {
+        let missing = self.layers.iter().filter(|(root, _)| {
+            self.blocks
+                .iter()
+                .any(|b| b.root == *root && !b.state.is_have())
+        });
+        u32::try_from(missing.count()).unwrap_or(u32::MAX)
     }
 
     /// The layers whose every block arrived (all of them once
@@ -951,7 +967,7 @@ impl MetadataState {
             // pieces against the Merkle roots nor answer hash requests, so it
             // waits for the layers too, up to `piece_layer_timeout` without
             // progress (a swarm of v1-only peers never sends them).
-            if let Some(fetch) = LayerFetch::for_info(&info, now, self.config.piece_layer_timeout) {
+            if let Some(fetch) = LayerFetch::for_info(&info, now, &self.config) {
                 self.layers = Some(fetch);
                 self.fill_hash_requests(now, out);
                 return;
@@ -1037,8 +1053,11 @@ impl MetadataState {
         if let Some(b) = fetch.blocks.get_mut(i) {
             b.state = Piece::Have;
         }
+        fetch.last_progress = now;
         if fetch.hybrid {
             fetch.deadline = Some(now + self.config.piece_layer_timeout);
+        } else {
+            fetch.stall_alert_at = Some(now + self.config.piece_layer_stall_alert);
         }
         self.downloaded = self
             .downloaded
@@ -1187,6 +1206,18 @@ impl MetadataState {
             // files whose layer is still missing.
             let (info, layers) = fetch.into_complete();
             self.finish(info, layers, out);
+        }
+        if let Some(fetch) = &mut self.layers
+            && let Some(at) = fetch.stall_alert_at
+            && now >= at
+        {
+            // Say so, then keep waiting: a v2-only torrent has no other way
+            // to check its pieces.
+            fetch.stall_alert_at = Some(now + self.config.piece_layer_stall_alert);
+            out.push(Effect::Alert(Alert::PieceLayersStalled {
+                missing_layers: fetch.missing_layers(),
+                silent: now.saturating_duration_since(fetch.last_progress),
+            }));
         }
         let mut keys: Vec<PeerKey> = self.peers.keys().copied().collect();
         keys.sort_unstable();

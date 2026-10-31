@@ -836,10 +836,7 @@ fn unescape(s: &str) -> Vec<u8> {
 
 /// An HTTP tracker that records every announced `info_hash` and returns
 /// `peer` only to announces for `only`.
-async fn recording_tracker(
-    only: InfoHash,
-    peer: SocketAddr,
-) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
+async fn recording_tracker(only: InfoHash, peer: SocketAddr) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/announce", listener.local_addr().unwrap());
     let seen = Arc::new(Mutex::new(Vec::new()));

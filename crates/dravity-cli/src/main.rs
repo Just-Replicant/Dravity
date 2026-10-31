@@ -618,6 +618,19 @@ async fn download(
                 }
                 let _ = writeln!(std::io::stderr(), "upload: piece {piece}: {message}");
             }
+            Alert::PieceLayersStalled {
+                missing_layers,
+                silent,
+            } => {
+                if tty {
+                    let _ = writeln!(std::io::stderr());
+                }
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "waiting for piece layers of {missing_layers} file(s): no peer has sent any for {}s (still asking)",
+                    silent.as_secs()
+                );
+            }
             Alert::Finished if !complete => {
                 complete = true;
                 if !seed {

@@ -95,6 +95,10 @@ pub struct Config {
     /// the files still missing one (a v2-only magnet always waits: it has
     /// no other way to check its pieces).
     pub piece_layer_timeout: Duration,
+    /// A v2-only magnet whose piece layers have not progressed for this
+    /// long raises [`Alert::PieceLayersStalled`] (and again after each
+    /// further period of silence). It keeps waiting and asking.
+    pub piece_layer_stall_alert: Duration,
     /// A request without an answer after this long is given to other peers.
     pub request_timeout: Duration,
     /// Drop a peer that sent nothing for this long.
@@ -187,6 +191,7 @@ impl Default for Config {
             dht_retry: Duration::from_secs(15),
             max_metadata_size: 8 * 1024 * 1024,
             piece_layer_timeout: Duration::from_secs(20),
+            piece_layer_stall_alert: Duration::from_secs(120),
             request_timeout: Duration::from_secs(30),
             peer_timeout: Duration::from_secs(180),
             peer_retry: Duration::from_secs(30),
@@ -533,6 +538,17 @@ pub enum Alert {
     Finished,
     /// The `info` dictionary of a magnet link was received and verified.
     MetadataReceived,
+    /// A v2-only magnet's metadata is verified, but no peer has sent any of
+    /// its missing piece layers for [`Config::piece_layer_stall_alert`]
+    /// (BEP 52 hash requests). The download cannot start without them; the
+    /// torrent keeps asking every peer that connects.
+    PieceLayersStalled {
+        /// Files whose piece layer is still incomplete.
+        missing_layers: u32,
+        /// Time since the last layer data arrived (or since the metadata
+        /// was verified).
+        silent: Duration,
+    },
     /// A peer was banned for sending data that failed the hash check. Its
     /// connections are closed and its address is not used again.
     PeerBanned {

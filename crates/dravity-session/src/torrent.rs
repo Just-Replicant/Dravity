@@ -32,7 +32,7 @@ use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 use dravity_core::merkle::Hash;
-use dravity_core::{BlockRef, InfoHash, InfoHashV2, MetaVersion, Metainfo, PeerId};
+use dravity_core::{BlockRef, Info, InfoHash, InfoHashV2, MetaVersion, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{
     Alert, AnnounceEvent, Bitfield, Config, DialHints, Effect, Event, MetadataState, PeerKey,
@@ -399,6 +399,7 @@ impl TorrentTask {
                     .with_info_hash(ctx.info_hash)
                     .with_info_bytes(info)
                     .with_piece_layers(metainfo.info().piece_length(), owned_layers(&metainfo))
+                    .with_padded_last_piece(padded_last_piece(metainfo.info()))
                     .with_missing_piece_layers(
                         metainfo.info().piece_length(),
                         missing_layers(&metainfo),
@@ -840,6 +841,7 @@ impl TorrentTask {
             state
                 .with_info_bytes(info)
                 .with_piece_layers(piece_length, owned_layers(&content.metainfo))
+                .with_padded_last_piece(padded_last_piece(content.metainfo.info()))
                 .with_missing_piece_layers(piece_length, missing_layers(&content.metainfo)),
         )
     }
@@ -1007,6 +1009,7 @@ impl TorrentTask {
             .with_info_hash(self.ctx.info_hash)
             .with_info_bytes(info)
             .with_piece_layers(info_meta.piece_length(), owned_layers(&content.metainfo))
+            .with_padded_last_piece(padded_last_piece(info_meta))
             .with_missing_piece_layers(info_meta.piece_length(), missing_layers(&content.metainfo))
             .with_priorities(&self.piece_priorities(&content)),
         };
@@ -1854,6 +1857,13 @@ fn missing_layers(metainfo: &Metainfo) -> Vec<(Hash, u32)> {
         .into_iter()
         .filter_map(|root| Some((root, info.piece_layer_len(&root)?)))
         .collect()
+}
+
+/// Whether peers may ask for the zeros after the last piece's content (see
+/// [`TorrentState::with_padded_last_piece`]): v2-only torrents, whose files
+/// are all piece-aligned. A hybrid's last piece is sized by its v1 view.
+fn padded_last_piece(info: &Info) -> bool {
+    info.version() == MetaVersion::V2
 }
 
 /// The piece layers of `metainfo`, owned, for serving BEP 52 hash requests.

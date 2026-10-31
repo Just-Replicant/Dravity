@@ -1347,3 +1347,81 @@ fn hash_requests_are_served_from_piece_layers() {
         assert_eq!(reply(&mut h, bad), Message::HashReject(bad));
     }
 }
+
+#[test]
+fn a_padded_last_piece_serves_whole_blocks_with_zeros() {
+    let padded = req(2, BLOCK_SIZE, BLOCK_SIZE);
+    // Not padded (v1 and hybrid): the block runs past the content.
+    let mut h = Harness::seed(config());
+    h.accept(1, fast());
+    h.msg(1, Message::Interested);
+    let fx = h.msg(1, Message::Request(padded));
+    assert!(reads(&fx).is_empty());
+    assert_eq!(sent(&fx, 1), [Message::Reject(padded)]);
+
+    // Padded (v2-only): storage reads the 10 content bytes, the peer gets
+    // the whole block, the rest zeros, as libtorrent asks for it.
+    let mut h = Harness::seed(config());
+    h.t = h.t.with_padded_last_piece(true);
+    h.accept(1, fast());
+    h.msg(1, Message::Interested);
+    let fx = h.msg(1, Message::Request(padded));
+    assert_eq!(reads(&fx), [(1, block(req(2, BLOCK_SIZE, 10)))]);
+    let fx = h.complete_reads(&fx);
+    let data = sent(&fx, 1)
+        .into_iter()
+        .find_map(|m| match m {
+            Message::Piece {
+                piece: 2,
+                offset,
+                data,
+            } if offset == BLOCK_SIZE => Some(data),
+            _ => None,
+        })
+        .expect("the padded block is sent");
+    assert_eq!(data.len(), BLOCK_SIZE as usize);
+    assert!(data[..10].iter().all(|&b| b == 1), "content first");
+    assert!(data[10..].iter().all(|&b| b == 0), "then zeros");
+    assert_eq!(h.t.stats().uploaded, u64::from(BLOCK_SIZE));
+
+    // The exact request still works, and both can be in flight at once.
+    let exact = req(2, BLOCK_SIZE, 10);
+    let fx = [
+        h.msg(1, Message::Request(exact)),
+        h.msg(1, Message::Request(padded)),
+    ]
+    .concat();
+    assert_eq!(reads(&fx).len(), 2);
+    let lengths: Vec<usize> = sent(&h.complete_reads(&fx), 1)
+        .into_iter()
+        .filter_map(|m| match m {
+            Message::Piece { data, .. } => Some(data.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lengths.len(), 2);
+    assert!(lengths.contains(&10) && lengths.contains(&(BLOCK_SIZE as usize)));
+
+    // Blocks that start in the padding, run past the piece length, or are
+    // not in the last piece are refused.
+    for bad in [
+        req(2, BLOCK_SIZE + 16, 100),
+        req(2, BLOCK_SIZE + 5, BLOCK_SIZE),
+        req(2, 0, BLOCK_SIZE + 1),
+        req(1, BLOCK_SIZE + 1, BLOCK_SIZE),
+    ] {
+        let fx = h.msg(1, Message::Request(bad));
+        assert!(reads(&fx).is_empty(), "{bad:?}");
+        assert_eq!(sent(&fx, 1), [Message::Reject(bad)], "{bad:?}");
+    }
+
+    // A failed read rejects the request as the peer sent it.
+    let fx = h.msg(1, Message::Request(padded));
+    let (_, stored) = reads(&fx)[0];
+    let fx = h.ev(Event::ReadFailed {
+        peer: PeerKey(1),
+        block: stored,
+        error: "disk".into(),
+    });
+    assert!(sent(&fx, 1).contains(&Message::Reject(padded)), "{fx:?}");
+}

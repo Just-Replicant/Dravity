@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dravity_core::merkle::{self, Hash, MAX_HASH_REQUEST};
 use dravity_core::{BLOCK_SIZE, BlockRef, InfoHash, PieceLayout};
 use dravity_wire::{
@@ -282,6 +282,10 @@ pub struct TorrentState {
     /// Piece length and the piece layers a hybrid still lacks, fetched in
     /// the background from peers that speak BEP 52.
     layer_fetch: Option<(u32, LayerSet)>,
+    /// Whether requests may reach into the zero padding that aligns the
+    /// last piece to a whole piece (v2-only torrents, see
+    /// [`TorrentState::with_padded_last_piece`]).
+    padded_last_piece: bool,
     /// Verified pieces to hash again now that their file's piece layer is
     /// known, and those being hashed.
     recheck: VecDeque<u32>,
@@ -340,6 +344,7 @@ impl TorrentState {
             info_bytes: None,
             piece_layers: None,
             layer_fetch: None,
+            padded_last_piece: false,
             recheck: VecDeque::new(),
             rechecking: HashSet::new(),
             info_hash: None,
@@ -393,6 +398,20 @@ impl TorrentState {
             .into_iter()
             .filter_map(|(root, pieces)| Some((root, usize::try_from(pieces).ok()?)));
         self.layer_fetch = LayerSet::new(piece_length, roots).map(|set| (piece_length, set));
+        self
+    }
+
+    /// Accepts requests for the last piece that run past the end of the
+    /// content into the zeros aligning it to a whole piece, answering them
+    /// with those zeros. For v2-only torrents: BEP 52 aligns every file to
+    /// pieces, and libtorrent (qBittorrent) treats the last file as padded
+    /// too, so it asks for a whole 16 KiB block of a last piece that is
+    /// shorter. Refusing that request (as BEP 3 sizes would) left it
+    /// re-requesting the block forever and never finishing. Our own
+    /// requests never ask for padding.
+    #[must_use]
+    pub const fn with_padded_last_piece(mut self, padded: bool) -> Self {
+        self.padded_last_piece = padded;
         self
     }
 
@@ -1835,8 +1854,7 @@ impl TorrentState {
             length: request.length,
         };
         let serving = self.is_active();
-        let valid =
-            self.picker.layout().is_valid_request(block) && self.picker.have().get(block.piece);
+        let valid = self.is_servable(block) && self.picker.have().get(block.piece);
         let max_queue = self.config.max_upload_queue;
         let Some(peer) = self.peers.get_mut(&key) else {
             return;
@@ -1853,6 +1871,49 @@ impl TorrentState {
         }
         peer.upload_queue.push_back(block);
         self.pump_uploads(out);
+    }
+
+    /// Whether a peer may ask for `block`: inside its piece, or (with
+    /// [`with_padded_last_piece`](Self::with_padded_last_piece)) starting
+    /// inside the last piece and ending within its piece-aligned padding.
+    fn is_servable(&self, block: BlockRef) -> bool {
+        let layout = self.picker.layout();
+        if layout.is_valid_request(block) {
+            return true;
+        }
+        let last = layout.piece_count().saturating_sub(1);
+        self.padded_last_piece
+            && block.piece == last
+            && block.length > 0
+            && block.length <= BLOCK_SIZE
+            && layout
+                .piece_size(last)
+                .is_some_and(|size| block.offset < size)
+            && u64::from(block.offset) + u64::from(block.length) <= u64::from(layout.piece_length())
+    }
+
+    /// Takes the request in `peer`'s `reading` that a read of `stored` (see
+    /// [`stored_part`]) answers: `stored` itself, or a
+    /// longer request for the same place that runs into the padding.
+    fn take_reading(&mut self, key: PeerKey, stored: BlockRef) -> Option<BlockRef> {
+        let size = self.picker.layout().piece_size(stored.piece)?;
+        let peer = self.peers.get_mut(&key)?;
+        if peer.reading.remove(&stored) {
+            return Some(stored);
+        }
+        if !self.padded_last_piece || stored.offset + stored.length != size {
+            return None;
+        }
+        let padded = peer
+            .reading
+            .iter()
+            .filter(|b| {
+                b.piece == stored.piece && b.offset == stored.offset && b.length > stored.length
+            })
+            .max_by_key(|b| b.length)
+            .copied()?;
+        peer.reading.remove(&padded);
+        Some(padded)
     }
 
     /// A peer no longer wants a block. With the fast extension a cancelled
@@ -1960,6 +2021,7 @@ impl TorrentState {
             peer.reading.insert(block);
             self.pending_reads += 1;
             self.upload_cursor = Some(key);
+            let block = stored_part(self.picker.layout(), block);
             out.push(Effect::ReadBlock { peer: key, block });
             if !peer.upload_queue.is_empty() {
                 order.push_back(key);
@@ -1976,29 +2038,31 @@ impl TorrentState {
         out: &mut Vec<Effect>,
     ) {
         self.pending_reads = self.pending_reads.saturating_sub(1);
-        let mut refund = false;
-        if let Some(peer) = self.peers.get_mut(&key) {
-            // Gone from `reading`: cancelled, choked, or the peer was
-            // dropped (those paths already refunded).
-            if peer.reading.remove(&block) {
-                if peer.may_download(block.piece) {
-                    let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
-                    peer.up_round = peer.up_round.saturating_add(len);
-                    peer.uploaded = peer.uploaded.saturating_add(len);
-                    self.uploaded = self.uploaded.saturating_add(len);
-                    let message = Message::Piece {
-                        piece: block.piece,
-                        offset: block.offset,
-                        data,
-                    };
-                    Self::send(peer, key, message, now, out);
+        // Gone from `reading`: cancelled, choked, or the peer was dropped
+        // (those paths already refunded).
+        if let Some(requested) = self.take_reading(key, block)
+            && let Some(peer) = self.peers.get_mut(&key)
+        {
+            if peer.may_download(requested.piece) {
+                // A padded request: the content read, then its zeros.
+                let data = if requested.length > block.length {
+                    pad_with_zeros(data, requested.length)
                 } else {
-                    refund = true;
-                }
+                    data
+                };
+                let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                peer.up_round = peer.up_round.saturating_add(len);
+                peer.uploaded = peer.uploaded.saturating_add(len);
+                self.uploaded = self.uploaded.saturating_add(len);
+                let message = Message::Piece {
+                    piece: requested.piece,
+                    offset: requested.offset,
+                    data,
+                };
+                Self::send(peer, key, message, now, out);
+            } else {
+                self.refund_upload(u64::from(requested.length));
             }
-        }
-        if refund {
-            self.refund_upload(u64::from(block.length));
         }
         self.pump_uploads(out);
     }
@@ -2019,17 +2083,12 @@ impl TorrentState {
             piece: block.piece,
             message: error,
         }));
-        let refund = if let Some(peer) = self.peers.get_mut(&key) {
-            // Already removed: a cancel or a choke rejected it and refunded.
-            let still = peer.reading.remove(&block);
-            if still && peer.fast {
+        // Already removed: a cancel or a choke rejected it and refunded.
+        let requested = self.take_reading(key, block);
+        if let (Some(block), Some(peer)) = (requested, self.peers.get_mut(&key)) {
+            if peer.fast {
                 Self::send(peer, key, Message::Reject(block.into()), now, out);
             }
-            still
-        } else {
-            false
-        };
-        if refund {
             self.refund_upload(u64::from(block.length));
         }
         self.pump_uploads(out);
@@ -2340,6 +2399,30 @@ fn hash_reply(layers: Option<&(u32, HashMap<Hash, Vec<Hash>>)>, request: HashReq
         },
         None => Message::HashReject(request),
     }
+}
+
+/// The part of `block` that is content (what storage reads); the rest of a
+/// [padded](TorrentState::with_padded_last_piece) request is zeros.
+fn stored_part(layout: &PieceLayout, block: BlockRef) -> BlockRef {
+    let size = layout.piece_size(block.piece).unwrap_or(0);
+    let end = size.min(block.offset.saturating_add(block.length));
+    BlockRef {
+        length: end.saturating_sub(block.offset),
+        ..block
+    }
+}
+
+/// `data` extended with zeros to `length` bytes (the padding of a padded
+/// last piece).
+fn pad_with_zeros(data: Bytes, length: u32) -> Bytes {
+    let length = usize::try_from(length).unwrap_or(usize::MAX);
+    if data.len() >= length {
+        return data;
+    }
+    let mut padded = BytesMut::with_capacity(length);
+    padded.extend_from_slice(&data);
+    padded.resize(length, 0);
+    padded.freeze()
 }
 
 fn metadata_reply(info: Option<&Bytes>, piece: u32) -> MetadataMessage {

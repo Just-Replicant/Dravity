@@ -1,4 +1,4 @@
-# Phase 6 — v2/hybrid torrents and web seeds: notes and decisions
+# Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption: notes and decisions
 
 Scope from the roadmap (plan §8): "BEP 52 v2/hybrid + Merkle; web seeds
 (BEP 19); optional io_uring backend; protocol encryption if required."
@@ -25,6 +25,7 @@ refused a magnet without a `btih` topic (`MagnetWithoutV1Hash`).
 | `dravity-wire` | no | BEP 52 `HashRequest` (21), `Hashes` (22), `HashReject` (23); `Reserved::v2` (reserved bit `0x10` of byte 7) |
 | `dravity-core` | no | `merkle` (SHA-256 trees over 16 KiB leaves, piece layers, pad hashes; `layer_proof`, `verify_proof` and `layer_requests` for hash requests); v2 `file tree` parsing with the same path checks as v1; `MetaVersion` (`V1`, `V2`, `Hybrid`); `Metainfo::info_hash_v2`, `swarm_hashes`, `web_seeds`, `with_web_seeds`, `set_piece_layer`; `Info::version`, `check_piece`, `pieces_root`, `piece_layers`, `missing_piece_layers`; `Magnet::swarm_hash`; `InfoHashV2::from_info_bytes`. Fix: BEP 47 padding files may share a name |
 | `dravity-storage` | yes | `verify_piece` goes through `Info::check_piece` (SHA-1, Merkle, or both); `FileIo` under `FileStorage` (`BlockingIo` by default); `UringIo` (feature `uring`, Linux) |
+| `dravity-tracker` | yes | `CryptoSupport` / `AnnounceRequest::crypto`: `supportcrypto` and `requirecrypto` on HTTP announces |
 | `dravity-engine` | no | `MetadataState::new_v2` / `with_info_hash_v2`: magnet metadata is checked with SHA-256 for `btmh`, with both hashes for a hybrid link; v2 magnets then fetch missing piece layers with hash requests (`Effect::MetadataReceived` carries them); `TorrentState::with_piece_layers` answers hash requests |
 | `dravity-mse` (new) | sans-IO core, async with feature `stream` | MSE/PE: `Initiator` / `Responder` state machines, `initiate` / `respond` and `MseStream` over Tokio I/O, `Policy` |
 | `dravity-webseed` (new) | yes (feature `client`) | `plan` (sans-IO): a file's URL under a web seed and the HTTP ranges, plus zero-filled padding, that make up a byte range of the torrent. `WebSeedClient` (reqwest + rustls, on by default): strict ranged `GET`s |
@@ -96,8 +97,10 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   `hash request`s from them (layers at or above the piece layer, with
   the uncles asked for). Requests for leaf layers below the piece layer
   (Dravity keeps only piece layers), malformed requests and unknown
-  roots get a `hash reject`, which BEP 52 allows. During metadata
-  exchange every request is rejected. Dravity sets the v2 reserved bit.
+  roots get a `hash reject`, which BEP 52 allows; serving leaf layers
+  would mean keeping every file's 16 KiB leaf hashes, which no v2 client
+  needs to download. During metadata exchange every request is rejected.
+  Dravity sets the v2 reserved bit.
 - **Persistence.** The session writes `piece layers` and `url-list` next
   to `info` in its saved `.torrent`, so a v2 torrent restores without a
   peer, and keeps its web seeds.
@@ -151,8 +154,10 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   refuses io_uring.
 - **No `unsafe`.** Each job owns a `dup` of the cached descriptor and an
   owned buffer (tokio-uring's ownership model), at the cost of one `dup`
-  and one copy per operation. `fsync` stays on the blocking path. The
-  workspace's `unsafe_code = "forbid"` holds.
+  and one copy per operation. Reads, writes and `fdatasync`
+  (`FileIo::sync_data`) all go through the ring. The workspace's
+  `unsafe_code = "forbid"` holds: tokio-uring's safe, owned-buffer API is
+  enough, so the backend has no `unsafe` code at all.
 - **Selection and fallback.** `SessionConfig::storage_backend`
   (`Blocking`, `IoUring`; CLI `--storage-backend`) applies to storage the
   session creates. Asking for io_uring in a build without the feature, or
@@ -199,8 +204,11 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   RC4 and 768-bit DH are weak by current standards and the peer is not
   authenticated. `PeerStatus::encrypted` (TUI flag `E`) marks
   RC4-encrypted connections; MSE with the plaintext method only hides the
-  handshake. Tracker `supportcrypto`/`requirecrypto` parameters and PEX
-  encryption flags are not sent.
+  handshake.
+- **Trackers.** HTTP announces carry `supportcrypto=1` under `Enabled`
+  and also `requirecrypto=1` under `Required`
+  (`dravity_tracker::CryptoSupport`), as the MSE spec describes; UDP
+  trackers have no such field. PEX encryption flags are not sent.
 
 ## Tests
 
@@ -219,15 +227,18 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   rules; the v2 reserved bit.
 - Core: `layer_proof` / `verify_proof` for every base layer, index and
   proof depth, including a proptest; `layer_requests` covering a layer.
+- Tracker: `supportcrypto` / `requirecrypto` in announce URLs.
 - Engine: `tests/metadata.rs` checks v2 magnets with SHA-256 and hybrid
   magnets against both hashes; a v2 magnet fetching its piece layers with
   hash requests (bad proofs ban, rejects move on), small files needing
-  none, and requests rejected during metadata exchange.
+  none, requests rejected during metadata exchange, and a 600-piece
+  layer fetched as two 512-hash blocks whose uncle hash is checked (a
+  forged uncle disconnects the peer).
   `tests/seeding.rs` serves hash requests from piece layers.
 - Storage: `tests/uring.rs` (feature `uring`) writes, reads and verifies
   through io_uring from many threads and checks that an unusable ring is
-  an error, not a panic; each test prints a note and passes when the
-  kernel refuses io_uring.
+  an error, not a panic, and flushes through the ring; each test prints
+  a note and passes when the kernel refuses io_uring.
 - MSE: RFC 6229 RC4 output, the 1024-byte drop, the prime (768 bits,
   Fermat-probable, safe), DH agreement and weak keys; a reference
   implementation of both sides written from the spec text (with PadC,
@@ -242,7 +253,8 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   between two sessions; a hybrid answering handshakes for both ids; a v2
   magnet with small files fetching metadata and downloading (and keeping
   its `ws`); a v2 magnet with multi-piece files fetching its piece layers
-  and downloading; a hybrid announcing both ids to a tracker; a hybrid
+  and downloading; a v2 magnet whose 520-piece layer takes two hash
+  requests with uncle proofs; a hybrid announcing both ids to a tracker; a hybrid
   magnet answering its v2 id once the metadata arrives;
   piece layers surviving a restart; v2-only and hybrid torrents
   downloaded from a web seed alone; a broken web seed retried without
@@ -263,11 +275,12 @@ against BEP 52's reference layout only.
 
 ## Deferred
 
-| Item | When |
+| Item | Why |
 |---|---|
-| Hash requests for leaf layers (below the piece layer) | rejected: Dravity keeps piece layers only; would need per-file leaf hashes |
-| Piece layers for hybrid magnets | they verify with SHA-1; fetching layers would let them serve v2-only peers' hash requests |
-| io_uring without the per-operation `dup` and copy, and io_uring `fsync` | needs registered buffers/files, i.e. `unsafe` or a different crate |
-| MSE tracker parameters (`supportcrypto`, `requirecrypto`) and PEX encryption flags | none needed for interop; a `Required` client may dial some plain peers in vain |
-| Create empty files (v1 and v2) | pre-existing: storage creates files when data arrives |
-| BEP 17 (`httpseeds`, Hoffman-style) | not planned; BEP 19 covers the common case |
+| Piece layers for hybrid magnets | they verify with SHA-1; fetching the layers too would only let them answer v2-only peers' hash requests |
+| io_uring without the per-operation `dup` and copy | needs registered buffers and files; one 16 KiB copy is cheap next to the hashing |
+| PEX encryption flags (`added.f` bit `0x01`) | peers learned over PEX are dialed with MSE first anyway under `Enabled` |
+
+Out of scope for Phase 6 and unchanged from earlier phases: creating
+empty files up front (storage creates a file when its data arrives) and
+BEP 17 `httpseeds` (BEP 19 covers web seeds in practice).

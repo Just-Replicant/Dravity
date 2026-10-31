@@ -50,11 +50,15 @@ See [`docs/phase-6.md`](docs/phase-6.md) for design notes.
   (`StorageBackend::{Blocking, IoUring}`) with a logged fallback to
   blocking I/O, `Session::storage_backend`; CLI `--storage-backend` and
   `uring` features on `dravity-session` and `dravity-cli`.
+  `FileIo::sync_data`, so io_uring also flushes through the ring.
 - Message Stream Encryption: the new `dravity-mse` crate (sans-IO
   `Initiator` / `Responder`, async `initiate` / `respond`, `MseStream`,
   `Policy`); `SessionConfig::encryption` (`EncryptionPolicy`, default
   `Enabled`) for TCP and uTP, incoming and outgoing;
   `PeerStatus::encrypted`; CLI `--encryption` and the `E` peer flag.
+- `dravity_tracker::CryptoSupport` and `AnnounceRequest::crypto`: HTTP
+  announces send `supportcrypto=1` (and `requirecrypto=1` under
+  `EncryptionPolicy::Required`).
 - Fuzz targets `webseed_plan` and `mse_handshake`; `metainfo_parse` checks
   v2 hashes and `check_piece`.
 
@@ -73,6 +77,7 @@ See [`docs/phase-6.md`](docs/phase-6.md) for design notes.
   plain handshake; set `SessionConfig::encryption` to
   `EncryptionPolicy::Disabled` (CLI `--encryption disabled`) for the old
   behaviour.
+- **Breaking:** `AnnounceRequest` has a new `crypto` field.
 - **Breaking:** a v2-only magnet with files larger than one piece no longer
   stops with a missing piece layers error; it fetches the layers.
 

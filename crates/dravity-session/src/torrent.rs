@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
-use dravity_core::{BlockRef, InfoHash, Metainfo, PeerId};
+use dravity_core::{BlockRef, InfoHash, InfoHashV2, MetaVersion, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{
     Alert, AnnounceEvent, Bitfield, Config, Effect, Event, MetadataState, PeerKey, Priority, Stats,
@@ -214,8 +214,21 @@ pub(crate) enum Source {
         metainfo: Arc<Metainfo>,
         storage: Arc<dyn Storage>,
     },
-    /// A magnet link: fetch the metadata first, then download into `dir`.
-    Magnet { download_dir: PathBuf },
+    /// A magnet link: fetch the metadata first, then download.
+    Magnet(MagnetStart),
+}
+
+/// What a magnet link's task needs once its metadata arrives.
+#[derive(Debug, Clone)]
+pub(crate) struct MagnetStart {
+    /// Where the content goes.
+    pub(crate) download_dir: PathBuf,
+    /// The link has a v1 hash (`btih`): the task's info-hash is that one.
+    pub(crate) v1: bool,
+    /// The link's v2 hash (`btmh`), checked as well.
+    pub(crate) info_hash_v2: Option<InfoHashV2>,
+    /// Web seeds from the link (`ws`), added to the torrent's.
+    pub(crate) web_seeds: Vec<String>,
 }
 
 /// The engine state machine currently driving the torrent.
@@ -259,8 +272,9 @@ pub(crate) struct TorrentTask {
     ctx: TorrentContext,
     phase: Phase,
     content: Option<Content>,
-    /// Download directory of a magnet link, used once metadata arrives.
-    download_dir: Option<PathBuf>,
+    /// A magnet link's download directory and extras, used once metadata
+    /// arrives.
+    magnet: Option<MagnetStart>,
     /// Verified `info` dictionary waiting to replace the metadata phase.
     metadata: Option<Bytes>,
     peers: HashMap<PeerKey, mpsc::Sender<PeerCommand>>,
@@ -306,7 +320,7 @@ impl TorrentTask {
         commands: mpsc::Receiver<Command>,
     ) -> Self {
         let mut file_priorities = file_priorities;
-        let (phase, content, download_dir) = match source {
+        let (phase, content, magnet) = match source {
             Source::Torrent { metainfo, storage } => {
                 let config = ctx.engine_config(metainfo.info().is_private());
                 file_priorities = files::normalize(metainfo.info(), &file_priorities)
@@ -324,9 +338,16 @@ impl TorrentTask {
                     None,
                 )
             }
-            Source::Magnet { download_dir } => {
-                let state = MetadataState::new(ctx.info_hash, ctx.engine_config(false));
-                (Phase::Metadata(Box::new(state)), None, Some(download_dir))
+            Source::Magnet(start) => {
+                let config = ctx.engine_config(false);
+                let state = match (start.v1, start.info_hash_v2) {
+                    (false, Some(v2)) => MetadataState::new_v2(v2, config),
+                    (_, Some(v2)) => {
+                        MetadataState::new(ctx.info_hash, config).with_info_hash_v2(v2)
+                    }
+                    (_, None) => MetadataState::new(ctx.info_hash, config),
+                };
+                (Phase::Metadata(Box::new(state)), None, Some(start))
             }
         };
         let (events_tx, events_rx) = mpsc::channel(ctx.config.event_queue.max(1));
@@ -335,7 +356,7 @@ impl TorrentTask {
             ctx,
             phase,
             content,
-            download_dir,
+            magnet,
             metadata: None,
             peers: HashMap::new(),
             utp_peers: HashSet::new(),
@@ -704,9 +725,10 @@ impl TorrentTask {
         let Phase::Metadata(_) = self.phase else {
             return;
         };
-        let Some(dir) = self.download_dir.take() else {
+        let Some(start) = self.magnet.take() else {
             return self.fail("magnet is missing a download directory".to_owned());
         };
+        let dir = start.download_dir;
         let tiers = self
             .ctx
             .trackers
@@ -714,9 +736,22 @@ impl TorrentTask {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let metainfo = match Metainfo::from_info_bytes(&info, tiers) {
-            Ok(metainfo) => Arc::new(metainfo),
+            Ok(metainfo) => metainfo.with_web_seeds(start.web_seeds),
             Err(e) => return self.fail(format!("invalid metadata: {e}")),
         };
+        if metainfo.info().version() == MetaVersion::V2
+            && !metainfo.info().missing_piece_layers().is_empty()
+        {
+            // Hash requests (BEP 52) are not spoken yet: without the piece
+            // layers the larger files of a v2-only torrent cannot be
+            // verified, and a hybrid would fall back to SHA-1.
+            return self.fail(
+                "v2-only torrent: piece layers are not in the metadata and \
+                 fetching them from peers is not supported; add the .torrent file"
+                    .to_owned(),
+            );
+        }
+        let metainfo = Arc::new(metainfo);
         let storage: Arc<dyn Storage> = match FileStorage::new(&dir, metainfo.info()) {
             Ok(storage) => Arc::new(storage),
             Err(e) => return self.fail(format!("setting up storage: {e}")),
@@ -816,7 +851,7 @@ impl TorrentTask {
             entry.record(self.ctx.info_hash)
         };
         if let Some(persist) = &self.ctx.persist {
-            persist.save_torrent(metainfo);
+            persist.save_torrent(&self.ctx.info_hash, metainfo);
             persist.save_record(&record);
         }
     }
@@ -868,6 +903,20 @@ impl TorrentTask {
         }
     }
 
+    /// The hashes to look up and announce in the DHT: the torrent's id, and
+    /// for a hybrid torrent its truncated v2 hash as well.
+    fn swarm_hashes(&self) -> Vec<InfoHash> {
+        let mut hashes = vec![self.ctx.info_hash];
+        if let Some(content) = &self.content {
+            for h in content.metainfo.swarm_hashes() {
+                if !hashes.contains(&h) {
+                    hashes.push(h);
+                }
+            }
+        }
+        hashes
+    }
+
     fn dht_lookup(&mut self) {
         let Some(dht) = self.ctx.dht.clone() else {
             // The engine only asks when DHT is enabled; answer anyway so it
@@ -878,7 +927,7 @@ impl TorrentTask {
             });
             return;
         };
-        let info_hash = self.ctx.info_hash;
+        let hashes = self.swarm_hashes();
         let timeout = self.ctx.config.dht_lookup_timeout;
         let port_map = self.ctx.port_map.clone();
         let listen_port = self.ctx.listen_port;
@@ -889,7 +938,18 @@ impl TorrentTask {
             .is_some_and(|c| c.metainfo.info().is_private());
         let tx = self.events_tx.clone();
         self.background.spawn(async move {
-            let (peers, failed) = lookup_peers(&dht, info_hash, timeout).await;
+            // Every swarm of the torrent at once; failed only if all failed.
+            let lookups = hashes.iter().map(|h| lookup_peers(&dht, *h, timeout));
+            let mut peers: Vec<SocketAddr> = Vec::new();
+            let mut failed = true;
+            for (found, lookup_failed) in futures_util::future::join_all(lookups).await {
+                failed &= lookup_failed;
+                for addr in found {
+                    if !peers.contains(&addr) {
+                        peers.push(addr);
+                    }
+                }
+            }
             tracing::debug!(peers = peers.len(), failed, "DHT lookup done");
             let _ = tx
                 .send(Input::Engine(Event::DhtPeers { peers, failed }))
@@ -906,10 +966,12 @@ impl TorrentTask {
                 .and_then(|rx| rx.borrow().external_port(dravity_portmap::Protocol::Tcp));
             if let Some(port) = listen_port.map(|_| announce_port(mapped, listen_port, configured))
             {
-                let announced =
-                    tokio::time::timeout(timeout, dht.announce(info_hash, Some(port))).await;
-                if let Ok(Err(e)) = announced {
-                    tracing::debug!(error = %e, "DHT announce failed");
+                for info_hash in hashes {
+                    let announced =
+                        tokio::time::timeout(timeout, dht.announce(info_hash, Some(port))).await;
+                    if let Ok(Err(e)) = announced {
+                        tracing::debug!(error = %e, "DHT announce failed");
+                    }
                 }
             }
         });
@@ -931,13 +993,15 @@ impl TorrentTask {
         let Some(port) = self.ctx.listen_port.map(|_| self.ctx.announce_port()) else {
             return;
         };
-        let info_hash = self.ctx.info_hash;
+        let hashes = self.swarm_hashes();
         let timeout = self.ctx.config.dht_lookup_timeout;
         self.background.spawn(async move {
-            let announced =
-                tokio::time::timeout(timeout, dht.announce(info_hash, Some(port))).await;
-            if let Ok(Err(e)) = announced {
-                tracing::debug!(error = %e, "DHT announce failed");
+            for info_hash in hashes {
+                let announced =
+                    tokio::time::timeout(timeout, dht.announce(info_hash, Some(port))).await;
+                if let Ok(Err(e)) = announced {
+                    tracing::debug!(error = %e, "DHT announce failed");
+                }
             }
         });
     }

@@ -61,6 +61,15 @@
 //!   peers ([`PeerStatus`]: address, pieces, byte totals, flags, transport).
 //! * **Trackers**: [`TorrentHandle::trackers`] lists every tracker with the
 //!   last announce outcome the torrent saw ([`TrackerStatus`]).
+//!
+//! Advanced (Phase 6):
+//!
+//! * **BEP 52**: v2-only and hybrid `.torrent` files download and seed like
+//!   v1 ones; pieces are checked with every hash the torrent has. A v2-only
+//!   torrent is known by its truncated v2 hash. A hybrid torrent also
+//!   accepts peers of its v2 swarm and is looked up and announced in the
+//!   DHT under both hashes. `urn:btmh:` magnet links fetch and check
+//!   metadata with SHA-256; piece layers are saved with the session state.
 
 mod catalog;
 mod codec;
@@ -108,7 +117,7 @@ pub use watch::{WatchConfig, WatchHandle};
 use crate::catalog::{Catalog, Entry, EntrySource};
 use crate::listen::{Acceptor, Bound, Registry, UtpSockets};
 use crate::persist::{Persister, TorrentRecord};
-use crate::torrent::{Command, Source, TorrentContext, TorrentTask, prepare_tiers};
+use crate::torrent::{Command, MagnetStart, Source, TorrentContext, TorrentTask, prepare_tiers};
 
 /// An engine [`Alert`] tagged with the torrent it concerns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,9 +457,13 @@ impl Session {
     ///
     /// Must be called from within a Tokio runtime.
     ///
+    /// A v2-only magnet (`urn:btmh:` alone) is looked up under its truncated
+    /// v2 hash and its metadata is checked with SHA-256 (BEP 52). The
+    /// magnet's web seeds (`ws`) join the torrent's own.
+    ///
     /// # Errors
-    /// [`SessionError::MagnetWithoutV1Hash`] for a v2-only magnet,
-    /// [`SessionError::StorageForMagnet`] if `options` carries a custom
+    /// [`SessionError::MagnetWithoutInfoHash`] for a magnet without any
+    /// info-hash, [`SessionError::StorageForMagnet`] if `options` carries a custom
     /// storage backend, [`SessionError::Duplicate`] if the torrent is
     /// already in the session.
     pub fn add_magnet(
@@ -458,7 +471,9 @@ impl Session {
         magnet: &Magnet,
         options: AddTorrentOptions,
     ) -> Result<TorrentHandle, SessionError> {
-        let info_hash = magnet.info_hash.ok_or(SessionError::MagnetWithoutV1Hash)?;
+        let info_hash = magnet
+            .swarm_hash()
+            .ok_or(SessionError::MagnetWithoutInfoHash)?;
         if options.storage.is_some() {
             return Err(SessionError::StorageForMagnet);
         }
@@ -492,7 +507,7 @@ impl Session {
         };
         if save && let Some(persist) = self.inner.persister() {
             if let Some(metainfo) = entry.metainfo() {
-                persist.save_torrent(metainfo);
+                persist.save_torrent(&info_hash, metainfo);
             }
             persist.save_record(&entry.record(info_hash));
         }
@@ -512,12 +527,16 @@ impl Session {
 
     /// Starts a task for `entry`. Called with the catalog locked.
     fn spawn(&self, info_hash: InfoHash, entry: &mut Entry) -> Result<TorrentHandle, SessionError> {
+        let mut aliases = Vec::new();
         let (source, trackers, mut peers) = match &entry.source {
             EntrySource::Torrent(metainfo) => {
                 let storage: Arc<dyn Storage> = match &entry.storage {
                     Some(storage) => Arc::clone(storage),
                     None => Arc::new(FileStorage::new(&entry.download_dir, metainfo.info())?),
                 };
+                // A hybrid torrent is also known by its truncated v2 hash:
+                // peers of the v2 swarm connect with that one.
+                aliases = metainfo.swarm_hashes();
                 let source = Source::Torrent {
                     metainfo: Arc::clone(metainfo),
                     storage,
@@ -532,9 +551,12 @@ impl Session {
                     .iter()
                     .filter_map(|p| p.parse::<SocketAddr>().ok())
                     .collect();
-                let source = Source::Magnet {
+                let source = Source::Magnet(MagnetStart {
                     download_dir: entry.download_dir.clone(),
-                };
+                    v1: magnet.info_hash.is_some(),
+                    info_hash_v2: magnet.info_hash_v2,
+                    web_seeds: magnet.web_seeds.clone(),
+                });
                 (source, trackers, peers)
             }
         };
@@ -567,11 +589,20 @@ impl Session {
             let _ = tx.try_send(Command::AddPeers(peers));
         }
         tokio::spawn(TorrentTask::new(ctx, source, entry.priorities.clone(), rx).run());
-        self.inner
-            .torrents
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(info_hash, tx.clone());
+        {
+            let mut registry = self
+                .inner
+                .torrents
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            registry.insert(info_hash, tx.clone());
+            for alias in aliases.into_iter().filter(|h| *h != info_hash) {
+                // Never take over a hash a running torrent answers to.
+                if registry.get(&alias).is_none_or(mpsc::Sender::is_closed) {
+                    registry.insert(alias, tx.clone());
+                }
+            }
+        }
         entry.commands = Some(tx.clone());
         Ok(TorrentHandle {
             info_hash,
@@ -833,7 +864,7 @@ impl Session {
             let source = match (metainfo, &record.magnet) {
                 (Some(metainfo), _) => EntrySource::Torrent(Arc::new(metainfo)),
                 (None, Some(uri)) => match Magnet::parse(uri) {
-                    Ok(magnet) if magnet.info_hash == Some(record.info_hash) => {
+                    Ok(magnet) if magnet.swarm_hash() == Some(record.info_hash) => {
                         EntrySource::Magnet(Box::new(magnet))
                     }
                     Ok(_) => {
@@ -980,7 +1011,9 @@ fn load_state_dir(dir: &Path) -> std::io::Result<Loaded> {
         let torrent_path = path.with_extension("torrent");
         let metainfo = match persist::read_bounded(&torrent_path, persist::MAX_TORRENT_FILE) {
             Ok(bytes) => match Metainfo::from_bytes(&bytes) {
-                Ok(m) if m.info_hash() == record.info_hash => Some(m),
+                // A v2-only magnet whose metadata turned out hybrid stays
+                // under the truncated v2 hash it was added with.
+                Ok(m) if m.swarm_hashes().contains(&record.info_hash) => Some(m),
                 Ok(_) => {
                     loaded
                         .failed

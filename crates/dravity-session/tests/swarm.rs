@@ -520,11 +520,6 @@ async fn magnet_fetches_metadata_then_downloads() {
     assert_files(dir.path(), &content, len_a);
 
     // Unsupported inputs are rejected up front.
-    let v2_only = Magnet::parse(&format!("magnet:?xt=urn:btmh:1220{}", "ab".repeat(32))).unwrap();
-    assert!(matches!(
-        session.add_magnet(&v2_only, AddTorrentOptions::new(dir.path())),
-        Err(dravity_session::SessionError::MagnetWithoutV1Hash)
-    ));
     let storage = Arc::new(dravity_storage::MemoryStorage::new(1));
     assert!(matches!(
         session.add_magnet(

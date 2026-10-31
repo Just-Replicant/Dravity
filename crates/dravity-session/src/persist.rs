@@ -323,6 +323,35 @@ pub fn torrent_file_bytes(metainfo: &Metainfo) -> Vec<u8> {
     }
     out.extend_from_slice(b"4:info");
     out.extend_from_slice(metainfo.info_bytes());
+    // BEP 52 piece layers live outside `info`; without them a v2 torrent
+    // could not verify its larger files after a restart.
+    let layers = metainfo.info().piece_layers();
+    if !layers.is_empty() {
+        out.extend_from_slice(b"12:piece layers");
+        Value::Dict(
+            layers
+                .into_iter()
+                .map(|(root, layer)| {
+                    (
+                        Cow::Owned(root.to_vec()),
+                        Value::Bytes(Cow::Owned(layer.concat())),
+                    )
+                })
+                .collect(),
+        )
+        .encode(&mut out);
+    }
+    if !metainfo.web_seeds().is_empty() {
+        out.extend_from_slice(b"8:url-list");
+        Value::List(
+            metainfo
+                .web_seeds()
+                .iter()
+                .map(|url| Value::Bytes(Cow::Borrowed(url.as_bytes())))
+                .collect(),
+        )
+        .encode(&mut out);
+    }
     out.push(b'e');
     out
 }
@@ -485,8 +514,10 @@ impl Persister {
     }
 
     /// Saves a torrent's metainfo.
-    pub(crate) fn save_torrent(&self, metainfo: &Metainfo) {
-        let path = path_for(&self.dir, &metainfo.info_hash(), "torrent");
+    /// Saves `metainfo` as the `.torrent` file of the torrent known as
+    /// `info_hash` in the session.
+    pub(crate) fn save_torrent(&self, info_hash: &InfoHash, metainfo: &Metainfo) {
+        let path = path_for(&self.dir, info_hash, "torrent");
         self.enqueue(path, Kind::Write(torrent_file_bytes(metainfo)));
     }
 

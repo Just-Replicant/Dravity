@@ -570,3 +570,155 @@ async fn web_seeds_can_be_turned_off() {
     assert_eq!(stats.pieces_have, 0);
     session.shutdown().await;
 }
+
+/// Percent-decodes a query value.
+fn unescape(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap();
+            out.push(u8::from_str_radix(hex, 16).unwrap());
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// An HTTP tracker that records every announced `info_hash` and returns
+/// `peer` only to announces for `only`.
+async fn recording_tracker(
+    only: InfoHash,
+    peer: SocketAddr,
+) -> (String, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/announce", listener.local_addr().unwrap());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    let SocketAddr::V4(v4) = peer else {
+        panic!("IPv4 only")
+    };
+    let mut compact = v4.ip().octets().to_vec();
+    compact.extend_from_slice(&v4.port().to_be_bytes());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let log = Arc::clone(&log);
+            let compact = compact.clone();
+            tokio::spawn(async move {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).to_string();
+                let target = text.split_whitespace().nth(1).unwrap_or("").to_owned();
+                let hash = target
+                    .split(['?', '&'])
+                    .find_map(|kv| kv.strip_prefix("info_hash="))
+                    .map(unescape)
+                    .unwrap_or_default();
+                let peers = if hash == only.as_bytes() {
+                    compact
+                } else {
+                    Vec::new()
+                };
+                log.lock().unwrap().push(hash);
+                let body = dict(vec![
+                    (b"interval", Value::Int(1800)),
+                    (b"peers", bstr(&peers)),
+                ])
+                .to_vec();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+            });
+        }
+    });
+    (url, seen)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hybrid_torrent_announces_both_ids_to_trackers() {
+    let mut files = sample();
+    let torrent = make(&mut files, true, None);
+    let base = Metainfo::from_bytes(&torrent).unwrap();
+    let ids = base.swarm_hashes();
+    assert_eq!(ids.len(), 2);
+    let seed_dir = tempfile::tempdir().unwrap();
+    let (seeder, port) = seed(&torrent, &files, seed_dir.path()).await;
+    // The tracker hands out the seed only in the v2 swarm.
+    let (url, seen) = recording_tracker(ids[1], local(port)).await;
+    let m = Metainfo::from_info_bytes(base.info_bytes(), vec![vec![url]]).unwrap();
+    let hash = m.info_hash();
+
+    let dir = tempfile::tempdir().unwrap();
+    let leecher = Session::new(config()).unwrap();
+    let mut alerts = leecher.subscribe();
+    leecher
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert_files(dir.path(), &files);
+    let announced = seen.lock().unwrap().clone();
+    for id in &ids {
+        assert!(
+            announced.iter().any(|h| h == id.as_bytes()),
+            "{id} announced: {announced:?}"
+        );
+    }
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hybrid_magnet_answers_to_its_v2_id_once_the_metadata_arrives() {
+    let mut files = sample();
+    let torrent = make(&mut files, true, None);
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    let ids = m.swarm_hashes();
+    let seed_dir = tempfile::tempdir().unwrap();
+    let (seeder, port) = seed(&torrent, &files, seed_dir.path()).await;
+
+    let leecher = Session::new(config()).unwrap();
+    let leech_port = leecher.listen_port().unwrap();
+    let mut alerts = leecher.subscribe();
+    let dir = tempfile::tempdir().unwrap();
+    let magnet = Magnet::parse(&format!(
+        "magnet:?xt=urn:btih:{}&x.pe=127.0.0.1:{port}",
+        ids[0]
+    ))
+    .unwrap();
+    leecher
+        .add_magnet(&magnet, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    until(&mut alerts, ids[0], |a| *a == Alert::Finished).await;
+    // No restart: the v2 swarm id now reaches the same torrent.
+    let mut sock = TcpStream::connect(local(leech_port)).await.unwrap();
+    sock.write_all(&Handshake::new(ids[1], PeerId::new([8; 20])).to_bytes())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 68];
+    tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut buf))
+        .await
+        .expect("handshake reply")
+        .unwrap();
+    let theirs = Handshake::decode(&mut BytesMut::from(&buf[..]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(theirs.info_hash, ids[1]);
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}

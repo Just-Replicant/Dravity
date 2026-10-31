@@ -120,7 +120,9 @@ pub use watch::{WatchConfig, WatchHandle};
 use crate::catalog::{Catalog, Entry, EntrySource};
 use crate::listen::{Acceptor, Bound, Registry, UtpSockets};
 use crate::persist::{Persister, TorrentRecord};
-use crate::torrent::{Command, MagnetStart, Source, TorrentContext, TorrentTask, prepare_tiers};
+use crate::torrent::{
+    Aliases, Command, MagnetStart, Source, TorrentContext, TorrentTask, prepare_tiers,
+};
 
 /// An engine [`Alert`] tagged with the torrent it concerns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -572,6 +574,7 @@ impl Session {
         };
         peers.extend(entry.peers.iter().copied());
         self.start_listening();
+        let (tx, rx) = mpsc::channel(64);
         let ctx = TorrentContext {
             info_hash,
             trackers: prepare_tiers(trackers),
@@ -593,8 +596,11 @@ impl Session {
                 .unwrap_or_else(PoisonError::into_inner)
                 .as_ref()
                 .map(PortMapper::subscribe),
+            aliases: Aliases {
+                registry: Arc::clone(&self.inner.torrents),
+                tx: tx.downgrade(),
+            },
         };
-        let (tx, rx) = mpsc::channel(64);
         if !peers.is_empty() {
             // Fresh channel with spare capacity: cannot fail.
             let _ = tx.try_send(Command::AddPeers(peers));
@@ -607,13 +613,8 @@ impl Session {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             registry.insert(info_hash, tx.clone());
-            for alias in aliases.into_iter().filter(|h| *h != info_hash) {
-                // Never take over a hash a running torrent answers to.
-                if registry.get(&alias).is_none_or(mpsc::Sender::is_closed) {
-                    registry.insert(alias, tx.clone());
-                }
-            }
         }
+        listen::register_aliases(&self.inner.torrents, info_hash, &aliases, &tx);
         entry.commands = Some(tx.clone());
         Ok(TorrentHandle {
             info_hash,

@@ -53,7 +53,7 @@ use crate::SessionAlert;
 use crate::catalog::{Catalog, EntrySource};
 use crate::config::SessionConfig;
 use crate::files::{self, FileProgress};
-use crate::listen::UtpSockets;
+use crate::listen::{self, Registry, UtpSockets};
 use crate::peer::{self, PeerCommand, PeerParams};
 use crate::persist::Persister;
 use crate::status::{self, PeerStatus, TrackerLog, TrackerOutcome, TrackerStatus, Transport};
@@ -183,6 +183,9 @@ pub(crate) struct TorrentContext {
     pub(crate) persist: Option<Persister>,
     /// Router port mapping status, when mapping runs.
     pub(crate) port_map: Option<tokio::sync::watch::Receiver<dravity_portmap::Status>>,
+    /// Registers the second swarm id of a hybrid magnet once its metadata
+    /// is known.
+    pub(crate) aliases: Aliases,
 }
 
 impl TorrentContext {
@@ -231,6 +234,22 @@ pub(crate) enum Source {
     },
     /// A magnet link: fetch the metadata first, then download.
     Magnet(MagnetStart),
+}
+
+/// The listener's routing table and this torrent's command channel (weak:
+/// the task must not keep itself alive).
+#[derive(Debug, Clone)]
+pub(crate) struct Aliases {
+    pub(crate) registry: Registry,
+    pub(crate) tx: mpsc::WeakSender<Command>,
+}
+
+impl Aliases {
+    fn register(&self, primary: InfoHash, hashes: &[InfoHash]) {
+        if let Some(tx) = self.tx.upgrade() {
+            listen::register_aliases(&self.registry, primary, hashes, &tx);
+        }
+    }
 }
 
 /// Piece layers by pieces root (BEP 52).
@@ -999,6 +1018,10 @@ impl TorrentTask {
     /// A magnet's metadata arrived: the catalog (and the state directory)
     /// now hold the torrent, so a resume or restart does not fetch it again.
     fn record_metadata(&self, metainfo: &Arc<Metainfo>) {
+        // A hybrid magnet: peers of the other swarm can connect right away.
+        self.ctx
+            .aliases
+            .register(self.ctx.info_hash, &metainfo.swarm_hashes());
         let record = {
             let mut catalog = self
                 .ctx
@@ -1046,16 +1069,19 @@ impl TorrentTask {
                 left,
             } => {
                 let req = self.announce_request(event, uploaded, downloaded, left);
+                // A hybrid torrent is in two swarms: trackers hear about
+                // both ids.
+                let extra: Vec<InfoHash> = self.swarm_hashes().into_iter().skip(1).collect();
                 if event == AnnounceEvent::Stopped {
                     // The task is about to exit: announce inline, bounded.
                     // Nobody can read the outcome once the task exits.
-                    let fut = announce_all(self.ctx.clone(), req);
+                    let fut = announce_all(self.ctx.clone(), req, extra);
                     let _ = tokio::time::timeout(self.ctx.config.stop_announce_timeout, fut).await;
                 } else {
                     let ctx = self.ctx.clone();
                     let tx = self.events_tx.clone();
                     self.background.spawn(async move {
-                        let (event, outcomes) = announce_all(ctx, req).await;
+                        let (event, outcomes) = announce_all(ctx, req, extra).await;
                         let _ = tx.send(Input::Announced { event, outcomes }).await;
                     });
                 }
@@ -1419,6 +1445,7 @@ fn dht_lookup_failed(timed_out: bool, peers_empty: bool, has_nodes: bool) -> boo
 async fn announce_all(
     ctx: TorrentContext,
     req: AnnounceRequest,
+    extra: Vec<InfoHash>,
 ) -> (Event, Vec<(String, TrackerOutcome)>) {
     let tiers: Vec<Vec<String>> = ctx
         .trackers
@@ -1444,6 +1471,7 @@ async fn announce_all(
             Arc::clone(&ctx.trackers),
             tier,
             req.clone(),
+            extra.clone(),
         ));
     }
     let mut merge = AnnounceMerge::default();
@@ -1496,13 +1524,36 @@ async fn announce_tier(
     tiers: Tiers,
     tier: Vec<String>,
     req: AnnounceRequest,
+    extra: Vec<InfoHash>,
 ) -> (Option<(String, AnnounceResponse)>, Vec<(String, String)>) {
     let mut errors = Vec::new();
     for url in tier {
         match client.announce(&url, &req).await {
-            Ok(response) => {
+            Ok(mut response) => {
                 tracing::debug!(%url, peers = response.peers.len(), "announce ok");
                 promote(&tiers, &url);
+                // The other swarm ids go to the tracker that answered. Their
+                // peers join the merge; their failures only get logged, the
+                // tier's outcome is the primary id's.
+                for info_hash in extra {
+                    let other = AnnounceRequest {
+                        info_hash,
+                        ..req.clone()
+                    };
+                    match client.announce(&url, &other).await {
+                        Ok(more) => {
+                            tracing::debug!(%url, %info_hash, peers = more.peers.len(), "announce ok");
+                            for peer in more.peers {
+                                if !response.peers.contains(&peer) {
+                                    response.peers.push(peer);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(%url, %info_hash, error = %error_chain(&e), "announce failed");
+                        }
+                    }
+                }
                 return (Some((url, response)), errors);
             }
             Err(e) => {
@@ -1771,8 +1822,14 @@ mod tests {
             num_want: Some(1),
             key: 7,
         };
-        let (answer, errors) =
-            announce_tier(client, Arc::clone(&tiers), vec![dead, good.clone()], req).await;
+        let (answer, errors) = announce_tier(
+            client,
+            Arc::clone(&tiers),
+            vec![dead, good.clone()],
+            req,
+            Vec::new(),
+        )
+        .await;
         assert_eq!(answer.expect("fallback").0, good);
         assert_eq!(errors.len(), 1, "the dead tracker was tried");
         assert_eq!(errors[0].0, dead_url);

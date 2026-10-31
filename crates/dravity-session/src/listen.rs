@@ -201,6 +201,23 @@ fn bind_one(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
 /// Torrents incoming connections can be routed to.
 pub(crate) type Registry = Arc<Mutex<HashMap<InfoHash, mpsc::Sender<Command>>>>;
 
+/// Routes incoming handshakes for each of `aliases` other than `primary`
+/// (a hybrid torrent's second swarm id) to `tx`. Never takes over a hash a
+/// running torrent answers to.
+pub(crate) fn register_aliases(
+    registry: &Registry,
+    primary: InfoHash,
+    aliases: &[InfoHash],
+    tx: &mpsc::Sender<Command>,
+) {
+    let mut registry = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    for alias in aliases.iter().copied().filter(|h| *h != primary) {
+        if registry.get(&alias).is_none_or(mpsc::Sender::is_closed) {
+            registry.insert(alias, tx.clone());
+        }
+    }
+}
+
 /// What an accept task needs.
 #[derive(Debug, Clone)]
 pub(crate) struct Acceptor {

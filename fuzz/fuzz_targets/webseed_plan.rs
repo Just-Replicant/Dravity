@@ -22,4 +22,16 @@ fuzz_target!(|data: &[u8]| {
     let end = (start + u64::from(*b) + 1).min(total);
     let plan = plan_range("http://seed.example/x/", m.info(), start..end).expect("range in bounds");
     assert_eq!(plan.iter().map(Segment::len).sum::<u64>(), end - start);
+    // Every fetch stays inside its file, as the client's range checks expect.
+    for segment in &plan {
+        if let Segment::Fetch {
+            offset,
+            length,
+            file_length,
+            ..
+        } = segment
+        {
+            assert!(*length > 0 && offset + length <= *file_length);
+        }
+    }
 });

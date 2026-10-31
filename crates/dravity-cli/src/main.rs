@@ -150,6 +150,11 @@ struct NetworkArgs {
     /// Never download from HTTP web seeds (BEP 19 `url-list`, magnet `ws`).
     #[arg(long)]
     no_web_seeds: bool,
+    /// Let web seeds reach loopback, private (LAN) and link-local
+    /// addresses. Off by default, so a torrent cannot make Dravity probe
+    /// the local network.
+    #[arg(long, conflicts_with = "no_web_seeds")]
+    web_seeds_allow_private: bool,
     /// How torrent data is read and written. `io-uring` needs a build with
     /// the `uring` feature on Linux; without it, or where the kernel refuses
     /// io_uring, blocking I/O is used and a warning is logged.
@@ -226,6 +231,9 @@ impl NetworkArgs {
         }
         if self.no_web_seeds {
             config.web_seed = None;
+        }
+        if let Some(web_seed) = config.web_seed.as_mut() {
+            web_seed.allow_private_addresses = self.web_seeds_allow_private;
         }
         config.storage_backend = self.storage_backend.into();
         config.encryption = self.encryption.into();

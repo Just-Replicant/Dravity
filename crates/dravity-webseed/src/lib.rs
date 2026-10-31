@@ -14,11 +14,13 @@
 //! Responses are untrusted: a short, long or unranged body is an error, and
 //! the data is still checked against the piece hashes by the session.
 
+mod addr;
 #[cfg(feature = "client")]
 mod client;
 mod error;
 pub mod plan;
 
+pub use addr::is_public;
 #[cfg(feature = "client")]
 pub use client::{WebSeedClient, WebSeedConfig};
 pub use error::WebSeedError;

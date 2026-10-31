@@ -19,6 +19,8 @@ client = [
     "dep:reqwest",
     "dep:rustls",
     "dep:rustls-platform-verifier",
+    "dep:tokio",
+    "dep:url",
 ]
 
 [dependencies]
@@ -27,6 +29,8 @@ reqwest = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-platform-verifier = { workspace = true, optional = true }
 thiserror.workspace = true
+tokio = { workspace = true, optional = true, features = ["net"] }
+url = { workspace = true, optional = true }
 
 [dev-dependencies]
 dravity-bencode.workspace = true

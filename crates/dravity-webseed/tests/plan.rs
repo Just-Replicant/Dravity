@@ -87,13 +87,15 @@ fn ranges_split_at_files_and_pad_with_zeros() {
             Segment::Fetch {
                 url: "http://h/my%20dir/a".into(),
                 offset: 4,
-                length: 6
+                length: 6,
+                file_length: 10,
             },
             Segment::Zeros { length: 6 },
             Segment::Fetch {
                 url: "http://h/my%20dir/b".into(),
                 offset: 0,
-                length: 14
+                length: 14,
+                file_length: 20,
             },
         ]
     );

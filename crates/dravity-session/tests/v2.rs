@@ -182,6 +182,10 @@ fn config() -> SessionConfig {
     c.dht = None;
     c.listen = Some(ListenConfig::loopback(0));
     c.port_mapping = None;
+    // The test web seeds listen on loopback.
+    if let Some(web_seed) = c.web_seed.as_mut() {
+        web_seed.allow_private_addresses = true;
+    }
     c
 }
 
@@ -657,7 +661,7 @@ async fn http_server(root: PathBuf, broken: bool) -> (SocketAddr, Arc<AtomicUsiz
                     count.fetch_add(1, Ordering::Relaxed);
                     let path = text.split_whitespace().nth(1).unwrap_or("/").to_owned();
                     let file = std::fs::read(root.join(path.trim_start_matches('/')));
-                    let (status, body) = match file {
+                    let (status, body, range_header) = match file {
                         Ok(data) if !broken => {
                             let range = text.lines().find_map(|l| {
                                 l.to_ascii_lowercase()
@@ -669,15 +673,20 @@ async fn http_server(root: PathBuf, broken: bool) -> (SocketAddr, Arc<AtomicUsiz
                                     let (a, b) = r.trim().split_once('-').unwrap();
                                     let (a, b): (usize, usize) =
                                         (a.parse().unwrap(), b.parse().unwrap());
-                                    ("206 Partial Content", data[a..=b].to_vec())
+                                    let total = data.len();
+                                    (
+                                        "206 Partial Content",
+                                        data[a..=b].to_vec(),
+                                        format!("content-range: bytes {a}-{b}/{total}\r\n"),
+                                    )
                                 }
-                                None => ("200 OK", data),
+                                None => ("200 OK", data, String::new()),
                             }
                         }
-                        _ => ("404 Not Found", Vec::new()),
+                        _ => ("404 Not Found", Vec::new(), String::new()),
                     };
                     let head = format!(
-                        "HTTP/1.1 {status}\r\ncontent-length: {}\r\n\r\n",
+                        "HTTP/1.1 {status}\r\n{range_header}content-length: {}\r\n\r\n",
                         body.len()
                     );
                     if sock.write_all(head.as_bytes()).await.is_err()

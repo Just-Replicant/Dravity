@@ -18,6 +18,9 @@ pub enum Segment {
         offset: u64,
         /// Number of bytes.
         length: u64,
+        /// The whole file's length, checked against the `Content-Range`
+        /// total or the length of a `200` body.
+        file_length: u64,
     },
     /// `length` bytes of a BEP 47 padding file: zeros, never fetched.
     Zeros {
@@ -116,6 +119,7 @@ pub fn plan_range(
                 url,
                 offset: from - start,
                 length,
+                file_length: file.length(),
             }),
             None => out.push(Segment::Zeros { length }),
         }

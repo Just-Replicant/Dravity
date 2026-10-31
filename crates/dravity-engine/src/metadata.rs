@@ -1,13 +1,13 @@
 //! Fetching a magnet link's `info` dictionary from peers (BEP 9), and the
-//! piece layers of a v2-only magnet with BEP 52 hash requests.
+//! piece layers of a v2 or hybrid magnet with BEP 52 hash requests.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dravity_core::merkle::{self, Hash, LayerRequest};
-use dravity_core::{InfoHash, InfoHashV2, Metainfo};
+use dravity_core::{InfoHash, InfoHashV2, MetaVersion, Metainfo};
 use dravity_wire::{
     ExtendedHandshake, HashRequest, METADATA_PIECE_LEN, Message, MetadataMessage, Reserved,
     metadata_piece_count,
@@ -75,11 +75,17 @@ struct LayerBlock {
     state: Piece,
 }
 
-/// The piece layers a verified v2 `info` still needs (BEP 52).
+/// The piece layers a verified v2 or hybrid `info` still needs (BEP 52).
 #[derive(Debug)]
 struct LayerFetch {
     /// The verified `info` bytes, reported once the layers are complete.
     info: Bytes,
+    /// A hybrid can fall back to its SHA-1 piece hashes, so its fetch has a
+    /// deadline and only asks peers that advertise BEP 52 (a v1-only peer
+    /// of a hybrid swarm does not know the hash messages).
+    hybrid: bool,
+    /// When a hybrid stops waiting (pushed back by every answer).
+    deadline: Option<Instant>,
     /// Layer above the leaves that holds one hash per piece.
     base_layer: u32,
     blocks: Vec<LayerBlock>,
@@ -89,8 +95,8 @@ struct LayerFetch {
 
 impl LayerFetch {
     /// What `info` still needs, or `None` when it needs nothing (or is not
-    /// a v2 torrent whose layers can be fetched).
-    fn for_info(info: &Bytes) -> Option<Self> {
+    /// a v2 or hybrid torrent whose layers can be fetched).
+    fn for_info(info: &Bytes, now: Instant, timeout: Duration) -> Option<Self> {
         let metainfo = Metainfo::from_info_bytes(info, Vec::new()).ok()?;
         let info_dict = metainfo.info();
         let per_piece = merkle::leaves_per_piece(info_dict.piece_length())?;
@@ -107,8 +113,11 @@ impl LayerFetch {
             }
             layers.push((root, vec![[0; 32]; pieces]));
         }
+        let hybrid = info_dict.version() == MetaVersion::Hybrid;
         (!blocks.is_empty()).then(|| Self {
             info: info.clone(),
+            hybrid,
+            deadline: hybrid.then(|| now + timeout),
             base_layer: per_piece.trailing_zeros(),
             blocks,
             layers,
@@ -140,6 +149,29 @@ impl LayerFetch {
 
     fn is_done(&self) -> bool {
         self.blocks.iter().all(|b| b.state.is_have())
+    }
+
+    /// Whether `peer` may be asked: every peer of a v2-only swarm speaks
+    /// BEP 52, a hybrid's peers only if they say so in the handshake.
+    fn can_ask(&self, reserved: Reserved) -> bool {
+        !self.hybrid || reserved.v2()
+    }
+
+    /// The layers whose every block arrived (all of them once
+    /// [`Self::is_done`]).
+    fn into_complete(self) -> (Bytes, Vec<(Hash, Vec<Hash>)>) {
+        let blocks = self.blocks;
+        let layers = self
+            .layers
+            .into_iter()
+            .filter(|(root, _)| {
+                blocks
+                    .iter()
+                    .filter(|b| b.root == *root)
+                    .all(|b| b.state.is_have())
+            })
+            .collect();
+        (self.info, layers)
     }
 }
 
@@ -262,7 +294,7 @@ pub struct MetadataState {
     hints: HintBook,
     downloaded: u64,
     complete: bool,
-    /// Set once a v2-only `info` is verified but some of its piece layers
+    /// Set once a v2 or hybrid `info` is verified but some of its piece layers
     /// are still being fetched from peers.
     layers: Option<LayerFetch>,
 }
@@ -914,11 +946,12 @@ impl MetadataState {
             self.sources.clear();
             // A v2-only torrent cannot check a piece of a file larger than a
             // piece without that file's piece layer, which BEP 9 does not
-            // carry: fetch the layers from peers first. A hybrid falls back
-            // to its SHA-1 piece hashes.
-            if !self.check_v1
-                && let Some(fetch) = LayerFetch::for_info(&info)
-            {
+            // carry: fetch the layers from peers first. A hybrid could
+            // start on SHA-1 alone, but then it could neither check its
+            // pieces against the Merkle roots nor answer hash requests, so it
+            // waits for the layers too, up to `piece_layer_timeout` without
+            // progress (a swarm of v1-only peers never sends them).
+            if let Some(fetch) = LayerFetch::for_info(&info, now, self.config.piece_layer_timeout) {
                 self.layers = Some(fetch);
                 self.fill_hash_requests(now, out);
                 return;
@@ -1004,21 +1037,24 @@ impl MetadataState {
         if let Some(b) = fetch.blocks.get_mut(i) {
             b.state = Piece::Have;
         }
+        if fetch.hybrid {
+            fetch.deadline = Some(now + self.config.piece_layer_timeout);
+        }
         self.downloaded = self
             .downloaded
             .saturating_add(u64::try_from(hashes.len()).unwrap_or(0));
         if fetch.is_done()
             && let Some(done) = self.layers.take()
         {
-            self.finish(done.info, done.layers, out);
+            let (info, layers) = done.into_complete();
+            self.finish(info, layers, out);
             return;
         }
         self.fill_hash_requests(now, out);
     }
 
     /// Asks connected peers for missing piece-layer blocks, at most
-    /// [`PIPELINE`] at a time per peer. Every peer of a v2-only swarm speaks
-    /// BEP 52, so the v2 handshake bit is not required.
+    /// [`PIPELINE`] at a time per peer (see [`LayerFetch::can_ask`]).
     fn fill_hash_requests(&mut self, now: Instant, out: &mut Vec<Effect>) {
         if self.status != TorrentStatus::FetchingMetadata {
             return;
@@ -1032,6 +1068,9 @@ impl MetadataState {
             let Some(peer) = self.peers.get_mut(&key) else {
                 continue;
             };
+            if !fetch.can_ask(peer.reserved) {
+                continue;
+            }
             let mut outstanding = fetch
                 .blocks
                 .iter()
@@ -1139,6 +1178,16 @@ impl MetadataState {
             }
         }
         self.abandon_stalled_size();
+        if self.status == TorrentStatus::FetchingMetadata
+            && let Some(fetch) = self
+                .layers
+                .take_if(|f| f.deadline.is_some_and(|d| now >= d))
+        {
+            // A hybrid whose swarm stopped answering: start on SHA-1 for the
+            // files whose layer is still missing.
+            let (info, layers) = fetch.into_complete();
+            self.finish(info, layers, out);
+        }
         let mut keys: Vec<PeerKey> = self.peers.keys().copied().collect();
         keys.sort_unstable();
         let mut dead = Vec::new();

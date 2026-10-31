@@ -250,6 +250,33 @@ fn hybrid_torrents_check_both_hashes() {
 }
 
 #[test]
+fn a_hybrid_piece_must_pass_merkle_as_well_as_sha1() {
+    // v1 piece hashes of `honest` with the v2 tree of `other`: data that
+    // matches SHA-1 but not the Merkle tree (a v1 collision, or a peer
+    // serving a different v2 file) is rejected.
+    let file = |seed| vec![F(vec!["one"], content(50_000, seed))];
+    let (honest, stream) = build("one", file(4), 16_384, true);
+    let (other, _) = build("one", file(5), 16_384, true);
+    let honest = Value::decode(&honest).unwrap().into_owned();
+    let mut forged = Value::decode(&other).unwrap().into_owned();
+    let pieces = honest.get(b"info").unwrap().get(b"pieces").unwrap().clone();
+    let mut info = forged.get(b"info").unwrap().clone();
+    insert(&mut info, b"pieces", Some(pieces));
+    insert(&mut forged, b"info", Some(info));
+    let m = Metainfo::from_bytes(&forged.to_vec()).unwrap();
+    let info = m.info();
+    assert_eq!(info.version(), MetaVersion::Hybrid);
+    assert!(info.missing_piece_layers().is_empty());
+    for i in 0..info.piece_count() {
+        let r = info.layout().piece_range(i).unwrap();
+        let piece = &stream[r.start as usize..r.end as usize];
+        let sha1: [u8; 20] = Sha1::digest(piece).into();
+        assert_eq!(info.piece_hash(i), Some(&sha1), "piece {i} passes SHA-1");
+        assert!(!info.check_piece(i, piece), "piece {i} fails Merkle");
+    }
+}
+
+#[test]
 fn hybrid_parts_must_agree() {
     let (bytes, _) = build("set", sample(), 32_768, true);
     let t = Value::decode(&bytes).unwrap().into_owned();

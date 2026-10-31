@@ -90,6 +90,11 @@ pub struct Config {
     pub dht_retry: Duration,
     /// Largest `info` dictionary accepted from peers for a magnet link.
     pub max_metadata_size: u64,
+    /// How long a hybrid magnet waits for its v2 piece layers without any
+    /// layer block arriving before the download starts on SHA-1 alone for
+    /// the files still missing one (a v2-only magnet always waits: it has
+    /// no other way to check its pieces).
+    pub piece_layer_timeout: Duration,
     /// A request without an answer after this long is given to other peers.
     pub request_timeout: Duration,
     /// Drop a peer that sent nothing for this long.
@@ -181,6 +186,7 @@ impl Default for Config {
             dht_interval: Duration::from_secs(5 * 60),
             dht_retry: Duration::from_secs(15),
             max_metadata_size: 8 * 1024 * 1024,
+            piece_layer_timeout: Duration::from_secs(20),
             request_timeout: Duration::from_secs(30),
             peer_timeout: Duration::from_secs(180),
             peer_retry: Duration::from_secs(30),

@@ -722,6 +722,7 @@ dependencies = [
  "dravity-core",
  "dravity-wire",
  "proptest",
+ "sha1",
  "thiserror",
 ]
 

@@ -82,13 +82,18 @@ impl Harness {
 
     /// Connects an extension-capable peer that offers `size` bytes.
     fn peer(&mut self, peer: u64, size: Option<u64>) -> Vec<Effect> {
+        self.peer_with(peer, size, Reserved::new().with_extension_protocol(true))
+    }
+
+    /// Like [`Self::peer`], with the handshake's `reserved` bytes.
+    fn peer_with(&mut self, peer: u64, size: Option<u64>, reserved: Reserved) -> Vec<Effect> {
         self.ev(Event::AddPeers {
             peers: vec![addr(peer as u16)],
         });
         let mut fx = self.ev(Event::PeerConnected {
             peer: PeerKey(peer),
             addr: addr(peer as u16),
-            reserved: Reserved::new().with_extension_protocol(true),
+            reserved,
             link: PeerLink::default(),
         });
         let hs = ExtendedHandshake {
@@ -670,6 +675,122 @@ fn large_piece_layers_are_fetched_in_blocks_with_uncle_proofs() {
     }
     assert_eq!(done, Some(vec![(tree.root, tree.layer.clone())]));
     assert!(h.m.is_complete());
+}
+
+/// A hybrid `info` (v1 and v2) with one file of `len` bytes in 16 KiB
+/// pieces, and the file's piece layer.
+fn hybrid_info(len: usize) -> (Bytes, merkle::FileHashes) {
+    use sha1::{Digest, Sha1};
+    let data: Vec<u8> = (0..len).map(|i| (i % 253) as u8).collect();
+    let tree = merkle::file_hashes(&data, 16_384).unwrap();
+    let pieces: Vec<u8> = data
+        .chunks(16_384)
+        .flat_map(|c| Sha1::digest(c).to_vec())
+        .collect();
+    let mut info = format!("d9:file treed5:a.bind0:d6:lengthi{len}e11:pieces root32:").into_bytes();
+    info.extend_from_slice(&tree.root);
+    info.extend_from_slice(
+        format!(
+            "eee6:lengthi{len}e12:meta versioni2e4:name5:a.bin12:piece lengthi16384e6:pieces{}:",
+            pieces.len()
+        )
+        .as_bytes(),
+    );
+    info.extend_from_slice(&pieces);
+    info.push(b'e');
+    (Bytes::from(info), tree)
+}
+
+/// The piece layers of the `MetadataReceived` in `fx`, if any.
+fn received_layers(fx: &[Effect]) -> Option<Vec<(merkle::Hash, Vec<merkle::Hash>)>> {
+    fx.iter().find_map(|e| match e {
+        Effect::MetadataReceived { piece_layers, .. } => Some(piece_layers.clone()),
+        _ => None,
+    })
+}
+
+fn v2_peer() -> Reserved {
+    Reserved::new().with_extension_protocol(true).with_v2(true)
+}
+
+#[test]
+fn hybrid_magnets_fetch_piece_layers_from_v2_peers() {
+    let (info, tree) = hybrid_info(5 * 16_384 + 100);
+    assert_eq!(tree.layer.len(), 6);
+    // A `btih` magnet: the SHA-1 info-hash checks the metadata.
+    let mut h = Harness::with(MetadataState::new(
+        InfoHash::from_info_bytes(&info),
+        Config::default(),
+    ));
+    h.peer(1, Some(info.len() as u64));
+    let fx = h.msg(1, data(0, &info));
+    // Verified, but the hand-over waits for the layer. Peer 1 does not
+    // advertise BEP 52, so it is not asked.
+    assert_eq!(received(&fx), None);
+    assert!(hash_requests(&fx).is_empty());
+    assert!(!h.m.is_complete());
+
+    let fx = h.peer_with(2, Some(info.len() as u64), v2_peer());
+    let asked = hash_requests(&fx);
+    assert_eq!(asked.len(), 1);
+    let (peer, r) = asked[0];
+    assert_eq!((peer, r.pieces_root), (2, tree.root));
+
+    // A forged proof drops the peer like for a v2-only magnet.
+    let mut bad = tree.clone();
+    bad.layer[0][0] ^= 1;
+    let fx = h.msg(2, answer(&bad, r));
+    assert!(fx.contains(&Effect::Disconnect { peer: PeerKey(2) }));
+    assert_eq!(received(&fx), None);
+
+    let fx = h.peer_with(3, Some(info.len() as u64), v2_peer());
+    let (peer, r) = hash_requests(&fx)[0];
+    assert_eq!(peer, 3);
+    let fx = h.msg(3, answer(&tree, r));
+    assert_eq!(received(&fx), Some(info));
+    assert_eq!(
+        received_layers(&fx),
+        Some(vec![(tree.root, tree.layer.clone())])
+    );
+    assert!(h.m.is_complete());
+}
+
+#[test]
+fn hybrid_magnets_start_on_sha1_when_no_peer_sends_layers() {
+    let (info, _) = hybrid_info(5 * 16_384 + 100);
+    let config = Config::default();
+    let timeout = config.piece_layer_timeout;
+    let mut h = Harness::with(MetadataState::new(InfoHash::from_info_bytes(&info), config));
+    h.peer_with(1, Some(info.len() as u64), v2_peer());
+    let fx = h.msg(1, data(0, &info));
+    let (_, r) = hash_requests(&fx)[0];
+    // The peer rejects the request; nobody else has the layer.
+    h.msg(1, Message::HashReject(r));
+    h.now += timeout - Duration::from_millis(1);
+    assert_eq!(received(&h.ev(Event::Tick)), None);
+    h.now += Duration::from_millis(1);
+    let fx = h.ev(Event::Tick);
+    assert_eq!(received(&fx), Some(info));
+    assert_eq!(received_layers(&fx), Some(Vec::new()));
+    assert!(h.m.is_complete());
+    // Nothing more is asked once the metadata is handed over.
+    assert!(hash_requests(&h.ev(Event::Tick)).is_empty());
+}
+
+#[test]
+fn v2_only_magnets_wait_for_their_layers() {
+    let (info, _) = v2_info(5 * 16_384 + 100);
+    let config = Config::default();
+    let timeout = config.piece_layer_timeout;
+    let mut h = Harness::with(MetadataState::new_v2(
+        InfoHashV2::from_info_bytes(&info),
+        config,
+    ));
+    h.peer(1, Some(info.len() as u64));
+    h.msg(1, data(0, &info));
+    h.now += timeout * 2;
+    assert_eq!(received(&h.ev(Event::Tick)), None);
+    assert!(!h.m.is_complete());
 }
 
 #[test]

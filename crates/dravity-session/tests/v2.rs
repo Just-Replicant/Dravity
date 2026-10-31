@@ -20,17 +20,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use dravity_bencode::{Dict, Value};
 use dravity_core::merkle;
 use dravity_core::{InfoHash, Magnet, MetaVersion, Metainfo, PeerId};
-use dravity_engine::{Alert, TorrentStatus};
-use dravity_session::{AddTorrentOptions, ListenConfig, Session, SessionAlert, SessionConfig};
-use dravity_wire::Handshake;
+use dravity_engine::{Alert, Bitfield, TorrentStatus};
+use dravity_session::{
+    AddTorrentOptions, ListenConfig, PeerCodec, Session, SessionAlert, SessionConfig,
+};
+use dravity_wire::{Handshake, Message, Reserved};
+use futures_util::{SinkExt, StreamExt};
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
+use tokio_util::codec::Framed;
 
 const PIECE: u32 = 32 * 1024;
 
@@ -369,6 +373,185 @@ async fn a_v2_magnet_fetches_piece_layers_and_downloads_multi_piece_files() {
     assert_eq!(stats.pieces_have, stats.piece_count);
     leecher.shutdown().await;
     seeder.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hybrid_magnet_fetches_piece_layers_keeps_them_and_serves_them() {
+    // A `btih` magnet of a hybrid torrent: the metadata comes with BEP 9,
+    // the layers of `video.bin` (5 pieces) and `tail.bin` (2) with BEP 52
+    // hash requests, so every piece is checked with SHA-1 and Merkle.
+    let mut files = sample();
+    let torrent = make(&mut files, true, None);
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    assert_eq!(m.info().piece_layers().len(), 2);
+    let ids = m.swarm_hashes();
+    let hash = m.info_hash();
+    let seed_dir = tempfile::tempdir().unwrap();
+    let (seeder, port) = seed(&torrent, &files, seed_dir.path()).await;
+
+    let state = tempfile::tempdir().unwrap();
+    let mut c = config();
+    c.state_dir = Some(state.path().to_path_buf());
+    let leecher = Session::new(c.clone()).unwrap();
+    let mut alerts = leecher.subscribe();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let magnet = Magnet::parse(&format!(
+        "magnet:?xt=urn:btih:{}&x.pe=127.0.0.1:{port}",
+        ids[0]
+    ))
+    .unwrap();
+    leecher
+        .add_magnet(&magnet, AddTorrentOptions::new(leech_dir.path()))
+        .unwrap();
+    let seen = until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert!(seen.contains(&Alert::MetadataReceived), "{seen:?}");
+    assert!(
+        !seen
+            .iter()
+            .any(|a| matches!(a, Alert::HashFailed { .. } | Alert::Error { .. })),
+        "{seen:?}"
+    );
+    assert_files(leech_dir.path(), &files);
+    let known = leecher.metainfo(hash).unwrap();
+    assert!(known.info().missing_piece_layers().is_empty());
+    assert_eq!(known.info().piece_layers(), m.info().piece_layers());
+    seeder.shutdown().await;
+
+    // The leecher now serves the layers: a v2-only magnet downloads from it
+    // alone (it could not check a multi-piece file without them).
+    let leech_port = leecher.listen_port().unwrap();
+    let third = Session::new(config()).unwrap();
+    let mut third_alerts = third.subscribe();
+    let third_dir = tempfile::tempdir().unwrap();
+    let v2 = m.info_hash_v2().unwrap();
+    let magnet = Magnet::parse(&format!(
+        "magnet:?xt=urn:btmh:1220{v2}&x.pe=127.0.0.1:{leech_port}"
+    ))
+    .unwrap();
+    third
+        .add_magnet(&magnet, AddTorrentOptions::new(third_dir.path()))
+        .unwrap();
+    until(&mut third_alerts, ids[1], |a| *a == Alert::Finished).await;
+    assert_files(third_dir.path(), &files);
+    third.shutdown().await;
+    leecher.shutdown().await;
+
+    // And keeps them across a restart.
+    let restarted = Session::new(c).unwrap();
+    let report = restarted.restore().await.unwrap();
+    assert_eq!(report.restored, [hash], "{report:?}");
+    let restored = restarted.metainfo(hash).unwrap();
+    assert!(restored.info().missing_piece_layers().is_empty());
+    assert_eq!(restored.info().piece_layers(), m.info().piece_layers());
+    restarted.shutdown().await;
+}
+
+/// A raw peer that has every piece of `stream` and serves it to anyone.
+async fn raw_seeder(info_hash: InfoHash, stream: Vec<u8>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stream = Arc::new(stream);
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let stream = Arc::clone(&stream);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 68];
+                if sock.read_exact(&mut buf).await.is_err() {
+                    return;
+                }
+                let ours = Handshake::new(info_hash, PeerId::new(*b"-TS0001-rawseedrawse"))
+                    .with_reserved(Reserved::new().with_v2(true));
+                if sock.write_all(&ours.to_bytes()).await.is_err() {
+                    return;
+                }
+                let mut framed = Framed::new(sock, PeerCodec::default());
+                let pieces = stream.len().div_ceil(PIECE as usize) as u32;
+                let have = Message::Bitfield(Bitfield::full(pieces).to_bytes());
+                if framed.send(have).await.is_err() {
+                    return;
+                }
+                while let Some(Ok(message)) = framed.next().await {
+                    let reply = match message {
+                        Message::Interested => Message::Unchoke,
+                        Message::Request(r) => {
+                            let start = r.piece as usize * PIECE as usize + r.offset as usize;
+                            Message::Piece {
+                                piece: r.piece,
+                                offset: r.offset,
+                                data: Bytes::copy_from_slice(
+                                    &stream[start..start + r.length as usize],
+                                ),
+                            }
+                        }
+                        _ => continue,
+                    };
+                    if framed.send(reply).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_whose_data_passes_sha1_but_not_merkle_is_banned() {
+    // A hybrid torrent whose v1 piece hashes describe `served` while its v2
+    // tree describes other bytes: every piece the peer sends passes SHA-1
+    // and fails Merkle, so it counts as a hash failure, nothing is kept,
+    // and the peer is banned like any peer sending bad data.
+    let len = 3 * PIECE as usize + 100;
+    let served = content(len, 7);
+    let mut honest = vec![(vec!["one.bin"], served.clone())];
+    let mut other = vec![(vec!["one.bin"], content(len, 8))];
+    let honest = Value::decode(&make(&mut honest, true, None))
+        .unwrap()
+        .into_owned();
+    let Value::Dict(mut forged) = Value::decode(&make(&mut other, true, None))
+        .unwrap()
+        .into_owned()
+    else {
+        unreachable!()
+    };
+    let pieces = honest.get(b"info").unwrap().get(b"pieces").unwrap().clone();
+    let Some(Value::Dict(info)) = forged.get_mut(&b"info"[..]) else {
+        unreachable!()
+    };
+    info.insert(Cow::Borrowed(&b"pieces"[..]), pieces);
+    let m = Metainfo::from_bytes(&Value::Dict(forged).to_vec()).unwrap();
+    assert_eq!(m.info().version(), MetaVersion::Hybrid);
+    let hash = m.info_hash();
+    let peer = raw_seeder(hash, served).await;
+
+    let mut c = config();
+    c.engine.hash_fail_ban = 2;
+    let leecher = Session::new(c).unwrap();
+    let mut alerts = leecher.subscribe();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = leecher
+        .add_torrent(m, AddTorrentOptions::new(dir.path()).with_peers([peer]))
+        .unwrap();
+    let seen = until(&mut alerts, hash, |a| matches!(a, Alert::PeerBanned { .. })).await;
+    assert!(
+        seen.iter().any(|a| matches!(a, Alert::HashFailed { .. })),
+        "{seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|a| matches!(a, Alert::PieceCompleted { .. })),
+        "{seen:?}"
+    );
+    assert!(
+        seen.contains(&Alert::PeerBanned { ip: peer.ip() }),
+        "{seen:?}"
+    );
+    // Banned: disconnected and not dialed again, and nothing was kept.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(handle.peers().await.unwrap().is_empty());
+    assert_eq!(handle.stats().await.unwrap().pieces_have, 0);
+    leecher.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

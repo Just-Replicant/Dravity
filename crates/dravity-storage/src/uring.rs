@@ -9,9 +9,9 @@
 //! thread runs many jobs concurrently on the ring.
 //!
 //! Each job hands the ring its own duplicate of the cached file descriptor
-//! (`dup`), which the uring thread closes when the operation is done. The
-//! storage's descriptor cache, path checks and `fsync`s stay exactly as in
-//! the blocking backend.
+//! (`dup`), which the uring thread closes when the operation is done.
+//! Reads, writes and `fdatasync` go through the ring; the storage's
+//! descriptor cache and path checks stay exactly as in the blocking backend.
 //!
 //! No `unsafe` is needed: buffers are moved into the ring by value
 //! (`Vec<u8>`), which is how tokio-uring keeps them alive until the kernel
@@ -41,6 +41,10 @@ enum Job {
         file: File,
         offset: u64,
         data: Vec<u8>,
+        reply: std_mpsc::SyncSender<io::Result<()>>,
+    },
+    SyncData {
+        file: File,
         reply: std_mpsc::SyncSender<io::Result<()>>,
     },
 }
@@ -76,6 +80,7 @@ impl std::fmt::Debug for Job {
             Self::Write { offset, data, .. } => {
                 write!(f, "Write {{ offset: {offset}, len: {} }}", data.len())
             }
+            Self::SyncData { .. } => f.write_str("SyncData"),
         }
     }
 }
@@ -183,6 +188,12 @@ async fn run(job: Job) {
             let _ = file.close().await;
             let _ = reply.send(result);
         }
+        Job::SyncData { file, reply } => {
+            let file = tokio_uring::fs::File::from_std(file);
+            let result = file.sync_data().await;
+            let _ = file.close().await;
+            let _ = reply.send(result);
+        }
     }
 }
 
@@ -219,5 +230,14 @@ impl FileIo for UringIo {
         let data = self.submit(job, &rx)?;
         buf.copy_from_slice(&data);
         Ok(())
+    }
+
+    fn sync_data(&self, file: &File) -> io::Result<()> {
+        let (reply, rx) = std_mpsc::sync_channel(1);
+        let job = Job::SyncData {
+            file: file.try_clone()?,
+            reply,
+        };
+        self.submit(job, &rx)
     }
 }

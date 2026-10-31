@@ -165,3 +165,23 @@ fn an_unusable_ring_is_an_error_not_a_panic() {
     };
     assert_eq!(fallback.name(), "blocking");
 }
+
+#[test]
+fn uring_flushes_through_the_ring() {
+    let Some(io) = uring() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.bin");
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    io.write_all_at(&file, b"durable", 3).unwrap();
+    io.sync_data(&file).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"\0\0\0durable");
+    // A read-only descriptor still flushes, as with `File::sync_data`.
+    let read_only = std::fs::File::open(&path).unwrap();
+    io.sync_data(&read_only).unwrap();
+    BlockingIo.sync_data(&read_only).unwrap();
+}

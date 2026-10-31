@@ -160,7 +160,9 @@ impl FileStorage {
                     .get(evict)
                     .map(|spec| spec.path.clone())
                     .unwrap_or_default();
-                open.sync_data().map_err(|e| StorageError::io(path, e))?;
+                self.io
+                    .sync_data(&open)
+                    .map_err(|e| StorageError::io(path, e))?;
             }
         }
         cache.open.insert(index, Arc::clone(&file));
@@ -174,7 +176,9 @@ impl FileStorage {
             .get(index)
             .map(|spec| spec.path.clone())
             .unwrap_or_default();
-        file.sync_data().map_err(|e| StorageError::io(path, e))
+        self.io
+            .sync_data(file)
+            .map_err(|e| StorageError::io(path, e))
     }
 }
 
@@ -310,7 +314,8 @@ impl Storage for FileStorage {
                 Err(e) if e.is_missing_data() => continue,
                 Err(e) => return Err(e),
             };
-            file.sync_data()
+            self.io
+                .sync_data(&file)
                 .map_err(|e| StorageError::io(&spec.path, e))?;
         }
         Ok(())

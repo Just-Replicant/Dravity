@@ -3,8 +3,8 @@
 //!
 //! The filesystem backend owns everything about *which* file and *where*:
 //! path safety, the descriptor cache, padding, flushing and stamps. A
-//! [`FileIo`] only performs one positional read or write on a file it is
-//! handed, so another I/O mechanism (such as io_uring, behind the `uring`
+//! [`FileIo`] only performs one positional read, write or flush on a file it
+//! is handed, so another I/O mechanism (such as io_uring, behind the `uring`
 //! feature) slots in without touching those rules.
 
 use std::fs::File;
@@ -32,6 +32,14 @@ pub trait FileIo: Send + Sync + std::fmt::Debug {
     /// Any I/O error; reading past the end of the file is
     /// [`io::ErrorKind::UnexpectedEof`].
     fn read_exact_at(&self, file: &File, buf: &mut [u8], offset: u64) -> io::Result<()>;
+
+    /// Makes the file's data durable (`fdatasync`).
+    ///
+    /// # Errors
+    /// Any I/O error from the flush.
+    fn sync_data(&self, file: &File) -> io::Result<()> {
+        file.sync_data()
+    }
 }
 
 /// The default: `pread`/`pwrite` (or `seek_read`/`seek_write` on Windows)

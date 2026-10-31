@@ -5,9 +5,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use dravity_core::merkle::{self, Hash, MAX_HASH_REQUEST};
 use dravity_core::{BLOCK_SIZE, BlockRef, InfoHash, PieceLayout};
 use dravity_wire::{
-    BlockRequest, ExtendedHandshake, METADATA_PIECE_LEN, Message, MetadataMessage, Reserved,
+    BlockRequest, ExtendedHandshake, HashRequest, METADATA_PIECE_LEN, Message, MetadataMessage,
+    Reserved,
 };
 
 use crate::ban::HashBans;
@@ -37,7 +39,13 @@ const MAX_SUGGESTED: usize = 16;
 fn message_defers_bitfield(message: &Message) -> bool {
     matches!(
         message,
-        Message::KeepAlive | Message::Port(_) | Message::Extended { .. } | Message::Unknown { .. }
+        Message::KeepAlive
+            | Message::Port(_)
+            | Message::Extended { .. }
+            | Message::Unknown { .. }
+            | Message::HashRequest(_)
+            | Message::Hashes { .. }
+            | Message::HashReject(_)
     )
 }
 
@@ -253,6 +261,9 @@ pub struct TorrentState {
     rate: Option<TokenBucket>,
     /// The bencoded `info` dictionary, served to peers with BEP 9.
     info_bytes: Option<Bytes>,
+    /// Piece length and piece layers by pieces root, served to peers with
+    /// BEP 52 hash requests.
+    piece_layers: Option<(u32, HashMap<Hash, Vec<Hash>>)>,
     /// Needed for the BEP 6 allowed fast set.
     info_hash: Option<InfoHash>,
     choker: Choker,
@@ -304,6 +315,7 @@ impl TorrentState {
             next_pex: None,
             rate: None,
             info_bytes: None,
+            piece_layers: None,
             info_hash: None,
             choker: Choker::default(),
             bans: HashBans::default(),
@@ -322,6 +334,20 @@ impl TorrentState {
     #[must_use]
     pub fn with_info_bytes(mut self, info: Bytes) -> Self {
         self.info_bytes = Some(info);
+        self
+    }
+
+    /// Serves `layers` (piece layers by pieces root, for a torrent with
+    /// `piece_length`) to peers that ask with BEP 52 hash requests. Without
+    /// them every hash request is rejected.
+    #[must_use]
+    pub fn with_piece_layers(
+        mut self,
+        piece_length: u32,
+        layers: impl IntoIterator<Item = (Hash, Vec<Hash>)>,
+    ) -> Self {
+        let layers: HashMap<Hash, Vec<Hash>> = layers.into_iter().collect();
+        self.piece_layers = (!layers.is_empty()).then_some((piece_length, layers));
         self
     }
 
@@ -1194,6 +1220,10 @@ impl TorrentState {
                     self.fill_connections(out);
                 }
             }
+            Message::HashRequest(request) => {
+                let reply = hash_reply(self.piece_layers.as_ref(), request);
+                Self::send(peer, key, reply, now, out);
+            }
             // Fast-extension messages from a peer without the extension and
             // DHT `port` are ignored.
             _ => {}
@@ -2032,6 +2062,41 @@ fn duplicate_candidate(
 }
 
 /// The answer to a `ut_metadata` request for `piece`.
+/// The answer to a BEP 52 hash request: `hashes` from a known piece layer,
+/// or `hash reject` (unknown root, a layer below the piece layer, a
+/// malformed or oversized range).
+fn hash_reply(layers: Option<&(u32, HashMap<Hash, Vec<Hash>>)>, request: HashRequest) -> Message {
+    let max = u32::try_from(MAX_HASH_REQUEST).unwrap_or(u32::MAX);
+    let proof =
+        layers
+            .filter(|_| request.is_well_formed(max))
+            .and_then(|(piece_length, layers)| {
+                let layer = layers.get(&request.pieces_root)?;
+                merkle::layer_proof(
+                    layer,
+                    *piece_length,
+                    request.base_layer,
+                    usize::try_from(request.index).ok()?,
+                    usize::try_from(request.length).ok()?,
+                    request.proof_layers,
+                )
+            });
+    match proof {
+        Some(proof) => Message::Hashes {
+            request,
+            hashes: proof
+                .base
+                .iter()
+                .chain(&proof.uncles)
+                .flatten()
+                .copied()
+                .collect::<Vec<u8>>()
+                .into(),
+        },
+        None => Message::HashReject(request),
+    }
+}
+
 fn metadata_reply(info: Option<&Bytes>, piece: u32) -> MetadataMessage {
     let Some(info) = info else {
         return MetadataMessage::Reject { piece };

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use dravity_core::BlockRef;
+use dravity_core::merkle::Hash;
 use dravity_wire::{Message, Reserved};
 
 use crate::picker::Priority;
@@ -421,6 +422,10 @@ pub enum Effect {
     MetadataReceived {
         /// The bencoded `info` dictionary.
         info: Bytes,
+        /// Piece layers fetched from peers with BEP 52 hash requests, by
+        /// pieces root, each verified against its root. Empty unless the
+        /// magnet link is v2-only and has files larger than a piece.
+        piece_layers: Vec<(Hash, Vec<Hash>)>,
     },
     /// Notify the application.
     Alert(Alert),

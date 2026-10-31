@@ -1243,3 +1243,78 @@ fn a_failed_upload_read_rejects_and_keeps_seeding() {
     );
     assert_eq!(h.t.status(), TorrentStatus::Finished);
 }
+
+#[test]
+fn hash_requests_are_served_from_piece_layers() {
+    use dravity_core::merkle;
+    use dravity_wire::HashRequest;
+
+    let data: Vec<u8> = (0..300_000usize).map(|i| (i % 249) as u8).collect();
+    let piece_length = 2 * BLOCK_SIZE;
+    let tree = merkle::file_hashes(&data, piece_length).unwrap();
+    assert_eq!(tree.layer.len(), 10);
+    let mut h = Harness {
+        t: TorrentState::new(layout(), config())
+            .with_piece_layers(piece_length, [(tree.root, tree.layer.clone())]),
+        now: Instant::now(),
+    };
+    h.ev(Event::Start);
+    h.ev(Event::PeerConnected {
+        peer: PeerKey(1),
+        addr: addr(1),
+        reserved: fast().with_v2(true),
+    });
+    let ask = |index, length, proof_layers| HashRequest {
+        pieces_root: tree.root,
+        base_layer: 1,
+        index,
+        length,
+        proof_layers,
+    };
+    let reply = |h: &mut Harness, r: HashRequest| {
+        h.ev(Event::Message {
+            peer: PeerKey(1),
+            message: Message::HashRequest(r),
+        })
+        .into_iter()
+        .find_map(|e| match e {
+            Effect::Send {
+                message: m @ (Message::Hashes { .. } | Message::HashReject(_)),
+                ..
+            } => Some(m),
+            _ => None,
+        })
+        .unwrap()
+    };
+    // Four hashes at index 4 of 16 (padded), with proof to the root.
+    let Message::Hashes { request, hashes } = reply(&mut h, ask(4, 4, 3)) else {
+        panic!("expected hashes");
+    };
+    assert_eq!(request, ask(4, 4, 3));
+    let (chunks, rest) = hashes.as_chunks::<32>();
+    assert!(rest.is_empty());
+    assert_eq!(chunks.len() as u64, request.reply_hashes());
+    assert_eq!(&chunks[..4], &tree.layer[4..8]);
+    assert!(merkle::verify_proof(
+        &chunks[..4],
+        &chunks[4..],
+        4,
+        &tree.root
+    ));
+    // Leaves, unknown roots and malformed ranges are rejected.
+    for bad in [
+        HashRequest {
+            base_layer: 0,
+            ..ask(0, 2, 0)
+        },
+        HashRequest {
+            pieces_root: [9; 32],
+            ..ask(0, 2, 0)
+        },
+        ask(2, 4, 0),
+        ask(0, 1024, 0),
+        ask(32, 2, 0),
+    ] {
+        assert_eq!(reply(&mut h, bad), Message::HashReject(bad));
+    }
+}

@@ -11,11 +11,12 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use dravity_core::merkle;
 use dravity_core::{InfoHash, InfoHashV2};
 use dravity_engine::{
     Alert, AnnounceEvent, Config, Effect, Event, MetadataState, PeerKey, TorrentStatus,
 };
-use dravity_wire::{ExtendedHandshake, Message, MetadataMessage, Reserved};
+use dravity_wire::{ExtendedHandshake, HashRequest, Message, MetadataMessage, Reserved};
 
 /// Our `ut_metadata` id (what peers send to us).
 const OURS: u8 = 1;
@@ -146,7 +147,7 @@ fn data(piece: u32, content: &[u8]) -> Message {
 
 fn received(fx: &[Effect]) -> Option<Bytes> {
     fx.iter().find_map(|e| match e {
-        Effect::MetadataReceived { info } => Some(info.clone()),
+        Effect::MetadataReceived { info, .. } => Some(info.clone()),
         _ => None,
     })
 }
@@ -494,4 +495,138 @@ fn hybrid_magnets_check_both_hashes() {
     );
     let bad = MetadataState::new(v1, Config::default()).with_info_hash_v2(InfoHashV2::new([4; 32]));
     assert_eq!(received(&Harness::with(bad).fetch(&content)), None);
+}
+
+/// A v2-only `info` with one file of `len` bytes in 16 KiB pieces, and the
+/// file's piece layer.
+fn v2_info(len: usize) -> (Bytes, merkle::FileHashes) {
+    let data: Vec<u8> = (0..len).map(|i| (i % 253) as u8).collect();
+    let tree = merkle::file_hashes(&data, 16_384).unwrap();
+    let mut info = format!("d9:file treed5:a.bind0:d6:lengthi{len}e11:pieces root32:").into_bytes();
+    info.extend_from_slice(&tree.root);
+    info.extend_from_slice(b"eee12:meta versioni2e4:name5:a.bin12:piece lengthi16384ee");
+    (Bytes::from(info), tree)
+}
+
+/// Every hash request in `fx`.
+fn hash_requests(fx: &[Effect]) -> Vec<(u64, HashRequest)> {
+    fx.iter()
+        .filter_map(|e| match e {
+            Effect::Send {
+                peer,
+                message: Message::HashRequest(r),
+            } => Some((peer.0, *r)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn answer(tree: &merkle::FileHashes, r: HashRequest) -> Message {
+    let proof = merkle::layer_proof(
+        &tree.layer,
+        16_384,
+        r.base_layer,
+        r.index as usize,
+        r.length as usize,
+        r.proof_layers,
+    )
+    .unwrap();
+    Message::Hashes {
+        request: r,
+        hashes: proof
+            .base
+            .iter()
+            .chain(&proof.uncles)
+            .flatten()
+            .copied()
+            .collect::<Vec<u8>>()
+            .into(),
+    }
+}
+
+#[test]
+fn v2_magnets_fetch_piece_layers_with_hash_requests() {
+    let (info, tree) = v2_info(5 * 16_384 + 100);
+    assert_eq!(tree.layer.len(), 6);
+    let v2 = InfoHashV2::from_info_bytes(&info);
+    let mut h = Harness::with(MetadataState::new_v2(v2, Config::default()));
+    h.peer(1, Some(info.len() as u64));
+    let fx = h.msg(1, data(0, &info));
+    // The info is verified, but the layer is missing: no hand-over yet.
+    assert_eq!(received(&fx), None);
+    assert!(!h.m.is_complete());
+    let asked = hash_requests(&fx);
+    assert_eq!(asked.len(), 1);
+    let (peer, r) = asked[0];
+    assert_eq!(peer, 1);
+    assert_eq!(r.pieces_root, tree.root);
+    assert_eq!(
+        (r.base_layer, r.index, r.length, r.proof_layers),
+        (0, 0, 8, 2)
+    );
+
+    // A wrong proof drops the peer and the block goes to the next one.
+    let mut bad = tree.clone();
+    bad.layer[2][0] ^= 1;
+    let fx = h.msg(1, answer(&bad, r));
+    assert!(fx.contains(&Effect::Disconnect { peer: PeerKey(1) }));
+    assert_eq!(received(&fx), None);
+    let fx = h.peer(2, Some(info.len() as u64));
+    let asked = hash_requests(&fx);
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].0, 2);
+
+    // A reject frees the block; a correct answer completes the metadata.
+    h.msg(2, Message::HashReject(asked[0].1));
+    let fx = h.peer(3, Some(info.len() as u64));
+    let (peer, r) = hash_requests(&fx)[0];
+    assert_eq!(peer, 3);
+    let fx = h.msg(3, answer(&tree, r));
+    let layers = fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::MetadataReceived {
+                info: got,
+                piece_layers,
+            } => {
+                assert_eq!(*got, info);
+                Some(piece_layers.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(layers, vec![(tree.root, tree.layer.clone())]);
+    assert!(h.m.is_complete());
+}
+
+#[test]
+fn small_v2_files_need_no_hash_requests() {
+    let (info, tree) = v2_info(10_000);
+    assert!(tree.layer.is_empty());
+    let mut h = Harness::with(MetadataState::new_v2(
+        InfoHashV2::from_info_bytes(&info),
+        Config::default(),
+    ));
+    h.peer(1, Some(info.len() as u64));
+    let fx = h.msg(1, data(0, &info));
+    assert!(hash_requests(&fx).is_empty());
+    assert_eq!(received(&fx), Some(info));
+}
+
+#[test]
+fn hash_requests_are_rejected_before_the_layers_are_known() {
+    let mut h = Harness::new(Config::default());
+    h.peer(1, None);
+    let r = HashRequest {
+        pieces_root: [1; 32],
+        base_layer: 0,
+        index: 0,
+        length: 2,
+        proof_layers: 0,
+    };
+    let fx = h.msg(1, Message::HashRequest(r));
+    assert!(fx.contains(&Effect::Send {
+        peer: PeerKey(1),
+        message: Message::HashReject(r)
+    }));
 }

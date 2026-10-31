@@ -9,6 +9,12 @@
 //!   positional reads/writes (no seek per block).
 //! * [`MemoryStorage`] — a byte buffer, for tests and small torrents.
 //!
+//! [`FileStorage`] performs its reads and writes through a [`FileIo`]:
+//! [`BlockingIo`] (`pread`/`pwrite`, the default) or, with the `uring`
+//! feature on Linux, `UringIo` (io_uring through `tokio-uring` on a
+//! dedicated thread; see its docs for falling back when the kernel or a
+//! container refuses io_uring).
+//!
 //! [`write_block`] and [`verify_piece`] adapt piece/block addresses to stream
 //! offsets. [`resume`] stores verified pieces plus file stamps so a restart
 //! can skip the hash check. All calls block; the session runs them on a
@@ -16,17 +22,23 @@
 
 mod error;
 mod file;
+mod io;
 mod memory;
 mod open;
 mod pos;
 pub mod resume;
+#[cfg(all(feature = "uring", target_os = "linux"))]
+mod uring;
 
 use dravity_core::{BlockRef, Info, PieceLayout};
 
 pub use error::StorageError;
 pub use file::{DEFAULT_MAX_OPEN_FILES, FileStorage};
+pub use io::{BlockingIo, FileIo};
 pub use memory::MemoryStorage;
 pub use resume::{FileStamp, ResumeData, ResumeError, load_resume, remove_resume, save_resume};
+#[cfg(all(feature = "uring", target_os = "linux"))]
+pub use uring::{DEFAULT_URING_ENTRIES, UringIo};
 
 /// Byte-range access to a torrent's content stream.
 ///

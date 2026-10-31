@@ -56,6 +56,8 @@ socket2 = "0.6"
 thiserror = "2"
 tokio = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
+# Optional io_uring storage backend (`uring` feature, Linux).
+tokio-uring = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "std"] }
 url = "2"

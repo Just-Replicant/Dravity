@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use dravity_core::Info;
 use dravity_core::layout::FileLayout;
 
+use crate::io::{BlockingIo, FileIo};
 use crate::open::open_beneath;
-use crate::{FileStamp, Storage, StorageError, check_range, pos};
+use crate::{FileStamp, Storage, StorageError, check_range};
 
 /// Default cap on simultaneously open files.
 pub const DEFAULT_MAX_OPEN_FILES: usize = 128;
@@ -41,7 +42,9 @@ struct FdCache {
 ///   every component is opened relative to its parent directory with
 ///   `O_NOFOLLOW`, so a link swapped in concurrently is refused too.
 /// * Open files are kept in an LRU cache; reads and writes are positional,
-///   so concurrent block writes never race on a shared cursor.
+///   so concurrent block writes never race on a shared cursor. They go
+///   through a [`FileIo`]: [`BlockingIo`] unless [`with_io`](Self::with_io)
+///   picks another (io_uring with the `uring` feature).
 /// * Files are created lazily on first write. Reading data that was never
 ///   written reports [`StorageError::is_missing_data`].
 #[derive(Debug)]
@@ -51,6 +54,7 @@ pub struct FileStorage {
     layout: FileLayout,
     cache: Mutex<FdCache>,
     max_open: usize,
+    io: Arc<dyn FileIo>,
 }
 
 impl FileStorage {
@@ -86,7 +90,21 @@ impl FileStorage {
             layout,
             cache: Mutex::new(FdCache::default()),
             max_open: DEFAULT_MAX_OPEN_FILES,
+            io: Arc::new(BlockingIo),
         })
+    }
+
+    /// Performs reads and writes through `io` instead of [`BlockingIo`].
+    #[must_use]
+    pub fn with_io(mut self, io: Arc<dyn FileIo>) -> Self {
+        self.io = io;
+        self
+    }
+
+    /// The I/O mechanism in use.
+    #[must_use]
+    pub fn io(&self) -> &dyn FileIo {
+        self.io.as_ref()
     }
 
     /// Sets the maximum number of simultaneously open files (at least 1).
@@ -229,7 +247,8 @@ impl Storage for FileStorage {
                 continue;
             }
             let file = self.handle(slice.file_index, true)?;
-            pos::write_all_at(&file, chunk, slice.file_offset)
+            self.io
+                .write_all_at(&file, chunk, slice.file_offset)
                 .map_err(|e| StorageError::io(&spec.path, e))?;
         }
         Ok(())
@@ -255,7 +274,8 @@ impl Storage for FileStorage {
                 continue;
             }
             let file = self.handle(slice.file_index, false)?;
-            pos::read_exact_at(&file, chunk, slice.file_offset)
+            self.io
+                .read_exact_at(&file, chunk, slice.file_offset)
                 .map_err(|e| StorageError::io(&spec.path, e))?;
         }
         Ok(())

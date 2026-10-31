@@ -48,6 +48,8 @@ rustls-platform-verifier = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.11"
+# SHA-256 for BEP 52 (v2 info-hashes and Merkle trees).
+sha2 = "0.11"
 # IPV6_V6ONLY listening sockets, so IPv4 and IPv6 can share a port.
 socket2 = "0.6"
 thiserror = "2"

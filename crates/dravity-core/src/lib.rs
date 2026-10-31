@@ -5,6 +5,7 @@
 //! * [`Magnet`] — magnet URI parsing and formatting.
 //! * [`compact`] — compact IPv4/IPv6 peer endpoints (BEP 23, BEP 7).
 //! * [`layout`] — piece, block and file arithmetic.
+//! * [`merkle`] — BEP 52 SHA-256 Merkle trees (pieces roots, piece layers).
 //! * [`path`] — rejection of unsafe file paths from untrusted metainfo.
 //!
 //! This crate is sans-IO: it never touches the network or filesystem.
@@ -14,6 +15,7 @@ mod encoding;
 mod info_hash;
 pub mod layout;
 pub mod magnet;
+pub mod merkle;
 pub mod metainfo;
 pub mod path;
 

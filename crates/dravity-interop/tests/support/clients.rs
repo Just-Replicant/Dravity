@@ -114,7 +114,8 @@ impl Qbittorrent {
                  Session\\DHTEnabled=false\nSession\\PeXEnabled=false\nSession\\LSDEnabled=false\n\
                  Session\\DefaultSavePath={}\n\n[Preferences]\nWebUI\\Port={api_port}\n\
                  WebUI\\Address=127.0.0.1\nWebUI\\LocalHostAuth=false\nWebUI\\CSRFProtection=false\n\
-                 WebUI\\HostHeaderValidation=false\nConnection\\UPnP=false\n",
+                 WebUI\\HostHeaderValidation=false\nConnection\\UPnP=false\n\
+                 Connection\\ResolvePeerCountries=false\n",
                 save.display()
             ),
         )
@@ -160,6 +161,8 @@ impl Qbittorrent {
             },
             "dht": false, "pex": false, "lsd": false, "upnp": false,
             "max_ratio_enabled": false,
+            // No GeoIP database download: the tests stay off the network.
+            "resolve_peer_countries": false,
             "queueing_enabled": false,
         });
         q.post_form(

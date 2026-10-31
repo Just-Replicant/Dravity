@@ -208,6 +208,9 @@ async fn run(case: Case) -> Result<Seen, String> {
     };
     let swarm = m.info_hash();
     let tmp = tempfile::tempdir().unwrap();
+    if std::env::var_os("DRAVITY_INTEROP_KEEP").is_some() {
+        eprintln!("keeping {}", tmp.path().display());
+    }
     let client = start_client(&case, &tmp.path().join("client")).await?;
     let session = dravity(&case);
     let port = session.listen_port().ok_or("no listen port")?;
@@ -278,6 +281,9 @@ async fn run(case: Case) -> Result<Seen, String> {
     session.shutdown().await;
     let version = client.version().to_owned();
     drop(client);
+    if std::env::var_os("DRAVITY_INTEROP_KEEP").is_some() {
+        let _ = tmp.keep();
+    }
     let (transport, encrypted) = result
         .map_err(|e| format!("{version}: {e}"))?
         .ok_or_else(|| format!("{version}: done, but no connection was ever seen"))?;

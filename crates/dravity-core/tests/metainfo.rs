@@ -547,3 +547,65 @@ fn from_info_bytes_matches_full_torrent() {
         Err(MetainfoError::InvalidPieceLength(0))
     ));
 }
+
+fn raw(bytes: &[u8]) -> Value<'static> {
+    Value::Bytes(Cow::Owned(bytes.to_vec()))
+}
+
+#[test]
+fn non_utf8_names_are_rejected_unless_a_utf8_variant_exists() {
+    // A v1 name that is not UTF-8: rejected, not decoded lossily.
+    let bad_name = with(single_info("x", 10, 16), "name", Some(raw(b"caf\xe9")));
+    assert_eq!(
+        parse(bad_name.clone()).unwrap_err(),
+        MetainfoError::NonUtf8Name("caf\u{fffd}".to_owned())
+    );
+    // `name.utf-8` (valid) wins.
+    let fixed = with(bad_name, "name.utf-8", Some(b("café")));
+    assert_eq!(parse(fixed).unwrap().info().name(), "café");
+
+    // Two path components that a lossy decode would merge into one name.
+    let files = vec![
+        dict(vec![("length", int(5)), ("path", list(vec![raw(b"\xff")]))]),
+        dict(vec![("length", int(5)), ("path", list(vec![raw(b"\xfe")]))]),
+    ];
+    assert!(matches!(
+        parse(multi_info("d", files, 10, 16)),
+        Err(MetainfoError::NonUtf8Name(_))
+    ));
+    // A valid `path.utf-8` is used instead of a broken `path`.
+    let files = vec![dict(vec![
+        ("length", int(5)),
+        ("path", list(vec![raw(b"\xff")])),
+        ("path.utf-8", list(vec![b("ok.bin")])),
+    ])];
+    let m = parse(multi_info("d", files, 5, 16)).unwrap();
+    assert_eq!(m.info().files()[0].path().to_string(), "ok.bin");
+    // A broken `path.utf-8` falls back to a valid `path`.
+    let files = vec![dict(vec![
+        ("length", int(5)),
+        ("path", list(vec![b("plain.bin")])),
+        ("path.utf-8", list(vec![raw(b"\xff")])),
+    ])];
+    let m = parse(multi_info("d", files, 5, 16)).unwrap();
+    assert_eq!(m.info().files()[0].path().to_string(), "plain.bin");
+}
+
+#[test]
+fn non_utf8_file_tree_keys_are_rejected() {
+    // Two v2 keys, `\xff` and `\xfe`, would both decode to U+FFFD.
+    let leaf = || dict(vec![("", dict(vec![("length", int(0))]))]);
+    let mut tree = Dict::new();
+    tree.insert(Cow::Owned(b"\xff".to_vec()), leaf());
+    tree.insert(Cow::Owned(b"\xfe".to_vec()), leaf());
+    let info = dict(vec![
+        ("file tree", Value::Dict(tree)),
+        ("meta version", int(2)),
+        ("name", b("d")),
+        ("piece length", int(16_384)),
+    ]);
+    assert_eq!(
+        parse(info).unwrap_err(),
+        MetainfoError::NonUtf8Name("\u{fffd}".to_owned())
+    );
+}

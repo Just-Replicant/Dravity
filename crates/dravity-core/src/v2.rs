@@ -126,7 +126,11 @@ fn walk(
         return leaf_file(leaf, path, out);
     }
     for (key, child) in dict {
-        let name = String::from_utf8_lossy(key).into_owned();
+        // BEP 52 names are UTF-8. A lossy decode could map two keys onto
+        // one path, or save a file under a name that is not its key.
+        let name = std::str::from_utf8(key)
+            .map_err(|_| MetainfoError::NonUtf8Name(String::from_utf8_lossy(key).into_owned()))?
+            .to_owned();
         let joined = || {
             let mut p = path.clone();
             p.push(name.clone());

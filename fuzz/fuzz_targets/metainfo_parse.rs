@@ -30,6 +30,15 @@ fuzz_target!(|data: &[u8]| {
             let _ = info.check_piece(p, &vec![0; len as usize]);
         }
     }
+    // Names are never decoded lossily: U+FFFD in a name must come from
+    // its UTF-8 encoding in the input.
+    let has_replacement = data.windows(3).any(|w| w == "\u{fffd}".as_bytes());
+    if !has_replacement {
+        assert!(!info.name().contains('\u{fffd}'), "lossy name");
+        for f in info.files() {
+            assert!(!f.path().to_string().contains('\u{fffd}'), "lossy path");
+        }
+    }
     for i in 0..info.files().len() {
         let path = info.file_path(i).expect("file index in range");
         assert!(

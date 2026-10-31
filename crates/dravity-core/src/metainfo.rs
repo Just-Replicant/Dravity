@@ -97,6 +97,13 @@ pub enum MetainfoError {
         #[source]
         source: PathError,
     },
+    /// A file name or path component (`name`, `path`, or a `file tree`
+    /// key) is not valid UTF-8 and has no valid `.utf-8` alternative. The
+    /// payload shows it with invalid bytes replaced by U+FFFD; Dravity does
+    /// not guess at the encoding, because two different names could then
+    /// collapse into one.
+    #[error("file name {0:?} is not valid UTF-8")]
+    NonUtf8Name(String),
     /// Two files have the same path.
     #[error("duplicate file path {0:?}")]
     DuplicatePath(String),
@@ -420,7 +427,11 @@ impl Info {
             .filter(|&l| l > 0)
             .ok_or(MetainfoError::InvalidPieceLength(raw.piece_length))?;
 
-        let name = raw.name_utf8.unwrap_or(raw.name).0;
+        let name = raw
+            .name_utf8
+            .filter(|t| t.1)
+            .unwrap_or(raw.name)
+            .into_name()?;
         validate_component(&name).map_err(|source| MetainfoError::UnsafePath {
             path: name.clone(),
             source,
@@ -463,14 +474,15 @@ impl Info {
                     .map(|f| {
                         let path = f
                             .path_utf8
+                            .filter(|p| p.iter().all(|t| t.1))
                             .unwrap_or(f.path)
                             .into_iter()
-                            .map(|t| t.0)
-                            .collect();
+                            .map(Text::into_name)
+                            .collect::<Result<Vec<_>, _>>()?;
                         let padding = f.attr.is_some_and(|a| a.0.contains('p'));
-                        (path, f.length, padding)
+                        Ok((path, f.length, padding))
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, MetainfoError>>()?;
                 (true, specs)
             }
         };
@@ -913,8 +925,21 @@ fn tiers(v: &Value<'_>) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// A byte string decoded as UTF-8, replacing invalid sequences.
-struct Text(String);
+/// A byte string decoded as UTF-8, replacing invalid sequences, and
+/// whether it was valid. Fine for free text (comments, URLs); names must be
+/// valid ([`Text::into_name`]).
+struct Text(String, bool);
+
+impl Text {
+    /// The string, if the bytes were valid UTF-8.
+    fn into_name(self) -> Result<String, MetainfoError> {
+        if self.1 {
+            Ok(self.0)
+        } else {
+            Err(MetainfoError::NonUtf8Name(self.0))
+        }
+    }
+}
 
 impl<'de> Deserialize<'de> for Text {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -925,10 +950,13 @@ impl<'de> Deserialize<'de> for Text {
                 f.write_str("a byte string")
             }
             fn visit_bytes<E>(self, v: &[u8]) -> Result<Text, E> {
-                Ok(Text(String::from_utf8_lossy(v).into_owned()))
+                Ok(match std::str::from_utf8(v) {
+                    Ok(s) => Text(s.to_owned(), true),
+                    Err(_) => Text(String::from_utf8_lossy(v).into_owned(), false),
+                })
             }
             fn visit_str<E>(self, v: &str) -> Result<Text, E> {
-                Ok(Text(v.to_owned()))
+                Ok(Text(v.to_owned(), true))
             }
         }
         d.deserialize_bytes(V)

@@ -16,6 +16,7 @@ Requires nightly and [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz).
 | `storage_resume` | No panics on any fastresume file; the bitfield length matches the piece count; encode → decode roundtrips |
 | `tracker_http_response` | No panics on any HTTP announce body; compact peer counts match the input length |
 | `tracker_udp_response` | No panics on any UDP connect/announce datagram; announce encode → parse roundtrips |
+| `mse_handshake` | No panics in either MSE handshake side on raw bytes or on a genuine exchange with a tampered step 3 or 4 (crypto fields, padding and IA lengths); an accepted handshake names the right torrent |
 
 ```sh
 cargo +nightly fuzz run metainfo_parse -- -max_total_time=300

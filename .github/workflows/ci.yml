@@ -42,6 +42,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # The sans-IO tracker codecs must build without the async client.
       - run: cargo clippy -p dravity-tracker --no-default-features --all-targets --locked -- -D warnings
+      # Likewise the sans-IO web seed planner.
+      - run: cargo clippy -p dravity-webseed --no-default-features --all-targets --locked -- -D warnings
 
   test:
     name: test (${{ matrix.os }})

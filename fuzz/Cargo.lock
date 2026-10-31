@@ -291,6 +291,7 @@ dependencies = [
  "dravity-storage",
  "dravity-tracker",
  "dravity-utp",
+ "dravity-webseed",
  "dravity-wire",
  "libfuzzer-sys",
  "serde",
@@ -380,6 +381,14 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "dravity-webseed"
+version = "0.1.0"
+dependencies = [
+ "dravity-core",
+ "thiserror",
 ]
 
 [[package]]

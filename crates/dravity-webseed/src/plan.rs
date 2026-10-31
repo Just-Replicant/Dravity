@@ -1,0 +1,148 @@
+//! Sans-IO web seed planning: which URL holds each file, and which HTTP
+//! ranges cover a range of the content stream.
+
+use std::ops::Range;
+
+use dravity_core::Info;
+
+use crate::WebSeedError;
+
+/// One part of a content-stream range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Segment {
+    /// Download `length` bytes at `offset` of the file at `url`.
+    Fetch {
+        /// The file's URL.
+        url: String,
+        /// First byte within the file.
+        offset: u64,
+        /// Number of bytes.
+        length: u64,
+    },
+    /// `length` bytes of a BEP 47 padding file: zeros, never fetched.
+    Zeros {
+        /// Number of bytes.
+        length: u64,
+    },
+}
+
+impl Segment {
+    /// Bytes this segment contributes.
+    #[must_use]
+    pub const fn len(&self) -> u64 {
+        match self {
+            Self::Fetch { length, .. } | Self::Zeros { length } => *length,
+        }
+    }
+
+    /// Whether the segment is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// The URL of file `index` on the web seed `base` (BEP 19).
+///
+/// A multi-file torrent's files live under `base/<name>/<path…>` (a `/` is
+/// added to `base` when missing). A single-file torrent's file is `base`
+/// itself, or `base<name>` when `base` ends with `/`. Path components are
+/// percent-encoded. `None` for padding files and out-of-range indices.
+///
+/// ```
+/// use dravity_core::Metainfo;
+/// use dravity_webseed::file_url;
+///
+/// let t = b"d4:infod6:lengthi3e4:name7:a b.txt12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+/// let m = Metainfo::from_bytes(t).unwrap();
+/// assert_eq!(file_url("http://h/f.txt", m.info(), 0).unwrap(), "http://h/f.txt");
+/// assert_eq!(file_url("http://h/d/", m.info(), 0).unwrap(), "http://h/d/a%20b.txt");
+/// ```
+#[must_use]
+pub fn file_url(base: &str, info: &Info, index: usize) -> Option<String> {
+    let file = info.files().get(index)?;
+    if file.is_padding() {
+        return None;
+    }
+    if !info.is_multi_file() {
+        return Some(if base.ends_with('/') {
+            format!("{base}{}", encode(info.name()))
+        } else {
+            base.to_owned()
+        });
+    }
+    let mut url = base.to_owned();
+    if !url.ends_with('/') {
+        url.push('/');
+    }
+    url.push_str(&encode(info.name()));
+    for c in file.path().components() {
+        url.push('/');
+        url.push_str(&encode(c));
+    }
+    Some(url)
+}
+
+/// The segments, in order, that make up `range` of the content stream on
+/// the web seed `base`. Empty files are skipped; padding becomes
+/// [`Segment::Zeros`].
+///
+/// # Errors
+/// [`WebSeedError::OutOfRange`] when `range` is empty or reaches past the
+/// content.
+pub fn plan_range(
+    base: &str,
+    info: &Info,
+    range: Range<u64>,
+) -> Result<Vec<Segment>, WebSeedError> {
+    if range.start >= range.end || range.end > info.total_length() {
+        return Err(WebSeedError::OutOfRange {
+            start: range.start,
+            end: range.end,
+        });
+    }
+    let mut out = Vec::new();
+    for (index, file) in info.files().iter().enumerate() {
+        let start = file.offset();
+        let end = start.saturating_add(file.length());
+        if end <= range.start || start >= range.end || file.length() == 0 {
+            continue;
+        }
+        let from = range.start.max(start);
+        let to = range.end.min(end);
+        let length = to - from;
+        match file_url(base, info, index) {
+            Some(url) => out.push(Segment::Fetch {
+                url,
+                offset: from - start,
+                length,
+            }),
+            None => out.push(Segment::Zeros { length }),
+        }
+    }
+    Ok(out)
+}
+
+/// Percent-encodes everything but RFC 3986 unreserved characters.
+fn encode(component: &str) -> String {
+    let mut out = String::with_capacity(component.len());
+    for b in component.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_reserved_bytes() {
+        assert_eq!(encode("a b/ü?#%"), "a%20b%2F%C3%BC%3F%23%25");
+        assert_eq!(encode("Az09-._~"), "Az09-._~");
+    }
+}

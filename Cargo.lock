@@ -808,6 +808,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dravity-webseed"
+version = "0.1.0"
+dependencies = [
+ "dravity-bencode",
+ "dravity-core",
+ "proptest",
+ "reqwest",
+ "rustls",
+ "rustls-platform-verifier",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "dravity-wire"
 version = "0.1.0"
 dependencies = [

@@ -75,6 +75,30 @@ See [`docs/phase-6.md`](docs/phase-6.md) for design notes.
 - `Storage::write_bytes` and `read_vec` (owned buffers),
   `dravity_storage::OpenFile`, and a `file_io` Criterion bench comparing
   the storage backends.
+- A hybrid that started on SHA-1 alone keeps fetching its missing piece
+  layers from BEP 52 peers while it downloads or seeds
+  (`TorrentState::with_missing_piece_layers`, `Effect::PieceLayerReceived`);
+  a completed layer is served, saved, and the file's pieces are checked
+  again (`Event::RecheckPieces`); refuted pieces are downloaded again.
+  `Info::pieces_with_root`.
+- `Alert::PieceLayersStalled` (`Config::piece_layer_stall_alert`, 2 min):
+  a v2-only magnet whose piece layers nobody sends says so, repeatedly,
+  in the CLI, TUI and HTTP event stream (`piece_layers_stalled`).
+- Web seed network safety: `WebSeedConfig::allow_private_addresses` (CLI
+  `--web-seeds-allow-private`, off by default), `dravity_webseed::is_public`,
+  `WebSeedError::ForbiddenAddress`, `ContentRange` and `FileLength`.
+- Batched block I/O: `Storage::write_many` / `read_many`,
+  `OpenFile::write_batch` / `read_batch`, `write_blocks` / `read_blocks`;
+  io_uring merges adjacent blocks into one `writev` / `readv` and submits
+  a batch in one ring round trip (about 5× faster block writes and reads
+  than one call per block in the bench). The session hands storage the
+  blocks queued since its last turn as one batch.
+- `dravity_engine::web_seed_addr` / `is_web_seed_addr`.
+- `TorrentState::with_padded_last_piece`.
+- The `dravity-interop` crate: opt-in tests (`DRAVITY_INTEROP=1`,
+  `#[ignore]`d) against `qbittorrent-nox` and `transmission-daemon` for
+  v1, hybrid and v2 torrents both ways, MSE disabled, enabled and
+  required, over TCP and uTP. Results are in `docs/phase-6.md`.
 
 #### Changed
 
@@ -103,11 +127,39 @@ See [`docs/phase-6.md`](docs/phase-6.md) for design notes.
   and `PeerAccepted` have a `link` field, `Effect::Connect` a `hints`
   field, `HandoverPeer` a `link` field and `Handover` a `hints` field.
 - Incoming peers are no longer flagged reachable (`0x10`) in PEX.
+- **Breaking:** web seeds are reported to the engine at synthetic
+  addresses in `100::/64` (RFC 6666) instead of their server's address;
+  the engine never dials, retries or shares an address in that prefix.
+- **Breaking:** `Segment::Fetch` carries the file's length; web seed
+  redirects stay on the original host (at most five) and non-public
+  addresses are refused by default.
+- **Breaking:** `MetainfoError::NonUtf8Name`: names and path components
+  must be valid UTF-8 (`name.utf-8` / `path.utf-8` are used when valid).
+- The v2 reserved bit is set only for torrents with a v2 info-hash (and
+  `btmh` magnets), in handshakes and listener replies, as libtorrent does.
 
 #### Fixed
 
 - BEP 47 padding files may share a name (e.g. several `.pad/16384`), as
   real hybrid torrents have; they were rejected as duplicate paths.
+- Two web seeds on the same host and port both run; a web seed no longer
+  hides a real peer at its server's address, and a dropped web seed is
+  no longer dialed as a BitTorrent peer on port 80 or 443.
+- A web seed `206` whose `Content-Range` does not match the request is
+  rejected before its bytes are delivered.
+- `file tree` keys that differ only in invalid UTF-8 no longer collapse
+  into one path.
+- uTP: selective ACK masks of any length are accepted; libtorrent's 3- or
+  6-byte masks were dropped with their data, stalling uploads to
+  qBittorrent until the connection timed out.
+- v2: whole blocks of a padded last piece are served; libtorrent asked for
+  them forever and a v2 download from Dravity never finished.
+- libtorrent dropped plaintext connections to v1-only torrents because
+  Dravity always set the v2 reserved bit.
+- Simultaneous connections between two peers (both dialing over uTP) are
+  resolved as libtorrent does (the lower listen port's outgoing
+  connection stays), instead of each side possibly closing a different
+  one and leaving none.
 
 ### Phase 5 — Full terminal UI
 

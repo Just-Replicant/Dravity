@@ -23,14 +23,16 @@ refused a magnet without a `btih` topic (`MagnetWithoutV1Hash`).
 | Crate | I/O? | Phase 6 additions |
 |---|---|---|
 | `dravity-wire` | no | BEP 52 `HashRequest` (21), `Hashes` (22), `HashReject` (23); `Reserved::v2` (reserved bit `0x10` of byte 7); `PexPeer::flags` is `Option<u8>` (unknown when `added.f` is short) with `PexPeer::has` |
-| `dravity-core` | no | `merkle` (SHA-256 trees over 16 KiB leaves, piece layers, pad hashes; `layer_proof`, `verify_proof` and `layer_requests` for hash requests); v2 `file tree` parsing with the same path checks as v1; `MetaVersion` (`V1`, `V2`, `Hybrid`); `Metainfo::info_hash_v2`, `swarm_hashes`, `web_seeds`, `with_web_seeds`, `set_piece_layer`; `Info::version`, `check_piece`, `pieces_root`, `piece_layers`, `missing_piece_layers`; `Magnet::swarm_hash`; `InfoHashV2::from_info_bytes`. Fix: BEP 47 padding files may share a name |
-| `dravity-storage` | yes | `verify_piece` goes through `Info::check_piece` (SHA-1, Merkle, or both); `FileIo` / `OpenFile` under `FileStorage` (`BlockingIo` by default); `UringIo` (feature `uring`, Linux); `Storage::write_bytes` / `read_vec` move owned buffers; `benches/file_io.rs` |
+| `dravity-core` | no | `merkle` (SHA-256 trees over 16 KiB leaves, piece layers, pad hashes; `layer_proof`, `verify_proof` and `layer_requests` for hash requests); v2 `file tree` parsing with the same path checks as v1; `MetaVersion` (`V1`, `V2`, `Hybrid`); `Metainfo::info_hash_v2`, `swarm_hashes`, `web_seeds`, `with_web_seeds`, `set_piece_layer`; `Info::version`, `check_piece`, `pieces_root`, `piece_layers`, `missing_piece_layers`; `Magnet::swarm_hash`; `InfoHashV2::from_info_bytes`; `Info::pieces_with_root`. Fixes: BEP 47 padding files may share a name; names that are not valid UTF-8 are refused (`MetainfoError::NonUtf8Name`) |
+| `dravity-storage` | yes | `verify_piece` goes through `Info::check_piece` (SHA-1, Merkle, or both); `FileIo` / `OpenFile` under `FileStorage` (`BlockingIo` by default); `UringIo` (feature `uring`, Linux); `Storage::write_bytes` / `read_vec` move owned buffers; `Storage::write_many` / `read_many` and `OpenFile::write_batch` / `read_batch` (one io_uring round trip per batch); `benches/file_io.rs` |
 | `dravity-tracker` | yes | `CryptoSupport` / `AnnounceRequest::crypto`: `supportcrypto` and `requirecrypto` on HTTP announces |
-| `dravity-engine` | no | `MetadataState::new_v2` / `with_info_hash_v2`: magnet metadata is checked with SHA-256 for `btmh`, with both hashes for a hybrid link; v2 and hybrid magnets then fetch missing piece layers with hash requests (`Effect::MetadataReceived` carries them, `Config::piece_layer_timeout` bounds a hybrid's wait); `TorrentState::with_piece_layers` answers hash requests; PEX flags from what connections showed (`PeerLink` on `Event::PeerConnected` / `PeerAccepted`, `DialHints` on `Effect::Connect`, `TorrentState::with_dial_hints`, `Handover::hints`) |
+| `dravity-engine` | no | `MetadataState::new_v2` / `with_info_hash_v2`: magnet metadata is checked with SHA-256 for `btmh`, with both hashes for a hybrid link; v2 and hybrid magnets then fetch missing piece layers with hash requests (`Effect::MetadataReceived` carries them, `Config::piece_layer_timeout` bounds a hybrid's wait); `TorrentState::with_piece_layers` answers hash requests; PEX flags from what connections showed (`PeerLink` on `Event::PeerConnected` / `PeerAccepted`, `DialHints` on `Effect::Connect`, `TorrentState::with_dial_hints`, `Handover::hints`); web seeds at synthetic `100::/64` addresses (`web_seed_addr`, `is_web_seed_addr`); a hybrid keeps fetching missing layers while it downloads or seeds (`TorrentState::with_missing_piece_layers`, `Effect::PieceLayerReceived`, `Event::RecheckPieces`); `Alert::PieceLayersStalled` (`Config::piece_layer_stall_alert`); `TorrentState::with_padded_last_piece`; simultaneous connections resolved as libtorrent does |
 | `dravity-mse` (new) | sans-IO core, async with feature `stream` | MSE/PE: `Initiator` / `Responder` state machines, `initiate` / `respond` and `MseStream` over Tokio I/O, `Policy` |
-| `dravity-webseed` (new) | yes (feature `client`) | `plan` (sans-IO): a file's URL under a web seed and the HTTP ranges, plus zero-filled padding, that make up a byte range of the torrent. `WebSeedClient` (reqwest + rustls, on by default): strict ranged `GET`s |
+| `dravity-webseed` (new) | yes (feature `client`) | `plan` (sans-IO): a file's URL under a web seed and the HTTP ranges, plus zero-filled padding, that make up a byte range of the torrent. `WebSeedClient` (reqwest + rustls, on by default): strict ranged `GET`s (`Content-Range` checked), same-host redirects, public addresses only unless `WebSeedConfig::allow_private_addresses` (`is_public`, a filtering resolver) |
 | `dravity-session` | async | v2/hybrid torrents and `btmh` magnets; a hybrid answers to, announces on (DHT and trackers) and looks up both swarm ids, also when added from a magnet; piece layers and web seeds are saved with the torrent; web seeds as virtual peers (`SessionConfig::web_seed`, `web_seed_retry`, `Transport::Web`); `SessionConfig::storage_backend` and `Session::storage_backend`; `SessionConfig::encryption`, `PeerStatus::encrypted`; dials follow PEX flags and earlier connections (MSE or plain first, uTP or TCP first, peers that cannot encrypt skipped under `Required`) |
-| `dravity-cli` | via session | `info` prints the version, the v2 hash and web seeds; `--no-web-seeds`; `--storage-backend blocking\|io-uring` (feature `uring`); `--encryption disabled\|enabled\|required`; the peer table flags web seeds with `W` and encrypted peers with `E` |
+| `dravity-utp` | yes | Fix: selective ACKs of any length are accepted (libtorrent sends 3- or 6-byte masks) |
+| `dravity-interop` (new, tests only) | runs other clients | opt-in tests against `qbittorrent-nox` and `transmission-daemon` (see Interop) |
+| `dravity-cli` | via session | `info` prints the version, the v2 hash and web seeds; `--no-web-seeds`; `--storage-backend blocking\|io-uring` (feature `uring`); `--encryption disabled\|enabled\|required`; `--web-seeds-allow-private`; the peer table flags web seeds with `W` and encrypted peers with `E`; stalled piece layers are printed and shown in the alert log |
 
 `dravity-http` is unchanged: its DTOs carry the session's info-hash,
 which for a v2-only torrent is the truncated v2 hash (see below).
@@ -108,8 +110,32 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   restarted by every accepted `hashes` reply) without progress hands the
   torrent over with the layers that are complete, and files whose layer
   is still missing verify with SHA-1 only (`check_piece` already allows
-  that for hybrids). Those layers are not fetched later; the torrent
-  cannot serve hash requests for those files.
+  that for hybrids). The fetch then continues in the background (see
+  the next point).
+- **A hybrid keeps fetching late layers.** After the timeout, or for a
+  hybrid `.torrent` that lacks some layers, `TorrentState` keeps asking
+  every BEP 52 peer (also ones that connect later) for the missing
+  layers while it downloads or seeds, with the same proof checks and
+  bans (shared `layers` module). A completed layer is served at once,
+  saved with the torrent (`Effect::PieceLayerReceived`), and every piece
+  of its file already accepted on SHA-1 alone is read back and checked
+  again (`Event::RecheckPieces`, `check_concurrency` at a time). A piece
+  the Merkle tree refutes is forgotten, reported as `HashFailed` and
+  downloaded again; a finished torrent goes back to downloading. Nobody
+  is banned for it, since the sender is no longer known.
+- **A stuck v2 magnet says so.** A v2-only magnet cannot fall back to
+  SHA-1, so it keeps waiting for its layers, but after
+  `Config::piece_layer_stall_alert` (2 min) without layer data it raises
+  `Alert::PieceLayersStalled { missing_layers, silent }`, and again
+  after each further period of silence (CLI line, TUI alert log, HTTP
+  event `piece_layers_stalled`).
+- **File names must be UTF-8.** `file tree` keys, v1 `name` and `path`
+  components were decoded with `from_utf8_lossy`, so two different keys
+  could collapse into one path, or a file be saved under a name that is
+  not its key. Names that are not valid UTF-8 now fail with
+  `MetainfoError::NonUtf8Name`; a v1 torrent may supply valid
+  `name.utf-8` / `path.utf-8` instead. Free text (comment, created by,
+  URLs) is still decoded leniently.
 - **SHA-1 pass, Merkle fail.** `Info::check_piece` requires both hashes
   for a hybrid piece whose layer is known, so data that passes SHA-1 and
   fails Merkle (a SHA-1 collision, or a peer serving another v2 file) is
@@ -125,7 +151,20 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   roots get a `hash reject`, which BEP 52 allows; serving leaf layers
   would mean keeping every file's 16 KiB leaf hashes, which no v2 client
   needs to download. During metadata exchange every request is rejected.
-  Dravity sets the v2 reserved bit.
+- **The v2 reserved bit is per torrent.** Dravity sets it, as libtorrent
+  does, only for a torrent with a v2 info-hash (v2 or hybrid metadata, or
+  before the metadata a magnet with a `btmh`), in its own handshakes and
+  in the listener's replies (`listen::Route::v2`; a `btih` magnet turns
+  it on once its metadata shows a hybrid). libtorrent 2.x drops a
+  plaintext connection whose handshake sets the bit for a v1-only
+  torrent (found by the interop tests).
+- **v2 last pieces are padded for requests.** libtorrent treats a v2-only
+  torrent's last file as padded to a whole piece and asks for whole 16
+  KiB blocks of a short last piece. `TorrentState::with_padded_last_piece`
+  (on for v2-only torrents) accepts a request that starts in the last
+  piece's content and ends within its piece length; storage reads the
+  content and the engine appends the zeros. Our own requests never ask
+  for padding.
 - **Persistence.** The session writes `piece layers` and `url-list` next
   to `info` in its saved `.torrent`, so a v2 torrent restores without a
   peer, and keeps its web seeds.
@@ -139,6 +178,16 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   rate limits, hash checks and bans then apply unchanged, and nothing in
   the sans-IO engine knows about HTTP. Being "incoming", it is never
   dialed back and never shared over PEX.
+- **Synthetic, unroutable addresses.** The engine allows one connection
+  per address, so a web seed is not reported at its server's address
+  (two seeds on one CDN host and port would collide, a real peer there
+  would be skipped, and a dropped seed would be redialed as a
+  BitTorrent peer on port 80 or 443). Web seed number N of a torrent is
+  `[100::N]:0`, in the IPv6 discard-only prefix (RFC 6666), which never
+  routes and never belongs to a real peer. The engine never pools,
+  dials, retries, learns hints for or shares over PEX an address in
+  `100::/64`, whoever names it; the session keeps its own back-off for
+  web seeds.
 - **Planning is sans-IO.** `dravity_webseed::plan_range` maps a stream
   range onto files: a URL and an HTTP range per file touched, zeros for
   padding (never requested). As BEP 19 specifies, a single-file torrent
@@ -149,11 +198,27 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   1 MiB, so a web seed costs one HTTP request per batch, not per 16 KiB
   block. `Cancel` drops queued blocks that have not been fetched yet.
 - **Untrusted responses.** A body must be exactly the requested range
-  (`206`). A `200` is accepted only for a range starting at file offset
-  0, and only its first bytes are read. Anything else, or a timeout, ends
+  (`206`), and its `Content-Range` must name the requested first and
+  last byte and (unless `*`) the file's length, or the response is
+  `WebSeedError::ContentRange` before a byte is delivered. A `200` is
+  accepted only for a range starting at file offset 0, with the file's
+  length as `Content-Length`, and only its first bytes are read. Anything else, or a timeout, ends
   the virtual peer. Data still goes through piece verification, so wrong
   content from a server is rejected and handled by the engine's usual
   hash-failure path, as for any peer.
+- **Network safety.** A torrent's `url-list` is untrusted input that
+  could aim the client at its own network. Redirects (at most five) stay
+  on the original host and port, may upgrade `http` to `https` but never
+  downgrade. Unless `WebSeedConfig::allow_private_addresses` (CLI
+  `--web-seeds-allow-private`) is set, an IP literal must be public
+  (`dravity_webseed::is_public`: no loopback, RFC 1918, CGNAT,
+  link-local including `169.254.169.254`, ULA, unspecified, multicast,
+  reserved or documentation ranges, nor IPv4-mapped forms of them), and
+  host names go through a resolver that keeps only public addresses.
+  The connection is made to the address that was checked, so DNS
+  rebinding between the check and the connect is not possible.
+  Environment proxies are not used (a proxy would resolve the name
+  itself).
 - **Only while downloading.** Web seeds start when the torrent is
   downloading and close when it finishes, pauses or checks; a seed
   never needs them. A failed seed is retried after
@@ -202,8 +267,37 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   piece verification from 3.07 to 2.65 ms (−15 %); blocking I/O did not
   change (0.57, 0.39, 2.41 ms). Per small operation, io_uring is still
   slower than `pread`/`pwrite` here: each one is a channel round trip to
-  the ring thread, which batching across blocks would amortize. The
-  backend stays opt-in.
+  the ring thread, which batching across blocks amortizes (next
+  points).
+- **Batched submissions.** Each io_uring call was a round trip to the
+  ring thread, paid once per 16 KiB block. `Storage::write_many` /
+  `read_many` (defaults: one call per block) let `FileStorage` split a
+  batch by file and hand each file its share at once
+  (`OpenFile::write_batch` / `read_batch`). `UringIo` sends a batch as
+  one job: blocks adjacent in the file become one `writev` / `readv` (at
+  most 256 buffers, continued after a short transfer), all runs are
+  submitted together and the caller wakes once, still without `unsafe`
+  or copies. The session queues the blocks the engine asks to write or
+  read and hands them over once no more input is ready (or 64 are
+  queued), so an idle task still sends a single block at once; a batch
+  that fails is retried block by block so only the failed blocks are
+  reported.
+- **Measured, batched.** Same bench and box, 16 MiB in 16 KiB blocks, one
+  piece (16 blocks) per batched call, median of 20 samples:
+
+  | Backend | Operation | One call per block | Batched | Change |
+  |---|---|---|---|---|
+  | io_uring | write | 4.88 ms | 0.87 ms | −82 % (5.6×) |
+  | io_uring | read | 3.10 ms | 0.63 ms | −80 % (4.9×) |
+  | blocking | write | 0.56 ms | 0.54 ms | about the same |
+  | blocking | read | 0.37 ms | 0.38 ms | about the same |
+
+  Piece verification is 2.87 ms on io_uring and 2.31 ms blocking (it
+  is dominated by hashing). With a warm page cache on this box, batched
+  io_uring is still about 1.6× slower than `pread` / `pwrite` on the
+  blocking pool; io_uring's advantage is expected on cold storage at high
+  queue depth, which this bench does not measure. The backend stays
+  opt-in.
 - **Selection and fallback.** `SessionConfig::storage_backend`
   (`Blocking`, `IoUring`; CLI `--storage-backend`) applies to storage the
   session creates. Asking for io_uring in a build without the feature, or
@@ -232,7 +326,8 @@ which for a v2-only torrent is the truncated v2 hash (see below).
 - **Policies** (`SessionConfig::encryption`, CLI `--encryption`), the
   spec's three client modes:
   - `Enabled` (default): incoming connections may be plain or MSE; outgoing
-    ones offer RC4 and plaintext (the responder picks RC4) and are redialed
+    ones offer RC4 and plaintext (Dravity's responder picks RC4;
+    libtorrent's default picks plaintext when both are offered) and are redialed
     with a plain handshake on the same transport if the peer accepts the
     connection but fails MSE. A dial that cannot connect at all is not
     redialed.
@@ -356,18 +451,120 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   and `E`; a download with `--storage-backend io-uring`; an unknown
   backend refused; two CLI processes (default `--encryption enabled`).
 - Fuzz: `metainfo_parse` also checks pieces through `check_piece` and the
-  v2 hashes; new `webseed_plan` and `mse_handshake`.
+  v2 hashes, and that no accepted name was decoded lossily; new
+  `webseed_plan` and `mse_handshake`.
+- Late fixes (this round): core rejects non-UTF-8 `file tree` keys and v1
+  names, and accepts valid `name.utf-8` / `path.utf-8`. Web seed
+  `tests/client.rs`: wrong, missing and shifted `Content-Range`, `200`
+  handling, same-host redirects (a redirect to `localhost` refused) and
+  refused addresses (loopback, `169.254.169.254`, `::1`, RFC 1918,
+  CGNAT, ULA, `0.0.0.0`, and a name resolving to loopback); `addr.rs`
+  unit tests for `is_public`. Engine: web seeds are never dialed,
+  retried or shared, and a real peer at a CDN's address still connects
+  (`tests/engine.rs`); a hybrid keeps fetching its layers after the
+  timeout and rechecks its pieces once one arrives, a stalled v2 magnet
+  alerts and keeps asking (`tests/metadata.rs`); simultaneous
+  connections keep the one the lower listen port opened, in both phases
+  (`tests/peers.rs`); a padded v2 last piece is served in whole blocks.
+  Session (`tests/v2.rs`): two web seeds on one host and port serve at
+  once; a failing web seed is never dialed as a peer; pieces a late layer
+  refutes are downloaded again; a v2 swarm is dialed with the v2 bit,
+  a v1 swarm without it (`tests/swarm.rs`, also the listener's reply).
+  Storage: batched writes and reads against single-block ones, across
+  files, on both backends (`tests/common/batch.rs`). uTP: selective ACK
+  masks of 3 and 6 bytes.
 
-Not covered: interop against other clients' v2/hybrid torrents and real
-HTTP servers (plan §9, Docker interop) — checked by construction
-against BEP 52's reference layout only.
+## Interop
+
+`crates/dravity-interop` runs Dravity against `qbittorrent-nox`
+(libtorrent 2.x, through its Web API) and `transmission-daemon` (through
+its RPC). It is opt-in, so the default `cargo test` stays hermetic: every
+test is `#[ignore]`d, also needs `DRAVITY_INTEROP=1`, and passes with a
+note when its client is not on `PATH`.
+
+```text
+DRAVITY_INTEROP=1 cargo test -p dravity-interop -- --ignored --test-threads=1 --nocapture
+```
+
+Each case starts a fresh client in a temporary profile on loopback, with
+DHT, PEX, local discovery, UPnP and GeoIP lookups off and a tracker of
+the test's own, and moves a three-file torrent (about 3.7 MiB, rate
+limited to 2.5 MB/s so the connection can be sampled mid-transfer) one
+way. The received files are compared byte for byte, and Dravity's view
+of the connection (TCP or uTP, RC4 or plain) is checked against the
+case: `required` must be RC4, `disabled` must be plain, a single-transport
+client must be reached over that transport. A transfer is bounded to 90
+s, client start-up and checks to 20–30 s. `DRAVITY_INTEROP_ONLY=<text>`
+runs the matching cases, `DRAVITY_INTEROP_KEEP=1` keeps the profiles and
+logs, `RUST_LOG` turns on Dravity's logs.
+
+Results on the development box (Linux 6.12, qBittorrent 5.1.0,
+Transmission 4.1.0-beta.2), 44 transfers, all passing. "plain" under
+`enabled` is expected: libtorrent picks the plaintext method when both
+are offered, and either side may dial first.
+
+| Client | Torrent | MSE (both sides) | Client transports | Client seeds → Dravity | Dravity seeds → client |
+|---|---|---|---|---|---|
+| qBittorrent 5.1.0 | v1 | disabled | TCP+uTP | ok, 1.9 s, uTP, plain | ok, 1.4 s, uTP, plain |
+| qBittorrent 5.1.0 | v2 | disabled | TCP+uTP | ok, 2.1 s, TCP, plain | ok, 1.4 s, uTP, plain |
+| qBittorrent 5.1.0 | v1 | enabled | TCP+uTP | ok, 2.0 s, TCP, RC4 | ok, 1.4 s, uTP, plain |
+| qBittorrent 5.1.0 | hybrid | enabled | TCP+uTP | ok, 2.1 s, TCP, RC4 | ok, 1.3 s, uTP, plain |
+| qBittorrent 5.1.0 | v2 | enabled | TCP+uTP | ok, 3.0 s, uTP, plain | ok, 1.4 s, uTP, RC4 |
+| qBittorrent 5.1.0 | v1 | required | TCP+uTP | ok, 3.0 s, uTP, RC4 | ok, 1.4 s, uTP, RC4 |
+| qBittorrent 5.1.0 | hybrid | required | TCP+uTP | ok, 2.1 s, TCP, RC4 | ok, 2.7 s, uTP, RC4 |
+| qBittorrent 5.1.0 | v2 | required | TCP+uTP | ok, 2.1 s, TCP, RC4 | ok, 1.3 s, uTP, RC4 |
+| qBittorrent 5.1.0 | v1 | enabled | TCP | ok, 2.9 s, TCP, plain | ok, 1.3 s, TCP, plain |
+| qBittorrent 5.1.0 | v2 | enabled | TCP | ok, 2.1 s, TCP, RC4 | ok, 1.3 s, TCP, RC4 |
+| qBittorrent 5.1.0 | v1 | enabled | uTP | ok, 2.0 s, uTP, RC4 | ok, 1.3 s, uTP, plain |
+| qBittorrent 5.1.0 | hybrid | enabled | uTP | ok, 2.0 s, uTP, RC4 | ok, 1.4 s, uTP, RC4 |
+| qBittorrent 5.1.0 | v2 | enabled | uTP | ok, 2.0 s, uTP, RC4 | ok, 1.4 s, uTP, plain |
+| Transmission 4.1.0-beta.2 | v1 | disabled | TCP+uTP | ok, 10.7 s, TCP, plain | ok, 11.4 s, TCP, plain |
+| Transmission 4.1.0-beta.2 | v1 | enabled | TCP+uTP | ok, 10.7 s, TCP, RC4 | ok, 11.4 s, TCP, RC4 |
+| Transmission 4.1.0-beta.2 | hybrid | enabled | TCP+uTP | ok, 10.7 s, TCP, RC4 | ok, 11.4 s, TCP, RC4 |
+| Transmission 4.1.0-beta.2 | v1 | required | TCP+uTP | ok, 10.7 s, TCP, RC4 | ok, 11.4 s, TCP, RC4 |
+| Transmission 4.1.0-beta.2 | hybrid | required | TCP+uTP | ok, 10.8 s, TCP, RC4 | ok, 11.4 s, TCP, RC4 |
+| Transmission 4.1.0-beta.2 | v1 | enabled | TCP | ok, 10.7 s, TCP, RC4 | ok, 11.4 s, TCP, RC4 |
+| Transmission 4.1.0-beta.2 | hybrid | enabled | TCP | ok, 10.8 s, TCP, RC4 | ok, 11.4 s, TCP, RC4 |
+| Transmission 4.1.0-beta.2 | v1 | enabled | uTP | ok, 10.7 s, uTP, RC4 | ok, 1.4 s, uTP, RC4 |
+| Transmission 4.1.0-beta.2 | hybrid | enabled | uTP | ok, 10.7 s, uTP, RC4 | ok, 1.4 s, uTP, RC4 |
+
+What the tests found, each fixed with a regression test of its own:
+
+| Bug | Symptom against the client | Fix |
+|---|---|---|
+| Selective ACK masks had to be a multiple of 4 bytes | libtorrent sends 3- or 6-byte masks; those packets were dropped with their data, so an upload to qBittorrent over uTP stalled until the 60 s timeout | accept any length (`f8125b1`) |
+| A v2 torrent's short last piece was sized by its content | libtorrent asks for the whole 16 KiB block of the padded last piece; Dravity rejected it and the v2 download from Dravity never finished | serve whole blocks of the padded last piece (`6ff5e87`) |
+| The v2 reserved bit was set for every torrent | libtorrent closes a plaintext connection that sets it for a v1-only torrent, so Dravity could not dial a v1 qBittorrent seed with encryption disabled | set the bit per torrent (`ddce83f`) |
+| Simultaneous connections kept whichever joined first | over uTP both connections share one address; libtorrent keeps the one the lower listen port opened, so each side could close a different one and leave none (about one uTP run in ten stalled for 60 s) | apply libtorrent's rule (`c2fb652`) |
+
+Client limitations, not Dravity bugs:
+
+- **Transmission has no v2.** Transmission 4.1 refuses v2-only torrents
+  ("unrecognized info") and runs hybrids as v1, so it has no v2 cases;
+  its hybrid cases exercise Dravity's hybrid support from the v1 side.
+- **Transmission reads pad files from disk.** Seeding a hybrid, it
+  checks BEP 47 padding files as real files and never completes its
+  check without them, so the harness writes them (zeros) for it.
+- **Transmission's 10 s pulse.** Over TCP, and as a seed over uTP,
+  Transmission sends `interested` or `unchoke` only at its next
+  rechoke pulse, about 10 s after the handshake; a packet capture shows
+  Dravity answering within a millisecond. Those cases take about 11 s.
+- **Transmission does not dial loopback peers from a tracker** and has
+  no RPC to add a peer, so Dravity dials it in the "Dravity seeds" cases.
+
+Not covered: real swarms and trackers on the Internet, DHT and PEX
+between clients (both off for determinism), and web seeds against real
+HTTP servers or CDNs (a loopback mock server covers the protocol cases).
 
 ## Deferred
 
 | Item | Why |
 |---|---|
-| Fetching a hybrid's missing layers after a `piece_layer_timeout` fallback | the files verify with SHA-1; only matters for answering v2-only peers |
-| io_uring batched submissions (one ring round trip for many blocks) | the per-operation channel round trip now dominates, but batching changes the `Storage` API |
+| io_uring registered (fixed) buffers and `SQPOLL` | blocks arrive as `Bytes` from the wire; registered buffers would need the copy that was just removed, and batching already removed the per-block round trip |
+| Serving leaf layers (below the piece layer) in hash requests | no v2 client asks for them; it would mean keeping every file's 16 KiB leaf hashes |
+| A PEX "unknown encryption" state under `Required` | BEP 11 has no such bit; a peer flagged without `0x01` is skipped (see PEX flags) |
+| Interop with DHT and PEX on, on real swarms and trackers, and web seeds against real CDNs | the loopback harness keeps runs deterministic and offline; these need a network and are left to manual testing |
+| v2 interop with Transmission | Transmission 4.1 does not support v2-only torrents |
 
 Out of scope for Phase 6 and unchanged from earlier phases: creating
 empty files up front (storage creates a file when its data arrives) and

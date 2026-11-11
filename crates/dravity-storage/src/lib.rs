@@ -246,6 +246,37 @@ pub fn read_block(
     }
 }
 
+/// Reads piece `piece` and returns the SHA-256 leaf hash
+/// ([`dravity_core::merkle::hash_leaf`]) of each 16 KiB block, in order (the
+/// last block may be shorter). Used to find which block of a failed piece
+/// was bad (smart banning).
+///
+/// # Errors
+/// [`StorageError::InvalidBlock`] for a piece index out of range, or any
+/// read error, including missing data.
+pub fn block_hashes(
+    storage: &dyn Storage,
+    info: &Info,
+    piece: u32,
+) -> Result<Vec<dravity_core::merkle::Hash>, StorageError> {
+    let Some(range) = info.layout().piece_range(piece) else {
+        return Err(StorageError::InvalidBlock(BlockRef {
+            piece,
+            offset: 0,
+            length: 0,
+        }));
+    };
+    let len = usize::try_from(range.end - range.start).map_err(|_| StorageError::OutOfBounds {
+        offset: range.start,
+        len: usize::MAX,
+    })?;
+    let data = storage.read_vec(range.start, len)?;
+    Ok(data
+        .chunks(dravity_core::BLOCK_SIZE as usize)
+        .map(dravity_core::merkle::hash_leaf)
+        .collect())
+}
+
 /// Reads piece `piece` and checks it against the metainfo with
 /// [`Info::check_piece`]: SHA-1 for v1, the BEP 52 Merkle hash for v2, both
 /// for hybrid torrents.

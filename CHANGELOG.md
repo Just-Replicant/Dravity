@@ -20,6 +20,18 @@ Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/ir
   host that is not itself an announce origin). New
   `TrackerError::Blocked`. The address classifier moved to
   `dravity_core::net::is_public` (`dravity_webseed::is_public` re-exports it).
+- **Smart ban (item 2):** a failed piece with blocks from more than one
+  address is quarantined while its blocks are hashed
+  (`Effect::HashBlocks` → `Event::BlockHashes`, SHA-256 per 16 KiB block
+  via `dravity_storage::block_hashes`); once a copy verifies, only the
+  senders of the blocks that differ are banned. On v2/hybrid torrents
+  the piece's leaf hashes are requested from a BEP 52 peer that did not
+  send it (verified against the piece layer) and convict at once.
+  `Config::smart_ban` (default on); strikes remain the fallback when the
+  blocks cannot be read or the tracking table (256 pieces) is full. Bans
+  are session-wide: a torrent's ban is shared with every other torrent
+  and the listener (`Session::ban_ip`, `unban_ip`, `banned_ips`,
+  `Event::BanIp`, `TorrentState::with_banned_ips`).
 
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 

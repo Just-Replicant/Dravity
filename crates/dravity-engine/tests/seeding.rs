@@ -1425,3 +1425,201 @@ fn a_padded_last_piece_serves_whole_blocks_with_zeros() {
     });
     assert!(sent(&fx, 1).contains(&Message::Reject(padded)), "{fx:?}");
 }
+
+/// Feeds piece 0's blocks from `senders` (block `i` from `senders[i]`).
+fn send_piece_zero(h: &mut Harness, senders: &[u64], fill: &[u8]) {
+    for (i, r) in [req(0, 0, BLOCK_SIZE), req(0, BLOCK_SIZE, BLOCK_SIZE)]
+        .iter()
+        .enumerate()
+    {
+        h.msg(
+            senders[i],
+            Message::Piece {
+                piece: r.piece,
+                offset: r.offset,
+                data: Bytes::from(vec![fill[i]; r.length as usize]),
+            },
+        );
+    }
+}
+
+fn hash_blocks(fx: &[Effect]) -> Vec<u32> {
+    fx.iter()
+        .filter_map(|e| match e {
+            Effect::HashBlocks { piece } => Some(*piece),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn smart_ban_convicts_only_the_sender_of_the_bad_block() {
+    let mut c = config();
+    c.max_requests_per_peer = 1;
+    c.initial_requests_per_peer = 1;
+    c.endgame = false;
+    let mut h = Harness::with_have(c, &[]);
+    h.connect(1, Reserved::new());
+    h.connect(2, Reserved::new());
+    // Peer 1 sends block 0, peer 2 block 1; the piece fails.
+    let fx = fail_piece_zero(&mut h, &[1, 2]);
+    assert_eq!(
+        hash_blocks(&fx),
+        [0],
+        "the failed piece's blocks are hashed"
+    );
+    assert!(
+        ![1, 2]
+            .iter()
+            .any(|&p| requests(&fx, p).iter().any(|r| r.piece == 0)),
+        "piece 0 is quarantined until its digests are in"
+    );
+    let good = [[1u8; 32], [2u8; 32]];
+    let fx = h.ev(Event::BlockHashes {
+        piece: 0,
+        hashes: vec![good[0], [9u8; 32]],
+    });
+    assert!(
+        !fx.iter()
+            .any(|e| matches!(e, Effect::Alert(Alert::PeerBanned { .. })))
+    );
+    // Downloaded again, all from peer 1, and it passes.
+    send_piece_zero(&mut h, &[1, 1], &[1, 2]);
+    let fx = h.ev(Event::PieceHashed { piece: 0, ok: true });
+    assert_eq!(hash_blocks(&fx), [0], "the verified blocks are hashed");
+    let fx = h.ev(Event::BlockHashes {
+        piece: 0,
+        hashes: good.to_vec(),
+    });
+    assert!(fx.contains(&Effect::Alert(Alert::PeerBanned { ip: addr(2).ip() })));
+    assert!(disconnects(&fx, 2));
+    assert!(!disconnects(&fx, 1));
+    assert_eq!(h.t.stats().banned, 1);
+}
+
+#[test]
+fn smart_ban_falls_back_to_strikes_when_blocks_cannot_be_read() {
+    let mut c = config();
+    c.hash_fail_ban = 1;
+    c.max_requests_per_peer = 1;
+    c.initial_requests_per_peer = 1;
+    c.endgame = false;
+    let mut h = Harness::with_have(c, &[]);
+    h.connect(1, Reserved::new());
+    h.connect(2, Reserved::new());
+    fail_piece_zero(&mut h, &[1, 2]);
+    let fx = h.ev(Event::BlockHashes {
+        piece: 0,
+        hashes: Vec::new(),
+    });
+    assert!(disconnects(&fx, 1) && disconnects(&fx, 2));
+}
+
+#[test]
+fn smart_ban_can_be_disabled() {
+    let mut c = config();
+    c.smart_ban = false;
+    c.max_requests_per_peer = 1;
+    c.initial_requests_per_peer = 1;
+    c.endgame = false;
+    let mut h = Harness::with_have(c, &[]);
+    h.connect(1, Reserved::new());
+    h.connect(2, Reserved::new());
+    let fx = fail_piece_zero(&mut h, &[1, 2]);
+    assert!(hash_blocks(&fx).is_empty());
+}
+
+#[test]
+fn session_bans_close_connections_without_an_alert() {
+    let mut h = Harness::with_have(config(), &[]);
+    h.connect(1, Reserved::new());
+    let fx = h.ev(Event::BanIp { ip: addr(1).ip() });
+    assert!(disconnects(&fx, 1));
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Alert(_))));
+    let fx = h.accept(9, Reserved::new());
+    assert!(!disconnects(&fx, 9), "another address is fine");
+    let mut t = TorrentState::new(layout(), config()).with_banned_ips([addr(3).ip()]);
+    t.update(h.now, Event::Start);
+    let fx = t.update(
+        h.now,
+        Event::PeerAccepted {
+            peer: PeerKey(3),
+            addr: addr(3),
+            reserved: Reserved::new(),
+            link: PeerLink::default(),
+        },
+    );
+    assert!(disconnects(&fx, 3));
+}
+
+#[test]
+fn smart_ban_uses_v2_leaf_hashes_to_convict_at_once() {
+    use dravity_core::merkle;
+    use dravity_wire::HashRequest;
+
+    let piece_length = 2 * BLOCK_SIZE;
+    let len = u64::from(5 * BLOCK_SIZE) + 10;
+    let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let tree = merkle::file_hashes(&data, piece_length).unwrap();
+    let leaves: Vec<merkle::Hash> = data.chunks(16_384).map(merkle::hash_leaf).collect();
+    let mut c = config();
+    c.max_requests_per_peer = 1;
+    c.initial_requests_per_peer = 1;
+    c.endgame = false;
+    let mut h = Harness::with_have(c, &[]);
+    h.t = TorrentState::new(layout(), h.t.config().clone())
+        .with_piece_layers(piece_length, [(tree.root, tree.layer.clone())])
+        .with_piece_roots([(tree.root, 0, 3)]);
+    h.ev(Event::Start);
+    let v2 = fast().with_v2(true);
+    h.connect(1, v2);
+    h.connect(2, v2);
+    h.connect(3, v2);
+    h.msg(3, Message::HaveAll);
+    let fx = fail_piece_zero(&mut h, &[1, 2]);
+    let request = HashRequest {
+        pieces_root: tree.root,
+        base_layer: 0,
+        index: 0,
+        length: 2,
+        proof_layers: 0,
+    };
+    assert_eq!(
+        sent(&fx, 3),
+        [Message::HashRequest(request)],
+        "a peer that sent nothing is asked for the leaves"
+    );
+    // A forged answer is ignored.
+    let fx = h.msg(
+        3,
+        Message::Hashes {
+            request,
+            hashes: Bytes::from(vec![7u8; 64]),
+        },
+    );
+    assert!(!disconnects(&fx, 1) && !disconnects(&fx, 2));
+    // The digests are recorded as suspects.
+    let fx = h.ev(Event::BlockHashes {
+        piece: 0,
+        hashes: vec![leaves[0], [9u8; 32]],
+    });
+    assert!(!disconnects(&fx, 1) && !disconnects(&fx, 2));
+    // The piece fails again with the same split; this time the leaves
+    // arrive intact and convict peer 2 without waiting for a good copy.
+    send_piece_zero(&mut h, &[1, 2], &[0, 0]);
+    let fx = h.ev(Event::PieceHashed {
+        piece: 0,
+        ok: false,
+    });
+    assert_eq!(sent(&fx, 3), [Message::HashRequest(request)]);
+    let fx = h.msg(
+        3,
+        Message::Hashes {
+            request,
+            hashes: leaves[..2].concat().into(),
+        },
+    );
+    assert!(disconnects(&fx, 2), "peer 2 sent the corrupt block");
+    assert!(!disconnects(&fx, 1));
+    assert!(fx.contains(&Effect::Alert(Alert::PeerBanned { ip: addr(2).ip() })));
+}

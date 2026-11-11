@@ -89,6 +89,7 @@ mod metadata;
 pub mod picker;
 mod pool;
 mod rate;
+mod smart_ban;
 mod state;
 mod types;
 mod web_seed;

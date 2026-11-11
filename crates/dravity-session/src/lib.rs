@@ -71,6 +71,7 @@
 //!   DHT under both hashes. `urn:btmh:` magnet links fetch and check
 //!   metadata with SHA-256; piece layers are saved with the session state.
 
+mod bans;
 mod catalog;
 mod codec;
 mod config;
@@ -87,7 +88,7 @@ pub mod watch;
 mod web_seed;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
@@ -244,6 +245,8 @@ struct Inner {
     torrents: Registry,
     /// Every torrent, running or paused.
     catalog: Catalog,
+    /// Addresses banned for bad data, shared by every torrent.
+    bans: bans::Bans,
     /// Session state writer, started with the first torrent.
     persist: OnceLock<Persister>,
     /// Bound sockets, until the first torrent starts the accept tasks
@@ -356,6 +359,7 @@ impl Session {
                 alerts,
                 torrents: Arc::new(Mutex::new(HashMap::new())),
                 catalog: Arc::new(Mutex::new(HashMap::new())),
+                bans: Arc::default(),
                 persist: OnceLock::new(),
                 listener: Mutex::new(listener),
                 listen_port,
@@ -409,6 +413,7 @@ impl Session {
             pending: Arc::new(Semaphore::new(
                 config.listen.as_ref().map_or(1, |l| l.max_pending.max(1)),
             )),
+            bans: Arc::clone(&self.inner.bans),
         };
         match listen::start(bound, &acceptor, &self.inner.stop) {
             Ok(utp) => {
@@ -634,6 +639,7 @@ impl Session {
             listen_port: self.inner.listen_port,
             utp: self.inner.utp.get().cloned().unwrap_or_default(),
             catalog: Arc::clone(&self.inner.catalog),
+            bans: Arc::clone(&self.inner.bans),
             persist: self.inner.persister().cloned(),
             port_map: self
                 .inner
@@ -667,6 +673,36 @@ impl Session {
             commands: tx,
             session: Arc::downgrade(&self.inner),
         })
+    }
+
+    /// Bans `ip` for the rest of the session: every running torrent closes
+    /// its connections and never dials or accepts it again, new torrents
+    /// start with it banned and the listener refuses it. Torrents add the
+    /// addresses they ban for bad data here themselves. Returns whether the
+    /// address was not banned before.
+    pub fn ban_ip(&self, ip: IpAddr) -> bool {
+        if !self.inner.bans.insert(ip) {
+            return false;
+        }
+        for entry in self.inner.catalog().values() {
+            if let Some(tx) = &entry.commands {
+                let _ = tx.try_send(Command::BanIp(ip));
+            }
+        }
+        true
+    }
+
+    /// Lifts a session ban on `ip` for the listener and torrents started
+    /// from now on. Running torrents keep refusing it until they restart.
+    /// Returns whether it was banned.
+    pub fn unban_ip(&self, ip: IpAddr) -> bool {
+        self.inner.bans.remove(ip)
+    }
+
+    /// Addresses banned in this session, sorted.
+    #[must_use]
+    pub fn banned_ips(&self) -> Vec<IpAddr> {
+        self.inner.bans.snapshot()
     }
 
     /// A handle to a running torrent.

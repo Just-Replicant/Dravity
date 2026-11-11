@@ -39,8 +39,8 @@ use dravity_engine::{
     PeerLink, Priority, Stats, TorrentState, TorrentStatus,
 };
 use dravity_storage::{
-    FileIo, FileStorage, ResumeData, Storage, load_resume, read_block, read_blocks, save_resume,
-    verify_piece, write_block, write_blocks,
+    FileIo, FileStorage, ResumeData, Storage, block_hashes, load_resume, read_block, read_blocks,
+    save_resume, verify_piece, write_block, write_blocks,
 };
 use dravity_tracker::{AnnounceRequest, AnnounceResponse, TrackerClient};
 use dravity_webseed::WebSeedClient;
@@ -164,6 +164,8 @@ pub(crate) enum Command {
     },
     CloseStream(u64),
     Stop(oneshot::Sender<()>),
+    /// An address was banned elsewhere in the session.
+    BanIp(IpAddr),
 }
 
 /// Shared, immutable inputs of a torrent task.
@@ -187,6 +189,8 @@ pub(crate) struct TorrentContext {
     pub(crate) utp: UtpSockets,
     /// The session's torrents, updated when a magnet's metadata arrives.
     pub(crate) catalog: Catalog,
+    /// The session-wide ban list.
+    pub(crate) bans: crate::bans::Bans,
     /// Session state writer, with a state directory.
     pub(crate) persist: Option<Persister>,
     /// Router port mapping status, when mapping runs.
@@ -403,6 +407,8 @@ impl TorrentTask {
                 // Served to magnet-link peers over BEP 9.
                 let info = Bytes::copy_from_slice(metainfo.info_bytes());
                 let state = TorrentState::new(*metainfo.info().layout(), config)
+                    .with_banned_ips(ctx.bans.snapshot())
+                    .with_piece_roots(piece_roots(&metainfo))
                     .with_info_hash(ctx.info_hash)
                     .with_info_bytes(info)
                     .with_piece_layers(metainfo.info().piece_length(), owned_layers(&metainfo))
@@ -598,6 +604,7 @@ impl TorrentTask {
                 None
             }
             Command::AddPeers(peers) => Some(Event::AddPeers { peers }),
+            Command::BanIp(ip) => Some(Event::BanIp { ip }),
             Command::Peers(reply) => {
                 let peers = match &self.phase {
                     Phase::Metadata(state) => state.peers(),
@@ -857,6 +864,8 @@ impl TorrentTask {
         let mut config = self.ctx.engine_config(content.metainfo.info().is_private());
         config.check_existing = false;
         let state = TorrentState::with_have(*content.metainfo.info().layout(), have, config)
+            .with_banned_ips(self.ctx.bans.snapshot())
+            .with_piece_roots(piece_roots(&content.metainfo))
             .with_info_hash(self.ctx.info_hash)
             .with_priorities(&self.piece_priorities(content));
         let info = info
@@ -1037,6 +1046,8 @@ impl TorrentTask {
                 *info_meta.layout(),
                 self.ctx.engine_config(info_meta.is_private()),
             )
+            .with_banned_ips(self.ctx.bans.snapshot())
+            .with_piece_roots(piece_roots(&content.metainfo))
             .with_info_hash(self.ctx.info_hash)
             .with_info_bytes(info)
             .with_piece_layers(info_meta.piece_length(), owned_layers(&content.metainfo))
@@ -1189,6 +1200,7 @@ impl TorrentTask {
             }
             Effect::WriteBlock { block, data } => self.write(block, data),
             Effect::HashPiece { piece } => self.hash(piece),
+            Effect::HashBlocks { piece } => self.hash_blocks(piece),
             Effect::ReadBlock { peer, block } => self.read(peer, block),
             Effect::Announce {
                 event,
@@ -1222,6 +1234,7 @@ impl TorrentTask {
             Effect::Alert(alert) => {
                 if let Alert::PeerBanned { ip } = &alert {
                     self.stop_web_seed(*ip);
+                    self.share_ban(*ip);
                 }
                 self.alert(alert);
             }
@@ -1514,6 +1527,58 @@ impl TorrentTask {
             };
             let _ = tx.send(Input::Engine(event)).await;
         });
+    }
+
+    /// Hashes each block of `piece` for smart banning and reports
+    /// [`Event::BlockHashes`] (empty if the piece cannot be read).
+    fn hash_blocks(&mut self, piece: u32) {
+        let Some(content) = self.content.clone() else {
+            self.local.push_back(Event::BlockHashes {
+                piece,
+                hashes: Vec::new(),
+            });
+            return;
+        };
+        let slots = Arc::clone(&self.hash_slots);
+        let tx = self.events_tx.clone();
+        self.disk.spawn(async move {
+            let Ok(_permit) = slots.acquire_owned().await else {
+                return;
+            };
+            let hashes = tokio::task::spawn_blocking(move || {
+                block_hashes(content.storage.as_ref(), content.metainfo.info(), piece)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+            let _ = tx
+                .send(Input::Engine(Event::BlockHashes { piece, hashes }))
+                .await;
+        });
+    }
+
+    /// Adds `ip` to the session's ban list and tells the other running
+    /// torrents.
+    fn share_ban(&self, ip: IpAddr) {
+        if !self.ctx.bans.insert(ip) {
+            return;
+        }
+        let catalog = self
+            .ctx
+            .catalog
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (hash, entry) in catalog.iter() {
+            if *hash == self.ctx.info_hash {
+                continue;
+            }
+            if let Some(tx) = &entry.commands {
+                // Best effort: a full queue still has the ban list on restart
+                // and the listener refuses the address.
+                let _ = tx.try_send(Command::BanIp(ip));
+            }
+        }
     }
 
     fn announce_request(
@@ -1918,6 +1983,19 @@ fn padded_last_piece(info: &Info) -> bool {
 }
 
 /// The piece layers of `metainfo`, owned, for serving BEP 52 hash requests.
+/// Each v2 file's pieces: `(pieces root, first piece, piece count)`, for
+/// smart banning's leaf hash requests.
+fn piece_roots(metainfo: &Metainfo) -> Vec<(Hash, u32, u32)> {
+    let info = metainfo.info();
+    let mut out = Vec::new();
+    for (root, _) in info.piece_layers() {
+        for range in info.pieces_with_root(&root) {
+            out.push((root, range.start, range.end.saturating_sub(range.start)));
+        }
+    }
+    out
+}
+
 fn owned_layers(metainfo: &Metainfo) -> PieceLayers {
     metainfo
         .info()

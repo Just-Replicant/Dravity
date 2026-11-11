@@ -21,6 +21,7 @@ use crate::layers::{Answer, LayerSet};
 use crate::picker::{Picker, Priority, Received};
 use crate::pool::{PeerPool, new_duplicate_wins};
 use crate::rate::TokenBucket;
+use crate::smart_ban::{SmartBan, Verdict};
 use crate::types::{
     Alert, AnnounceEvent, Config, DialHints, Effect, Event, PeerInfo, PeerKey, PeerLink, Stats,
     TorrentStatus,
@@ -294,6 +295,13 @@ pub struct TorrentState {
     info_hash: Option<InfoHash>,
     choker: Choker,
     bans: HashBans,
+    /// Remembered blocks of failed pieces ([`Config::smart_ban`]).
+    smart: SmartBan,
+    /// The v2 files' pieces: `(pieces root, first piece, piece count)`, for
+    /// leaf hash requests about failed pieces.
+    piece_roots: Vec<(Hash, u32, u32)>,
+    /// Leaf hash requests about failed pieces, by piece.
+    leaf_requests: HashMap<u32, (PeerKey, HashRequest)>,
     upload_rate: Option<TokenBucket>,
     /// Block reads for uploads in flight.
     pending_reads: usize,
@@ -350,6 +358,9 @@ impl TorrentState {
             info_hash: None,
             choker: Choker::default(),
             bans: HashBans::default(),
+            smart: SmartBan::default(),
+            piece_roots: Vec::new(),
+            leaf_requests: HashMap::new(),
             upload_rate: None,
             pending_reads: 0,
             upload_cursor: None,
@@ -488,6 +499,26 @@ impl TorrentState {
     #[must_use]
     pub fn with_connecting(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
         self.pool.adopt_connecting(addrs);
+        self
+    }
+
+    /// IP addresses banned elsewhere in the session: never dialed or
+    /// accepted (see [`Event::BanIp`]).
+    #[must_use]
+    pub fn with_banned_ips(mut self, ips: impl IntoIterator<Item = IpAddr>) -> Self {
+        for ip in ips {
+            self.bans.ban(ip);
+        }
+        self
+    }
+
+    /// The pieces of each v2 file with a piece layer: `(pieces root, first
+    /// piece, piece count)`. With [`Config::smart_ban`], the leaf hashes of
+    /// a failed piece are then asked from BEP 52 peers to find the bad
+    /// block before the piece is downloaded again.
+    #[must_use]
+    pub fn with_piece_roots(mut self, roots: impl IntoIterator<Item = (Hash, u32, u32)>) -> Self {
+        self.piece_roots = roots.into_iter().collect();
         self
     }
 
@@ -656,6 +687,14 @@ impl TorrentState {
                 self.fail(format!("storage write failed: {error}"), &mut out);
             }
             Event::PieceHashed { piece, ok } => self.on_hashed(now, piece, ok, &mut out),
+            Event::BlockHashes { piece, hashes } => {
+                self.on_block_hashes(now, piece, &hashes, &mut out);
+            }
+            Event::BanIp { ip } => {
+                if self.bans.ban(ip) {
+                    self.disconnect_ip(crate::ban::canonical_ip(ip), &mut out);
+                }
+            }
             Event::RecheckPieces { pieces } => {
                 let have = self.picker.have();
                 let fresh: Vec<u32> = pieces
@@ -1361,11 +1400,16 @@ impl TorrentState {
                 Self::send(peer, key, reply, now, out);
             }
             Message::Hashes { request, hashes } => {
+                if self.on_leaf_hashes(key, &request, &hashes, out) {
+                    return;
+                }
                 if !self.on_hashes(now, key, &request, &hashes, out) {
                     return;
                 }
             }
             Message::HashReject(request) => {
+                self.leaf_requests
+                    .retain(|_, (k, r)| !(*k == key && *r == request));
                 let retry_at = now + self.config.request_timeout;
                 if let Some((_, set)) = &mut self.layer_fetch {
                     set.on_reject(key, &request, retry_at);
@@ -1502,7 +1546,7 @@ impl TorrentState {
         self.downloaded = self.downloaded.saturating_add(u64::from(length));
         if self.picker.block_received(block) == Received::Accepted {
             if let Some(ip) = from_ip {
-                self.bans.record(piece, ip);
+                self.bans.record(piece, block.offset, ip);
             }
             self.pending_writes += 1;
             out.push(Effect::WriteBlock { block, data });
@@ -1635,18 +1679,24 @@ impl TorrentState {
             return;
         }
         if !ok {
-            self.picker.piece_hashed(piece, false);
             out.push(Effect::Alert(Alert::HashFailed { piece }));
-            for ip in self.bans.failed(
-                piece,
-                self.config.hash_fail_ban,
-                now,
-                self.config.hash_fail_quiet,
-            ) {
-                self.ban(ip, out);
+            let senders = self.bans.take(piece);
+            let distinct: HashSet<IpAddr> = senders.values().copied().collect();
+            if self.config.smart_ban && distinct.len() > 1 && self.smart.has_room() {
+                // Keep the piece away from the picker until its blocks are
+                // hashed, so no new block overwrites the evidence.
+                self.smart.failed(piece, senders);
+                out.push(Effect::HashBlocks { piece });
+                self.request_leaves(now, piece, &distinct, out);
+                return;
             }
+            self.picker.piece_hashed(piece, false);
+            self.strike(now, &senders, out);
         } else if self.picker.piece_hashed(piece, true) {
             self.bans.passed(piece);
+            if self.smart.passed(piece) {
+                out.push(Effect::HashBlocks { piece });
+            }
             self.add_have_bytes(piece);
             out.push(Effect::Alert(Alert::PieceCompleted { piece }));
             for key in self.sorted_keys() {
@@ -1662,6 +1712,150 @@ impl TorrentState {
             }
         }
         self.fill_all_requests(now, out);
+    }
+
+    /// Strikes the senders of a failed piece and bans those over the limit.
+    fn strike(&mut self, now: Instant, senders: &HashMap<u32, IpAddr>, out: &mut Vec<Effect>) {
+        for ip in self.bans.strike(
+            senders,
+            self.config.hash_fail_ban,
+            now,
+            self.config.hash_fail_quiet,
+        ) {
+            self.ban(ip, out);
+        }
+    }
+
+    /// The block digests of a piece hashed for [`Config::smart_ban`].
+    fn on_block_hashes(
+        &mut self,
+        now: Instant,
+        piece: u32,
+        hashes: &[Hash],
+        out: &mut Vec<Effect>,
+    ) {
+        match self.smart.on_digests(piece, hashes) {
+            Verdict::Ignored => {}
+            Verdict::Compared { banned } => {
+                for ip in banned {
+                    self.convict(ip, out);
+                }
+            }
+            Verdict::Recorded { banned } => {
+                self.picker.piece_hashed(piece, false);
+                for ip in banned {
+                    self.convict(ip, out);
+                }
+                self.fill_all_requests(now, out);
+            }
+            Verdict::Unhashed { senders } => {
+                self.picker.piece_hashed(piece, false);
+                self.strike(now, &senders, out);
+                self.fill_all_requests(now, out);
+            }
+        }
+    }
+
+    /// The file and position of a v2 `piece`: `(pieces root, index in the
+    /// file's piece layer)`.
+    fn piece_root(&self, piece: u32) -> Option<(Hash, u32)> {
+        self.piece_roots.iter().find_map(|&(root, first, count)| {
+            let index = piece.checked_sub(first)?;
+            (index < count).then_some((root, index))
+        })
+    }
+
+    /// Asks a BEP 52 peer that has `piece` (preferably not one of its
+    /// `senders`) for the piece's leaf hashes.
+    fn request_leaves(
+        &mut self,
+        now: Instant,
+        piece: u32,
+        senders: &HashSet<IpAddr>,
+        out: &mut Vec<Effect>,
+    ) {
+        let Some((root, index)) = self.piece_root(piece) else {
+            return;
+        };
+        let Some((piece_length, layers)) = &self.piece_layers else {
+            return;
+        };
+        if !layers.contains_key(&root) {
+            return;
+        }
+        let Some(per_piece) = merkle::leaves_per_piece(*piece_length) else {
+            return;
+        };
+        let (Ok(length), true) = (u32::try_from(per_piece), per_piece >= 2) else {
+            return;
+        };
+        let Some(start) = index.checked_mul(length) else {
+            return;
+        };
+        let mut candidates: Vec<(bool, PeerKey)> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.v2 && p.has.get(piece))
+            .map(|(k, p)| (senders.contains(&crate::ban::canonical_ip(p.addr.ip())), *k))
+            .collect();
+        candidates.sort_unstable();
+        let Some(&(_, key)) = candidates.first() else {
+            return;
+        };
+        let request = HashRequest {
+            pieces_root: root,
+            base_layer: 0,
+            index: start,
+            length,
+            proof_layers: 0,
+        };
+        self.leaf_requests.insert(piece, (key, request));
+        if let Some(peer) = self.peers.get_mut(&key) {
+            Self::send(peer, key, Message::HashRequest(request), now, out);
+        }
+    }
+
+    /// A `hashes` reply to a leaf request: verified against the piece-layer
+    /// hash before it is used. Returns `true` if it answered one.
+    fn on_leaf_hashes(
+        &mut self,
+        key: PeerKey,
+        request: &HashRequest,
+        hashes: &[u8],
+        out: &mut Vec<Effect>,
+    ) -> bool {
+        let Some(piece) = self
+            .leaf_requests
+            .iter()
+            .find(|(_, (k, r))| *k == key && r == request)
+            .map(|(p, _)| *p)
+        else {
+            return false;
+        };
+        self.leaf_requests.remove(&piece);
+        let (chunks, rest) = hashes.as_chunks::<32>();
+        let leaves: Vec<Hash> = if rest.is_empty() {
+            chunks.to_vec()
+        } else {
+            Vec::new()
+        };
+        let expected = self.piece_root(piece).and_then(|(root, index)| {
+            let (_, layers) = self.piece_layers.as_ref()?;
+            layers
+                .get(&root)?
+                .get(usize::try_from(index).ok()?)
+                .copied()
+        });
+        let width = usize::try_from(request.length).unwrap_or(0);
+        let verified = leaves.len() == width
+            && expected.is_some()
+            && merkle::root_padded(&leaves, width, 0) == expected;
+        if verified {
+            for ip in self.smart.on_leaves(piece, leaves) {
+                self.convict(ip, out);
+            }
+        }
+        true
     }
 
     /// Asks `key` for missing piece-layer blocks (at most
@@ -2251,6 +2445,18 @@ impl TorrentState {
     fn ban(&mut self, ip: IpAddr, out: &mut Vec<Effect>) {
         let ip = crate::ban::canonical_ip(ip);
         out.push(Effect::Alert(Alert::PeerBanned { ip }));
+        self.disconnect_ip(ip, out);
+    }
+
+    /// Bans `ip`, convicted by smart banning, for the rest of the torrent.
+    fn convict(&mut self, ip: IpAddr, out: &mut Vec<Effect>) {
+        if self.bans.ban(ip) {
+            self.ban(ip, out);
+        }
+    }
+
+    /// Closes every connection of the (canonical) `ip` and forgets it.
+    fn disconnect_ip(&mut self, ip: IpAddr, out: &mut Vec<Effect>) {
         let keys: Vec<PeerKey> = self
             .sorted_keys()
             .into_iter()

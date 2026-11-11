@@ -413,3 +413,33 @@ async fn the_watch_folder_adds_torrents_and_magnets() {
     handle.stop().await;
     session.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_ban_refuses_the_address_everywhere() {
+    let (len_a, len_b) = (40_000, 30_000);
+    let (encoded, content) = make_torrent(len_a, len_b);
+    let seed = seed(&encoded, &content, len_a).await;
+    let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+    assert!(seed.session.ban_ip(loopback));
+    assert!(!seed.session.ban_ip(loopback), "already banned");
+    // The v4-mapped form is the same address.
+    assert!(!seed.session.ban_ip("::ffff:127.0.0.1".parse().unwrap()));
+    assert_eq!(seed.session.banned_ips(), vec![loopback]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let leecher = Session::new(config()).unwrap();
+    let handle = leecher
+        .add_torrent(
+            metainfo(&encoded),
+            AddTorrentOptions::new(dir.path()).with_peers([seed.addr]),
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let progress = handle.progress().await.unwrap();
+    assert_eq!(progress.stats.bytes_have, 0, "the banned leecher got data");
+
+    assert!(seed.session.unban_ip(loopback));
+    assert!(seed.session.banned_ips().is_empty());
+    leecher.shutdown().await;
+    seed.session.shutdown().await;
+}

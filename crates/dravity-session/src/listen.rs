@@ -263,6 +263,9 @@ pub(crate) struct Acceptor {
     pub(crate) handshake_timeout: Duration,
     pub(crate) encryption: Policy,
     pub(crate) pending: Arc<Semaphore>,
+    /// The session's ban list: banned addresses are closed before the
+    /// handshake.
+    pub(crate) bans: crate::bans::Bans,
 }
 
 /// Starts one accept task per socket; they end when `stop` is cancelled.
@@ -315,6 +318,10 @@ async fn accept_utp(socket: Arc<UtpSocket>, acceptor: Acceptor, stop: Cancellati
 /// Handshakes and routes one accepted connection in its own task, within
 /// the pending-handshake budget.
 fn handle(stream: RawStream, addr: SocketAddr, acceptor: &Acceptor) {
+    if acceptor.bans.contains(addr.ip()) {
+        tracing::debug!(%addr, "banned address; closing");
+        return;
+    }
     let Ok(permit) = Arc::clone(&acceptor.pending).try_acquire_owned() else {
         tracing::debug!(%addr, "too many incoming handshakes; closing");
         return;

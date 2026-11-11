@@ -170,6 +170,15 @@ pub struct Config {
     /// failure, so a shared NAT is not banned for mistakes spread over the
     /// whole download. Bans themselves are not lifted.
     pub hash_fail_quiet: Duration,
+    /// Smart banning (default `true`): when a piece with several
+    /// contributors fails, find out which block was bad instead of striking
+    /// everyone. The driver hashes the failed piece's blocks
+    /// ([`Effect::HashBlocks`]) and again once the piece passes; the sender
+    /// of a block whose digest differs from the verified one is banned at
+    /// once. For v2 and hybrid torrents the 16 KiB leaf hashes are also
+    /// asked from BEP 52 peers, so the verdict can come before the piece is
+    /// downloaded again. Sole contributors are still handled by strikes.
+    pub smart_ban: bool,
     /// Port we accept connections on, advertised in the extension handshake
     /// (`p`) so peers that we dialed can tell others how to reach us.
     pub listen_port: Option<u16>,
@@ -215,6 +224,7 @@ impl Default for Config {
             allowed_fast: dravity_wire::DEFAULT_ALLOWED_FAST,
             hash_fail_ban: 4,
             hash_fail_quiet: Duration::from_secs(60 * 60),
+            smart_ban: true,
             listen_port: None,
         }
     }
@@ -352,6 +362,21 @@ pub enum Event {
         /// Whether the SHA-1 matched.
         ok: bool,
     },
+    /// Result of an [`Effect::HashBlocks`]: one digest per block, in order.
+    /// Empty when the piece could not be read.
+    BlockHashes {
+        /// Piece index.
+        piece: u32,
+        /// SHA-256 leaf hash of each block.
+        hashes: Vec<Hash>,
+    },
+    /// Ban an address banned elsewhere in the session (another torrent's
+    /// hash-failure or smart ban): its connections are closed and it is
+    /// never dialed or accepted again. No [`Alert::PeerBanned`] is raised.
+    BanIp {
+        /// The address (an IPv4-mapped IPv6 address is its IPv4 address).
+        ip: IpAddr,
+    },
     /// The driver installed a piece layer from
     /// [`Effect::PieceLayerReceived`]: hash the verified pieces in `pieces`
     /// again (each with [`Effect::HashPiece`], now against the Merkle tree
@@ -480,6 +505,14 @@ pub enum Effect {
     },
     /// Hash a piece from storage, then report [`Event::PieceHashed`].
     HashPiece {
+        /// Piece index.
+        piece: u32,
+    },
+    /// Hash every 16 KiB block of a piece as it is on storage with
+    /// [`merkle::hash_leaf`](dravity_core::merkle::hash_leaf) (the last
+    /// block may be shorter), then report [`Event::BlockHashes`]. Used by
+    /// [`Config::smart_ban`].
+    HashBlocks {
         /// Piece index.
         piece: u32,
     },

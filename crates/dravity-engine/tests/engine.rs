@@ -1756,3 +1756,28 @@ fn the_start_check_skips_pieces_the_prescan_ruled_out() {
     assert!(!fx.iter().any(|e| matches!(e, Effect::HashPiece { .. })));
     assert_eq!(h.t.status(), TorrentStatus::Downloading);
 }
+
+#[test]
+fn the_request_budget_bounds_requests_across_peers() {
+    let blocks: u32 = 64;
+    let piece = blocks * BLOCK_SIZE;
+    let big = PieceLayout::new(piece, 4 * u64::from(piece)).unwrap();
+    let mut c = config();
+    c.initial_requests_per_peer = 8;
+    c.max_requests_per_peer = 8;
+    c.request_budget = 12;
+    let mut h = Harness::new(c.clone());
+    h.t = TorrentState::new(big, c);
+    h.ev(Event::Start);
+    let mut asked = Vec::new();
+    for p in 1..=3 {
+        connect(&mut h, p, Reserved::new().with_fast(true));
+        h.msg(p, Message::HaveAll);
+        asked.push(requests(&h.msg(p, Message::Unchoke), p));
+    }
+    let counts: Vec<usize> = asked.iter().map(Vec::len).collect();
+    assert_eq!(counts, [8, 4, 0], "the budget, not 3 x 8");
+    // A delivery frees one request's worth of budget.
+    let fx = h.msg(1, data_for(asked[0][0]));
+    assert_eq!(requests(&fx, 1).len(), 1);
+}

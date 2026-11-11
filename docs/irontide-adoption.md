@@ -18,6 +18,7 @@ sound version, with the difference explained), **open** (not started).
 | 6 | Hash on arrival | done | `perf(core,session): verify pieces as their blocks are written` | [notes](#6-hash-on-arrival) |
 | 7 | Byte-budgeted read cache (Storage middleware) | partial | `feat(storage,session): shared read cache middleware` | [notes](#7-read-cache) |
 | 8 | Verify-before-download prescan | done | `perf(storage,engine,session): prescan files before the start check` | [notes](#8-prescan) |
+| 9 | BDP-adaptive request budget | done | `feat(engine): BDP request depth and a torrent request budget` | [notes](#9-bdp-request-budget) |
 
 ## Design notes
 
@@ -165,3 +166,20 @@ pieces in its `Checking` phase, and they simply stay missing. A
 preallocated (full-length) file gives no information, so its pieces are
 hashed as before. This is always correct, because the prescan only
 removes pieces that could not possibly verify.
+
+### 9. BDP request budget
+
+`dravity-engine/src/window.rs` adds `Bdp` next to the AIMD `Window`. The
+engine measures what it needs from its own events, so no new I/O-side
+event is required. The round trip is request time to block arrival
+(both are already in `inflight`). The rate is the bytes delivered
+between ticks, smoothed with an EWMA. The base round trip is the
+minimum sample from the last 10 s. A smoothed round trip would include
+the queueing our own requests cause and would drive the depth up
+without bound. The depth is `max(window, bdp)` within
+`max_requests_per_peer` and `reqq`. A timeout clears the estimate and
+leaves AIMD in charge for 10 s, so a congested peer is not refilled
+from stale numbers. `Config::request_budget` caps outstanding requests
+across the torrent. The scripted tests cover the budget split across
+peers and the existing timeout and `reqq` behavior. Unit tests cover the
+BDP arithmetic, minimum-RTT expiry and the hand-back after a loss.

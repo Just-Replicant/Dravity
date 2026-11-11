@@ -78,6 +78,14 @@ Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/ir
   skips hashing them (`TorrentState::with_absent_pieces` /
   `set_absent_pieces`). A new or partial download is checked in O(files)
   plus the pieces that may be present.
+- **BDP request depth and torrent budget (item 9):** each peer's request
+  depth is the larger of its AIMD window and its bandwidth-delay product
+  (EWMA delivery rate × minimum recent request round trip, +25 % and two
+  blocks), still capped by `max_requests_per_peer` and `reqq`; a request
+  timeout hands control back to AIMD for 10 s. New
+  `Config::request_budget` (1024 blocks) bounds outstanding requests
+  across all peers of a torrent. Rate and RTT are measured from the
+  engine's own events, so it stays sans-IO.
 
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 

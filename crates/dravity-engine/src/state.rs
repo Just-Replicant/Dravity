@@ -27,7 +27,7 @@ use crate::types::{
     TorrentStatus,
 };
 use crate::web_seed::is_web_seed_addr;
-use crate::window::Window;
+use crate::window::{Bdp, Window};
 
 /// Most peers that may hold a request for the same block (endgame and
 /// stealing): the original requester plus one more.
@@ -122,6 +122,8 @@ struct Peer {
     snub_since: Option<Instant>,
     /// When the peer last held the optimistic unchoke (or connected).
     last_optimistic: Instant,
+    /// Delivery rate and base round trip, for the request depth.
+    bdp: Bdp,
 }
 
 impl Peer {
@@ -169,6 +171,7 @@ impl Peer {
             uploaded: 0,
             snub_since: None,
             last_optimistic: now,
+            bdp: Bdp::default(),
         }
     }
 
@@ -183,11 +186,17 @@ impl Peer {
         !self.am_choking || self.allowed_out.contains(&piece)
     }
 
-    /// Outstanding requests allowed now: the AIMD window, capped by the
-    /// peer's advertised `reqq`.
+    /// Outstanding requests allowed now: the AIMD window, or the peer's
+    /// bandwidth-delay product when that is deeper (a fast, distant peer
+    /// gets a full pipe at once instead of after many round trips), up to
+    /// [`Config::max_requests_per_peer`] and the peer's advertised `reqq`.
     fn request_limit(&self) -> usize {
-        let window = self.window.size().min(self.ext.reqq.unwrap_or(u32::MAX));
-        usize::try_from(window).unwrap_or(usize::MAX)
+        let depth = self
+            .window
+            .size()
+            .max(self.bdp.target().min(self.window.max()))
+            .min(self.ext.reqq.unwrap_or(u32::MAX));
+        usize::try_from(depth).unwrap_or(usize::MAX)
     }
 }
 
@@ -1559,10 +1568,10 @@ impl TorrentState {
         }
         let mut from_ip = None;
         if let Some(peer) = self.peers.get_mut(&key) {
-            let before = peer.inflight.len();
-            peer.inflight.retain(|(b, _)| *b != block);
-            if peer.inflight.len() < before {
+            if let Some(&(_, requested)) = peer.inflight.iter().find(|(b, _)| *b == block) {
+                peer.inflight.retain(|(b, _)| *b != block);
                 peer.window.on_block();
+                peer.bdp.on_block(now, requested, length);
             }
             peer.down_round = peer.down_round.saturating_add(u64::from(length));
             peer.downloaded = peer.downloaded.saturating_add(u64::from(length));
@@ -1626,6 +1635,13 @@ impl TorrentState {
             return;
         }
         let piece_count = self.picker.layout().piece_count();
+        // Requests outstanding at the other peers, for the torrent budget.
+        let others: usize = self
+            .peers
+            .iter()
+            .filter(|(k, _)| **k != key)
+            .map(|(_, p)| p.inflight.len())
+            .sum();
         let Some(peer) = self.peers.get_mut(&key) else {
             return;
         };
@@ -1649,7 +1665,11 @@ impl TorrentState {
         };
         let has = choked_mask.as_ref().unwrap_or(&peer.has);
         let limit = peer.request_limit();
-        while peer.inflight.len() < limit && self.pending_writes < self.config.max_pending_writes {
+        let budget = self.config.request_budget.max(1);
+        while peer.inflight.len() < limit
+            && others + peer.inflight.len() < budget
+            && self.pending_writes < self.config.max_pending_writes
+        {
             if self
                 .rate
                 .as_ref()
@@ -2008,6 +2028,7 @@ impl TorrentState {
                     dead.push(key);
                     continue;
                 }
+                peer.bdp.on_tick(now);
                 let timeout = self.config.request_timeout;
                 let mut expired = Vec::new();
                 peer.inflight.retain(|(block, since)| {
@@ -2022,6 +2043,7 @@ impl TorrentState {
                     // that has grown to 128 with reqq 4 becomes 2.
                     let reqq = peer.ext.reqq.unwrap_or(u32::MAX);
                     peer.window.on_timeout(reqq);
+                    peer.bdp.on_loss(now);
                 }
                 if now.saturating_duration_since(peer.last_sent) >= self.config.keepalive_interval {
                     Self::send(peer, key, Message::KeepAlive, now, out);

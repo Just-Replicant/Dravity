@@ -63,8 +63,14 @@ pub struct Config {
     /// requests). A smaller `reqq` from the peer's extension handshake wins.
     pub max_requests_per_peer: usize,
     /// Request window a new peer starts with; it grows while blocks arrive
-    /// in time and halves when a request times out.
+    /// in time and halves when a request times out. A peer whose measured
+    /// bandwidth-delay product (delivery rate × base round trip) is deeper
+    /// gets that depth at once, still within `max_requests_per_peer`.
     pub initial_requests_per_peer: usize,
+    /// Block requests outstanding across all peers of the torrent. Many
+    /// peers then share a bounded amount of requested-but-undelivered data
+    /// instead of each filling its own window.
+    pub request_budget: usize,
     /// Request a block from a second peer when the first has not delivered
     /// it after this long and the second has nothing else to do (piece
     /// stealing from slow peers).
@@ -190,6 +196,7 @@ impl Default for Config {
             max_peers: 50,
             max_requests_per_peer: 128,
             initial_requests_per_peer: 4,
+            request_budget: 1024,
             steal_after: Duration::from_secs(10),
             endgame: true,
             download_rate_limit: None,

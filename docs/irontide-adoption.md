@@ -14,6 +14,7 @@ sound version, with the difference explained), **open** (not started).
 | 2 | Session-wide smart ban | done | `feat(engine,session): session-wide smart ban` | [notes](#2-smart-ban) |
 | 3 | Global connection cap with one admit function and a loom model | done | `feat(core,session): session-wide connection cap` | [notes](#3-connection-cap) |
 | 4 | Session-wide hash pool | done | `perf(session): share one hash pool across torrents` | [notes](#4-hash-pool) |
+| 5 | Sans-IO purity tripwire tests | done | `test: sans-IO purity tripwires` | [notes](#5-purity-tripwires) |
 
 ## Design notes
 
@@ -90,3 +91,16 @@ runs its own threads with `catch_unwind`. Dravity gets the same
 isolation from `spawn_blocking`'s `JoinError`: a panicking job reports
 `StorageFailed` and frees its slot. Dedicated threads would duplicate
 the blocking pool that storage I/O already uses.
+
+### 5. Purity tripwires
+
+Each crate that mixes sans-IO modules with Tokio code lists those
+modules in `tests/sans_io_purity.rs` (with `include_str!`, so the check
+needs no features). The crates that are sans-IO as a whole
+(`dravity-core`, `-engine`, `-wire`, `-bencode`) scan every file in
+`src/` instead, so a new file is covered automatically. The scan rejects
+these tokens: tokio, `.await`, `async fn`/`async move`, socket types,
+`ToSocketAddrs`, `std::fs`, `std::thread`, `Instant::now`,
+`SystemTime::now`, reqwest and rustix. It skips comments, because doc
+examples may show a clock, and the trailing `mod tests`. A self-test
+proves the checker catches a violation.

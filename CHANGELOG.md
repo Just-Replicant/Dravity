@@ -49,6 +49,13 @@ Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/ir
   pool, so N torrents rechecking at once no longer run N × cores
   blocking jobs. A panicking job reports a storage error and frees its
   slot. `Session::hash_jobs_running` shows the pool's load.
+- **Sans-IO purity tripwires (item 5):** `tests/sans_io_purity.rs` in
+  `dravity-utp` (`conn`, `packet`), `dravity-mse` (`handshake`,
+  `crypto`), `dravity-webseed` (`plan`, `addr`), `dravity-tracker`
+  (`http`, `udp`, `guard`, `types`) and `dravity-portmap` (`natpmp`), and
+  for every file of `dravity-core`, `-engine`, `-wire` and `-bencode`,
+  fail the build when a sans-IO module mentions tokio, `.await`, sockets,
+  `std::fs`, threads or the clock (comments and unit tests excepted).
 
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 

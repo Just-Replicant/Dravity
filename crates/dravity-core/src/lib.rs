@@ -9,9 +9,11 @@
 //! * [`merkle`] — BEP 52 SHA-256 Merkle trees (pieces roots, piece layers).
 //! * [`path`] — rejection of unsafe file paths from untrusted metainfo.
 //! * [`net`] — public/non-public address classification (SSRF checks).
+//! * [`admit`] — the session-wide connection cap.
 //!
 //! This crate is sans-IO: it never touches the network or filesystem.
 
+pub mod admit;
 pub mod compact;
 mod encoding;
 mod info_hash;

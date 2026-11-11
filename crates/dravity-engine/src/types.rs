@@ -329,6 +329,13 @@ pub enum Event {
         /// pass `false` so a bad peer is not dialed in a loop.
         retry: bool,
     },
+    /// An [`Effect::Connect`] was not started because the session-wide
+    /// connection cap was reached. The address is not blamed: it is
+    /// dialed again after [`DEFERRED_DIAL_RETRY`](crate::DEFERRED_DIAL_RETRY).
+    PeerConnectDeferred {
+        /// Address that was not dialed.
+        addr: SocketAddr,
+    },
     /// A connected peer went away (EOF, I/O error, protocol error).
     PeerDisconnected {
         /// The peer.

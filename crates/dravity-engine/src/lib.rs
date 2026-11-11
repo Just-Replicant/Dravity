@@ -98,6 +98,7 @@ mod window;
 pub use bitfield::Bitfield;
 pub use metadata::{Handover, HandoverPeer, MetadataState};
 pub use picker::{ParsePriorityError, Picker, Priority};
+pub use pool::DEFERRED_DIAL_RETRY;
 pub use rate::TokenBucket;
 pub use state::TorrentState;
 pub use types::{

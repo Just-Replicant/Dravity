@@ -408,6 +408,16 @@ impl MetadataState {
                 }
                 self.fill_connections(&mut out);
             }
+            Event::PeerConnectDeferred { addr } => {
+                // Not the peer's fault, and dialing the next address now
+                // would only be deferred too.
+                self.pool.dial_done(addr);
+                let peers = &self.peers;
+                self.pool
+                    .schedule_retry(now + crate::DEFERRED_DIAL_RETRY, addr, |a| {
+                        Self::is_connected(peers, a)
+                    });
+            }
             Event::PeerDisconnected { peer } => {
                 if let Some(addr) = self.remove_peer(peer) {
                     self.schedule_retry(now, addr);

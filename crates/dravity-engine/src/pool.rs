@@ -8,9 +8,13 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::web_seed::is_web_seed_addr;
+
+/// How long an address waits after a dial was deferred by the session's
+/// connection cap ([`Event::PeerConnectDeferred`](crate::Event::PeerConnectDeferred)).
+pub const DEFERRED_DIAL_RETRY: Duration = Duration::from_secs(5);
 
 /// Upper bound on queued plus waiting peer addresses.
 pub(crate) const MAX_POOL: usize = 2_000;

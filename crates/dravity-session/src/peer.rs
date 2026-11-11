@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
+use dravity_core::admit::ConnectionSlot;
 use dravity_core::{InfoHash, PeerId};
 use dravity_engine::{DialHints, PeerKey};
 use dravity_mse::{MseError, Policy};
@@ -281,11 +282,16 @@ async fn dial(params: &PeerParams) -> Result<Dialed, HandshakeError> {
 }
 
 /// Connects, handshakes and runs the connection until either side closes.
+///
+/// `slot` is the connection's place under the session-wide cap, held until
+/// the task ends.
 pub(crate) async fn run(
     params: PeerParams,
     events: mpsc::Sender<Input>,
     commands: mpsc::Receiver<PeerCommand>,
+    slot: ConnectionSlot,
 ) {
+    let _slot = slot;
     let (key, addr) = (params.key, params.addr);
     let (stream, reserved, leftover, mse) = match dial(&params).await {
         Ok(Dialed {
@@ -340,7 +346,9 @@ pub(crate) async fn run_accepted(
     leftover: BytesMut,
     events: mpsc::Sender<Input>,
     commands: mpsc::Receiver<PeerCommand>,
+    slot: ConnectionSlot,
 ) {
+    let _slot = slot;
     serve(key, addr, stream, leftover, &events, commands).await;
 }
 
@@ -505,7 +513,14 @@ mod tests {
             encryption: Policy::Disabled,
             hints: DialHints::default(),
         };
-        tokio::spawn(run(params, events_tx, cmd_rx));
+        tokio::spawn(run(
+            params,
+            events_tx,
+            cmd_rx,
+            dravity_core::admit::ConnectionLimit::default()
+                .try_admit()
+                .unwrap(),
+        ));
         assert!(matches!(events.recv().await, Some(Input::Connected { .. })));
         let next = tokio::time::timeout(Duration::from_secs(2), events.recv()).await;
         assert!(

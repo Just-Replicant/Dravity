@@ -93,6 +93,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
+use dravity_core::admit::ConnectionLimit;
 use dravity_core::{InfoHash, Magnet, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{Alert, Priority, Stats};
@@ -104,7 +105,7 @@ use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub use codec::{CodecError, PeerCodec};
-pub use config::{SessionConfig, StorageBackend};
+pub use config::{DEFAULT_MAX_CONNECTIONS, SessionConfig, StorageBackend};
 pub use dravity_mse::Policy as EncryptionPolicy;
 pub use dravity_portmap::{
     Mapped as PortMapped, Method as PortMapMethod, PortMapConfig, Protocol as PortMapProtocol,
@@ -247,6 +248,8 @@ struct Inner {
     catalog: Catalog,
     /// Addresses banned for bad data, shared by every torrent.
     bans: bans::Bans,
+    /// The session-wide cap on open peer connections.
+    connections: ConnectionLimit,
     /// Session state writer, started with the first torrent.
     persist: OnceLock<Persister>,
     /// Bound sockets, until the first torrent starts the accept tasks
@@ -347,6 +350,7 @@ impl Session {
         let dht = config.dht.as_ref().map(Dht::new).transpose()?;
         let (alerts, _) = broadcast::channel(config.alert_buffer.max(1));
         let stop = CancellationToken::new();
+        let connections = ConnectionLimit::new(config.max_connections);
         Ok(Self {
             inner: Arc::new(Inner {
                 config: Arc::new(config),
@@ -360,6 +364,7 @@ impl Session {
                 torrents: Arc::new(Mutex::new(HashMap::new())),
                 catalog: Arc::new(Mutex::new(HashMap::new())),
                 bans: Arc::default(),
+                connections,
                 persist: OnceLock::new(),
                 listener: Mutex::new(listener),
                 listen_port,
@@ -414,6 +419,7 @@ impl Session {
                 config.listen.as_ref().map_or(1, |l| l.max_pending.max(1)),
             )),
             bans: Arc::clone(&self.inner.bans),
+            connections: self.inner.connections.clone(),
         };
         match listen::start(bound, &acceptor, &self.inner.stop) {
             Ok(utp) => {
@@ -640,6 +646,7 @@ impl Session {
             utp: self.inner.utp.get().cloned().unwrap_or_default(),
             catalog: Arc::clone(&self.inner.catalog),
             bans: Arc::clone(&self.inner.bans),
+            connections: self.inner.connections.clone(),
             persist: self.inner.persister().cloned(),
             port_map: self
                 .inner
@@ -690,6 +697,25 @@ impl Session {
             }
         }
         true
+    }
+
+    /// Peer connections open now, across every torrent (each holds a slot
+    /// of [`SessionConfig::max_connections`]).
+    #[must_use]
+    pub fn connection_count(&self) -> usize {
+        self.inner.connections.live()
+    }
+
+    /// The session-wide connection cap now in force.
+    #[must_use]
+    pub fn max_connections(&self) -> Option<usize> {
+        self.inner.connections.max()
+    }
+
+    /// Changes the session-wide connection cap at once. Lowering it closes
+    /// no connection: new ones wait until enough have ended.
+    pub fn set_max_connections(&self, max: Option<usize>) {
+        self.inner.connections.set_max(max);
     }
 
     /// Lifts a session ban on `ip` for the listener and torrents started

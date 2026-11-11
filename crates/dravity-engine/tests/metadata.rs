@@ -1074,3 +1074,17 @@ fn a_hybrid_rechecks_its_pieces_once_a_layer_arrives() {
     assert!(hashed(&fx).is_empty());
     assert_eq!(t.picker().wanted_left(), 16_384);
 }
+
+#[test]
+fn a_deferred_dial_is_retried_while_fetching_metadata() {
+    let mut h = Harness::new(Config::default());
+    let fx = h.ev(Event::AddPeers {
+        peers: vec![addr(1)],
+    });
+    assert!(fx.iter().any(|e| matches!(e, Effect::Connect { .. })));
+    let fx = h.ev(Event::PeerConnectDeferred { addr: addr(1) });
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Connect { .. })));
+    h.now += dravity_engine::DEFERRED_DIAL_RETRY;
+    let fx = h.ev(Event::Tick);
+    assert!(fx.iter().any(|e| matches!(e, Effect::Connect { .. })));
+}

@@ -43,6 +43,10 @@ impl std::fmt::Display for StorageBackend {
     }
 }
 
+/// Default [`SessionConfig::max_connections`]: well under the usual
+/// 1024 file descriptor limit, with room for files and other sockets.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 500;
+
 /// Session-wide settings. [`SessionConfig::default`] is a reasonable start.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -79,6 +83,12 @@ pub struct SessionConfig {
     pub peer_queue: usize,
     /// Capacity of each torrent's event queue (peer, disk, hash, tracker).
     pub event_queue: usize,
+    /// Open peer connections across every torrent, dialed or accepted,
+    /// TCP or uTP (each torrent also keeps its own
+    /// [`max_peers`](dravity_engine::Config::max_peers)). At the cap the
+    /// listener closes new connections and dials wait. `None` removes the
+    /// cap.
+    pub max_connections: Option<usize>,
     /// Concurrent piece-hash jobs per torrent.
     pub hash_workers: usize,
     /// Time allowed for the `stopped` announce when a torrent stops.
@@ -133,6 +143,7 @@ impl Default for SessionConfig {
             tick_interval: Duration::from_secs(1),
             peer_queue: 256,
             event_queue: 1024,
+            max_connections: Some(DEFAULT_MAX_CONNECTIONS),
             hash_workers: std::thread::available_parallelism().map_or(2, usize::from),
             stop_announce_timeout: Duration::from_secs(5),
             alert_buffer: 1024,

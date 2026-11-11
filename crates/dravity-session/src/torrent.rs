@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
+use dravity_core::admit::{ConnectionLimit, ConnectionSlot};
 use dravity_core::merkle::Hash;
 use dravity_core::{BlockRef, Info, InfoHash, InfoHashV2, MetaVersion, Metainfo, PeerId};
 use dravity_dht::Dht;
@@ -118,6 +119,8 @@ pub(crate) struct Accepted {
     pub(crate) reserved: Reserved,
     /// Bytes that arrived after the handshake.
     pub(crate) leftover: BytesMut,
+    /// The connection's slot under the session-wide cap.
+    pub(crate) slot: ConnectionSlot,
 }
 
 /// A torrent's content, once its metadata is known.
@@ -191,6 +194,8 @@ pub(crate) struct TorrentContext {
     pub(crate) catalog: Catalog,
     /// The session-wide ban list.
     pub(crate) bans: crate::bans::Bans,
+    /// The session-wide connection cap: every dial takes a slot first.
+    pub(crate) connections: ConnectionLimit,
     /// Session state writer, with a state directory.
     pub(crate) persist: Option<Persister>,
     /// Router port mapping status, when mapping runs.
@@ -1375,6 +1380,7 @@ impl TorrentTask {
             addr,
             reserved,
             leftover,
+            slot,
         } = accepted;
         let (key, rx) = self.new_peer();
         if stream.kind() == Transport::Utp {
@@ -1395,6 +1401,7 @@ impl TorrentTask {
             leftover,
             self.events_tx.clone(),
             rx,
+            slot,
         ));
         Event::PeerAccepted {
             peer: key,
@@ -1415,6 +1422,11 @@ impl TorrentTask {
                 .push_back(Event::PeerConnectFailed { addr, retry: false });
             return;
         }
+        let Some(slot) = self.ctx.connections.try_admit() else {
+            tracing::trace!(%addr, "session connection limit reached; dial deferred");
+            self.local.push_back(Event::PeerConnectDeferred { addr });
+            return;
+        };
         let (key, rx) = self.new_peer();
         let params = PeerParams {
             key,
@@ -1430,7 +1442,7 @@ impl TorrentTask {
         };
         // Peer tasks are not in `background`: dropping their command sender
         // ends them, and they must not delay shutdown.
-        tokio::spawn(peer::run(params, self.events_tx.clone(), rx));
+        tokio::spawn(peer::run(params, self.events_tx.clone(), rx, slot));
     }
 
     fn write(&mut self, block: BlockRef, data: Bytes) {

@@ -32,6 +32,17 @@ Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/ir
   are session-wide: a torrent's ban is shared with every other torrent
   and the listener (`Session::ban_ip`, `unban_ip`, `banned_ips`,
   `Event::BanIp`, `TorrentState::with_banned_ips`).
+- **Session connection cap (item 3):** `SessionConfig::max_connections`
+  (default 500, `--max-connections`, 0 for none) caps open peer
+  connections across all torrents, TCP and uTP, dialed and accepted. One
+  lock-free counter (`dravity_core::admit::{ConnectionLimit,
+  ConnectionSlot, admit_permitted}`) hands out RAII slots: the listener
+  closes connections over the cap before the handshake, and a dial over
+  the cap is reported as the new `Event::PeerConnectDeferred` (no blame;
+  dialed again after `DEFERRED_DIAL_RETRY`, 5 s). Changeable at runtime
+  (`Session::set_max_connections`, `max_connections`, `connection_count`).
+  A loom model (`dravity-core/tests/loom_admit.rs`, CI job `loom`) checks
+  the counter under every interleaving.
 
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 

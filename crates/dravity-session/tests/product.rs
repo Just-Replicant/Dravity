@@ -443,3 +443,33 @@ async fn a_session_ban_refuses_the_address_everywhere() {
     leecher.shutdown().await;
     seed.session.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_session_connection_cap_holds_dials_until_raised() {
+    let (len_a, len_b) = (40_000, 30_000);
+    let (encoded, content) = make_torrent(len_a, len_b);
+    let seed = seed(&encoded, &content, len_a).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = config();
+    c.max_connections = Some(0);
+    let leecher = Session::new(c).unwrap();
+    assert_eq!(leecher.max_connections(), Some(0));
+    let mut alerts = leecher.subscribe();
+    let m = metainfo(&encoded);
+    let hash = m.info_hash();
+    let handle = leecher
+        .add_torrent(
+            m,
+            AddTorrentOptions::new(dir.path()).with_peers([seed.addr]),
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(leecher.connection_count(), 0);
+    assert_eq!(handle.progress().await.unwrap().stats.bytes_have, 0);
+    // Raised at runtime: the deferred dial goes out and the download ends.
+    leecher.set_max_connections(Some(4));
+    until_finished(&mut alerts, hash).await;
+    assert!(leecher.connection_count() <= 4);
+    leecher.shutdown().await;
+    seed.session.shutdown().await;
+}

@@ -1694,3 +1694,34 @@ fn web_seeds_are_never_dialed_retried_or_shared() {
     let fx = h.advance(h.t.config().peer_retry * 3);
     assert!(dials(&fx).iter().all(|a| !is_web_seed_addr(*a)), "{fx:?}");
 }
+
+fn connects(fx: &[Effect]) -> Vec<SocketAddr> {
+    fx.iter()
+        .filter_map(|e| match e {
+            Effect::Connect { addr, .. } => Some(*addr),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_deferred_dial_waits_without_blame() {
+    let mut c = config();
+    c.max_peers = 1;
+    let mut h = Harness::new(c);
+    h.ev(Event::Start);
+    let fx = h.ev(Event::AddPeers {
+        peers: vec![addr(1), addr(2)],
+    });
+    assert_eq!(connects(&fx), [addr(1)]);
+    // The session's connection cap is full: nothing else is dialed now.
+    let fx = h.ev(Event::PeerConnectDeferred { addr: addr(1) });
+    assert!(connects(&fx).is_empty(), "{fx:?}");
+    // The next tick dials the queued address; the deferred one comes back
+    // after `DEFERRED_DIAL_RETRY`.
+    let fx = h.advance(Duration::from_secs(1));
+    assert_eq!(connects(&fx), [addr(2)]);
+    h.ev(Event::PeerConnectDeferred { addr: addr(2) });
+    let fx = h.advance(dravity_engine::DEFERRED_DIAL_RETRY);
+    assert_eq!(connects(&fx), [addr(1)]);
+}

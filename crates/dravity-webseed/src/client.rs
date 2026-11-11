@@ -137,6 +137,36 @@ fn redirect(attempt: Attempt<'_>) -> reqwest::redirect::Action {
 }
 
 impl WebSeedClient {
+    /// Whether this client may connect to non-public addresses.
+    #[must_use]
+    pub const fn allows_private(&self) -> bool {
+        self.allow_private
+    }
+
+    /// Checks `url` before any request: `http` or `https`, a host, and
+    /// (unless [`WebSeedConfig::allow_private_addresses`] is set) a public
+    /// IP literal. Host names are not resolved here.
+    ///
+    /// # Errors
+    /// [`WebSeedError::InvalidUrl`], [`WebSeedError::UnsupportedScheme`], or
+    /// [`WebSeedError::ForbiddenAddress`].
+    pub fn validate_url(&self, url: &str) -> Result<Url, WebSeedError> {
+        let parsed = Url::parse(url).map_err(|_| WebSeedError::InvalidUrl(url.into()))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(WebSeedError::UnsupportedScheme(parsed.scheme().to_owned()));
+        }
+        match parsed.host() {
+            Some(url::Host::Ipv4(ip)) if !self.allow_private && !is_public(IpAddr::V4(ip)) => {
+                Err(WebSeedError::ForbiddenAddress(IpAddr::V4(ip)))
+            }
+            Some(url::Host::Ipv6(ip)) if !self.allow_private && !is_public(IpAddr::V6(ip)) => {
+                Err(WebSeedError::ForbiddenAddress(IpAddr::V6(ip)))
+            }
+            Some(_) => Ok(parsed),
+            None => Err(WebSeedError::InvalidUrl(url.into())),
+        }
+    }
+
     /// Builds a client.
     ///
     /// # Errors
@@ -207,22 +237,7 @@ impl WebSeedClient {
             length,
             file_length,
         } = wanted;
-        let parsed = Url::parse(url).map_err(|_| WebSeedError::InvalidUrl(url.into()))?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            return Err(WebSeedError::UnsupportedScheme(parsed.scheme().to_owned()));
-        }
-        if !self.allow_private {
-            // IP literals never reach the resolver.
-            let literal = match parsed.host() {
-                Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
-                Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
-                Some(url::Host::Domain(_)) => None,
-                None => return Err(WebSeedError::InvalidUrl(url.into())),
-            };
-            if let Some(ip) = literal.filter(|ip| !is_public(*ip)) {
-                return Err(WebSeedError::ForbiddenAddress(ip));
-            }
-        }
+        let parsed = self.validate_url(url)?;
         if length == 0 {
             return Ok(());
         }
@@ -373,6 +388,32 @@ mod tests {
         ] {
             assert_eq!(parse_content_range(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn private_literals_are_refused_unless_allowed() {
+        let strict = WebSeedClient::new(&WebSeedConfig::default()).unwrap();
+        assert!(matches!(
+            strict.validate_url("http://169.254.169.254/latest"),
+            Err(WebSeedError::ForbiddenAddress(_))
+        ));
+        assert!(matches!(
+            strict.validate_url("http://[::1]/x"),
+            Err(WebSeedError::ForbiddenAddress(_))
+        ));
+        assert!(strict.validate_url("http://93.184.215.14/x").is_ok());
+        assert!(strict.validate_url("https://cdn.example/a").is_ok());
+        assert!(matches!(
+            strict.validate_url("ftp://cdn.example/a"),
+            Err(WebSeedError::UnsupportedScheme(_))
+        ));
+        let open = WebSeedClient::new(&WebSeedConfig {
+            allow_private_addresses: true,
+            ..WebSeedConfig::default()
+        })
+        .unwrap();
+        assert!(open.validate_url("http://127.0.0.1/x").is_ok());
+        assert!(open.allows_private());
     }
 
     #[test]

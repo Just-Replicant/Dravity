@@ -3,11 +3,13 @@
 //!
 //! The byte-level request builders and reply parsers are plain functions,
 //! tested without sockets; [`connect`] drives them over a `TcpStream`.
-//! The SOCKS5 UDP ASSOCIATE datagram header is provided as a codec
-//! ([`udp_header`], [`parse_udp_header`]) for a future UDP relay.
+//! The SOCKS5 bytes come from [`dravity_core::socks5`], which the
+//! tracker client's UDP relay ([`dravity_tracker::UdpProxy`]) shares.
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use dravity_core::socks5;
+use std::net::{IpAddr, SocketAddr};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -218,11 +220,7 @@ pub fn socks4_reply(reply: &[u8]) -> Result<(), ProxyError> {
 /// have credentials.
 #[must_use]
 pub fn socks5_greeting(with_auth: bool) -> Vec<u8> {
-    if with_auth {
-        vec![5, 2, 0, 2]
-    } else {
-        vec![5, 1, 0]
-    }
+    socks5::greeting(with_auth)
 }
 
 /// The RFC 1929 username/password sub-negotiation.
@@ -230,50 +228,20 @@ pub fn socks5_greeting(with_auth: bool) -> Vec<u8> {
 /// # Errors
 /// [`ProxyError::CredentialsTooLong`] if either is over 255 bytes.
 pub fn socks5_auth(user: &str, pass: &str) -> Result<Vec<u8>, ProxyError> {
-    let ulen = u8::try_from(user.len()).map_err(|_| ProxyError::CredentialsTooLong)?;
-    let plen = u8::try_from(pass.len()).map_err(|_| ProxyError::CredentialsTooLong)?;
-    let mut out = vec![1, ulen];
-    out.extend_from_slice(user.as_bytes());
-    out.push(plen);
-    out.extend_from_slice(pass.as_bytes());
-    Ok(out)
-}
-
-fn push_addr(out: &mut Vec<u8>, target: SocketAddr) {
-    match target.ip() {
-        IpAddr::V4(ip) => {
-            out.push(1);
-            out.extend_from_slice(&ip.octets());
-        }
-        IpAddr::V6(ip) => {
-            out.push(4);
-            out.extend_from_slice(&ip.octets());
-        }
-    }
-    out.extend_from_slice(&target.port().to_be_bytes());
+    socks5::auth(user, pass).ok_or(ProxyError::CredentialsTooLong)
 }
 
 /// A SOCKS5 request: `command` 1 is CONNECT, 3 is UDP ASSOCIATE.
 #[must_use]
 pub fn socks5_request(command: u8, target: SocketAddr) -> Vec<u8> {
-    let mut out = vec![5, command, 0];
-    push_addr(&mut out, target);
-    out
+    socks5::request(command, target)
 }
 
 /// How many bytes the SOCKS5 reply whose first 5 bytes are `head` has
 /// in total, or `None` if `head` is invalid.
 #[must_use]
 pub fn socks5_reply_len(head: &[u8; 5]) -> Option<usize> {
-    let [5, _, 0, atyp, len] = *head else {
-        return None;
-    };
-    match atyp {
-        1 => Some(4 + 4 + 2),
-        4 => Some(4 + 16 + 2),
-        3 => Some(4 + 1 + usize::from(len) + 2),
-        _ => None,
-    }
+    socks5::reply_len(head)
 }
 
 /// Checks a SOCKS5 reply's status byte.
@@ -290,9 +258,7 @@ pub fn socks5_status(head: &[u8; 5]) -> Result<(), ProxyError> {
 /// The header that prefixes a datagram sent through a SOCKS5 UDP relay.
 #[must_use]
 pub fn udp_header(target: SocketAddr) -> Vec<u8> {
-    let mut out = vec![0, 0, 0];
-    push_addr(&mut out, target);
-    out
+    socks5::udp_header(target)
 }
 
 /// Splits a datagram received from a SOCKS5 UDP relay into its source
@@ -300,24 +266,7 @@ pub fn udp_header(target: SocketAddr) -> Vec<u8> {
 /// refused (`None`).
 #[must_use]
 pub fn parse_udp_header(datagram: &[u8]) -> Option<(SocketAddr, &[u8])> {
-    match datagram {
-        [0, 0, 0, 1, a, b, c, d, p1, p2, rest @ ..] => Some((
-            SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(*a, *b, *c, *d)),
-                u16::from_be_bytes([*p1, *p2]),
-            ),
-            rest,
-        )),
-        [0, 0, 0, 4, rest @ ..] => {
-            let ip: [u8; 16] = rest.get(..16)?.try_into().ok()?;
-            let port: [u8; 2] = rest.get(16..18)?.try_into().ok()?;
-            Some((
-                SocketAddr::new(IpAddr::from(ip), u16::from_be_bytes(port)),
-                rest.get(18..)?,
-            ))
-        }
-        _ => None,
-    }
+    socks5::parse_udp_header(datagram)
 }
 
 /// An HTTP `CONNECT` request for `target`.

@@ -5,11 +5,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::relay::{UdpLink, UdpProxy};
 use dravity_core::net::is_public;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect::{Attempt, Policy};
 use rustls_platform_verifier::BuilderVerifierExt;
-use tokio::net::UdpSocket;
 use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
 
@@ -39,6 +39,9 @@ pub struct ClientConfig {
     /// (`[user:pass@]host:port`; the `h`/`a` forms resolve names at the
     /// proxy). UDP trackers are not proxied.
     pub http_proxy: Option<String>,
+    /// Send UDP tracker requests through this SOCKS5 proxy's UDP relay
+    /// (UDP ASSOCIATE). The tracker's host name is resolved locally first.
+    pub udp_proxy: Option<UdpProxy>,
 }
 
 impl Default for ClientConfig {
@@ -50,6 +53,7 @@ impl Default for ClientConfig {
             user_agent: concat!("Dravity/", env!("CARGO_PKG_VERSION")).to_owned(),
             ssrf_mitigation: true,
             http_proxy: None,
+            udp_proxy: None,
         }
     }
 }
@@ -68,7 +72,7 @@ const MAX_CACHED_CONNECTIONS: usize = 256;
 /// from the same port replaces the id the first announce just stored.
 #[derive(Debug)]
 struct UdpEndpoint {
-    socket: Arc<UdpSocket>,
+    socket: Arc<UdpLink>,
     id: Option<u64>,
     /// When `id` was stored, or when the socket was created if there is none.
     at: Instant,
@@ -410,17 +414,14 @@ impl TrackerClient {
     async fn udp_socket(
         &self,
         addr: SocketAddr,
-    ) -> Result<(Arc<UdpSocket>, Arc<AsyncMutex<()>>), TrackerError> {
+    ) -> Result<(Arc<UdpLink>, Arc<AsyncMutex<()>>), TrackerError> {
         if let Some((socket, gate)) = self.endpoint_handle(addr) {
             return Ok((socket, gate));
         }
-        let bind = if addr.is_ipv6() {
-            "[::]:0"
-        } else {
-            "0.0.0.0:0"
-        };
-        let socket = Arc::new(UdpSocket::bind(bind).await?);
-        socket.connect(addr).await?;
+        let socket = Arc::new(match &self.config.udp_proxy {
+            Some(proxy) => UdpLink::relayed(proxy, addr).await?,
+            None => UdpLink::direct(addr).await?,
+        });
         let mut endpoints = self.lock_endpoints();
         if let Some(existing) = endpoints.get(&addr) {
             return Ok((Arc::clone(&existing.socket), Arc::clone(&existing.gate)));
@@ -439,7 +440,7 @@ impl TrackerClient {
         Ok((socket, gate))
     }
 
-    fn endpoint_handle(&self, addr: SocketAddr) -> Option<(Arc<UdpSocket>, Arc<AsyncMutex<()>>)> {
+    fn endpoint_handle(&self, addr: SocketAddr) -> Option<(Arc<UdpLink>, Arc<AsyncMutex<()>>)> {
         self.lock_endpoints()
             .get(&addr)
             .map(|endpoint| (Arc::clone(&endpoint.socket), Arc::clone(&endpoint.gate)))
@@ -457,7 +458,7 @@ impl TrackerClient {
 
     async fn udp_request_with(
         &self,
-        socket: &UdpSocket,
+        socket: &UdpLink,
         addr: SocketAddr,
         connection_id: u64,
         req: UdpRequest<'_>,
@@ -522,7 +523,7 @@ impl TrackerClient {
         &self,
         addr: SocketAddr,
         id: u64,
-        socket: &Arc<UdpSocket>,
+        socket: &Arc<UdpLink>,
         gate: &Arc<AsyncMutex<()>>,
     ) {
         let mut endpoints = self.lock_endpoints();
@@ -578,7 +579,7 @@ impl TrackerClient {
     /// ignored (they may be late answers to an earlier attempt).
     async fn exchange<T>(
         &self,
-        socket: &UdpSocket,
+        socket: &UdpLink,
         packet: &[u8],
         retries: u32,
         parse: impl Fn(&[u8]) -> Result<T, TrackerError>,

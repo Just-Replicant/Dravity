@@ -377,6 +377,17 @@ impl Session {
         if tracker_config.http_proxy.is_none() {
             tracker_config.http_proxy.clone_from(&proxy_url);
         }
+        if tracker_config.udp_proxy.is_none()
+            && let Some(socks) = config
+                .proxy
+                .as_ref()
+                .filter(|p| p.kind == proxy::ProxyKind::Socks5)
+        {
+            tracker_config.udp_proxy = Some(dravity_tracker::UdpProxy::new(
+                socks.server.clone(),
+                socks.auth.clone(),
+            ));
+        }
         let tracker = TrackerClient::new(tracker_config)?;
         let (storage_backend, file_io) = storage_io(config.storage_backend);
         let web_seed = config

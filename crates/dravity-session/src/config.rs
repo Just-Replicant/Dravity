@@ -132,8 +132,10 @@ pub struct SessionConfig {
     pub ip_filter: Option<std::sync::Arc<crate::IpFilter>>,
     /// Dial peers through this proxy (TCP only: uTP is skipped while a
     /// proxy is set). HTTP(S) tracker and web seed requests go through it
-    /// too (SOCKS with remote DNS, `socks5h`/`socks4a`). UDP traffic (DHT, UDP trackers, LSD) and incoming
-    /// connections are not proxied. `None` (the default) connects directly.
+    /// too (SOCKS with remote DNS, `socks5h`/`socks4a`), and a SOCKS5
+    /// proxy relays UDP tracker requests (UDP ASSOCIATE). The DHT, LSD
+    /// (LAN multicast only) and incoming connections are not proxied.
+    /// `None` (the default) connects directly.
     pub proxy: Option<crate::proxy::Proxy>,
     /// DSCP value (0 to [`crate::MAX_DSCP`]) marked on peer TCP connections,
     /// e.g. 8 (CS1, "lower effort") so home routers deprioritise

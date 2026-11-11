@@ -27,6 +27,7 @@ pub mod net;
 pub mod path;
 pub mod priority;
 pub mod rate;
+pub mod socks5;
 mod v2;
 pub mod verify;
 

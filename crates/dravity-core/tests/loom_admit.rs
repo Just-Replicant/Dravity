@@ -62,3 +62,32 @@ fn the_cap_holds_while_slots_are_released() {
         }
     });
 }
+
+/// Lowering the cap races an admission: once the change is visible, no
+/// new slot is handed out, and the count is never above the larger cap.
+#[test]
+fn lowering_the_cap_races_an_admit() {
+    loom::model(|| {
+        let limit = ConnectionLimit::new(Some(2));
+        let admitter = {
+            let limit = limit.clone();
+            thread::spawn(move || {
+                let slot = limit.try_admit();
+                assert!(limit.live() <= 2);
+                slot
+            })
+        };
+        let setter = {
+            let limit = limit.clone();
+            thread::spawn(move || limit.set_max(Some(0)))
+        };
+        setter.join().unwrap();
+        // The setter has finished: every later admit sees the new cap.
+        assert!(limit.try_admit().is_none());
+        let slot = admitter.join().unwrap();
+        assert_eq!(limit.live(), usize::from(slot.is_some()));
+        drop(slot);
+        assert_eq!(limit.live(), 0);
+        assert_eq!(limit.max(), Some(0));
+    });
+}

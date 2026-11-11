@@ -37,6 +37,7 @@ sound version, with the difference explained), **open** (not started).
 | 24 | Peer extras: GeoIP country, DSCP marking, persistent web-seed stats | done | `feat(session,cli): GeoIP peer countries, DSCP marking and persistent web seed back-off` | [notes](#24-peer-extras) |
 | 25 | BEP 55 holepunch (ut_holepunch) | done | `feat(wire,engine,cli): BEP 55 ut_holepunch relaying and rendezvous` | [notes](#25-bep-55-holepunch) |
 | 26 | BEP 52 conformance vector suite | done | `test(core): BEP 52 conformance vectors from an independent reference` | [notes](#26-bep-52-conformance-vectors) |
+| 27 | More loom models: shared rate bucket, live cap changes | done | `test(core,session): loom models for the shared rate bucket and live cap changes` | [notes](#27-more-loom-models) |
 
 ## Design notes
 
@@ -441,3 +442,10 @@ turns LSD on.
 - Sizes: 1, 100, 16383, 16384, 16385, 32767, 32768, 32769, 65536, 65537, 3 leaves + 5 bytes, 7 leaves, and 9 leaves + 1 byte, each at three piece lengths. That covers files under one leaf, an exact leaf, one byte over, an exact piece, a short last piece, and leaf counts that are not a power of two.
 - Checks: `merkle::file_hashes` (root and layer), `root_from_layer` agreeing with the root, `pad_hash(0)` being zeros and `pad_hash(1)` being SHA-256 of 64 zero bytes, and an empty file having no root. Real multi-file v2 torrents are built with `TorrentCreator` and their `pieces root`s and `piece layers` compared with the vectors. Single-piece files must have no layer, and the v2 info hash must equal SHA-256 of `info_bytes()`.
 - All three tests passed on the first run apart from a test bug: v2 files are aligned to pieces, so the stream model shows padding entries, and the test now skips them. No library change was needed.
+
+### 27. More loom models
+
+- Dravity's shared mutable state is the connection counter (`admit`, modelled since item 4) and, from item 16, the session-wide rate buckets and the live connection cap. The buckets lived in `dravity-session` behind a `std` mutex, out of loom's reach. The arithmetic is now `dravity_core::rate::TokenBucket`: pure, with the clock passed in, so it fits the core purity test. `SharedBucket` is that bucket behind `Arc<Mutex<_>>`, using `loom::sync` under `--cfg loom` the same way `admit.rs` does. `dravity-session::rate::Limiter` is a thin wrapper on tokio's clock (`Instant::into_std`), so paused-time tests still drive it.
+- Models: (1) two takes of 500 bytes at 1000 B/s at the same instant: in every interleaving the waits are exactly 0.5 s and 1 s and the debt is exactly 1000. (2) `set_rate` racing `take`: the new rate always wins, the debt is exactly the taken bytes, and the wait is priced at the rate that held the lock. (3) `set_max(Some(0))` racing `try_admit`: once the setter has joined, no admit succeeds, the count never exceeds the old cap, and every slot returns.
+- Found while writing them: two callers can reach the lock with timestamps out of order. The old code set `last = now` regardless, so a later caller with an earlier timestamp moved the clock back and the next caller was credited the same interval twice. `last` now only moves forward, and a unit test covers it.
+- dcheck's loom step (`--test 'loom_*'`) picks up the new file automatically.

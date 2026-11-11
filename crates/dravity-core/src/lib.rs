@@ -26,6 +26,7 @@ pub mod metainfo;
 pub mod net;
 pub mod path;
 pub mod priority;
+pub mod rate;
 mod v2;
 pub mod verify;
 

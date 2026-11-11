@@ -7,73 +7,38 @@
 //! queue in order of arrival. Waiting on receive stops reading the
 //! socket, which lets TCP (or uTP) flow control slow the sender.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
+use dravity_core::rate::MAX_WAIT;
+use dravity_core::rate::SharedBucket;
 use tokio::time::Instant;
 
-/// Longest a single call sleeps, so lowering a limit sharply does not
-/// stall a connection for minutes.
-const MAX_WAIT: Duration = Duration::from_secs(2);
-
+/// One direction's bucket ([`dravity_core::rate`]), on tokio's clock so
+/// paused-time tests control it.
 #[derive(Debug)]
-struct Bucket {
-    /// Bytes per second; `None` is unlimited.
-    rate: Option<u64>,
-    /// Available bytes; negative is debt.
-    tokens: f64,
-    last: Instant,
-}
-
-/// One direction's bucket.
-#[derive(Debug)]
-pub(crate) struct Limiter(Mutex<Bucket>);
+pub(crate) struct Limiter(SharedBucket);
 
 impl Limiter {
     fn new(rate: Option<u64>) -> Self {
-        Self(Mutex::new(Bucket {
-            rate: rate.filter(|&r| r > 0),
-            tokens: 0.0,
-            last: Instant::now(),
-        }))
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Bucket> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        Self(SharedBucket::new(rate, Instant::now().into_std()))
     }
 
     /// The limit in bytes per second.
     #[cfg(test)]
     fn rate(&self) -> Option<u64> {
-        self.lock().rate
+        self.0.rate()
     }
 
     /// Changes the limit; takes effect for the next call.
     pub(crate) fn set_rate(&self, rate: Option<u64>) {
-        let mut b = self.lock();
-        b.rate = rate.filter(|&r| r > 0);
-        b.tokens = b.tokens.min(0.0);
-        b.last = Instant::now();
+        self.0.set_rate(rate, Instant::now().into_std());
     }
 
     /// Takes `bytes` tokens and returns how long the caller must wait.
-    #[allow(clippy::cast_precision_loss)] // byte counts far below 2^52
     fn take(&self, bytes: usize, now: Instant) -> Duration {
-        let mut b = self.lock();
-        let Some(rate) = b.rate else {
-            return Duration::ZERO;
-        };
-        let rate = rate as f64;
-        let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
-        b.last = now;
-        // At most one second of burst.
-        b.tokens = (b.tokens + elapsed * rate).min(rate);
-        b.tokens -= bytes as f64;
-        if b.tokens >= 0.0 {
-            Duration::ZERO
-        } else {
-            Duration::from_secs_f64(-b.tokens / rate).min(MAX_WAIT)
-        }
+        self.0.take(bytes, now.into_std())
     }
 
     /// Waits until `bytes` may pass.

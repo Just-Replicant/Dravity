@@ -635,7 +635,7 @@ async fn v2_torrents_keep_their_piece_layers_across_a_restart() {
 /// `206` and those bytes, without one the whole file; anything missing (or
 /// everything, with `broken`) gets `404`. Counts requests.
 async fn http_server(root: PathBuf, broken: bool) -> (SocketAddr, Arc<AtomicUsize>) {
-    let (addr, hits, _) = http_server_with(root, broken, Duration::ZERO).await;
+    let (addr, hits, _) = http_server_with(root, broken, false, Duration::ZERO).await;
     (addr, hits)
 }
 
@@ -644,6 +644,7 @@ async fn http_server(root: PathBuf, broken: bool) -> (SocketAddr, Arc<AtomicUsiz
 async fn http_server_with(
     root: PathBuf,
     broken: bool,
+    corrupt: bool,
     delay: Duration,
 ) -> (SocketAddr, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -682,7 +683,10 @@ async fn http_server_with(
                     tokio::time::sleep(delay).await;
                     let file = std::fs::read(root.join(path.trim_start_matches('/')));
                     let (status, body, range_header) = match file {
-                        Ok(data) if !broken => {
+                        Ok(mut data) if !broken => {
+                            if corrupt && !data.is_empty() {
+                                data[0] ^= 0xff;
+                            }
                             let range = text.lines().find_map(|l| {
                                 l.to_ascii_lowercase()
                                     .strip_prefix("range: bytes=")
@@ -990,6 +994,7 @@ async fn two_web_seeds_on_one_host_both_serve() {
     let (addr, _, log) = http_server_with(
         served.path().to_path_buf(),
         false,
+        false,
         Duration::from_millis(50),
     )
     .await;
@@ -1117,6 +1122,55 @@ async fn a_private_web_seed_url_is_never_contacted() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(hits.load(Ordering::Relaxed), 0);
+    assert!(
+        handle
+            .peers()
+            .await
+            .unwrap()
+            .iter()
+            .all(|p| p.transport != dravity_session::Transport::Web)
+    );
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_web_seed_that_fails_the_hash_check_is_not_retried() {
+    // Corrupt bytes with a matching Content-Range pass the HTTP checks and
+    // fail the piece hash. One such piece bans the synthetic address; the
+    // URL is then not fetched again.
+    let mut files = small();
+    let served = tempfile::tempdir().unwrap();
+    write_files(served.path(), &files);
+    let (addr, hits, _) =
+        http_server_with(served.path().to_path_buf(), false, true, Duration::ZERO).await;
+    let torrent = make(&mut files, false, Some(&format!("http://{addr}/")));
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    let hash = m.info_hash();
+    let mut c = config();
+    c.engine.hash_fail_ban = 2;
+    c.web_seed_retry = Duration::from_millis(50);
+    let session = Session::new(c).unwrap();
+    let mut alerts = session.subscribe();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = session
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    let seen = until(
+        &mut alerts,
+        hash,
+        |a| matches!(a, Alert::PeerBanned { ip } if is_web_seed_addr(SocketAddr::new(*ip, 0))),
+    )
+    .await;
+    assert!(
+        seen.iter().any(|a| matches!(a, Alert::HashFailed { .. })),
+        "{seen:?}"
+    );
+    // In-flight ranges may still finish. Nothing new starts after that.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let settled = hits.load(Ordering::Relaxed);
+    assert!(settled > 0);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(hits.load(Ordering::Relaxed), settled);
     assert!(
         handle
             .peers()

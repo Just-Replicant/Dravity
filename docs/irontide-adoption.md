@@ -29,6 +29,7 @@ sound version, with the difference explained), **open** (not started).
 | 16 | Live settings, session-wide rate limits and queueing | partial | `feat(session,http,cli): live settings, session rate limits and queueing` | [notes](#16-live-settings-rate-limits-and-queueing) |
 | 17 | BEP 53 select-only magnets (so=) | done | `feat(core,session): BEP 53 select-only magnets` | [notes](#17-bep-53-select-only-magnets) |
 | 18 | Wire extensions: upload_only, lt_donthave, super-seeding, lt_tex | done | `feat(wire,engine,session,cli): upload_only, lt_donthave, super-seeding and tracker exchange` | [notes](#18-wire-extensions) |
+| 19 | BEP 40 canonical peer priority | done | `feat(core,engine): BEP 40 canonical peer priority at the connection cap` | [notes](#19-bep-40-peer-priority) |
 
 ## Design notes
 
@@ -372,3 +373,10 @@ turns LSD on.
 - Super-seeding is active only while the torrent is complete. Peers get `HaveNone` (fast extension) or nothing instead of a bitfield and no allowed-fast set, then one `Have` for a piece they lack, chosen by (times revealed, swarm availability, index). Requests for any other piece are rejected. When the peer announces its piece, it is shown the next one. irontide waits until a *different* peer announces the piece; Dravity reveals on the receiver's own `Have`, the simpler variant libtorrent also uses, which is safe because the reveal counter still spreads pieces.
 - Our tracker list goes out once per peer after its handshake; received URLs not yet known (at most 100 in total) are reported once with `Effect::TrackersReceived`. Learned URLs are not relayed to other peers. The session appends them as one new tier, so the torrent's own tiers keep priority and they show in `TorrentHandle::trackers`.
 - Tests: wire unit and doc tests, five engine tests in `tests/seeding.rs` (upload_only both ways, lt_donthave receive and send, lt_tex with filtering and the off switch, super-seeding reveal/reject/next) and `tests/exchange.rs` (a leecher learns the seed's tracker; private torrents do not).
+
+### 19. BEP 40 peer priority
+
+- `dravity-core/src/priority.rs` is a self-written CRC-32C (bitwise, Castagnoli polynomial) plus the BEP 40 masking: IPv4 keeps `ff.ff.55.55`, `ff.ff.ff.55` for the same /16, everything for the same /24; same host compares the ports. IPv4-mapped IPv6 counts as IPv4. For IPv6 the first 6, 7 or 8 bytes are kept whole depending on the shared /48 or /56 and the rest masked with `0x55`. Both BEP 40 IPv4 vectors (`0xec2d7224`, `0x99568189`) are unit and doc tests.
+- Engine: `external_ip` comes from the latest `yourip` in an extension handshake (unspecified and loopback ignored, so loopback tests are unchanged). At the cap, `on_connected` compares the newcomer with the connected peer of lowest rank (using its reachable address) and evicts that peer only if the newcomer ranks strictly higher; the ranking is deterministic, so two peers cannot flap. While our address is unknown the old behaviour (refuse the newcomer) stays.
+- Dial order stays FIFO: when below the cap every queued address is dialed anyway, and at the cap no dial is made, so ranking the queue would change nothing; the eviction path is where BEP 40 matters.
+- Tests: vectors, symmetry, same-host ports, mapped addresses, IPv6 symmetry, and `at_the_cap_a_higher_bep40_priority_replaces_the_lowest` (unknown address refuses, lower rank refused, higher rank replaces).

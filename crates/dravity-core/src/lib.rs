@@ -25,6 +25,7 @@ pub mod merkle;
 pub mod metainfo;
 pub mod net;
 pub mod path;
+pub mod priority;
 mod v2;
 pub mod verify;
 

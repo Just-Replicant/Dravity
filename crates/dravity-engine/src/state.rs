@@ -348,6 +348,9 @@ pub struct TorrentState {
     upload_only_sent: bool,
     /// Times each piece was revealed while super-seeding.
     super_revealed: HashMap<u32, u32>,
+    /// Our public address as peers report it (`yourip`), for BEP 40
+    /// priorities.
+    external_ip: Option<IpAddr>,
 }
 
 impl TorrentState {
@@ -410,6 +413,7 @@ impl TorrentState {
             trackers: Vec::new(),
             upload_only_sent: false,
             super_revealed: HashMap::new(),
+            external_ip: None,
         }
     }
 
@@ -1196,6 +1200,15 @@ impl TorrentState {
             self.remove_peer(old);
             out.push(Effect::Disconnect { peer: old });
         }
+        let full = self.peers.len() >= self.config.max_peers;
+        if !refused && full && !Self::is_connected(&self.peers, addr) {
+            // BEP 40: at the cap, a connection both sides rank higher
+            // replaces the lowest-ranked one.
+            if let Some(victim) = self.lower_priority_peer(addr) {
+                self.remove_peer(victim);
+                out.push(Effect::Disconnect { peer: victim });
+            }
+        }
         if refused
             || self.peers.len() >= self.config.max_peers
             || Self::is_connected(&self.peers, addr)
@@ -1380,6 +1393,19 @@ impl TorrentState {
         out.push(Effect::Disconnect { peer: key });
         self.fill_connections(out);
         self.pump_uploads(out);
+    }
+
+    /// The connected peer with the lowest BEP 40 priority, if `addr`
+    /// ranks above it. `None` while our public address is unknown.
+    fn lower_priority_peer(&self, addr: SocketAddr) -> Option<PeerKey> {
+        let ours = SocketAddr::new(self.external_ip?, self.config.listen_port.unwrap_or(0));
+        let rank = |a: SocketAddr| dravity_core::priority::peer_priority(ours, a);
+        let (key, lowest) = self
+            .peers
+            .iter()
+            .map(|(k, p)| (*k, rank(p.reachable.unwrap_or(p.addr))))
+            .min_by_key(|&(k, r)| (r, k))?;
+        (rank(addr) > lowest).then_some(key)
     }
 
     /// BEP 16 super-seeding is on and we have every piece.
@@ -1617,6 +1643,9 @@ impl TorrentState {
             ext::HANDSHAKE_ID => {
                 if let Ok(hs) = ExtendedHandshake::decode(payload) {
                     peer.ext.update(&hs);
+                    if let Some(ip) = hs.your_ip.as_deref().and_then(ip_from_bytes) {
+                        self.external_ip = Some(ip);
+                    }
                     if self.config.tracker_exchange
                         && !peer.tex_sent
                         && !self.trackers.is_empty()
@@ -2917,4 +2946,15 @@ fn metadata_reply(info: Option<&Bytes>, piece: u32) -> MetadataMessage {
         }
         _ => MetadataMessage::Reject { piece },
     }
+}
+
+/// An address from 4 or 16 raw bytes (`yourip`); `None` for other lengths
+/// and for addresses that cannot be public (unspecified, loopback).
+fn ip_from_bytes(bytes: &[u8]) -> Option<IpAddr> {
+    let ip = if let Ok(v4) = <[u8; 4]>::try_from(bytes) {
+        IpAddr::from(v4)
+    } else {
+        IpAddr::from(<[u8; 16]>::try_from(bytes).ok()?)
+    };
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
 }

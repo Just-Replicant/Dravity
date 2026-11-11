@@ -1866,3 +1866,26 @@ fn super_seeding_reveals_one_piece_at_a_time() {
     assert_eq!(next.len(), 1);
     assert_ne!(next, one);
 }
+
+#[test]
+fn at_the_cap_a_higher_bep40_priority_replaces_the_lowest() {
+    use dravity_core::priority::peer_priority;
+    let mut c = config();
+    c.max_peers = 1;
+    let mut h = Harness::with_have(c, &[]);
+    h.connect(1, ext_reserved());
+    let ours = SocketAddr::from(([1, 2, 3, 4], 0));
+    let rank = |n: u16| peer_priority(ours, addr(n));
+    // Unknown public address: a newcomer is refused as before.
+    let fx = h.accept(2, fast());
+    assert!(disconnects(&fx, 2) && !disconnects(&fx, 1));
+    // Peer 1 tells us our public address.
+    h.msg(1, ext_msg(0, b"d1:mde6:yourip4:\x01\x02\x03\x04e"));
+    let higher = (2..200).find(|&n| rank(n) > rank(1)).unwrap();
+    let lower = (2..200).find(|&n| rank(n) < rank(1)).unwrap();
+    let fx = h.accept(u64::from(lower), fast());
+    assert!(disconnects(&fx, u64::from(lower)) && !disconnects(&fx, 1));
+    let fx = h.accept(u64::from(higher), fast());
+    assert!(disconnects(&fx, 1), "the lower-ranked peer goes");
+    assert!(!disconnects(&fx, u64::from(higher)));
+}

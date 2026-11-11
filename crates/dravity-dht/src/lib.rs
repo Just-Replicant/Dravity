@@ -21,7 +21,9 @@
 
 pub mod demux;
 pub mod krpc;
+pub mod routing;
 pub mod secure_id;
+pub mod store;
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};

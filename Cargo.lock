@@ -725,6 +725,7 @@ dependencies = [
  "dravity-core",
  "futures-util",
  "mainline",
+ "sha1",
  "thiserror",
  "tokio",
 ]

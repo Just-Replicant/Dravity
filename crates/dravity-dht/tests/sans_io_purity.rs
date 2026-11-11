@@ -1,5 +1,6 @@
-//! Purity tripwire: the KRPC codec, BEP 42 ids and the datagram
-//! classifier never do I/O, spawn tasks or read the clock.
+//! Purity tripwire: the KRPC codec, BEP 42 ids, the datagram
+//! classifier, the routing table and the peer store never do I/O, spawn
+//! tasks or read the clock.
 
 #![allow(clippy::indexing_slicing, clippy::panic)]
 
@@ -49,7 +50,9 @@ fn the_codecs_stay_pure() {
     for (name, source) in [
         ("demux.rs", include_str!("../src/demux.rs")),
         ("krpc.rs", include_str!("../src/krpc.rs")),
+        ("routing.rs", include_str!("../src/routing.rs")),
         ("secure_id.rs", include_str!("../src/secure_id.rs")),
+        ("store.rs", include_str!("../src/store.rs")),
     ] {
         let report = violations(source);
         assert!(report.is_empty(), "I/O in {name}:\n{}", report.join("\n"));

@@ -1088,6 +1088,46 @@ async fn a_failing_web_seed_is_never_dialed_as_a_peer() {
     session.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_web_seed_url_is_never_contacted() {
+    // The default policy refuses loopback. The URL is not retried and no
+    // connection is opened, so it never occupies a peer slot.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&hits);
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            count.fetch_add(1, Ordering::Relaxed);
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    let mut files = small();
+    let m =
+        Metainfo::from_bytes(&make(&mut files, false, Some(&format!("http://{server}/")))).unwrap();
+    let mut c = config();
+    c.web_seed.as_mut().unwrap().allow_private_addresses = false;
+    c.web_seed_retry = Duration::from_millis(40);
+    let session = Session::new(c).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = session
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+    assert!(
+        handle
+            .peers()
+            .await
+            .unwrap()
+            .iter()
+            .all(|p| p.transport != dravity_session::Transport::Web)
+    );
+    session.shutdown().await;
+}
+
 /// Waits until `session` knows every piece layer of `hash`.
 async fn until_layers_known(session: &Session, hash: InfoHash) {
     tokio::time::timeout(Duration::from_secs(30), async {

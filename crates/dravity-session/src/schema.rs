@@ -67,7 +67,7 @@ lsd: Restart, ["--no-lsd"], "Local Service Discovery (BEP 14): find peers of the
 scrape_interval: Restart, ["--scrape-interval"], "Scrape every tracker this often (BEP 48 / BEP 15) and show the counts in `crate::TrackerStatus::scrape`.";
 stop_announce_timeout: Restart, [], "Time allowed for the `stopped` announce when a torrent stops.";
 alert_buffer: Restart, [], "Broadcast buffer for alerts; slow subscribers miss older alerts.";
-dht: Restart, ["--no-dht"], "Run a DHT node (BEP 5) for peer discovery; `None` disables the DHT.";
+dht: Restart, ["--no-dht", "--native-dht"], "Run a DHT node (BEP 5) for peer discovery; `None` disables the DHT.";
 dht_lookup_timeout: Restart, [], "Time allowed for one DHT lookup.";
 resume_dir: Restart, [], "Directory for fastresume files (`<info-hash>.resume`).";
 state_dir: Restart, [], "Directory for session state (`crate::persist`): the torrents of the session, their directories, file priorities and paused flags, so `crate::Session::restore` can bring them back after a restart.";

@@ -44,7 +44,7 @@ torrent starts.
 | `scrape_interval` | restart | `--scrape-interval` | Scrape every tracker this often (BEP 48 / BEP 15) and show the counts in `crate::TrackerStatus::scrape`. |
 | `stop_announce_timeout` | restart | — | Time allowed for the `stopped` announce when a torrent stops. |
 | `alert_buffer` | restart | — | Broadcast buffer for alerts; slow subscribers miss older alerts. |
-| `dht` | restart | `--no-dht` | Run a DHT node (BEP 5) for peer discovery; `None` disables the DHT. |
+| `dht` | restart | `--no-dht`, `--native-dht` | Run a DHT node (BEP 5) for peer discovery; `None` disables the DHT. |
 | `dht_lookup_timeout` | restart | — | Time allowed for one DHT lookup. |
 | `resume_dir` | restart | — | Directory for fastresume files (`<info-hash>.resume`). |
 | `state_dir` | restart | — | Directory for session state (`crate::persist`): the torrents of the session, their directories, file priorities and paused flags, so `crate::Session::restore` can bring them back after a restart. |

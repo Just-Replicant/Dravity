@@ -64,6 +64,11 @@ pub struct DhtConfig {
     pub server_mode: bool,
     /// Stop a lookup after collecting this many distinct peers.
     pub max_peers: usize,
+    /// Run Dravity's own node ([`native::NativeDht`]) instead of
+    /// `mainline` (default `false` until it has been checked against the
+    /// live network). Needs a Tokio runtime when the node starts;
+    /// `server_mode` does not apply (the native node always answers).
+    pub native: bool,
 }
 
 impl Default for DhtConfig {
@@ -74,6 +79,7 @@ impl Default for DhtConfig {
             bind_address: None,
             server_mode: false,
             max_peers: DEFAULT_MAX_PEERS,
+            native: false,
         }
     }
 }
@@ -94,8 +100,38 @@ impl DhtConfig {
 /// when the last clone is dropped.
 #[derive(Debug, Clone)]
 pub struct Dht {
-    inner: AsyncDht,
+    inner: Backend,
     max_peers: usize,
+}
+
+#[derive(Debug, Clone)]
+enum Backend {
+    Mainline(AsyncDht),
+    Native {
+        node: native::NativeDht,
+        /// `host:port` entries, resolved at each (re)bootstrap.
+        bootstrap: std::sync::Arc<Vec<String>>,
+    },
+}
+
+/// The public routers a native node joins through by default.
+pub const DEFAULT_BOOTSTRAP: &[&str] = &[
+    "router.bittorrent.com:6881",
+    "dht.transmissionbt.com:6881",
+    "dht.libtorrent.org:25401",
+];
+
+/// Per-query timeout of the native node.
+const NATIVE_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn resolve(entries: &[String]) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    for entry in entries {
+        if let Ok(addrs) = tokio::net::lookup_host(entry.as_str()).await {
+            out.extend(addrs.filter(SocketAddr::is_ipv4));
+        }
+    }
+    out
 }
 
 impl Dht {
@@ -104,6 +140,9 @@ impl Dht {
     /// # Errors
     /// [`DhtError::Start`] if the socket cannot be bound.
     pub fn new(config: &DhtConfig) -> Result<Self, DhtError> {
+        if config.native {
+            return Self::new_native(config);
+        }
         let mut builder = mainline::Dht::builder();
         match &config.bootstrap {
             Some(nodes) if nodes.is_empty() => {
@@ -124,14 +163,44 @@ impl Dht {
             builder.server_mode();
         }
         Ok(Self {
-            inner: builder.build()?.as_async(),
+            inner: Backend::Mainline(builder.build()?.as_async()),
+            max_peers: config.max_peers.max(1),
+        })
+    }
+
+    fn new_native(config: &DhtConfig) -> Result<Self, DhtError> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(std::io::Error::other)?;
+        let _entered = runtime.enter();
+        let socket = std::net::UdpSocket::bind((
+            config.bind_address.unwrap_or(Ipv4Addr::UNSPECIFIED),
+            config.port.unwrap_or(0),
+        ))?;
+        let node = native::NativeDht::from_std(socket, NATIVE_QUERY_TIMEOUT)?;
+        let bootstrap = std::sync::Arc::new(
+            config
+                .bootstrap
+                .clone()
+                .unwrap_or_else(|| DEFAULT_BOOTSTRAP.iter().map(|s| (*s).to_owned()).collect()),
+        );
+        let joining = node.clone();
+        let entries = std::sync::Arc::clone(&bootstrap);
+        tokio::spawn(async move {
+            joining.bootstrap(&resolve(&entries).await).await;
+        });
+        Ok(Self {
+            inner: Backend::Native { node, bootstrap },
             max_peers: config.max_peers.max(1),
         })
     }
 
     /// Local address of the node's UDP socket.
     pub async fn local_addr(&self) -> SocketAddr {
-        SocketAddr::V4(self.inner.info().await.local_addr())
+        match &self.inner {
+            Backend::Mainline(dht) => SocketAddr::V4(dht.info().await.local_addr()),
+            Backend::Native { node, .. } => node
+                .local_addr()
+                .unwrap_or_else(|_| SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))),
+        }
     }
 
     /// Asks the network for nodes near our id. `true` if any node answered.
@@ -140,7 +209,12 @@ impl Dht {
     /// bootstrap has already filled the routing table; use [`Self::has_nodes`]
     /// for that.
     pub async fn bootstrapped(&self) -> bool {
-        self.inner.bootstrapped().await
+        match &self.inner {
+            Backend::Mainline(dht) => dht.bootstrapped().await,
+            Backend::Native { node, bootstrap } => {
+                node.bootstrap(&resolve(bootstrap).await).await > 0
+            }
+        }
     }
 
     /// Whether the routing table currently has a live neighbor.
@@ -155,7 +229,10 @@ impl Dht {
     /// The node's routing table as `host:port` bootstrap entries (useful to
     /// start other nodes from this one).
     pub async fn to_bootstrap(&self) -> Vec<String> {
-        self.inner.to_bootstrap().await
+        match &self.inner {
+            Backend::Mainline(dht) => dht.to_bootstrap().await,
+            Backend::Native { node, .. } => node.nodes().iter().map(ToString::to_string).collect(),
+        }
     }
 
     /// Batches of peers for `info_hash`, as the DHT reports them.
@@ -168,17 +245,28 @@ impl Dht {
         &self,
         info_hash: InfoHash,
     ) -> impl Stream<Item = Vec<SocketAddr>> + Send + '_ {
-        self.inner
-            .get_peers(mainline::Id::from(*info_hash.as_bytes()))
-            .map(|batch| {
-                batch
-                    .into_iter()
-                    .filter_map(|addr| {
-                        let addr = SocketAddr::V4(addr);
-                        (addr.port() != 0 && !addr.ip().is_unspecified()).then_some(addr)
-                    })
-                    .collect()
+        let usable = |addr: &SocketAddr| addr.port() != 0 && !addr.ip().is_unspecified();
+        match &self.inner {
+            Backend::Mainline(dht) => dht
+                .get_peers(mainline::Id::from(*info_hash.as_bytes()))
+                .map(move |batch| {
+                    batch
+                        .into_iter()
+                        .map(SocketAddr::V4)
+                        .filter(usable)
+                        .collect()
+                })
+                .left_stream(),
+            Backend::Native { node, bootstrap } => futures_util::stream::once(async move {
+                if node.table_len() == 0 {
+                    node.bootstrap(&resolve(bootstrap).await).await;
+                }
+                let mut peers = node.get_peers(*info_hash.as_bytes()).await.peers;
+                peers.retain(usable);
+                peers
             })
+            .right_stream(),
+        }
     }
 
     /// Looks up peers for `info_hash`, returning distinct addresses as they
@@ -211,11 +299,19 @@ impl Dht {
     /// # Errors
     /// [`DhtError::Announce`] if no node accepted the announce.
     pub async fn announce(&self, info_hash: InfoHash, port: Option<u16>) -> Result<(), DhtError> {
-        self.inner
-            .announce_peer(mainline::Id::from(*info_hash.as_bytes()), port)
-            .await
-            .map(drop)
-            .map_err(|e| DhtError::Announce(e.to_string()))
+        match &self.inner {
+            Backend::Mainline(dht) => dht
+                .announce_peer(mainline::Id::from(*info_hash.as_bytes()), port)
+                .await
+                .map(drop)
+                .map_err(|e| DhtError::Announce(e.to_string())),
+            Backend::Native { node, .. } => {
+                match node.announce(*info_hash.as_bytes(), port).await.1 {
+                    0 => Err(DhtError::Announce("no node accepted".to_owned())),
+                    _ => Ok(()),
+                }
+            }
+        }
     }
 }
 

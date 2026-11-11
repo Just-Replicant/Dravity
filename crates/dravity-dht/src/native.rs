@@ -99,6 +99,24 @@ impl NativeDht {
     /// If the socket cannot be bound.
     pub async fn with_id(addr: SocketAddr, id: [u8; 20], timeout: Duration) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
+        Ok(Self::start(socket, id, timeout))
+    }
+
+    /// A node on an already bound socket, without awaiting (must be
+    /// called within a Tokio runtime).
+    ///
+    /// # Errors
+    /// If the socket cannot be registered with the runtime.
+    pub fn from_std(socket: std::net::UdpSocket, timeout: Duration) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
+        Ok(Self::start(
+            UdpSocket::from_std(socket)?,
+            random_bytes(),
+            timeout,
+        ))
+    }
+
+    fn start(socket: UdpSocket, id: [u8; 20], timeout: Duration) -> Self {
         let shared = Arc::new(Shared {
             socket,
             id,
@@ -113,10 +131,22 @@ impl NativeDht {
             timeout,
         });
         let task = tokio::spawn(receive(Arc::downgrade(&shared)));
-        Ok(Self {
+        Self {
             shared,
             _task: Arc::new(AbortOnDrop(task)),
-        })
+        }
+    }
+
+    /// The addresses in the routing table, closest to our id first.
+    #[must_use]
+    pub fn nodes(&self) -> Vec<SocketAddr> {
+        let state = self.shared.lock();
+        state
+            .table
+            .closest(&self.shared.id, usize::MAX)
+            .into_iter()
+            .map(|n| n.addr)
+            .collect()
     }
 
     /// Our node id.

@@ -139,3 +139,30 @@ async fn live_bootstrap_reaches_the_public_dht() {
     let lookup = node.get_peers([0x11; 20]).await;
     assert!(!lookup.closest.is_empty(), "a lookup reached live nodes");
 }
+
+/// `Dht` with `native` set runs `NativeDht` behind the same API the
+/// session uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_dht_facade_runs_the_native_node() {
+    let nodes = swarm(6).await;
+    let seed = nodes[0].local_addr().unwrap().to_string();
+    let config = || {
+        let mut c = dravity_dht::DhtConfig::with_bootstrap(vec![seed.clone()]);
+        c.native = true;
+        c.bind_address = Some(std::net::Ipv4Addr::LOCALHOST);
+        c
+    };
+    let a = dravity_dht::Dht::new(&config()).unwrap();
+    let b = dravity_dht::Dht::new(&config()).unwrap();
+    assert!(a.bootstrapped().await);
+    assert!(b.bootstrapped().await);
+    assert!(a.has_nodes().await);
+    assert!(!a.to_bootstrap().await.is_empty());
+    let hash = dravity_core::InfoHash::new([0x42; 20]);
+    a.announce(hash, Some(6001)).await.unwrap();
+    assert_eq!(
+        b.get_peers(hash).await,
+        vec![SocketAddr::from(([127, 0, 0, 1], 6001))]
+    );
+    assert_eq!(a.local_addr().await.ip(), std::net::Ipv4Addr::LOCALHOST);
+}

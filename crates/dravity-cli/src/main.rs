@@ -269,6 +269,10 @@ struct NetworkArgs {
     /// Do not use the DHT for peer discovery.
     #[arg(long)]
     no_dht: bool,
+    /// Run Dravity's own DHT node instead of the `mainline` one
+    /// (experimental until checked against the live network).
+    #[arg(long, conflicts_with = "no_dht")]
+    native_dht: bool,
     /// Do not look for peers on the local network (BEP 14 Local Service
     /// Discovery; private torrents never use it).
     #[arg(long)]
@@ -393,6 +397,11 @@ impl NetworkArgs {
         }
         if self.no_dht {
             config.dht = None;
+        }
+        if self.native_dht
+            && let Some(dht) = &mut config.dht
+        {
+            dht.native = true;
         }
         if self.no_web_seeds {
             config.web_seed = None;

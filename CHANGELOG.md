@@ -147,6 +147,9 @@ See [`docs/phase-6.md`](docs/phase-6.md) for design notes.
   no longer dialed as a BitTorrent peer on port 80 or 443.
 - A web seed `206` whose `Content-Range` does not match the request is
   rejected before its bytes are delivered.
+- A web seed banned for bad data is not started again, and a URL that
+  can never be fetched (forbidden address, bad scheme, or a name that
+  resolves only to non-public addresses) never opens a connection.
 - `file tree` keys that differ only in invalid UTF-8 no longer collapse
   into one path.
 - uTP: selective ACK masks of any length are accepted; libtorrent's 3- or

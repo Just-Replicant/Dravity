@@ -4,8 +4,8 @@ use std::net::{IpAddr, SocketAddr};
 
 use bytes::Bytes;
 use dravity_wire::{
-    ExtendedHandshake, LT_DONTHAVE, LT_TEX, Message, PexMessage, PexPeer, TrackerExchange,
-    UT_METADATA, UT_PEX,
+    ExtendedHandshake, Holepunch, LT_DONTHAVE, LT_TEX, Message, PexMessage, PexPeer,
+    TrackerExchange, UT_HOLEPUNCH, UT_METADATA, UT_PEX,
 };
 
 use crate::types::Config;
@@ -18,6 +18,11 @@ pub(crate) const OUR_UT_PEX: u8 = 2;
 pub(crate) const OUR_LT_DONTHAVE: u8 = 3;
 /// Extended message id peers use to send us `lt_tex` tracker lists.
 pub(crate) const OUR_LT_TEX: u8 = 4;
+/// Extended message id peers use to send us BEP 55 `ut_holepunch`.
+pub(crate) const OUR_UT_HOLEPUNCH: u8 = 5;
+/// Most addresses remembered as "learned over PEX from a peer that can
+/// relay a holepunch".
+pub(crate) const MAX_HOLEPUNCH_SOURCES: usize = 1_000;
 /// Extended message id of the handshake.
 pub(crate) const HANDSHAKE_ID: u8 = 0;
 /// Incoming PEX addresses kept from one message. The codec allows 200 per
@@ -43,6 +48,8 @@ pub(crate) struct PeerExtensions {
     pub(crate) lt_tex: Option<u8>,
     /// BEP 21: the peer does not want to download.
     pub(crate) upload_only: bool,
+    /// Id to use when sending `ut_holepunch` to the peer.
+    pub(crate) ut_holepunch: Option<u8>,
 }
 
 impl PeerExtensions {
@@ -53,6 +60,7 @@ impl PeerExtensions {
         self.ut_pex = id(UT_PEX);
         self.lt_donthave = id(LT_DONTHAVE);
         self.lt_tex = id(LT_TEX);
+        self.ut_holepunch = id(UT_HOLEPUNCH);
         if let Some(upload_only) = hs.upload_only {
             self.upload_only = upload_only;
         }
@@ -85,6 +93,9 @@ pub(crate) fn our_handshake(
     }
     if config.tracker_exchange {
         extensions.push((LT_TEX.to_owned(), OUR_LT_TEX));
+    }
+    if config.holepunch {
+        extensions.push((UT_HOLEPUNCH.to_owned(), OUR_UT_HOLEPUNCH));
     }
     extensions.sort();
     let your_ip = match peer.ip() {
@@ -149,6 +160,14 @@ pub(crate) fn tex_message(id: u8, trackers: &[String]) -> Message {
     let msg = TrackerExchange {
         added: trackers.to_vec(),
     };
+    Message::Extended {
+        id,
+        payload: Bytes::from(msg.encode()),
+    }
+}
+
+/// A `ut_holepunch` message.
+pub(crate) fn holepunch_message(id: u8, msg: Holepunch) -> Message {
     Message::Extended {
         id,
         payload: Bytes::from(msg.encode()),

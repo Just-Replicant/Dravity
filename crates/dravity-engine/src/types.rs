@@ -131,6 +131,10 @@ pub struct Config {
     /// Exchange tracker URLs with peers (`lt_tex`). Disable for private
     /// torrents.
     pub tracker_exchange: bool,
+    /// BEP 55 `ut_holepunch`: relay rendezvous between two connected
+    /// peers, and ask a PEX source to relay one when dialing a peer it
+    /// told us about fails. Disable for private torrents.
+    pub holepunch: bool,
     /// BEP 16 super-seeding while the torrent is complete: peers see no
     /// bitfield, only one piece at a time chosen from the least shared,
     /// and get the next once they announce it. Speeds up initial seeding.
@@ -265,6 +269,7 @@ impl Default for Config {
             download_rate_limit: None,
             pex: true,
             tracker_exchange: true,
+            holepunch: true,
             super_seed: false,
             pex_interval: Duration::from_secs(60),
             dht: false,

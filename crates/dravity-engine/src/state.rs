@@ -351,6 +351,11 @@ pub struct TorrentState {
     /// Our public address as peers report it (`yourip`), for BEP 40
     /// priorities.
     external_ip: Option<IpAddr>,
+    /// Addresses learned over PEX from a peer that supports holepunch
+    /// relaying (BEP 55): who to ask if dialing them fails.
+    holepunch_relays: HashMap<SocketAddr, PeerKey>,
+    /// Addresses a rendezvous was already requested for (once each).
+    holepunch_tried: HashSet<SocketAddr>,
 }
 
 impl TorrentState {
@@ -414,6 +419,8 @@ impl TorrentState {
             upload_only_sent: false,
             super_revealed: HashMap::new(),
             external_ip: None,
+            holepunch_relays: HashMap::new(),
+            holepunch_tried: HashSet::new(),
         }
     }
 
@@ -744,6 +751,7 @@ impl TorrentState {
                 self.pool.dial_done(addr);
                 if retry {
                     self.schedule_retry(now, addr);
+                    self.request_holepunch(now, addr, &mut out);
                 }
                 self.fill_connections(&mut out);
             }
@@ -1712,10 +1720,27 @@ impl TorrentState {
                 }
                 false
             }
+            ext::OUR_UT_HOLEPUNCH if self.config.holepunch => {
+                match dravity_wire::Holepunch::decode(payload) {
+                    Some(msg) => self.on_holepunch(now, key, msg, out),
+                    None => self.disconnect(key, out),
+                }
+                false
+            }
             ext::OUR_UT_PEX if self.config.pex => match ext::pex_added(payload) {
                 Some(added) if !added.is_empty() => {
+                    let relay = self.config.holepunch && peer.ext.ut_holepunch.is_some();
                     for p in &added {
                         self.hints.learn_pex(p.addr, p.flags);
+                        let punchable = p
+                            .flags
+                            .is_some_and(|f| f & dravity_wire::PEX_HOLEPUNCH != 0);
+                        if relay
+                            && punchable
+                            && self.holepunch_relays.len() < ext::MAX_HOLEPUNCH_SOURCES
+                        {
+                            self.holepunch_relays.insert(p.addr, key);
+                        }
                     }
                     self.add_to_pool(added.iter().map(|p| p.addr).collect());
                     true
@@ -1723,6 +1748,100 @@ impl TorrentState {
                 _ => false,
             },
             _ => false,
+        }
+    }
+
+    /// Dialing `addr` failed: if a connected peer told us about it over
+    /// PEX and can relay, ask it for a rendezvous (BEP 55), once.
+    fn request_holepunch(&mut self, now: Instant, addr: SocketAddr, out: &mut Vec<Effect>) {
+        let Some(relay) = self.holepunch_relays.remove(&addr) else {
+            return;
+        };
+        if !self.config.holepunch || !self.holepunch_tried.insert(addr) {
+            return;
+        }
+        if self.holepunch_tried.len() > ext::MAX_HOLEPUNCH_SOURCES {
+            self.holepunch_tried.clear();
+        }
+        if let Some(peer) = self.peers.get_mut(&relay)
+            && let Some(id) = peer.ext.ut_holepunch
+        {
+            let message = ext::holepunch_message(id, dravity_wire::Holepunch::Rendezvous(addr));
+            Self::send(peer, relay, message, now, out);
+        }
+    }
+
+    /// A `ut_holepunch` message from `key`.
+    fn on_holepunch(
+        &mut self,
+        now: Instant,
+        key: PeerKey,
+        msg: dravity_wire::Holepunch,
+        out: &mut Vec<Effect>,
+    ) {
+        use dravity_wire::{Holepunch, HolepunchError};
+        match msg {
+            Holepunch::Rendezvous(target) => {
+                let Some(sender) = self.peers.get(&key) else {
+                    return;
+                };
+                let sender_addr = sender.reachable.unwrap_or(sender.addr);
+                let Some(reply_id) = sender.ext.ut_holepunch else {
+                    return;
+                };
+                let found = self
+                    .peers
+                    .iter()
+                    .find(|(_, p)| p.addr == target || p.reachable == Some(target))
+                    .map(|(&k, p)| (k, p.ext.ut_holepunch, p.reachable.unwrap_or(p.addr)));
+                let outcome = match found {
+                    _ if target == sender_addr => Err(HolepunchError::NoSelf),
+                    Some((k, _, _)) if k == key => Err(HolepunchError::NoSelf),
+                    None => Err(HolepunchError::NotConnected),
+                    Some((_, None, _)) => Err(HolepunchError::NoSupport),
+                    Some((k, Some(id), target_addr)) => Ok((k, id, target_addr)),
+                };
+                match outcome {
+                    Ok((target_key, target_id, target_addr)) => {
+                        if let Some(p) = self.peers.get_mut(&target_key) {
+                            let m =
+                                ext::holepunch_message(target_id, Holepunch::Connect(sender_addr));
+                            Self::send(p, target_key, m, now, out);
+                        }
+                        if let Some(p) = self.peers.get_mut(&key) {
+                            let m =
+                                ext::holepunch_message(reply_id, Holepunch::Connect(target_addr));
+                            Self::send(p, key, m, now, out);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(p) = self.peers.get_mut(&key) {
+                            let m =
+                                ext::holepunch_message(reply_id, Holepunch::Error(target, error));
+                            Self::send(p, key, m, now, out);
+                        }
+                    }
+                }
+            }
+            Holepunch::Connect(addr) => {
+                // Only relays we asked, or peers relaying for others, send
+                // these; either way dial once over uTP if we can use it.
+                let peers = &self.peers;
+                let banned = self.swarm_ban.contains(&addr) || self.bans.is_banned(addr.ip());
+                if banned
+                    || addr.port() == 0
+                    || !self.is_active()
+                    || self.peers.len() + self.pool.connecting() >= self.config.max_peers
+                    || !self.pool.dial_now(addr, |a| Self::is_connected(peers, a))
+                {
+                    return;
+                }
+                let mut hints = self.hints.get(addr);
+                hints.utp = Some(true);
+                out.push(Effect::Connect { addr, hints });
+            }
+            // Nothing to do: the address stays in the retry list.
+            Holepunch::Error(..) => {}
         }
     }
 
@@ -2824,6 +2943,9 @@ fn pex_flags(peer: &Peer, hints: DialHints) -> u8 {
     }
     if peer.link.utp || hints.utp == Some(true) {
         flags |= dravity_wire::PEX_UTP;
+    }
+    if peer.ext.ut_holepunch.is_some() {
+        flags |= dravity_wire::PEX_HOLEPUNCH;
     }
     // Only a connection we opened proves others can open one too.
     if !peer.incoming {

@@ -411,7 +411,7 @@ fn download_preallocated_and_durable() {
             "1M",
         ])
         .args(["--max-active-downloads", "1", "--max-active-seeds", "1"])
-        .args(["--super-seed", "--no-tracker-exchange"])
+        .args(["--super-seed", "--no-tracker-exchange", "--no-holepunch"])
         .output()
         .unwrap();
     assert!(

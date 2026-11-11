@@ -243,6 +243,10 @@ struct NetworkArgs {
     /// torrents never do).
     #[arg(long)]
     no_tracker_exchange: bool,
+    /// Do not relay or request BEP 55 holepunches (`ut_holepunch`;
+    /// private torrents never do).
+    #[arg(long)]
+    no_holepunch: bool,
     /// Refuse peers in the ranges of this blocklist (eMule `ipfilter.dat`,
     /// PeerGuardian P2P text, or one address, range or CIDR per line).
     #[arg(long, value_name = "FILE")]
@@ -382,6 +386,7 @@ impl NetworkArgs {
         }
         config.peer_dscp = self.peer_dscp;
         config.engine.tracker_exchange = !self.no_tracker_exchange;
+        config.engine.holepunch = !self.no_holepunch;
         if !self.no_lsd && config.listen.is_some() {
             config.lsd = Some(dravity_session::LsdConfig::default());
         }

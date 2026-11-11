@@ -129,6 +129,21 @@ impl PeerPool {
         None
     }
 
+    /// Marks `addr` connecting for a dial outside the queue (a holepunch);
+    /// `false` if it is connected or already being dialed.
+    pub(crate) fn dial_now(
+        &mut self,
+        addr: SocketAddr,
+        connected: impl Fn(SocketAddr) -> bool,
+    ) -> bool {
+        if addr.port() == 0 || is_web_seed_addr(addr) || connected(addr) {
+            return false;
+        }
+        self.queue.retain(|a| *a != addr);
+        self.retry.retain(|(_, a)| *a != addr);
+        self.connecting.insert(addr)
+    }
+
     /// A dial finished (either way).
     pub(crate) fn dial_done(&mut self, addr: SocketAddr) {
         self.connecting.remove(&addr);

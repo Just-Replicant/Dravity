@@ -237,6 +237,7 @@ impl TorrentContext {
         config.dht = self.dht.is_some() && !private;
         config.pex = config.pex && !private;
         config.tracker_exchange = config.tracker_exchange && !private;
+        config.holepunch = config.holepunch && !private;
         config.listen_port = self.listen_port;
         config
     }

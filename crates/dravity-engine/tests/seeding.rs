@@ -1889,3 +1889,120 @@ fn at_the_cap_a_higher_bep40_priority_replaces_the_lowest() {
     assert!(disconnects(&fx, 1), "the lower-ranked peer goes");
     assert!(!disconnects(&fx, u64::from(higher)));
 }
+
+fn holepunch_sent(fx: &[Effect], peer: u64, id: u8) -> Vec<dravity_wire::Holepunch> {
+    sent(fx, peer)
+        .into_iter()
+        .filter_map(|m| match m {
+            Message::Extended { id: got, payload } if got == id => {
+                dravity_wire::Holepunch::decode(&payload)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn holepunch_msg(msg: dravity_wire::Holepunch) -> Message {
+    // Our id for ut_holepunch.
+    Message::Extended {
+        id: 5,
+        payload: Bytes::from(msg.encode()),
+    }
+}
+
+#[test]
+fn a_relay_pairs_two_peers_for_a_holepunch() {
+    use dravity_wire::{Holepunch, HolepunchError};
+    let mut h = Harness::seed(config());
+    let hs = our_handshake(&h.connect(1, ext_reserved()), 1);
+    assert!(hs.extension_id("ut_holepunch").is_some());
+    h.msg(1, ext_msg(0, b"d1:md12:ut_holepunchi9eee"));
+    h.connect(2, ext_reserved());
+    h.msg(2, ext_msg(0, b"d1:md12:ut_holepunchi9eee"));
+    h.connect(3, ext_reserved());
+    h.msg(3, ext_msg(0, b"d1:mdee"));
+
+    let fx = h.msg(1, holepunch_msg(Holepunch::Rendezvous(addr(2))));
+    assert_eq!(holepunch_sent(&fx, 2, 9), [Holepunch::Connect(addr(1))]);
+    assert_eq!(holepunch_sent(&fx, 1, 9), [Holepunch::Connect(addr(2))]);
+
+    for (target, error) in [
+        (addr(7), HolepunchError::NotConnected),
+        (addr(3), HolepunchError::NoSupport),
+        (addr(1), HolepunchError::NoSelf),
+    ] {
+        let fx = h.msg(1, holepunch_msg(Holepunch::Rendezvous(target)));
+        assert_eq!(
+            holepunch_sent(&fx, 1, 9),
+            [Holepunch::Error(target, error)],
+            "{target}"
+        );
+    }
+    // A malformed message drops the sender.
+    let fx = h.msg(
+        1,
+        Message::Extended {
+            id: 5,
+            payload: Bytes::from_static(&[9]),
+        },
+    );
+    assert!(disconnects(&fx, 1));
+}
+
+#[test]
+fn a_failed_dial_asks_the_pex_source_for_a_rendezvous_once() {
+    use dravity_wire::{Holepunch, PexPeer};
+    let mut h = Harness::with_have(config(), &[]);
+    h.connect(1, ext_reserved());
+    h.msg(1, ext_msg(0, b"d1:md6:ut_pexi8e12:ut_holepunchi9eee"));
+    let target = SocketAddr::from(([10, 9, 9, 9], 7000));
+    let pex = PexMessage {
+        added: vec![PexPeer {
+            addr: target,
+            flags: Some(dravity_wire::PEX_HOLEPUNCH | dravity_wire::PEX_UTP),
+        }],
+        dropped: Vec::new(),
+    };
+    let fx = h.msg(
+        1,
+        Message::Extended {
+            id: 2,
+            payload: Bytes::from(pex.encode()),
+        },
+    );
+    assert!(
+        fx.iter()
+            .any(|e| matches!(e, Effect::Connect { addr, .. } if *addr == target)),
+        "{fx:?}"
+    );
+    let fx = h.ev(Event::PeerConnectFailed {
+        addr: target,
+        retry: true,
+    });
+    assert_eq!(holepunch_sent(&fx, 1, 9), [Holepunch::Rendezvous(target)]);
+    // The relay answers: dial now, over uTP.
+    let fx = h.msg(1, holepunch_msg(Holepunch::Connect(target)));
+    let hints = fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::Connect { addr, hints } if *addr == target => Some(*hints),
+            _ => None,
+        })
+        .expect("a holepunch dial");
+    assert_eq!(hints.utp, Some(true));
+    // That fails too: no second rendezvous for the same address.
+    let fx = h.ev(Event::PeerConnectFailed {
+        addr: target,
+        retry: true,
+    });
+    assert!(holepunch_sent(&fx, 1, 9).is_empty());
+
+    // Disabled: not advertised and messages are ignored.
+    let mut c = config();
+    c.holepunch = false;
+    let mut off = Harness::with_have(c, &[]);
+    let hs = our_handshake(&off.connect(1, ext_reserved()), 1);
+    assert!(hs.extension_id("ut_holepunch").is_none());
+    let fx = off.msg(1, holepunch_msg(Holepunch::Connect(target)));
+    assert!(fx.iter().all(|e| !matches!(e, Effect::Connect { .. })));
+}

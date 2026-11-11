@@ -8,6 +8,8 @@
 //!   following symbolic links, an LRU cache of open file descriptors, and
 //!   positional reads/writes (no seek per block).
 //! * [`MemoryStorage`] — a byte buffer, for tests and small torrents.
+//! * [`CachedStorage`] — a middleware that keeps recently read chunks in
+//!   a shared, byte-budgeted [`ReadCache`] (for seeding).
 //!
 //! [`FileStorage`] performs its reads and writes through a [`FileIo`], which
 //! adopts each file the storage opens as an [`OpenFile`]:
@@ -22,6 +24,7 @@
 //! can skip the hash check. All calls block; the session runs them on a
 //! blocking thread pool.
 
+pub mod cache;
 mod error;
 mod file;
 mod io;
@@ -35,6 +38,7 @@ mod uring;
 use bytes::Bytes;
 use dravity_core::{BlockRef, Info, PieceLayout};
 
+pub use cache::{CacheStats, CachedStorage, ReadCache};
 pub use error::StorageError;
 pub use file::{DEFAULT_MAX_OPEN_FILES, FileStorage};
 pub use io::{BlockingIo, FileIo, OpenFile};

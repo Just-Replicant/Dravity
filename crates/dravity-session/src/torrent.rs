@@ -41,8 +41,8 @@ use dravity_engine::{
     PeerLink, Priority, Stats, TorrentState, TorrentStatus,
 };
 use dravity_storage::{
-    FileIo, FileStorage, ResumeData, Storage, block_hashes, load_resume, read_block, read_blocks,
-    save_resume, verify_piece, write_block, write_blocks,
+    CachedStorage, FileIo, FileStorage, ReadCache, ResumeData, Storage, block_hashes, load_resume,
+    read_block, read_blocks, save_resume, verify_piece, write_block, write_blocks,
 };
 use dravity_tracker::{AnnounceRequest, AnnounceResponse, TrackerClient};
 use dravity_webseed::WebSeedClient;
@@ -196,6 +196,8 @@ pub(crate) struct TorrentContext {
     pub(crate) catalog: Catalog,
     /// The session-wide ban list.
     pub(crate) bans: crate::bans::Bans,
+    /// The session's read cache, for storages the session creates.
+    pub(crate) read_cache: Option<Arc<ReadCache>>,
     /// The session-wide hashing pool.
     pub(crate) hash_pool: HashPool,
     /// The session-wide connection cap: every dial takes a slot first.
@@ -1042,7 +1044,10 @@ impl TorrentTask {
         }
         let metainfo = Arc::new(metainfo);
         let storage: Arc<dyn Storage> = match FileStorage::new(&dir, metainfo.info()) {
-            Ok(storage) => Arc::new(storage.with_io(Arc::clone(&self.ctx.file_io))),
+            Ok(storage) => cached(
+                Arc::new(storage.with_io(Arc::clone(&self.ctx.file_io))),
+                self.ctx.read_cache.as_ref(),
+            ),
             Err(e) => return self.fail(format!("setting up storage: {e}")),
         };
         self.file_priorities = files::normalize(metainfo.info(), &self.file_priorities)
@@ -1929,6 +1934,17 @@ fn error_chain(e: &dyn std::error::Error) -> String {
         source = inner.source();
     }
     text
+}
+
+/// Wraps `storage` in the session's read cache, if there is one.
+pub(crate) fn cached(
+    storage: Arc<dyn Storage>,
+    cache: Option<&Arc<ReadCache>>,
+) -> Arc<dyn Storage> {
+    match cache {
+        Some(cache) => Arc::new(CachedStorage::new(storage, Arc::clone(cache))),
+        None => storage,
+    }
 }
 
 /// Bytes of early blocks one torrent's hashers may hold while they wait to

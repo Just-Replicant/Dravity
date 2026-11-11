@@ -473,3 +473,33 @@ async fn the_session_connection_cap_holds_dials_until_raised() {
     leecher.shutdown().await;
     seed.session.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seeding_reads_go_through_the_shared_cache() {
+    let (len_a, len_b) = (60_000, 50_000);
+    let (encoded, content) = make_torrent(len_a, len_b);
+    let seed = seed(&encoded, &content, len_a).await;
+    for _ in 0..2 {
+        let dir = tempfile::tempdir().unwrap();
+        let leecher = Session::new(config()).unwrap();
+        let mut alerts = leecher.subscribe();
+        let m = metainfo(&encoded);
+        let hash = m.info_hash();
+        leecher
+            .add_torrent(
+                m,
+                AddTorrentOptions::new(dir.path()).with_peers([seed.addr]),
+            )
+            .unwrap();
+        until_finished(&mut alerts, hash).await;
+        leecher.shutdown().await;
+    }
+    let stats = seed.session.read_cache_stats().unwrap();
+    assert!(stats.hits > 0, "{stats:?}");
+    assert!(stats.bytes <= stats.budget);
+    seed.session.shutdown().await;
+
+    let mut c = config();
+    c.read_cache = None;
+    assert!(Session::new(c).unwrap().read_cache_stats().is_none());
+}

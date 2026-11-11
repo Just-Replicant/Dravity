@@ -16,6 +16,7 @@ sound version, with the difference explained), **open** (not started).
 | 4 | Session-wide hash pool | done | `perf(session): share one hash pool across torrents` | [notes](#4-hash-pool) |
 | 5 | Sans-IO purity tripwire tests | done | `test: sans-IO purity tripwires` | [notes](#5-purity-tripwires) |
 | 6 | Hash on arrival | done | `perf(core,session): verify pieces as their blocks are written` | [notes](#6-hash-on-arrival) |
+| 7 | Byte-budgeted read cache (Storage middleware) | partial | `feat(storage,session): shared read cache middleware` | [notes](#7-read-cache) |
 
 ## Design notes
 
@@ -127,3 +128,26 @@ pieces, pieces whose early blocks would push the torrent over 32 MiB,
 and all checks of existing data fall back to reading the piece back.
 A storage test counts the bytes read and shows that a download reads
 back nothing (before this change it read back the whole torrent).
+
+### 7. Read cache
+
+This follows design rule 8 of the plan: a `Storage` middleware
+(`dravity-storage/src/cache.rs`). `CachedStorage` wraps any storage.
+`ReadCache` is shared by every storage the session creates, so all
+torrents draw on one byte budget (`SessionConfig::read_cache`, default
+64 MiB). The policy is a segmented LRU. A chunk enters on probation and
+moves to the protected segment (at most 80 % of the budget) on its
+second hit, so a recheck or a peer sweeping the torrent cannot flush the
+pieces that peers keep asking for. `read_many` serves hits from memory
+and sends all the misses to the wrapped storage as one batch, so
+io_uring batching survives. Writes go through and drop the chunks they
+overlap. Each write bumps an epoch, and a read that raced a write does
+not insert what it read.
+
+**Why partial:** irontide pairs its ARC cache with a unified buffer pool
+that also backs in-flight writes. Dravity's writes already use
+reference-counted `Bytes` straight from the wire, and the hash-on-arrival
+hashers (item 6) hold only early blocks, so a shared write pool would add
+copies, not remove them. The read side, which is where seeding gains, is
+fully implemented. Segmented LRU replaces ARC because it gives the same
+scan resistance with simpler and cheaper bookkeeping.

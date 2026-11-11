@@ -65,6 +65,13 @@ Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/ir
   (`SessionConfig::hash_on_arrival`, default on). Rechecks, duplicate
   blocks and pieces whose early blocks exceed 32 MiB per torrent still
   read back. Hybrids no longer hash a piece twice from disk.
+- **Read cache (item 7):** `dravity_storage::{CachedStorage, ReadCache,
+  CacheStats}`, a `Storage` middleware with a segmented-LRU cache of
+  16 KiB chunks under one byte budget shared by all torrents (scan
+  resistant: a chunk is protected on its second hit). Writes go through
+  and invalidate; a read that raced a write is not cached. The session
+  wraps the storages it creates (`SessionConfig::read_cache`, default
+  64 MiB, `--read-cache`, `Session::read_cache_stats`).
 
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 

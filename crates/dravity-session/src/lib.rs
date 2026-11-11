@@ -99,14 +99,14 @@ use dravity_core::{InfoHash, Magnet, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{Alert, Priority, Stats};
 use dravity_portmap::{Mapping, PortMapper};
-use dravity_storage::{BlockingIo, FileIo, FileStorage, Storage};
+use dravity_storage::{BlockingIo, CacheStats, FileIo, FileStorage, ReadCache, Storage};
 use dravity_tracker::TrackerClient;
 use dravity_webseed::WebSeedClient;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub use codec::{CodecError, PeerCodec};
-pub use config::{DEFAULT_MAX_CONNECTIONS, SessionConfig, StorageBackend};
+pub use config::{DEFAULT_MAX_CONNECTIONS, DEFAULT_READ_CACHE, SessionConfig, StorageBackend};
 pub use dravity_mse::Policy as EncryptionPolicy;
 pub use dravity_portmap::{
     Mapped as PortMapped, Method as PortMapMethod, PortMapConfig, Protocol as PortMapProtocol,
@@ -253,6 +253,8 @@ struct Inner {
     connections: ConnectionLimit,
     /// Piece hashing for every torrent, within `hash_workers`.
     hash_pool: hash_pool::HashPool,
+    /// The read cache shared by the storages the session creates.
+    read_cache: Option<Arc<ReadCache>>,
     /// Session state writer, started with the first torrent.
     persist: OnceLock<Persister>,
     /// Bound sockets, until the first torrent starts the accept tasks
@@ -355,6 +357,7 @@ impl Session {
         let stop = CancellationToken::new();
         let connections = ConnectionLimit::new(config.max_connections);
         let hash_pool = hash_pool::HashPool::new(config.hash_workers);
+        let read_cache = config.read_cache.filter(|&b| b > 0).map(ReadCache::new);
         Ok(Self {
             inner: Arc::new(Inner {
                 config: Arc::new(config),
@@ -370,6 +373,7 @@ impl Session {
                 bans: Arc::default(),
                 connections,
                 hash_pool,
+                read_cache,
                 persist: OnceLock::new(),
                 listener: Mutex::new(listener),
                 listen_port,
@@ -600,9 +604,12 @@ impl Session {
             EntrySource::Torrent(metainfo) => {
                 let storage: Arc<dyn Storage> = match &entry.storage {
                     Some(storage) => Arc::clone(storage),
-                    None => Arc::new(
-                        FileStorage::new(&entry.download_dir, metainfo.info())?
-                            .with_io(Arc::clone(&self.inner.file_io)),
+                    None => torrent::cached(
+                        Arc::new(
+                            FileStorage::new(&entry.download_dir, metainfo.info())?
+                                .with_io(Arc::clone(&self.inner.file_io)),
+                        ),
+                        self.inner.read_cache.as_ref(),
                     ),
                 };
                 // A hybrid torrent is also known by its truncated v2 hash:
@@ -653,6 +660,7 @@ impl Session {
             bans: Arc::clone(&self.inner.bans),
             connections: self.inner.connections.clone(),
             hash_pool: self.inner.hash_pool.clone(),
+            read_cache: self.inner.read_cache.clone(),
             persist: self.inner.persister().cloned(),
             port_map: self
                 .inner
@@ -717,6 +725,12 @@ impl Session {
     #[must_use]
     pub fn hash_jobs_running(&self) -> usize {
         self.inner.hash_pool.busy()
+    }
+
+    /// Counters of the shared read cache, if it is on.
+    #[must_use]
+    pub fn read_cache_stats(&self) -> Option<CacheStats> {
+        self.inner.read_cache.as_ref().map(|c| c.stats())
     }
 
     /// The session-wide connection cap now in force.

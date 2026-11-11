@@ -143,6 +143,10 @@ struct NetworkArgs {
     /// Maximum open peer connections across all torrents; 0 for no cap.
     #[arg(long, default_value_t = dravity_session::DEFAULT_MAX_CONNECTIONS, value_name = "N")]
     max_connections: usize,
+    /// Memory for recently read torrent data, shared by all torrents (helps
+    /// seeding); accepts `K`/`M`/`G` suffixes, 0 turns it off.
+    #[arg(long, value_name = "SIZE", value_parser = format::parse_rate, default_value = "64M")]
+    read_cache: u64,
     /// Download rate limit in bytes per second; accepts `K`/`M`/`G`
     /// suffixes (binary), e.g. `500K` or `2M`.
     #[arg(long, value_name = "RATE", value_parser = format::parse_rate)]
@@ -229,6 +233,7 @@ impl NetworkArgs {
         config.engine.upload_rate_limit = self.upload_limit.filter(|&r| r > 0);
         config.engine.max_peers = self.max_peers.max(1);
         config.max_connections = (self.max_connections > 0).then_some(self.max_connections);
+        config.read_cache = usize::try_from(self.read_cache).ok().filter(|&b| b > 0);
         config.engine.download_rate_limit = self.download_limit.filter(|&r| r > 0);
         if self.no_dht {
             config.dht = None;

@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use dravity_engine::{Alert, Priority, Stats, TorrentStatus};
 use dravity_session::{
-    FileProgress, LiveSettings, PortMapMethod, PortMapProtocol, PortMapStatus, SessionAlert,
-    SettingsUpdate, TorrentSummary,
+    FileProgress, LiveSettings, PortMapMethod, PortMapProtocol, PortMapStatus, PortMapped,
+    SessionAlert, SettingsUpdate, TorrentSummary,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -52,6 +52,22 @@ pub(crate) struct PortMappingDto {
     external_ip: Option<IpAddr>,
     mapped: Vec<MappedDto>,
     error: Option<String>,
+    /// IPv6 firewall pinholes (PCP).
+    pinholes: Vec<MappedDto>,
+    pinhole_error: Option<String>,
+}
+
+impl From<&PortMapped> for MappedDto {
+    fn from(m: &PortMapped) -> Self {
+        Self {
+            protocol: match m.mapping.protocol {
+                PortMapProtocol::Tcp => "tcp",
+                PortMapProtocol::Udp => "udp",
+            },
+            port: m.mapping.port,
+            external_port: m.external_port,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -70,19 +86,10 @@ impl From<&PortMapStatus> for PortMappingDto {
                 PortMapMethod::Upnp => "upnp",
             }),
             external_ip: status.external_ip.map(IpAddr::V4),
-            mapped: status
-                .mapped
-                .iter()
-                .map(|m| MappedDto {
-                    protocol: match m.mapping.protocol {
-                        PortMapProtocol::Tcp => "tcp",
-                        PortMapProtocol::Udp => "udp",
-                    },
-                    port: m.mapping.port,
-                    external_port: m.external_port,
-                })
-                .collect(),
+            mapped: status.mapped.iter().map(Into::into).collect(),
             error: status.error.clone(),
+            pinholes: status.pinholes.iter().map(Into::into).collect(),
+            pinhole_error: status.pinhole_error.clone(),
         }
     }
 }

@@ -8,7 +8,7 @@
 //! sends a host such as 10.1.2.5/8 to 10.1.2.1. When the route cannot be
 //! read, NAT-PMP is skipped; UPnP can still find a gateway with SSDP.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// The default IPv4 gateway in Linux's `/proc/net/route` format: the
 /// `Gateway` column (little-endian hex) of the first up route with
@@ -75,6 +75,64 @@ pub fn parse_route_get_default(text: &str) -> Option<Ipv4Addr> {
         let gateway = parts.next()?.parse::<Ipv4Addr>().ok()?;
         (!gateway.is_unspecified()).then_some(gateway)
     })
+}
+
+/// The IPv6 default router in Linux's `/proc/net/ipv6_route` format: the
+/// next hop and interface name of the first up gateway route to `::/0`.
+///
+/// ```
+/// use std::net::Ipv6Addr;
+///
+/// let table = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 \
+///     fe800000000000000000000000000001 00000400 00000001 00000000 00450003 eth0\n";
+/// let (router, iface) = dravity_portmap::parse_proc_net_ipv6_route(table).unwrap();
+/// assert_eq!(router, "fe80::1".parse::<Ipv6Addr>().unwrap());
+/// assert_eq!(iface, "eth0");
+/// ```
+#[must_use]
+pub fn parse_proc_net_ipv6_route(text: &str) -> Option<(Ipv6Addr, String)> {
+    text.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (dest, plen, next_hop, flags, iface) = (
+            fields.first()?,
+            fields.get(1)?,
+            fields.get(4)?,
+            fields.get(8)?,
+            fields.get(9)?,
+        );
+        let flags = u32::from_str_radix(flags, 16).ok()?;
+        // RTF_UP | RTF_GATEWAY
+        if dest.len() != 32
+            || dest.bytes().any(|b| b != b'0')
+            || *plen != "00"
+            || flags & 0x3 != 0x3
+        {
+            return None;
+        }
+        let router = Ipv6Addr::from(u128::from_str_radix(next_hop, 16).ok()?);
+        (!router.is_unspecified()).then(|| (router, (*iface).to_owned()))
+    })
+}
+
+/// The IPv6 default router with the interface index a link-local address
+/// needs as its scope, or `None` when there is no IPv6 default route we
+/// can read (only Linux is read today).
+#[must_use]
+pub fn default_gateway_v6() -> Option<(Ipv6Addr, u32)> {
+    #[cfg(target_os = "linux")]
+    {
+        let table = std::fs::read_to_string("/proc/net/ipv6_route").ok()?;
+        let (router, iface) = parse_proc_net_ipv6_route(&table)?;
+        if iface.contains(['/', '.']) {
+            return None;
+        }
+        let index = std::fs::read_to_string(format!("/sys/class/net/{iface}/ifindex")).ok()?;
+        Some((router, index.trim().parse().ok()?))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// The default gateway, or `None` when this host has no IPv4 default route
@@ -179,6 +237,36 @@ destination: default
             parse_route_get_default("destination: default\n    gateway: link#14\n"),
             None
         );
+    }
+
+    #[test]
+    fn reads_the_ipv6_default_router() {
+        // The on-link /64, a loopback host route, then the default route.
+        let table = "\
+fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 enp0s3
+00000000000000000000000000000001 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 0000000a 00000000 80200001 lo
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200 lo
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe80000000000000021122fffe334455 00000400 00000001 00000000 00450003 wlan0
+";
+        let (router, iface) = parse_proc_net_ipv6_route(table).unwrap();
+        assert_eq!(
+            router,
+            "fe80::211:22ff:fe33:4455".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(iface, "wlan0");
+        // The unreachable `lo` default (no RTF_GATEWAY) is not a router.
+        assert_eq!(
+            parse_proc_net_ipv6_route(
+                table
+                    .lines()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .as_str()
+            ),
+            None
+        );
+        assert_eq!(parse_proc_net_ipv6_route("garbage\n"), None);
     }
 
     #[cfg(windows)]

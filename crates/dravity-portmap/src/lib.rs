@@ -22,7 +22,7 @@ pub mod pcp;
 pub mod upnp;
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -31,7 +31,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 pub use gateway::{
-    default_gateway, parse_proc_net_route, parse_route_get_default, parse_windows_route,
+    default_gateway, default_gateway_v6, parse_proc_net_ipv6_route, parse_proc_net_route,
+    parse_route_get_default, parse_windows_route,
 };
 pub use http::Url;
 pub use natpmp::{NatPmpError, Protocol};
@@ -50,6 +51,14 @@ pub struct PortMapConfig {
     pub upnp: bool,
     /// NAT-PMP server; `None` uses the default gateway on port 5351.
     pub gateway: Option<SocketAddrV4>,
+    /// Also ask the IPv6 default router for PCP firewall pinholes, so
+    /// peers can reach our global IPv6 address through a router that
+    /// blocks unsolicited inbound IPv6 (RFC 6887 §10.3; nothing is
+    /// translated, so the port stays ours).
+    pub ipv6: bool,
+    /// PCP server for pinholes; `None` uses the IPv6 default router on
+    /// port 5351 (Linux).
+    pub gateway_v6: Option<SocketAddrV6>,
     /// UPnP device description URL; `None` discovers it with SSDP.
     pub upnp_location: Option<String>,
     /// Requested mapping lifetime; mappings are renewed at half of it.
@@ -69,6 +78,8 @@ impl Default for PortMapConfig {
             natpmp: true,
             upnp: true,
             gateway: None,
+            ipv6: true,
+            gateway_v6: None,
             upnp_location: None,
             lifetime: Duration::from_secs(2 * 3600),
             description: "Dravity".to_owned(),
@@ -119,6 +130,12 @@ pub struct Status {
     pub mapped: Vec<Mapped>,
     /// Why mapping failed last, if it did.
     pub error: Option<String>,
+    /// IPv6 firewall pinholes open on the router (PCP), independent of
+    /// the IPv4 mappings above.
+    pub pinholes: Vec<Mapped>,
+    /// Why the IPv6 pinholes failed last, if they did (`None` with
+    /// [`PortMapConfig::ipv6`] off).
+    pub pinhole_error: Option<String>,
 }
 
 impl Status {
@@ -153,6 +170,9 @@ pub enum PortMapError {
     /// No default gateway is known.
     #[error("no default gateway")]
     NoGateway,
+    /// No global IPv6 address to open a pinhole for.
+    #[error("no global IPv6 address")]
+    NoGlobalAddress,
     /// No UPnP internet gateway answered, or it has no port-mapping service.
     #[error("no UPnP internet gateway found")]
     NoDevice,
@@ -212,6 +232,15 @@ enum Active {
     Upnp(upnp::Service),
 }
 
+/// IPv6 pinholes made with PCP: the server, the socket address requests
+/// leave from, and each request (renewals and deletes reuse its nonce).
+#[derive(Debug)]
+struct Pinholes {
+    server: SocketAddr,
+    from: SocketAddr,
+    requests: Vec<pcp::MapRequest>,
+}
+
 async fn run(
     config: PortMapConfig,
     mappings: Vec<Mapping>,
@@ -219,8 +248,20 @@ async fn run(
     stop: CancellationToken,
 ) {
     loop {
-        let (active, wait) = match map_all(&config, &mappings).await {
-            Ok((active, next)) => {
+        let (pinholes, pinhole_status) = if config.ipv6 {
+            match map_pinholes(&config, &mappings).await {
+                Ok((pinholes, mapped)) => (Some(pinholes), (mapped, None)),
+                Err(e) => {
+                    tracing::debug!(error = %e, "IPv6 pinholes failed");
+                    (None, (Vec::new(), Some(e.to_string())))
+                }
+            }
+        } else {
+            (None, (Vec::new(), None))
+        };
+        let (active, mut wait) = match map_all(&config, &mappings).await {
+            Ok((active, mut next)) => {
+                (next.pinholes, next.pinhole_error) = pinhole_status;
                 status.send_replace(next);
                 // Renew at half the lifetime (RFC 6886 §3.3).
                 (Some(active), config.lifetime / 2)
@@ -231,10 +272,15 @@ async fn run(
                     s.method = None;
                     s.mapped.clear();
                     s.error = Some(e.to_string());
+                    (s.pinholes, s.pinhole_error) = pinhole_status;
                 });
                 (None, config.retry)
             }
         };
+        if pinholes.is_some() {
+            // Pinholes must be renewed in time even while IPv4 retries.
+            wait = wait.min(config.lifetime / 2);
+        }
         let stopped = tokio::select! {
             () = stop.cancelled() => true,
             () = tokio::time::sleep(wait.max(Duration::from_secs(1))) => false,
@@ -243,7 +289,13 @@ async fn run(
             if let Some(active) = active {
                 unmap_all(&config, &mappings, &active).await;
             }
-            status.send_modify(|s| s.mapped.clear());
+            if let Some(pinholes) = pinholes {
+                close_pinholes(&pinholes).await;
+            }
+            status.send_modify(|s| {
+                s.mapped.clear();
+                s.pinholes.clear();
+            });
             return;
         }
     }
@@ -314,7 +366,22 @@ async fn pcp_exchange(
     server: SocketAddrV4,
     request: &pcp::MapRequest,
 ) -> Result<pcp::MapResponse, PortMapError> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+    pcp_exchange_from(
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V4(server),
+        request,
+    )
+    .await
+}
+
+/// [`pcp_exchange`] from a chosen local address (a pinhole request must
+/// come from the address it opens, RFC 6887 §8.3).
+async fn pcp_exchange_from(
+    from: SocketAddr,
+    server: SocketAddr,
+    request: &pcp::MapRequest,
+) -> Result<pcp::MapResponse, PortMapError> {
+    let socket = UdpSocket::bind(from).await?;
     socket.connect(server).await?;
     let bytes = request.encode();
     let mut buf = [0u8; 1100];
@@ -356,7 +423,7 @@ async fn map_pcp(
     mappings: &[Mapping],
 ) -> Result<(Active, Status), PortMapError> {
     let server = natpmp_server(config)?;
-    let client = upnp::local_addr_towards(std::net::SocketAddr::V4(server))?;
+    let client = upnp::local_addr_towards(SocketAddr::V4(server))?;
     let lifetime = u32::try_from(config.lifetime.as_secs()).unwrap_or(u32::MAX);
     let mut status = Status {
         method: Some(Method::Pcp),
@@ -374,7 +441,7 @@ async fn map_pcp(
             lifetime,
         };
         let response = pcp_exchange(server, &request).await?;
-        if let std::net::IpAddr::V4(ip) = response.external_ip
+        if let IpAddr::V4(ip) = response.external_ip
             && !ip.is_unspecified()
         {
             status.external_ip = Some(ip);
@@ -387,6 +454,105 @@ async fn map_pcp(
     }
     tracing::info!(?status, "ports mapped with PCP");
     Ok((Active::Pcp(server, requests), status))
+}
+
+/// The PCP server for pinholes.
+fn pinhole_server(config: &PortMapConfig) -> Result<SocketAddrV6, PortMapError> {
+    config
+        .gateway_v6
+        .or_else(|| {
+            default_gateway_v6()
+                .map(|(router, scope)| SocketAddrV6::new(router, natpmp::SERVER_PORT, 0, scope))
+        })
+        .ok_or(PortMapError::NoGateway)
+}
+
+/// A well-known public IPv6 address, only used to ask the kernel which
+/// source address it would pick: `connect` on UDP sends nothing.
+const GLOBAL_PROBE: SocketAddrV6 = SocketAddrV6::new(
+    Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+    53,
+    0,
+    0,
+);
+
+fn source_towards(dest: SocketAddrV6) -> io::Result<Ipv6Addr> {
+    let socket = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))?;
+    socket.connect(dest)?;
+    match socket.local_addr()?.ip() {
+        IpAddr::V6(ip) => Ok(ip),
+        IpAddr::V4(_) => Err(io::Error::from(io::ErrorKind::AddrNotAvailable)),
+    }
+}
+
+/// Link-local (`fe80::/10`) or unspecified: no use to a remote peer.
+const fn unreachable_from_afar(ip: Ipv6Addr) -> bool {
+    ip.is_unspecified() || ip.segments()[0] & 0xffc0 == 0xfe80
+}
+
+/// Our address for pinholes: the source towards the router, or, when that
+/// is link-local (the router usually is), the source towards the internet.
+fn pinhole_client(server: SocketAddrV6) -> Result<Ipv6Addr, PortMapError> {
+    let near = source_towards(server)?;
+    if !unreachable_from_afar(near) {
+        return Ok(near);
+    }
+    let far = source_towards(GLOBAL_PROBE).map_err(|_| PortMapError::NoGlobalAddress)?;
+    if unreachable_from_afar(far) {
+        return Err(PortMapError::NoGlobalAddress);
+    }
+    Ok(far)
+}
+
+async fn map_pinholes(
+    config: &PortMapConfig,
+    mappings: &[Mapping],
+) -> Result<(Pinholes, Vec<Mapped>), PortMapError> {
+    let server = pinhole_server(config)?;
+    let client = pinhole_client(server)?;
+    let from = SocketAddr::from((client, 0));
+    let lifetime = u32::try_from(config.lifetime.as_secs()).unwrap_or(u32::MAX);
+    let mut mapped = Vec::new();
+    let mut requests = Vec::new();
+    for mapping in mappings {
+        let request = pcp::MapRequest {
+            nonce: nonce(),
+            protocol: mapping.protocol,
+            internal_port: mapping.port,
+            external_port: mapping.port,
+            external_ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            client_ip: IpAddr::V6(client),
+            lifetime,
+        };
+        let response = pcp_exchange_from(from, SocketAddr::V6(server), &request).await?;
+        mapped.push(Mapped {
+            mapping: *mapping,
+            external_port: response.external_port,
+        });
+        requests.push(request);
+    }
+    tracing::info!(%client, ?mapped, "IPv6 pinholes open with PCP");
+    Ok((
+        Pinholes {
+            server: SocketAddr::V6(server),
+            from,
+            requests,
+        },
+        mapped,
+    ))
+}
+
+async fn close_pinholes(pinholes: &Pinholes) {
+    for request in &pinholes.requests {
+        let delete = pcp::MapRequest {
+            lifetime: 0,
+            external_port: 0,
+            ..*request
+        };
+        if let Err(e) = pcp_exchange_from(pinholes.from, pinholes.server, &delete).await {
+            tracing::debug!(port = request.internal_port, error = %e, "closing pinhole failed");
+        }
+    }
 }
 
 async fn map_natpmp(
@@ -479,7 +645,7 @@ async fn map_upnp(
     let description = http::request(&location, "GET", &[], &[], config.timeout).await?;
     let xml = String::from_utf8_lossy(&description.body);
     let service = upnp::parse_description(&xml, &location).ok_or(PortMapError::NoDevice)?;
-    let std::net::IpAddr::V4(local) = upnp::local_addr_towards(service.control.addr)? else {
+    let IpAddr::V4(local) = upnp::local_addr_towards(service.control.addr)? else {
         return Err(PortMapError::NoDevice);
     };
     let mut status = Status {

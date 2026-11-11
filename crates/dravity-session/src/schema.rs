@@ -39,7 +39,7 @@ registry! {
 peer_id_prefix: Restart, [], "Peer id prefix in Azureus style (`-DV0001-`); the rest is random.";
 listen: Restart, ["--port", "--no-listen", "--no-utp"], "Accept incoming peer connections (TCP, and uTP unless `ListenConfig::utp` is `None`); `None` only dials out over TCP.";
 prefer_utp: Restart, ["--prefer-utp"], "Dial peers over uTP first and fall back to TCP.";
-port_mapping: Restart, ["--no-port-mapping"], "Ask the router (NAT-PMP, then UPnP IGD) to forward the listening port, TCP and (with uTP) UDP, so peers behind no NAT of their own can reach us.";
+port_mapping: Restart, ["--no-port-mapping"], "Ask the router (PCP, NAT-PMP, then UPnP IGD) to forward the listening port, TCP and (with uTP) UDP, so peers behind no NAT of their own can reach us, and open matching IPv6 firewall pinholes with PCP.";
 announce_port: Restart, ["--port"], "Port reported to trackers when the session does not listen (for example behind a proxy that forwards to us).";
 engine: Restart, [], "Per-torrent engine tunables.";
 tracker: Restart, [], "Tracker client settings.";

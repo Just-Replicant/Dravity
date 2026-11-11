@@ -16,7 +16,7 @@ torrent starts.
 | `peer_id_prefix` | restart | — | Peer id prefix in Azureus style (`-DV0001-`); the rest is random. |
 | `listen` | restart | `--port`, `--no-listen`, `--no-utp` | Accept incoming peer connections (TCP, and uTP unless `ListenConfig::utp` is `None`); `None` only dials out over TCP. |
 | `prefer_utp` | restart | `--prefer-utp` | Dial peers over uTP first and fall back to TCP. |
-| `port_mapping` | restart | `--no-port-mapping` | Ask the router (NAT-PMP, then UPnP IGD) to forward the listening port, TCP and (with uTP) UDP, so peers behind no NAT of their own can reach us. |
+| `port_mapping` | restart | `--no-port-mapping` | Ask the router (PCP, NAT-PMP, then UPnP IGD) to forward the listening port, TCP and (with uTP) UDP, so peers behind no NAT of their own can reach us, and open matching IPv6 firewall pinholes with PCP. |
 | `announce_port` | restart | `--port` | Port reported to trackers when the session does not listen (for example behind a proxy that forwards to us). |
 | `engine` | restart | — | Per-torrent engine tunables. |
 | `tracker` | restart | — | Tracker client settings. |

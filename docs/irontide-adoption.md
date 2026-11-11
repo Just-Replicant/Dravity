@@ -26,6 +26,7 @@ sound version, with the difference explained), **open** (not started).
 | 13 | Torrent creation (v1/v2/hybrid, BEP 47 pads, auto piece size) and dravity create | done | `feat(core,storage,cli): torrent creation and dravity create` | [notes](#13-torrent-creation) |
 | 14 | Tracker scrape (BEP 48 HTTP, BEP 15 UDP) in TrackerStatus | done | `feat(tracker,session,cli): tracker scrape` | [notes](#14-tracker-scrape) |
 | 15 | Local Service Discovery (BEP 14), off for private torrents | done | `feat(lsd,session,cli): local service discovery` | [notes](#15-local-service-discovery) |
+| 16 | Live settings, session-wide rate limits and queueing | partial | `feat(session,http,cli): live settings, session rate limits and queueing` | [notes](#16-live-settings-rate-limits-and-queueing) |
 
 ## Design notes
 
@@ -346,3 +347,11 @@ messages, own announces filtered), a leecher that finds a seed only
 through LSD and completes, and a private torrent that is never
 discovered. The library default is off, so embedders opt in. The CLI
 turns LSD on.
+
+### 16. Live settings, rate limits and queueing
+
+- `dravity-session/src/settings.rs` holds the live subset (`LiveSettings`) and the update type. `SettingsUpdate` fields are `Option<Option<_>>`: absent leaves a value alone, `Some(None)` lifts it. `applied_to` validates every field and builds the next value before anything is touched; `Session::apply_settings` then swaps it in under one mutex and pushes the rates and connection cap. `SessionConfig` runs through the same validation in `Session::new` (`SessionError::Settings`). `max_connections = Some(0)` stays valid (it holds every dial until raised, as before).
+- `rate.rs` is a debt token bucket per direction shared by all peer tasks (`RateLimits`). A peer task takes download tokens after forwarding a received `Piece` and upload tokens before writing one, so session caps apply across torrents on top of each torrent's engine limit. A wait is capped at 2 s per acquisition so a lowered limit takes effect quickly and keep-alives are not starved. Rates below 16 KiB/s are refused because one 16 KiB block per second is the slowest pace peers tolerate.
+- `queue.rs`: `plan()` is a pure function from the catalog (running, paused, queued, complete, added order) and the limits to keep/start/queue decisions, unit tested on its own. A task (`run`, about once per second, holding only a `Weak<Inner>`) learns completion from each handle's stats, then stops the newest surplus torrents (marked `queued`) and starts the oldest queued ones. Paused and failed torrents take no slot; pausing or resuming clears `queued`. `add_*` queues a new torrent at once when its class is full.
+- **Partial:** irontide also rebinds the listen port live with rollback on failure; Dravity's listen port stays a restart setting because the listeners, port mapping and LSD announces are all bound to it at start. Live settings and the queued flag are not persisted by `dravity serve` (the CLI flags apply at each start).
+- Tests: settings and queue-plan unit tests, `rate.rs` pacing tests, `tests/settings.rs` (all-or-nothing update, a 96 KiB download paced by a 32 KiB/s session limit, one-at-a-time queue then live lift and seed limit), the HTTP `settings_are_read_and_patched_all_at_once`, CLI flag tests and the TUI limit-prompt test.

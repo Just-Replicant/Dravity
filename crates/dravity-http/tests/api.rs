@@ -610,3 +610,47 @@ async fn serve_stops_on_shutdown_with_an_event_stream_open() {
         .unwrap();
     session.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_are_read_and_patched_all_at_once() {
+    let session = Session::new(config()).unwrap();
+    let app = dravity_http::router(session.clone(), HttpConfig::new("unused"));
+    let read = get(&app, "/api/v1/settings").await;
+    assert_eq!(read.status, StatusCode::OK);
+    assert_eq!(read.json()["download_rate_limit"], Json::Null);
+
+    let patched = send_json(
+        &app,
+        Method::PATCH,
+        "/api/v1/settings",
+        &json!({ "download_rate_limit": 65536, "max_active_downloads": 2 }),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK);
+    assert_eq!(patched.json()["download_rate_limit"], 65536);
+    assert_eq!(session.settings().max_active_downloads, Some(2));
+
+    // One bad field rejects the whole patch.
+    let rejected = send_json(
+        &app,
+        Method::PATCH,
+        "/api/v1/settings",
+        &json!({ "download_rate_limit": null, "upload_rate_limit": 1 }),
+    )
+    .await;
+    assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
+    assert_eq!(session.settings().download_rate_limit, Some(65536));
+
+    let unknown = send_json(&app, Method::PATCH, "/api/v1/settings", &json!({ "x": 1 })).await;
+    assert!(unknown.status.is_client_error());
+
+    let lifted = send_json(
+        &app,
+        Method::PATCH,
+        "/api/v1/settings",
+        &json!({ "download_rate_limit": null }),
+    )
+    .await;
+    assert_eq!(lifted.json()["download_rate_limit"], Json::Null);
+    assert_eq!(lifted.json()["max_active_downloads"], 2);
+}

@@ -197,6 +197,12 @@ cargo run --release -p dravity-cli -- serve --download-dir downloads --tui
 DRAVITY_TOKEN=change-me cargo run --release -p dravity-cli -- serve \
     --download-dir downloads --watch torrents
 curl -H 'Authorization: Bearer change-me' localhost:9091/api/v1/torrents
+# 4 MiB/s down for all torrents together, at most 2 downloading at once
+# (the rest queue); the same settings change live over the API or with L/U in the TUI
+cargo run --release -p dravity-cli -- serve --download-dir downloads \
+    --global-download-limit 4M --max-active-downloads 2
+curl -X PATCH -H 'Authorization: Bearer change-me' -H 'Content-Type: application/json' \
+    -d '{"upload_rate_limit": 1048576, "max_active_seeds": null}' localhost:9091/api/v1/settings
 # make a hybrid (v1 + v2) torrent of a directory, with a tracker and a web seed
 cargo run --release -p dravity-cli -- create ./share -t http://tracker/announce -w https://host/share/
 ```

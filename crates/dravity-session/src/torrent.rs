@@ -210,6 +210,8 @@ pub(crate) struct TorrentContext {
     pub(crate) read_cache: Option<Arc<ReadCache>>,
     /// The session-wide hashing pool.
     pub(crate) hash_pool: HashPool,
+    /// The session-wide rate limits.
+    pub(crate) rates: crate::rate::RateLimits,
     /// The session-wide connection cap: every dial takes a slot first.
     pub(crate) connections: ConnectionLimit,
     /// Session state writer, with a state directory.
@@ -1440,13 +1442,13 @@ impl TorrentTask {
             mse: stream.uses_mse().then_some(true),
         };
         tokio::spawn(peer::run_accepted(
-            key,
-            addr,
+            (key, addr),
             stream,
             leftover,
             self.events_tx.clone(),
             rx,
             slot,
+            self.ctx.rates.clone(),
         ));
         Event::PeerAccepted {
             peer: key,
@@ -1484,6 +1486,7 @@ impl TorrentTask {
             prefer_utp: self.ctx.config.prefer_utp,
             encryption: self.ctx.config.encryption,
             hints,
+            rates: self.ctx.rates.clone(),
         };
         // Peer tasks are not in `background`: dropping their command sender
         // ends them, and they must not delay shutdown.

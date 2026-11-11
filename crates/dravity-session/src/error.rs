@@ -32,6 +32,9 @@ pub enum SessionError {
     /// The web seed HTTP/TLS client could not be built.
     #[error(transparent)]
     WebSeed(#[from] dravity_webseed::WebSeedError),
+    /// A rate limit or connection cap in the config is invalid.
+    #[error(transparent)]
+    Settings(#[from] crate::SettingsError),
     /// The torrent is not in the session.
     #[error("torrent {0} is not in the session")]
     Unknown(InfoHash),

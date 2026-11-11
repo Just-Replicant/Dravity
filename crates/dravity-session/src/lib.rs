@@ -83,6 +83,9 @@ mod listen;
 mod lsd;
 mod peer;
 pub mod persist;
+mod queue;
+mod rate;
+mod settings;
 mod status;
 mod stream;
 mod torrent;
@@ -121,6 +124,7 @@ pub use error::SessionError;
 pub use file_stream::{DEFAULT_READAHEAD, FileStream};
 pub use files::FileProgress;
 pub use listen::ListenConfig;
+pub use settings::{LiveSettings, MIN_RATE_LIMIT, SettingsError, SettingsUpdate};
 pub use status::{PeerStatus, ScrapeOutcome, TrackerOutcome, TrackerStatus, Transport};
 pub use torrent::TorrentProgress;
 pub use watch::{WatchConfig, WatchHandle};
@@ -214,6 +218,9 @@ pub struct TorrentSummary {
     pub download_dir: PathBuf,
     /// Paused by [`Session::pause`] (or added paused).
     pub paused: bool,
+    /// Waiting in the queue for an active slot
+    /// ([`LiveSettings::max_active_downloads`] / `max_active_seeds`).
+    pub queued: bool,
     /// A task is running. Neither running nor paused means it stopped after
     /// an error; [`Session::resume`] restarts it.
     pub running: bool,
@@ -269,6 +276,12 @@ struct Inner {
     utp: OnceLock<UtpSockets>,
     /// Router port mapping, once the listener started.
     port_mapper: Mutex<Option<PortMapper>>,
+    /// The live settings ([`Session::apply_settings`]).
+    live: Mutex<LiveSettings>,
+    /// Session-wide rate limits, shared by every peer connection.
+    rates: rate::RateLimits,
+    /// The queue task, started with the first torrent.
+    queue_started: OnceLock<()>,
     /// Ends the accept tasks when the last session clone is dropped.
     _stop: DropGuard,
     stop: CancellationToken,
@@ -362,6 +375,16 @@ impl Session {
         let connections = ConnectionLimit::new(config.max_connections);
         let hash_pool = hash_pool::HashPool::new(config.hash_workers);
         let read_cache = config.read_cache.filter(|&b| b > 0).map(ReadCache::new);
+        let live = LiveSettings {
+            download_rate_limit: config.download_rate_limit,
+            upload_rate_limit: config.upload_rate_limit,
+            max_connections: config.max_connections,
+            max_active_downloads: config.max_active_downloads,
+            max_active_seeds: config.max_active_seeds,
+        };
+        // The config goes through the same checks as a live update.
+        SettingsUpdate::from(live).applied_to(LiveSettings::default())?;
+        let rates = rate::RateLimits::new(config.upload_rate_limit, config.download_rate_limit);
         Ok(Self {
             inner: Arc::new(Inner {
                 config: Arc::new(config),
@@ -383,6 +406,9 @@ impl Session {
                 listen_port,
                 utp: OnceLock::new(),
                 port_mapper: Mutex::new(None),
+                live: Mutex::new(live),
+                rates,
+                queue_started: OnceLock::new(),
                 _stop: stop.clone().drop_guard(),
                 stop,
             }),
@@ -585,6 +611,10 @@ impl Session {
         }
         let handle = if entry.paused {
             self.idle_handle(info_hash)
+        } else if self.queue_full(&catalog, &entry) {
+            entry.queued = true;
+            self.start_queue();
+            self.idle_handle(info_hash)
         } else {
             self.spawn(info_hash, &mut entry)?
         };
@@ -596,6 +626,36 @@ impl Session {
         }
         catalog.insert(info_hash, entry);
         Ok(handle)
+    }
+
+    /// Whether a new torrent must wait: its kind (a download, unless it is
+    /// known complete) already has every active slot taken.
+    fn queue_full(&self, catalog: &HashMap<InfoHash, Entry>, new: &Entry) -> bool {
+        let live = self.settings();
+        let limit = if new.complete {
+            live.max_active_seeds
+        } else {
+            live.max_active_downloads
+        };
+        limit.is_some_and(|max| {
+            catalog
+                .values()
+                .filter(|e| e.is_running() && e.complete == new.complete)
+                .count()
+                >= max
+        })
+    }
+
+    /// Starts the queue task once (needs a Tokio runtime).
+    fn start_queue(&self) {
+        self.inner.queue_started.get_or_init(|| {
+            let every = self
+                .inner
+                .config
+                .tick_interval
+                .clamp(Duration::from_millis(10), Duration::from_secs(1));
+            tokio::spawn(queue::run(Arc::downgrade(&self.inner), every));
+        });
     }
 
     /// A handle with no task behind it (paused torrents).
@@ -655,6 +715,7 @@ impl Session {
         };
         peers.extend(entry.peers.iter().copied());
         self.start_listening();
+        self.start_queue();
         let (tx, rx) = mpsc::channel(64);
         let ctx = TorrentContext {
             info_hash,
@@ -673,6 +734,7 @@ impl Session {
             bans: Arc::clone(&self.inner.bans),
             connections: self.inner.connections.clone(),
             hash_pool: self.inner.hash_pool.clone(),
+            rates: self.inner.rates.clone(),
             read_cache: self.inner.read_cache.clone(),
             persist: self.inner.persister().cloned(),
             port_map: self
@@ -755,7 +817,44 @@ impl Session {
     /// Changes the session-wide connection cap at once. Lowering it closes
     /// no connection: new ones wait until enough have ended.
     pub fn set_max_connections(&self, max: Option<usize>) {
+        let mut live = self
+            .inner
+            .live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         self.inner.connections.set_max(max);
+        live.max_connections = max;
+    }
+
+    /// The live settings now in force.
+    #[must_use]
+    pub fn settings(&self) -> LiveSettings {
+        *self
+            .inner
+            .live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Changes live settings while the session runs. The whole update is
+    /// checked first: if any field is invalid nothing changes. Rate limits
+    /// and the connection cap apply at once; queue limits at the queue's
+    /// next round (about a second). Returns the settings now in force.
+    ///
+    /// # Errors
+    /// [`SettingsError::Invalid`] for the first invalid field.
+    pub fn apply_settings(&self, update: SettingsUpdate) -> Result<LiveSettings, SettingsError> {
+        let mut live = self
+            .inner
+            .live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let next = update.applied_to(*live)?;
+        self.inner.rates.down.set_rate(next.download_rate_limit);
+        self.inner.rates.up.set_rate(next.upload_rate_limit);
+        self.inner.connections.set_max(next.max_connections);
+        *live = next;
+        Ok(next)
     }
 
     /// Lifts a session ban on `ip` for the listener and torrents started
@@ -803,6 +902,7 @@ impl Session {
                 name: entry.name(),
                 download_dir: entry.download_dir.clone(),
                 paused: entry.paused,
+                queued: entry.queued,
                 running: entry.is_running(),
                 has_metadata: entry.metainfo().is_some(),
                 file_priorities: entry.priorities.clone(),
@@ -842,6 +942,7 @@ impl Session {
                 return Ok(());
             }
             entry.paused = true;
+            entry.queued = false;
             if let Some(persist) = self.inner.persister() {
                 persist.save_record(&entry.record(info_hash));
             }
@@ -874,6 +975,7 @@ impl Session {
             });
         }
         let handle = self.spawn(info_hash, entry)?;
+        entry.queued = false;
         if entry.paused {
             entry.paused = false;
             if let Some(persist) = self.inner.persister() {
@@ -1053,6 +1155,8 @@ impl Session {
                 storage: None,
                 priorities: record.priorities.clone(),
                 paused: record.paused,
+                queued: false,
+                complete: false,
                 added_at: record.added_at,
                 commands: None,
             };
@@ -1116,13 +1220,15 @@ fn entry(source: EntrySource, options: AddTorrentOptions) -> Entry {
         storage: options.storage,
         priorities: options.file_priorities,
         paused: options.paused,
+        queued: false,
+        complete: false,
         added_at: persist::unix_now(),
         commands: None,
     }
 }
 
 /// Stops a torrent task and waits for it. A no-op if it already stopped.
-async fn stop_task(commands: &mpsc::Sender<Command>) {
+pub(crate) async fn stop_task(commands: &mpsc::Sender<Command>) {
     let (tx, rx) = oneshot::channel();
     if commands.send(Command::Stop(tx)).await.is_ok() {
         let _ = rx.await;

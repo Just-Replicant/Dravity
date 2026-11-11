@@ -8,6 +8,8 @@
 //! | Method | Path | |
 //! |---|---|---|
 //! | `GET` | `/api/v1/session` | Peer id, listen port, DHT, port mapping |
+//! | `GET` | `/api/v1/settings` | Live settings (rate limits, connection cap, queue) |
+//! | `PATCH` | `/api/v1/settings` | Change settings; all fields apply or none do |
 //! | `GET` | `/api/v1/torrents` | Every torrent, running or not |
 //! | `POST` | `/api/v1/torrents` | Add: a `.torrent` body (`?download_dir=&paused=`) or JSON `{"magnet": …, "download_dir", "paused", "file_priorities", "peers"}` |
 //! | `GET` | `/api/v1/torrents/{info_hash}` | One torrent with live stats and files |
@@ -142,6 +144,10 @@ fn build(session: Session, config: HttpConfig, closing: watch::Receiver<bool>) -
     };
     Router::new()
         .route("/api/v1/session", get(routes::session_info))
+        .route(
+            "/api/v1/settings",
+            get(routes::settings).patch(routes::patch_settings),
+        )
         .route("/api/v1/torrents", get(routes::list).post(routes::add))
         .route(
             "/api/v1/torrents/{info_hash}",

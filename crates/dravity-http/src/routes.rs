@@ -20,8 +20,8 @@ use tokio::sync::broadcast;
 use crate::AppState;
 use crate::dto::{
     self, AddMagnetDto, AddOptionsDto, AddQueryDto, AddedDto, AlertDto, EventsQueryDto, FileDto,
-    FilePriorityDto, PeersDto, PrioritiesDto, RemoveQueryDto, SessionDto, TorrentDetailDto,
-    TorrentDto,
+    FilePriorityDto, PeersDto, PrioritiesDto, RemoveQueryDto, SessionDto, SettingsDto,
+    SettingsPatchDto, TorrentDetailDto, TorrentDto,
 };
 use crate::error::ApiError;
 use crate::{metrics, range};
@@ -100,6 +100,22 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
         s
     })
+}
+
+pub(crate) async fn settings(State(state): State<AppState>) -> Json<SettingsDto> {
+    Json(state.session.settings().into())
+}
+
+/// Applies a settings patch; nothing changes if any field is invalid.
+pub(crate) async fn patch_settings(
+    State(state): State<AppState>,
+    Json(body): Json<SettingsPatchDto>,
+) -> Result<Json<SettingsDto>, ApiError> {
+    let applied = state
+        .session
+        .apply_settings(body.into())
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(Json(applied.into()))
 }
 
 pub(crate) async fn list(State(state): State<AppState>) -> Json<Vec<TorrentDto>> {

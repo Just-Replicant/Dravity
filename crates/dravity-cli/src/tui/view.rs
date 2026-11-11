@@ -350,12 +350,21 @@ pub(crate) enum Prompt {
     AddPeer { info_hash: InfoHash, text: String },
     /// Editing [`View::filter`].
     Filter,
+    /// A session-wide rate limit (`500K`, `2M`; empty or `0` lifts it).
+    Limit { direction: Direction, text: String },
     /// Remove a torrent (and maybe its files) once Enter confirms.
     Confirm {
         info_hash: InfoHash,
         name: String,
         delete_files: bool,
     },
+}
+
+/// Which session-wide rate limit a prompt sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Direction {
+    Download,
+    Upload,
 }
 
 /// What a key asks for.
@@ -381,6 +390,8 @@ pub(crate) enum Action {
     },
     CycleSort,
     OpenFilter,
+    /// `L` / `U`: the session-wide download / upload limit prompt.
+    OpenLimit(Direction),
     Help,
     /// Any key while the key list is shown.
     DismissHelp,
@@ -414,6 +425,11 @@ pub(crate) enum Request {
         info_hash: InfoHash,
         name: String,
         delete_files: bool,
+    },
+    /// The limit prompt's line; the prompt stays open until it applies.
+    SetLimit {
+        direction: Direction,
+        text: String,
     },
 }
 
@@ -618,13 +634,24 @@ impl View {
             }
             Action::CycleSort => self.sort = self.sort.next(),
             Action::OpenFilter => self.prompt = Some(Prompt::Filter),
+            Action::OpenLimit(direction) => {
+                self.prompt = Some(Prompt::Limit {
+                    direction,
+                    text: String::new(),
+                });
+                self.message.clear();
+            }
             Action::Input(c) => match &mut self.prompt {
-                Some(Prompt::Add(text) | Prompt::AddPeer { text, .. }) => text.push(c),
+                Some(
+                    Prompt::Add(text) | Prompt::AddPeer { text, .. } | Prompt::Limit { text, .. },
+                ) => text.push(c),
                 Some(Prompt::Filter) => self.filter.push(c),
                 Some(Prompt::Confirm { .. }) | None => {}
             },
             Action::Backspace => match &mut self.prompt {
-                Some(Prompt::Add(text) | Prompt::AddPeer { text, .. }) => {
+                Some(
+                    Prompt::Add(text) | Prompt::AddPeer { text, .. } | Prompt::Limit { text, .. },
+                ) => {
                     text.pop();
                 }
                 Some(Prompt::Filter) => {
@@ -644,6 +671,9 @@ impl View {
                     return Some(Request::AddPeer { info_hash, text });
                 }
                 Prompt::Filter => self.prompt = None,
+                Prompt::Limit { direction, text } => {
+                    return Some(Request::SetLimit { direction, text });
+                }
                 Prompt::Confirm {
                     info_hash,
                     name,

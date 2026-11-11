@@ -115,6 +115,17 @@ pub struct SessionConfig {
     /// When written data is forced to disk. Default: [`Durability::Never`]
     /// (sync on resume save, descriptor eviction and stop only).
     pub durability: Durability,
+    /// Session-wide download limit in bytes per second, shared by every
+    /// torrent on top of each torrent's own limit. Changeable live
+    /// ([`crate::Session::apply_settings`]).
+    pub download_rate_limit: Option<u64>,
+    /// Session-wide upload limit in bytes per second.
+    pub upload_rate_limit: Option<u64>,
+    /// Torrents downloading at once; later ones wait in the queue.
+    /// `None` (the default) is unlimited.
+    pub max_active_downloads: Option<usize>,
+    /// Torrents seeding at once; later ones wait in the queue.
+    pub max_active_seeds: Option<usize>,
     /// Local Service Discovery (BEP 14): find peers of the same torrents on
     /// the local network by multicast. Needs a listener; private torrents
     /// never use it. `None` (the default) turns it off.
@@ -181,6 +192,10 @@ impl Default for SessionConfig {
             read_cache: Some(DEFAULT_READ_CACHE),
             preallocate: PreallocateMode::None,
             durability: Durability::Never,
+            download_rate_limit: None,
+            upload_rate_limit: None,
+            max_active_downloads: None,
+            max_active_seeds: None,
             lsd: None,
             scrape_interval: None,
             stop_announce_timeout: Duration::from_secs(5),

@@ -6,7 +6,8 @@ use std::path::PathBuf;
 
 use dravity_engine::{Alert, Priority, Stats, TorrentStatus};
 use dravity_session::{
-    FileProgress, PortMapMethod, PortMapProtocol, PortMapStatus, SessionAlert, TorrentSummary,
+    FileProgress, LiveSettings, PortMapMethod, PortMapProtocol, PortMapStatus, SessionAlert,
+    SettingsUpdate, TorrentSummary,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -111,12 +112,14 @@ impl From<&TorrentSummary> for TorrentDto {
     }
 }
 
-/// `running`, `paused` or `stopped` (after an error).
+/// `running`, `paused`, `queued` or `stopped` (after an error).
 pub(crate) const fn state(t: &TorrentSummary) -> &'static str {
     if t.running {
         "running"
     } else if t.paused {
         "paused"
+    } else if t.queued {
+        "queued"
     } else {
         "stopped"
     }
@@ -440,5 +443,65 @@ mod tests {
             ])
         );
         assert!(serde_json::from_str::<PriorityDto>(r#""urgent""#).is_err());
+    }
+}
+
+/// `GET /api/v1/settings`: the live settings (`null` is unlimited).
+#[derive(Debug, Serialize)]
+pub(crate) struct SettingsDto {
+    download_rate_limit: Option<u64>,
+    upload_rate_limit: Option<u64>,
+    max_connections: Option<usize>,
+    max_active_downloads: Option<usize>,
+    max_active_seeds: Option<usize>,
+}
+
+impl From<LiveSettings> for SettingsDto {
+    fn from(s: LiveSettings) -> Self {
+        Self {
+            download_rate_limit: s.download_rate_limit,
+            upload_rate_limit: s.upload_rate_limit,
+            max_connections: s.max_connections,
+            max_active_downloads: s.max_active_downloads,
+            max_active_seeds: s.max_active_seeds,
+        }
+    }
+}
+
+/// `PATCH /api/v1/settings`: a missing field is left alone, `null` lifts
+/// the limit, a number sets it. Applied all at once or not at all.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SettingsPatchDto {
+    #[serde(default, deserialize_with = "present")]
+    download_rate_limit: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "present")]
+    upload_rate_limit: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "present")]
+    max_connections: Option<Option<usize>>,
+    #[serde(default, deserialize_with = "present")]
+    max_active_downloads: Option<Option<usize>>,
+    #[serde(default, deserialize_with = "present")]
+    max_active_seeds: Option<Option<usize>>,
+}
+
+/// A field that is present: `null` becomes `Some(None)`.
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+impl From<SettingsPatchDto> for SettingsUpdate {
+    fn from(p: SettingsPatchDto) -> Self {
+        let mut u = Self::default();
+        u.download_rate_limit = p.download_rate_limit;
+        u.upload_rate_limit = p.upload_rate_limit;
+        u.max_connections = p.max_connections;
+        u.max_active_downloads = p.max_active_downloads;
+        u.max_active_seeds = p.max_active_seeds;
+        u
     }
 }

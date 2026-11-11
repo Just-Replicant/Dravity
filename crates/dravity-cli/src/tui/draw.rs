@@ -6,16 +6,17 @@ use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap};
 
-use super::view::{Focus, Pane, Prompt, StatsRow, TrackerState, View};
+use super::view::{Direction, Focus, Pane, Prompt, StatsRow, TrackerState, View};
 use crate::format;
 
 /// Alert lines shown under the detail pane.
 pub(crate) const ALERT_LINES: u16 = 4;
 
 /// The full key list `?` shows in place of the footer.
-const HELP: [&str; 6] = [
+const HELP: [&str; 7] = [
     "torrents: a add · 1/2/3 or enter detail · space/p pause or resume · d remove · D remove and delete files",
     "          o sort (added, name, progress, down rate) · / filter by name · tab files pane",
+    "          L / U download / upload limit for all torrents (live; empty lifts it)",
     "detail:   1 files · 2 peers · 3 trackers · tab next pane · esc back · ↑↓/j k move",
     "files:    s skip · l low · n normal · h high   peers: a add a peer (host:port)",
     "peer flags: C we choke them · c they choke us · I we want · i they want · < incoming · U uTP · W web seed · E encrypted",
@@ -117,6 +118,17 @@ pub(crate) fn draw(frame: &mut Frame<'_>, view: &View) {
                     Line::from(question),
                     Line::from("enter confirms · esc cancels"),
                 ],
+            );
+        }
+        Some(Prompt::Limit { direction, text }) => {
+            let title = match direction {
+                Direction::Download => " Download limit, all torrents (e.g. 2M; empty lifts it) ",
+                Direction::Upload => " Upload limit, all torrents (e.g. 500K; empty lifts it) ",
+            };
+            popup(
+                frame,
+                title,
+                vec![Line::from(format!("{text}▏")), message_line(view)],
             );
         }
         Some(Prompt::Filter) | None => {}
@@ -478,6 +490,7 @@ fn keys(view: &View) -> String {
     match (&view.prompt, view.focus, view.pane) {
         (Some(Prompt::Add(_)), ..) => "enter add · esc cancel".to_owned(),
         (Some(Prompt::AddPeer { .. }), ..) => "enter connect · esc cancel".to_owned(),
+        (Some(Prompt::Limit { .. }), ..) => "enter apply · esc cancel".to_owned(),
         (Some(Prompt::Confirm { .. }), ..) => "enter confirm · esc cancel".to_owned(),
         (Some(Prompt::Filter), ..) => {
             format!("filter: {}▏ · enter keep · esc clear", view.filter)
@@ -509,7 +522,9 @@ fn draw_footer(frame: &mut Frame<'_>, view: &View, area: Rect) {
     // A popup shows its own message.
     let in_popup = matches!(
         view.prompt,
-        Some(Prompt::Add(_) | Prompt::AddPeer { .. } | Prompt::Confirm { .. })
+        Some(
+            Prompt::Add(_) | Prompt::AddPeer { .. } | Prompt::Confirm { .. } | Prompt::Limit { .. }
+        )
     );
     let text = if view.message.is_empty() || in_popup {
         keys

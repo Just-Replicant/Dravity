@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, FramedParts};
 
 use crate::codec::PeerCodec;
+use crate::rate::RateLimits;
 use crate::stream::{PeerStream, RawStream};
 use crate::torrent::Input;
 
@@ -46,6 +47,8 @@ pub(crate) struct PeerParams {
     pub(crate) encryption: Policy,
     /// What PEX flags or earlier connections say about the peer.
     pub(crate) hints: DialHints,
+    /// The session-wide rate limits.
+    pub(crate) rates: RateLimits,
 }
 
 /// Why a handshake failed.
@@ -334,22 +337,39 @@ pub(crate) async fn run(
     {
         return;
     }
-    serve(key, addr, stream, leftover, &events, commands).await;
+    serve(
+        key,
+        addr,
+        stream,
+        leftover,
+        &events,
+        commands,
+        &params.rates,
+    )
+    .await;
 }
 
 /// Runs a connection the listener accepted and handshook. The owner
 /// already told the engine about it.
 pub(crate) async fn run_accepted(
-    key: PeerKey,
-    addr: SocketAddr,
+    (key, addr): (PeerKey, SocketAddr),
     stream: PeerStream,
     leftover: BytesMut,
     events: mpsc::Sender<Input>,
     commands: mpsc::Receiver<PeerCommand>,
     slot: ConnectionSlot,
+    rates: RateLimits,
 ) {
     let _slot = slot;
-    serve(key, addr, stream, leftover, &events, commands).await;
+    serve(key, addr, stream, leftover, &events, commands, &rates).await;
+}
+
+/// Payload bytes of a piece message (what the rate limits count).
+fn payload(message: &Message) -> usize {
+    match message {
+        Message::Piece { data, .. } => data.len(),
+        _ => 0,
+    }
 }
 
 /// Moves messages between an established connection and the owner until
@@ -361,6 +381,7 @@ async fn serve<S>(
     leftover: BytesMut,
     events: &mpsc::Sender<Input>,
     mut commands: mpsc::Receiver<PeerCommand>,
+    rates: &RateLimits,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -374,8 +395,13 @@ async fn serve<S>(
         tokio::select! {
             message = framed.next() => match message {
                 Some(Ok(message)) => {
+                    let bytes = payload(&message);
                     if events.send(Input::Message { key, message }).await.is_err() {
                         break "session closed".into();
+                    }
+                    // Holding the next read lets flow control slow the peer.
+                    if bytes > 0 {
+                        rates.down.acquire(bytes).await;
                     }
                 }
                 Some(Err(e)) => break e.to_string(),
@@ -384,10 +410,14 @@ async fn serve<S>(
             command = commands.recv() => match command {
                 Some(PeerCommand::Send(message)) => {
                     // Batch everything already queued into one flush.
+                    rates.up.acquire(payload(&message)).await;
                     let mut result = framed.feed(message).await;
                     while result.is_ok() {
                         match commands.try_recv() {
-                            Ok(PeerCommand::Send(m)) => result = framed.feed(m).await,
+                            Ok(PeerCommand::Send(m)) => {
+                                rates.up.acquire(payload(&m)).await;
+                                result = framed.feed(m).await;
+                            }
                             Err(_) => break,
                         }
                     }
@@ -512,6 +542,7 @@ mod tests {
             prefer_utp: false,
             encryption: Policy::Disabled,
             hints: DialHints::default(),
+            rates: RateLimits::new(None, None),
         };
         tokio::spawn(run(
             params,

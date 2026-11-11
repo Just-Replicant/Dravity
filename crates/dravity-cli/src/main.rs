@@ -219,6 +219,22 @@ struct NetworkArgs {
     /// suffixes (binary), e.g. `500K` or `2M`.
     #[arg(long, value_name = "RATE", value_parser = format::parse_rate)]
     download_limit: Option<u64>,
+    /// Download rate limit for all torrents together, in bytes per second
+    /// (at least 16K); accepts `K`/`M`/`G` suffixes.
+    #[arg(long, value_name = "RATE", value_parser = format::parse_rate)]
+    global_download_limit: Option<u64>,
+    /// Upload rate limit for all torrents together, in bytes per second
+    /// (at least 16K); accepts `K`/`M`/`G` suffixes.
+    #[arg(long, value_name = "RATE", value_parser = format::parse_rate)]
+    global_upload_limit: Option<u64>,
+    /// Run at most this many unfinished torrents at once; the rest wait
+    /// queued and start, oldest first, as slots free up.
+    #[arg(long, value_name = "N")]
+    max_active_downloads: Option<usize>,
+    /// Seed at most this many finished torrents at once; the rest wait
+    /// queued.
+    #[arg(long, value_name = "N")]
+    max_active_seeds: Option<usize>,
     /// Do not use the DHT for peer discovery.
     #[arg(long)]
     no_dht: bool,
@@ -313,6 +329,10 @@ impl NetworkArgs {
             .then(|| std::time::Duration::from_secs(self.scrape_interval.saturating_mul(60)));
         config.durability = self.durability;
         config.engine.download_rate_limit = self.download_limit.filter(|&r| r > 0);
+        config.download_rate_limit = self.global_download_limit.filter(|&r| r > 0);
+        config.upload_rate_limit = self.global_upload_limit.filter(|&r| r > 0);
+        config.max_active_downloads = self.max_active_downloads;
+        config.max_active_seeds = self.max_active_seeds;
         if !self.no_lsd && config.listen.is_some() {
             config.lsd = Some(dravity_session::LsdConfig::default());
         }

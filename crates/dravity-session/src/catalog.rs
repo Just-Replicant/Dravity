@@ -40,6 +40,10 @@ pub(crate) struct Entry {
     /// File priorities as last set (empty: all normal).
     pub(crate) priorities: Vec<Priority>,
     pub(crate) paused: bool,
+    /// Stopped by the queue, waiting for an active slot.
+    pub(crate) queued: bool,
+    /// Last seen complete (seeding), for the queue.
+    pub(crate) complete: bool,
     pub(crate) added_at: u64,
     /// The running task's queue, if one was started.
     pub(crate) commands: Option<mpsc::Sender<Command>>,

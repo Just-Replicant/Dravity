@@ -404,6 +404,13 @@ fn download_preallocated_and_durable() {
         ])
         .args(["--seed-choking", "anti-leech", "--auto-upload-slots"])
         .args(["--scrape-interval", "30", "--no-lsd"])
+        .args([
+            "--global-download-limit",
+            "4M",
+            "--global-upload-limit",
+            "1M",
+        ])
+        .args(["--max-active-downloads", "1", "--max-active-seeds", "1"])
         .output()
         .unwrap();
     assert!(
@@ -412,6 +419,25 @@ fn download_preallocated_and_durable() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(std::fs::read(out_dir.join("hello.bin")).unwrap(), data);
+}
+
+#[test]
+fn rejects_a_global_limit_below_the_minimum() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = content();
+    let (torrent, _) = write_torrent(dir.path(), &data);
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .arg("--output")
+        .arg(dir.path().join("out"))
+        .args(["--no-dht", "--no-port-mapping", "--no-lsd", "--quiet"])
+        .args(["--global-upload-limit", "1K"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("upload_rate_limit"), "{stderr}");
 }
 
 #[test]

@@ -25,6 +25,64 @@ pub struct LiveSettings {
     pub max_active_seeds: Option<usize>,
 }
 
+/// File in the state directory holding the last applied live settings.
+pub(crate) const SETTINGS_FILE: &str = "settings.bencode";
+
+impl LiveSettings {
+    /// Bencodes the settings; an unlimited (`None`) field is left out.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        use std::borrow::Cow;
+        let mut d = dravity_bencode::Dict::new();
+        let mut put = |k: &str, v: Option<u64>| {
+            if let Some(v) = v {
+                d.insert(
+                    Cow::Owned(k.as_bytes().to_vec()),
+                    dravity_bencode::Value::Int(i64::try_from(v).unwrap_or(i64::MAX)),
+                );
+            }
+        };
+        let wide = |v: Option<usize>| v.and_then(|v| u64::try_from(v).ok());
+        put("download_rate_limit", self.download_rate_limit);
+        put("upload_rate_limit", self.upload_rate_limit);
+        put("max_connections", wide(self.max_connections));
+        put("max_active_downloads", wide(self.max_active_downloads));
+        put("max_active_seeds", wide(self.max_active_seeds));
+        put("version", Some(1));
+        dravity_bencode::Value::Dict(d).to_vec()
+    }
+
+    /// Decodes [`encode`](Self::encode)'s output; `None` if it is not a
+    /// version-1 settings dictionary or a value is negative.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let value = dravity_bencode::Value::decode(bytes).ok()?;
+        let d = value.as_dict()?;
+        if d.get(b"version".as_slice())
+            .and_then(dravity_bencode::Value::as_int)
+            != Some(1)
+        {
+            return None;
+        }
+        let get = |k: &str| -> Option<Option<u64>> {
+            match d.get(k.as_bytes()) {
+                None => Some(None),
+                Some(v) => u64::try_from(v.as_int()?).ok().map(Some),
+            }
+        };
+        let narrow = |v: Option<u64>| -> Option<Option<usize>> {
+            v.map_or(Some(None), |v| usize::try_from(v).ok().map(Some))
+        };
+        Some(Self {
+            download_rate_limit: get("download_rate_limit")?,
+            upload_rate_limit: get("upload_rate_limit")?,
+            max_connections: narrow(get("max_connections")?)?,
+            max_active_downloads: narrow(get("max_active_downloads")?)?,
+            max_active_seeds: narrow(get("max_active_seeds")?)?,
+        })
+    }
+}
+
 impl LiveSettings {
     /// Whether the queue limits anything.
     pub(crate) const fn queues(&self) -> bool {
@@ -115,6 +173,23 @@ impl SettingsUpdate {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn live_settings_round_trip_through_bencode() {
+        let mut s = LiveSettings::default();
+        assert_eq!(LiveSettings::decode(&s.encode()), Some(s));
+        s.download_rate_limit = Some(1);
+        s.max_connections = Some(0);
+        s.max_active_seeds = Some(9);
+        assert_eq!(LiveSettings::decode(&s.encode()), Some(s));
+        assert_eq!(LiveSettings::decode(b"d7:versioni2ee"), None);
+        assert_eq!(
+            LiveSettings::decode(b"d15:max_connectionsi-1e7:versioni1ee"),
+            None
+        );
+        assert_eq!(LiveSettings::decode(b"junk"), None);
+    }
+
     use super::*;
 
     #[test]

@@ -912,6 +912,13 @@ impl Session {
         self.inner.rates.up.set_rate(next.upload_rate_limit);
         self.inner.connections.set_max(next.max_connections);
         *live = next;
+        drop(live);
+        if let Some(dir) = &self.inner.config.state_dir {
+            let path = dir.join(settings::SETTINGS_FILE);
+            if let Err(e) = persist::write_atomic(&path, &next.encode()) {
+                tracing::warn!(path = %path.display(), error = %e, "cannot save the live settings");
+            }
+        }
         Ok(next)
     }
 
@@ -1200,6 +1207,23 @@ impl Session {
             restored: Vec::new(),
             failed: loaded.failed,
         };
+        // Live settings changed in an earlier run come back before the
+        // torrents, so queue limits apply to them.
+        if let Some(dir) = &self.inner.config.state_dir {
+            let path = dir.join(settings::SETTINGS_FILE);
+            match std::fs::read(&path) {
+                Ok(bytes) => match LiveSettings::decode(&bytes) {
+                    Some(saved) => {
+                        if let Err(e) = self.apply_settings(SettingsUpdate::from(saved)) {
+                            report.failed.push((path, e.to_string()));
+                        }
+                    }
+                    None => report.failed.push((path, "invalid settings file".into())),
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => report.failed.push((path, e.to_string())),
+            }
+        }
         for (path, record, metainfo) in loaded.torrents {
             let source = match (metainfo, &record.magnet) {
                 (Some(metainfo), _) => EntrySource::Torrent(Arc::new(metainfo)),

@@ -186,3 +186,35 @@ async fn the_queue_runs_one_download_at_a_time() {
     leecher.shutdown().await;
     seed.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_settings_survive_a_restart() {
+    let state = tempfile::tempdir().unwrap();
+    let mut c = config();
+    c.listen = None;
+    c.state_dir = Some(state.path().to_path_buf());
+    let expected = {
+        let s = Session::new(c.clone()).unwrap();
+        let mut update = SettingsUpdate::default();
+        update.download_rate_limit = Some(Some(50_000));
+        update.max_connections = Some(Some(7));
+        update.max_active_downloads = Some(Some(2));
+        let applied = s.apply_settings(update).unwrap();
+        s.shutdown().await;
+        applied
+    };
+    let s = Session::new(c.clone()).unwrap();
+    // Not applied until restore: a fresh session starts from its config.
+    assert_eq!(s.settings().download_rate_limit, None);
+    let report = s.restore().await.unwrap();
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert_eq!(s.settings(), expected);
+    s.shutdown().await;
+
+    // A damaged settings file is reported, not fatal.
+    std::fs::write(state.path().join("settings.bencode"), b"junk").unwrap();
+    let s = Session::new(c).unwrap();
+    let report = s.restore().await.unwrap();
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    s.shutdown().await;
+}

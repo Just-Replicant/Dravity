@@ -151,6 +151,14 @@ pub struct TorrentProgress {
     pub files: Option<Vec<FileProgress>>,
 }
 
+/// Where the session accepts peers after a rebind.
+#[derive(Debug, Clone)]
+pub(crate) struct Relisten {
+    pub(crate) port: Option<u16>,
+    pub(crate) utp: UtpSockets,
+    pub(crate) port_map: Option<tokio::sync::watch::Receiver<dravity_portmap::Status>>,
+}
+
 /// Commands from [`TorrentHandle`](crate::TorrentHandle), streams and the
 /// listener.
 #[derive(Debug)]
@@ -172,6 +180,8 @@ pub(crate) enum Command {
         piece: u32,
         reply: oneshot::Sender<()>,
     },
+    /// The session moved its listener ([`crate::Session::set_listen_port`]).
+    Relisten(Relisten),
     /// A stream's urgent window, replacing its previous one.
     Stream {
         id: u64,
@@ -680,6 +690,13 @@ impl TorrentTask {
     /// event for those that do.
     fn command(&mut self, command: Command) -> Option<Event> {
         match command {
+            Command::Relisten(update) => {
+                self.ctx.listen_port = update.port;
+                self.ctx.utp = update.utp;
+                self.ctx.port_map = update.port_map;
+                self.announce_dht_port();
+                Some(Event::Reannounce)
+            }
             Command::Stats(reply) => {
                 let _ = reply.send(self.phase.stats());
                 None

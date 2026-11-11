@@ -218,3 +218,49 @@ async fn live_settings_survive_a_restart() {
     assert_eq!(report.failed.len(), 1, "{report:?}");
     s.shutdown().await;
 }
+
+#[tokio::test]
+async fn the_listen_port_moves_while_seeding() {
+    let src = tempfile::tempdir().unwrap();
+    let data = content(64 * 1024, 9);
+    let (seeder, old) = seed(src.path(), &[("moved.bin", data.clone())]).await;
+    let new_port = seeder.set_listen_port(0).await.unwrap();
+    assert_ne!(new_port, old.port());
+    assert_eq!(seeder.listen_port(), Some(new_port));
+    // Asking for the port in use is a no-op.
+    assert_eq!(seeder.set_listen_port(new_port).await.unwrap(), new_port);
+    // The old socket is retired (its accept task ends promptly).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while tokio::net::TcpStream::connect(old).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("old port still accepts");
+    // A peer reaches the seed on the new port and downloads.
+    let out = tempfile::tempdir().unwrap();
+    let leecher = Session::new(config()).unwrap();
+    let mut alerts = leecher.subscribe();
+    let m = torrent("moved.bin", &data);
+    let hash = m.info_hash();
+    let new_addr = SocketAddr::from(([127, 0, 0, 1], new_port));
+    leecher
+        .add_torrent(m, AddTorrentOptions::new(out.path()).with_peers([new_addr]))
+        .unwrap();
+    until_finished(&mut alerts, hash).await;
+    assert_eq!(std::fs::read(out.path().join("moved.bin")).unwrap(), data);
+}
+
+#[tokio::test]
+async fn the_listen_port_moves_before_accepting_and_without_a_listener_it_is_refused() {
+    let session = Session::new(config()).unwrap();
+    let before = session.listen_port().unwrap();
+    let after = session.set_listen_port(0).await.unwrap();
+    assert_ne!(before, after);
+    assert_eq!(session.listen_port(), Some(after));
+    let mut c = config();
+    c.listen = None;
+    let quiet = Session::new(c).unwrap();
+    assert!(quiet.set_listen_port(0).await.is_err());
+    assert_eq!(quiet.listen_port(), None);
+}

@@ -282,9 +282,15 @@ struct Inner {
     listener: Mutex<Option<Bound>>,
     /// The [`SessionConfig::network`] listener, until accepting starts.
     net_listener: Mutex<Option<Box<dyn transport::TransportListener>>>,
-    listen_port: Option<u16>,
-    /// uTP sockets, once the listener started.
-    utp: OnceLock<UtpSockets>,
+    /// The port accepting peers now ([`Session::set_listen_port`] moves it).
+    listen_port: Mutex<Option<u16>>,
+    /// uTP sockets, once the listener started (replaced on a rebind).
+    utp: Mutex<UtpSockets>,
+    /// How incoming connections are handled, once accepting started.
+    acceptor: Mutex<Option<Acceptor>>,
+    /// Ends the current listener's accept tasks, LSD and nothing else, so a
+    /// rebind can retire them.
+    listen_stop: Mutex<CancellationToken>,
     /// Router port mapping, once the listener started.
     port_mapper: Mutex<Option<PortMapper>>,
     /// The live settings ([`Session::apply_settings`]).
@@ -446,8 +452,10 @@ impl Session {
                 persist: OnceLock::new(),
                 listener: Mutex::new(listener),
                 net_listener: Mutex::new(net_listener),
-                listen_port,
-                utp: OnceLock::new(),
+                listen_port: Mutex::new(listen_port),
+                utp: Mutex::new(UtpSockets::default()),
+                acceptor: Mutex::new(None),
+                listen_stop: Mutex::new(stop.child_token()),
                 port_mapper: Mutex::new(None),
                 live: Mutex::new(live),
                 rates,
@@ -475,18 +483,174 @@ impl Session {
     /// The TCP port the session accepts peers on, if it listens.
     #[must_use]
     pub fn listen_port(&self) -> Option<u16> {
-        self.inner.listen_port
+        *self
+            .inner
+            .listen_port
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Moves the listener to `port` (0 picks a free one) while the session
+    /// runs, and returns the port now accepting peers.
+    ///
+    /// The new TCP (and uTP) sockets are bound before the old ones are
+    /// retired, so a port that cannot be bound leaves everything as it
+    /// was. Connections already open stay open. Router port mapping and
+    /// LSD restart on the new port, and every running torrent re-announces
+    /// it to its trackers and the DHT. Torrents keep advertising the old
+    /// port in the `p` field of extension handshakes until they restart.
+    /// The new port is not persisted: the configured one applies at the
+    /// next start.
+    ///
+    /// # Errors
+    /// [`SessionError::Listen`] if the session does not listen on sockets
+    /// ([`SessionConfig::listen`] unset, or a custom
+    /// [`SessionConfig::network`]) or the port cannot be bound.
+    pub async fn set_listen_port(&self, port: u16) -> Result<u16, SessionError> {
+        let config = &self.inner.config;
+        let listen = config
+            .listen
+            .as_ref()
+            .filter(|_| config.network.is_none())
+            .ok_or_else(|| {
+                SessionError::Listen(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "the session does not listen on sockets",
+                ))
+            })?;
+        if port != 0 && self.listen_port() == Some(port) {
+            return Ok(port);
+        }
+        let mut wanted = listen.clone();
+        wanted.port = port;
+        let bound = listen::bind(&wanted).map_err(SessionError::Listen)?;
+        let new_port = bound.port;
+        let acceptor = {
+            let mut pending = self
+                .inner
+                .listener
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let acceptor = self
+                .inner
+                .acceptor
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            match acceptor {
+                Some(acceptor) => acceptor,
+                None => {
+                    // Not accepting yet: the first torrent starts these.
+                    *pending = Some(bound);
+                    *self
+                        .inner
+                        .listen_port
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = Some(new_port);
+                    return Ok(new_port);
+                }
+            }
+        };
+        let token = self.inner.stop.child_token();
+        let utp = listen::start(bound, &acceptor, &token).map_err(SessionError::Listen)?;
+        std::mem::replace(
+            &mut *self
+                .inner
+                .listen_stop
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            token.clone(),
+        )
+        .cancel();
+        *self
+            .inner
+            .utp
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = utp.clone();
+        *self
+            .inner
+            .listen_port
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(new_port);
+        let old_mapper = self
+            .inner
+            .port_mapper
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(mapper) = old_mapper {
+            // Removing the old mappings is a courtesy; never hang on a router.
+            let _ = tokio::time::timeout(Duration::from_secs(5), mapper.stop()).await;
+        }
+        let port_map = self.start_side_services(new_port, &token);
+        let mut routes: Vec<mpsc::Sender<Command>> = Vec::new();
+        for route in self
+            .inner
+            .torrents
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+        {
+            if !routes.iter().any(|tx| tx.same_channel(&route.tx)) {
+                routes.push(route.tx.clone());
+            }
+        }
+        for tx in routes {
+            let _ = tx
+                .send(Command::Relisten(torrent::Relisten {
+                    port: Some(new_port),
+                    utp: utp.clone(),
+                    port_map: port_map.clone(),
+                }))
+                .await;
+        }
+        tracing::info!(port = new_port, "listener moved");
+        Ok(new_port)
+    }
+
+    /// Starts router port mapping and LSD for `port`, LSD under `stop`;
+    /// returns a port mapping subscription.
+    fn start_side_services(
+        &self,
+        port: u16,
+        stop: &CancellationToken,
+    ) -> Option<tokio::sync::watch::Receiver<dravity_portmap::Status>> {
+        let config = &self.inner.config;
+        let mut port_map = None;
+        if let Some(mapping) = &config.port_mapping {
+            let mut mappings = vec![Mapping {
+                protocol: dravity_portmap::Protocol::Tcp,
+                port,
+            }];
+            if config.listen.as_ref().is_some_and(|l| l.utp.is_some()) {
+                mappings.push(Mapping {
+                    protocol: dravity_portmap::Protocol::Udp,
+                    port,
+                });
+            }
+            let mapper = PortMapper::start(mapping.clone(), mappings);
+            port_map = Some(mapper.subscribe());
+            *self
+                .inner
+                .port_mapper
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(mapper);
+        }
+        if let Some(lsd) = &config.lsd {
+            lsd::start(lsd, port, Arc::clone(&self.inner.catalog), stop.clone());
+        }
+        port_map
     }
 
     /// Starts accepting on the bound sockets (once; needs the runtime that
     /// `add_torrent` runs in).
     fn start_listening(&self) {
-        let bound = self
+        let mut pending = self
             .inner
             .listener
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+            .unwrap_or_else(PoisonError::into_inner);
+        let bound = pending.take();
         let net_listener = self
             .inner
             .net_listener
@@ -516,40 +680,33 @@ impl Session {
         let Some(bound) = bound else {
             return;
         };
-        match listen::start(bound, &acceptor, &self.inner.stop) {
+        *self
+            .inner
+            .acceptor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(acceptor.clone());
+        drop(pending);
+        let token = self
+            .inner
+            .listen_stop
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        match listen::start(bound, &acceptor, &token) {
             Ok(utp) => {
-                let _ = self.inner.utp.set(utp);
+                *self
+                    .inner
+                    .utp
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = utp;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "cannot accept peers");
                 return;
             }
         }
-        if let (Some(mapping), Some(port)) = (&config.port_mapping, self.inner.listen_port) {
-            let mut mappings = vec![Mapping {
-                protocol: dravity_portmap::Protocol::Tcp,
-                port,
-            }];
-            if config.listen.as_ref().is_some_and(|l| l.utp.is_some()) {
-                mappings.push(Mapping {
-                    protocol: dravity_portmap::Protocol::Udp,
-                    port,
-                });
-            }
-            *self
-                .inner
-                .port_mapper
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) =
-                Some(PortMapper::start(mapping.clone(), mappings));
-        }
-        if let (Some(lsd), Some(port)) = (&config.lsd, self.inner.listen_port) {
-            lsd::start(
-                lsd,
-                port,
-                Arc::clone(&self.inner.catalog),
-                self.inner.stop.clone(),
-            );
+        if let Some(port) = self.listen_port() {
+            self.start_side_services(port, &token);
         }
     }
 
@@ -785,8 +942,13 @@ impl Session {
             config: Arc::clone(&self.inner.config),
             alerts: self.inner.alerts.clone(),
             tracker_key: fastrand::u32(..),
-            listen_port: self.inner.listen_port,
-            utp: self.inner.utp.get().cloned().unwrap_or_default(),
+            listen_port: self.listen_port(),
+            utp: self
+                .inner
+                .utp
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
             catalog: Arc::clone(&self.inner.catalog),
             bans: Arc::clone(&self.inner.bans),
             connections: self.inner.connections.clone(),

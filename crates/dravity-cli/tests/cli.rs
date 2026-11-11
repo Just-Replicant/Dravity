@@ -402,6 +402,8 @@ fn download_preallocated_and_durable() {
             "per-piece",
             "--quiet",
         ])
+        .args(["--seed-choking", "anti-leech", "--auto-upload-slots"])
+        .args(["--scrape-interval", "30"])
         .output()
         .unwrap();
     assert!(

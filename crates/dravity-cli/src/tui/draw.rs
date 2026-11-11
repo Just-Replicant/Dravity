@@ -409,6 +409,24 @@ fn draw_trackers(frame: &mut Frame<'_>, view: &View, area: Rect) {
                 format!("{} — {error}", t.url),
             ),
         };
+        // A scrape fills in counts the announce did not report and adds
+        // the tracker's completed-download count.
+        let (seeds, leech, text) = match t.scrape {
+            Some(s) => (
+                if seeds == "-" {
+                    s.seeders.to_string()
+                } else {
+                    seeds
+                },
+                if leech == "-" {
+                    s.leechers.to_string()
+                } else {
+                    leech
+                },
+                format!("{text} · {} downloaded", s.downloaded),
+            ),
+            None => (seeds, leech, text),
+        };
         Row::new(vec![
             t.tier.to_string(),
             status.to_owned(),
@@ -697,16 +715,23 @@ mod tests {
                     leechers: Some(3),
                     peers: 15,
                 },
+                scrape: None,
             },
             TrackerRow {
                 tier: 0,
                 url: "http://dead/announce".to_owned(),
                 state: TrackerState::Failed("connection refused".to_owned()),
+                scrape: None,
             },
             TrackerRow {
                 tier: 1,
                 url: "udp://later:80".to_owned(),
                 state: TrackerState::Waiting,
+                scrape: Some(dravity_session::ScrapeStats {
+                    seeders: 77,
+                    leechers: 5,
+                    downloaded: 901,
+                }),
             },
         ];
         let screen = render(&v, 120, 30);
@@ -718,6 +743,12 @@ mod tests {
             "{screen}"
         );
         assert!(screen.contains("waiting"), "{screen}");
+        // A scrape fills in counts and the download total.
+        assert!(screen.contains("77"), "{screen}");
+        assert!(
+            screen.contains("udp://later:80 · 901 downloaded"),
+            "{screen}"
+        );
         assert!(screen.contains("tab files"), "{screen}");
     }
 

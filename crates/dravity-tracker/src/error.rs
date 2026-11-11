@@ -43,6 +43,10 @@ pub enum TrackerError {
     #[cfg(feature = "client")]
     #[error("tracker request blocked: {0}")]
     Blocked(#[from] crate::guard::Blocked),
+    /// The tracker does not support scraping (its announce URL does not
+    /// end in `announce…`), or left the torrent out of the answer.
+    #[error("the tracker cannot be scraped for this torrent")]
+    NoScrape,
     /// The host name did not resolve to any address.
     #[error("could not resolve tracker host `{0}`")]
     Resolve(String),

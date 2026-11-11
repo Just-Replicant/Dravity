@@ -23,6 +23,7 @@ sound version, with the difference explained), **open** (not started).
 | 11 | Preallocation and durability modes | done | `feat(storage,session): preallocation and durability modes` | [notes](#11-preallocation-and-durability) |
 | 12 | Seed choking variants and an upload slot tuner | done | `feat(engine): seed choking modes and an upload slot tuner` | [notes](#12-seed-choking-and-slot-tuner) |
 | 13 | Torrent creation (v1/v2/hybrid, BEP 47 pads, auto piece size) and dravity create | done | `feat(core,storage,cli): torrent creation and dravity create` | [notes](#13-torrent-creation) |
+| 14 | Tracker scrape (BEP 48 HTTP, BEP 15 UDP) in TrackerStatus | done | `feat(tracker,session,cli): tracker scrape` | [notes](#14-tracker-scrape) |
 
 ## Design notes
 
@@ -290,3 +291,27 @@ dictionary. A storage test verifies a created directory torrent with
 `--source`, `--no-date` and `--force`. Hashing is single-threaded.
 irontide hashes in parallel; this can come later because the creator
 is sans-IO and its v1 and v2 streams are independent.
+
+### 14. Tracker scrape
+
+The codec is sans-IO. `http::scrape_url` applies BEP 48's convention:
+only a last path segment that starts with `announce` has a scrape URL,
+and the query is kept (passkeys). `parse_scrape_response` reads the
+`files` dictionary keyed by the 20-byte hash. UDP adds action 2, with
+at most 74 hashes per packet and one `(seeders, completed, leechers)`
+triple per hash.
+
+The client's UDP path is now generic over `UdpRequest::{Announce,
+Scrape}`. Scrapes share the endpoint cache, the gate, the connection-id
+TTL and the retry rules with announces. HTTP scrapes go through the same
+SSRF guard, judged on the announce URL. The scrape URL differs only in
+`announce` becoming `scrape` on the same host, so a LAN tracker
+announced at `/announce` can be scraped at `/scrape`.
+
+The session never scrapes unless asked: `TorrentHandle::scrape()` (it
+replies once every tracker has answered) or
+`SessionConfig::scrape_interval`. All trackers are scraped concurrently
+in the background. Results go into `TrackerLog` beside the announce
+outcomes. Tests run in-process trackers: an HTTP scrape, a missing
+torrent, a URL without `announce`, two UDP scrapes on one connection id,
+and session scrapes on demand and on a schedule.

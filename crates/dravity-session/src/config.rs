@@ -115,6 +115,10 @@ pub struct SessionConfig {
     /// When written data is forced to disk. Default: [`Durability::Never`]
     /// (sync on resume save, descriptor eviction and stop only).
     pub durability: Durability,
+    /// Scrape every tracker this often (BEP 48 / BEP 15) and show the
+    /// counts in [`crate::TrackerStatus::scrape`]. `None` (the default)
+    /// scrapes only on [`crate::TorrentHandle::scrape`].
+    pub scrape_interval: Option<Duration>,
     /// Time allowed for the `stopped` announce when a torrent stops.
     pub stop_announce_timeout: Duration,
     /// Broadcast buffer for alerts; slow subscribers miss older alerts.
@@ -173,6 +177,7 @@ impl Default for SessionConfig {
             read_cache: Some(DEFAULT_READ_CACHE),
             preallocate: PreallocateMode::None,
             durability: Durability::Never,
+            scrape_interval: None,
             stop_announce_timeout: Duration::from_secs(5),
             alert_buffer: 1024,
             dht: Some(DhtConfig::default()),

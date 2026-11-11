@@ -58,7 +58,9 @@ use crate::hash_pool::HashPool;
 use crate::listen::{self, Registry, UtpSockets};
 use crate::peer::{self, PeerCommand, PeerParams};
 use crate::persist::Persister;
-use crate::status::{self, PeerStatus, TrackerLog, TrackerOutcome, TrackerStatus, Transport};
+use crate::status::{
+    self, PeerStatus, ScrapeOutcome, TrackerLog, TrackerOutcome, TrackerStatus, Transport,
+};
 use crate::stream::PeerStream;
 use crate::web_seed::{self, WebSeedParams};
 use crate::{EncryptionPolicy, SessionAlert};
@@ -110,6 +112,12 @@ pub(crate) enum Input {
         event: Event,
         outcomes: Vec<(String, TrackerOutcome)>,
     },
+    /// A scrape finished; `reply` waits for the tracker list if a handle
+    /// asked for it.
+    Scraped {
+        outcomes: Vec<(String, ScrapeOutcome)>,
+        reply: Option<oneshot::Sender<Vec<TrackerStatus>>>,
+    },
 }
 
 /// A connection the listener accepted and handshook for this torrent.
@@ -152,6 +160,8 @@ pub(crate) enum Command {
     AddPeers(Vec<SocketAddr>),
     Peers(oneshot::Sender<Vec<PeerStatus>>),
     Trackers(oneshot::Sender<Vec<TrackerStatus>>),
+    /// Scrape every tracker now, then reply with the tracker list.
+    Scrape(oneshot::Sender<Vec<TrackerStatus>>),
     Incoming(Accepted),
     /// One priority per file (already validated against the metadata, or
     /// kept until it arrives).
@@ -367,6 +377,8 @@ pub(crate) struct TorrentTask {
     web_peers: HashSet<PeerKey>,
     /// The last announce outcome per tracker URL.
     tracker_log: TrackerLog,
+    /// When the next scheduled scrape is due.
+    next_scrape: Option<Instant>,
     next_key: u64,
     events_tx: mpsc::Sender<Input>,
     events_rx: mpsc::Receiver<Input>,
@@ -466,6 +478,7 @@ impl TorrentTask {
             web_seeds: Vec::new(),
             web_peers: HashSet::new(),
             tracker_log: TrackerLog::default(),
+            next_scrape: None,
             next_key: 0,
             events_tx,
             events_rx,
@@ -645,13 +658,11 @@ impl TorrentTask {
                 None
             }
             Command::Trackers(reply) => {
-                let tiers = self
-                    .ctx
-                    .trackers
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone();
-                let _ = reply.send(self.tracker_log.list(&tiers));
+                let _ = reply.send(self.tracker_list());
+                None
+            }
+            Command::Scrape(reply) => {
+                self.scrape(Some(reply));
                 None
             }
             Command::Incoming(accepted) => Some(self.accept(accepted)),
@@ -787,6 +798,7 @@ impl TorrentTask {
                 },
                 _ = tick.tick() => {
                     self.maintain_web_seeds();
+                    self.scheduled_scrape();
                     Event::Tick
                 }
                 // Reap finished background work so the set does not grow.
@@ -983,6 +995,13 @@ impl TorrentTask {
             Input::Announced { event, outcomes } => {
                 self.tracker_log.record(Instant::now(), outcomes);
                 event
+            }
+            Input::Scraped { outcomes, reply } => {
+                self.tracker_log.record_scrapes(Instant::now(), outcomes);
+                if let Some(reply) = reply {
+                    let _ = reply.send(self.tracker_list());
+                }
+                return None;
             }
         })
     }
@@ -1658,6 +1677,69 @@ impl TorrentTask {
                 let _ = tx.try_send(Command::BanIp(ip));
             }
         }
+    }
+
+    /// Every tracker with its last announce and scrape.
+    fn tracker_list(&self) -> Vec<TrackerStatus> {
+        let tiers = self
+            .ctx
+            .trackers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        self.tracker_log.list(&tiers)
+    }
+
+    /// Scrapes when [`SessionConfig::scrape_interval`] says one is due.
+    fn scheduled_scrape(&mut self) {
+        let Some(every) = self.ctx.config.scrape_interval else {
+            return;
+        };
+        let now = Instant::now();
+        if self.next_scrape.is_some_and(|at| now < at) {
+            return;
+        }
+        self.next_scrape = Some(now + every);
+        self.scrape(None);
+    }
+
+    /// Scrapes every tracker in the background; the results come back as
+    /// [`Input::Scraped`].
+    fn scrape(&mut self, reply: Option<oneshot::Sender<Vec<TrackerStatus>>>) {
+        let urls: Vec<String> = self
+            .ctx
+            .trackers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
+        let client = self.ctx.tracker.clone();
+        let hash = *self.ctx.info_hash.as_bytes();
+        let tx = self.events_tx.clone();
+        self.background.spawn(async move {
+            let mut set = JoinSet::new();
+            for url in urls {
+                let client = client.clone();
+                set.spawn(async move {
+                    let outcome = match client.scrape(&url, &hash).await {
+                        Ok(stats) => ScrapeOutcome::Ok(stats),
+                        Err(e) => ScrapeOutcome::Failed {
+                            error: e.to_string(),
+                        },
+                    };
+                    (url, outcome)
+                });
+            }
+            let mut outcomes = Vec::new();
+            while let Some(joined) = set.join_next().await {
+                if let Ok(outcome) = joined {
+                    outcomes.push(outcome);
+                }
+            }
+            let _ = tx.send(Input::Scraped { outcomes, reply }).await;
+        });
     }
 
     fn announce_request(

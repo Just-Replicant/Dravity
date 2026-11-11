@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use dravity_core::{InfoHash, PeerId};
 use dravity_tracker::{
-    AnnounceEvent, AnnounceRequest, ClientConfig, CryptoSupport, TrackerClient, TrackerError, udp,
+    AnnounceEvent, AnnounceRequest, ClientConfig, CryptoSupport, ScrapeStats, TrackerClient,
+    TrackerError, udp,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
@@ -402,4 +403,74 @@ async fn ssrf_checks_can_be_disabled() {
         .announce("http://127.0.0.1:9/admin", &request())
         .await;
     assert!(!matches!(r, Err(TrackerError::Blocked(_))), "{r:?}");
+}
+
+#[tokio::test]
+async fn http_scrape() {
+    let (url, task) = http_tracker(
+        "200 OK",
+        b"d5:filesd20:\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11d8:completei7e10:downloadedi90e10:incompletei2eeee",
+    )
+    .await;
+    let stats = client().scrape(&url, &[0x11; 20]).await.unwrap();
+    assert_eq!(
+        stats,
+        ScrapeStats {
+            seeders: 7,
+            leechers: 2,
+            downloaded: 90
+        }
+    );
+    let line = task.await.unwrap();
+    assert!(line.starts_with("GET /scrape?info_hash=%11%11"), "{line}");
+    // Missing from the answer, or a URL without `announce`: no scrape.
+    let (url, _t) = http_tracker("200 OK", b"d5:filesdee").await;
+    assert!(matches!(
+        client().scrape(&url, &[0x11; 20]).await,
+        Err(TrackerError::NoScrape)
+    ));
+    assert!(matches!(
+        client()
+            .scrape("http://127.0.0.1:1/tracker", &[0x11; 20])
+            .await,
+        Err(TrackerError::NoScrape)
+    ));
+}
+
+#[tokio::test]
+async fn udp_scrape_reuses_the_connection() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("udp://{}", server.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        let (n, from) = server.recv_from(&mut buf).await.unwrap();
+        assert_eq!(n, 16);
+        let tid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+        server
+            .send_to(&udp::encode_connect_response(tid, 55), from)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let (n, from) = server.recv_from(&mut buf).await.unwrap();
+            assert_eq!(n, 36, "one hash");
+            assert_eq!(u64::from_be_bytes(buf[..8].try_into().unwrap()), 55);
+            assert_eq!(&buf[16..36], &[0x22; 20]);
+            let tid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+            let stats = [ScrapeStats {
+                seeders: 1,
+                leechers: 2,
+                downloaded: 3,
+            }];
+            server
+                .send_to(&udp::encode_scrape_response(tid, &stats), from)
+                .await
+                .unwrap();
+        }
+    });
+    let c = client();
+    for _ in 0..2 {
+        let stats = c.scrape(&url, &[0x22; 20]).await.unwrap();
+        assert_eq!(stats.downloaded, 3);
+    }
+    task.await.unwrap();
 }

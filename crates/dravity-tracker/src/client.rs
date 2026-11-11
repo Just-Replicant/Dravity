@@ -14,7 +14,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
 
 use crate::error::TrackerError;
-use crate::types::{AnnounceRequest, AnnounceResponse};
+use crate::types::{AnnounceRequest, AnnounceResponse, ScrapeStats};
 use crate::{guard, http, udp};
 
 /// Timeouts and retry policy for [`TrackerClient`].
@@ -86,6 +86,20 @@ pub struct TrackerClient {
     config: ClientConfig,
     endpoints: Arc<Mutex<HashMap<SocketAddr, UdpEndpoint>>>,
     trusted: Arc<TrustedHosts>,
+}
+
+/// A request that needs a UDP connection id.
+#[derive(Debug, Clone, Copy)]
+enum UdpRequest<'a> {
+    Announce(&'a AnnounceRequest),
+    Scrape(&'a [[u8; 20]]),
+}
+
+/// The answer to a [`UdpRequest`].
+#[derive(Debug)]
+enum UdpAnswer {
+    Announce(AnnounceResponse),
+    Scrape(Vec<ScrapeStats>),
 }
 
 /// Most host names remembered as announce origins; the set is cleared when
@@ -228,7 +242,49 @@ impl TrackerClient {
         let parsed = Url::parse(url).map_err(|_| TrackerError::InvalidUrl(url.to_owned()))?;
         match parsed.scheme() {
             "http" | "https" => self.announce_http(url, req).await,
-            "udp" => self.announce_udp(&parsed, req).await,
+            "udp" => match self.udp_request(&parsed, UdpRequest::Announce(req)).await? {
+                UdpAnswer::Announce(response) => Ok(response),
+                UdpAnswer::Scrape(_) => Err(TrackerError::Malformed("unexpected UDP action")),
+            },
+            other => Err(TrackerError::UnsupportedScheme(other.to_owned())),
+        }
+    }
+
+    /// Scrapes the tracker whose announce URL is `url` for `info_hash`
+    /// (BEP 48 over HTTP, BEP 15 over UDP).
+    ///
+    /// # Errors
+    /// [`TrackerError::NoScrape`] for an HTTP tracker whose URL does not
+    /// end in `announce…`, a torrent missing from the answer, and every
+    /// error [`Self::announce`] can return.
+    pub async fn scrape(
+        &self,
+        url: &str,
+        info_hash: &[u8; 20],
+    ) -> Result<ScrapeStats, TrackerError> {
+        let parsed = Url::parse(url).map_err(|_| TrackerError::InvalidUrl(url.to_owned()))?;
+        match parsed.scheme() {
+            "http" | "https" => {
+                let scrape = http::scrape_url(url, &[*info_hash]).ok_or(TrackerError::NoScrape)?;
+                let body = self.get(url, &scrape).await?;
+                http::parse_scrape_response(&body)?
+                    .into_iter()
+                    .find(|(hash, _)| hash == info_hash)
+                    .map(|(_, stats)| stats)
+                    .ok_or(TrackerError::NoScrape)
+            }
+            "udp" => {
+                let hashes = [*info_hash];
+                match self
+                    .udp_request(&parsed, UdpRequest::Scrape(&hashes))
+                    .await?
+                {
+                    UdpAnswer::Scrape(stats) => {
+                        stats.into_iter().next().ok_or(TrackerError::NoScrape)
+                    }
+                    UdpAnswer::Announce(_) => Err(TrackerError::Malformed("unexpected UDP action")),
+                }
+            }
             other => Err(TrackerError::UnsupportedScheme(other.to_owned())),
         }
     }
@@ -239,8 +295,17 @@ impl TrackerClient {
         req: &AnnounceRequest,
     ) -> Result<AnnounceResponse, TrackerError> {
         let url = http::announce_url(base, req);
+        let body = self.get(base, &url).await?;
+        http::parse_announce_response(&body)
+    }
+
+    /// GETs `url` (built from the announce URL `base`) through the SSRF
+    /// guard and returns the body, at most [`http::MAX_RESPONSE_LEN`]. The
+    /// guard judges `base`: a scrape URL differs from its announce URL only
+    /// in `announce` becoming `scrape`, on the same host.
+    async fn get(&self, base: &str, url: &str) -> Result<Vec<u8>, TrackerError> {
         if self.config.ssrf_mitigation {
-            let parsed = Url::parse(&url).map_err(|_| TrackerError::InvalidUrl(base.to_owned()))?;
+            let parsed = Url::parse(base).map_err(|_| TrackerError::InvalidUrl(base.to_owned()))?;
             guard::check_announce(&parsed)?;
             if let Some(url::Host::Domain(name)) = parsed.host() {
                 self.trusted.insert(name);
@@ -260,14 +325,10 @@ impl TrackerClient {
             }
             body.extend_from_slice(&chunk);
         }
-        http::parse_announce_response(&body)
+        Ok(body)
     }
 
-    async fn announce_udp(
-        &self,
-        url: &Url,
-        req: &AnnounceRequest,
-    ) -> Result<AnnounceResponse, TrackerError> {
+    async fn udp_request(&self, url: &Url, req: UdpRequest<'_>) -> Result<UdpAnswer, TrackerError> {
         let host = url
             .host_str()
             .ok_or_else(|| TrackerError::InvalidUrl(url.to_string()))?;
@@ -279,29 +340,29 @@ impl TrackerClient {
             .await?
             .next()
             .ok_or_else(|| TrackerError::Resolve(host.to_owned()))?;
-        match self.announce_udp_at(addr, req).await {
+        match self.udp_request_at(addr, req).await {
             // The socket may be dead (a refused datagram sticks to a connected
             // UDP socket). Drop it and try once more from a new port.
             Err(TrackerError::Io(_)) => {
                 self.drop_endpoint(addr);
-                self.announce_udp_at(addr, req).await
+                self.udp_request_at(addr, req).await
             }
             other => other,
         }
     }
 
-    /// One announce on the socket cached for `addr`, creating that socket if
+    /// One request on the socket cached for `addr`, creating that socket if
     /// needed. The endpoint's gate is held for the whole exchange.
-    async fn announce_udp_at(
+    async fn udp_request_at(
         &self,
         addr: SocketAddr,
-        req: &AnnounceRequest,
-    ) -> Result<AnnounceResponse, TrackerError> {
+        req: UdpRequest<'_>,
+    ) -> Result<UdpAnswer, TrackerError> {
         let (socket, gate) = self.udp_socket(addr).await?;
         let _hold = gate.lock().await;
         if let Some(connection_id) = self.cached_connection(addr) {
             match self
-                .udp_announce_with(&socket, addr, connection_id, req, 0)
+                .udp_request_with(&socket, addr, connection_id, req, 0)
                 .await
             {
                 Err(e @ TrackerError::Io(_)) => return Err(self.fail_socket(addr, e)),
@@ -324,7 +385,7 @@ impl TrackerClient {
         };
         self.remember_connection(addr, connection_id, &socket, &gate);
         match self
-            .udp_announce_with(&socket, addr, connection_id, req, self.config.udp_retries)
+            .udp_request_with(&socket, addr, connection_id, req, self.config.udp_retries)
             .await
         {
             Err(e @ TrackerError::Io(_)) => Err(self.fail_socket(addr, e)),
@@ -385,20 +446,32 @@ impl TrackerClient {
         self.lock_endpoints().remove(&addr);
     }
 
-    async fn udp_announce_with(
+    async fn udp_request_with(
         &self,
         socket: &UdpSocket,
         addr: SocketAddr,
         connection_id: u64,
-        req: &AnnounceRequest,
+        req: UdpRequest<'_>,
         retries: u32,
-    ) -> Result<AnnounceResponse, TrackerError> {
+    ) -> Result<UdpAnswer, TrackerError> {
         let tid = fastrand::u32(..);
-        let packet = udp::announce_request(connection_id, tid, req);
-        self.exchange(socket, &packet, retries, |p| {
-            udp::parse_announce_response(p, tid, addr.is_ipv6())
-        })
-        .await
+        match req {
+            UdpRequest::Announce(req) => {
+                let packet = udp::announce_request(connection_id, tid, req);
+                self.exchange(socket, &packet, retries, |p| {
+                    udp::parse_announce_response(p, tid, addr.is_ipv6()).map(UdpAnswer::Announce)
+                })
+                .await
+            }
+            UdpRequest::Scrape(hashes) => {
+                let packet = udp::scrape_request(connection_id, tid, hashes);
+                let count = hashes.len().min(udp::MAX_SCRAPE_HASHES);
+                self.exchange(socket, &packet, retries, |p| {
+                    udp::parse_scrape_response(p, tid, count).map(UdpAnswer::Scrape)
+                })
+                .await
+            }
+        }
     }
 
     fn lock_endpoints(&self) -> std::sync::MutexGuard<'_, HashMap<SocketAddr, UdpEndpoint>> {

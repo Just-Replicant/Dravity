@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use dravity_core::InfoHash;
 use dravity_engine::{Alert, Priority, Stats, TorrentStatus};
-use dravity_session::{FileProgress, PeerStatus, TrackerOutcome, TrackerStatus, Transport};
+use dravity_session::{
+    FileProgress, PeerStatus, ScrapeOutcome, ScrapeStats, TrackerOutcome, TrackerStatus, Transport,
+};
 
 use crate::format;
 
@@ -235,6 +237,8 @@ pub(crate) struct TrackerRow {
     pub(crate) tier: usize,
     pub(crate) url: String,
     pub(crate) state: TrackerState,
+    /// The last successful scrape.
+    pub(crate) scrape: Option<ScrapeStats>,
 }
 
 impl From<&TrackerStatus> for TrackerRow {
@@ -255,10 +259,15 @@ impl From<&TrackerStatus> for TrackerRow {
             Some(TrackerOutcome::Failed { error }) => TrackerState::Failed(error.clone()),
             Some(_) => TrackerState::Failed("unknown outcome".to_owned()),
         };
+        let scrape = match &t.scrape {
+            Some(ScrapeOutcome::Ok(stats)) => Some(*stats),
+            _ => None,
+        };
         Self {
             tier: t.tier,
             url: t.url.clone(),
             state,
+            scrape,
         }
     }
 }

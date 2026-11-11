@@ -22,4 +22,4 @@ pub mod udp;
 #[cfg(feature = "client")]
 pub use client::{ClientConfig, TrackerClient, UDP_CONNECTION_TTL};
 pub use error::TrackerError;
-pub use types::{AnnounceEvent, AnnounceRequest, AnnounceResponse, CryptoSupport};
+pub use types::{AnnounceEvent, AnnounceRequest, AnnounceResponse, CryptoSupport, ScrapeStats};

@@ -113,12 +113,13 @@ pub use dravity_portmap::{
     Status as PortMapStatus,
 };
 pub use dravity_storage::{Durability, PreallocateMode};
+pub use dravity_tracker::ScrapeStats;
 pub use dravity_webseed::WebSeedConfig;
 pub use error::SessionError;
 pub use file_stream::{DEFAULT_READAHEAD, FileStream};
 pub use files::FileProgress;
 pub use listen::ListenConfig;
-pub use status::{PeerStatus, TrackerOutcome, TrackerStatus, Transport};
+pub use status::{PeerStatus, ScrapeOutcome, TrackerOutcome, TrackerStatus, Transport};
 pub use torrent::TorrentProgress;
 pub use watch::{WatchConfig, WatchHandle};
 
@@ -1262,6 +1263,21 @@ impl TorrentHandle {
         let (tx, rx) = oneshot::channel();
         self.commands
             .send(Command::Trackers(tx))
+            .await
+            .map_err(|_| self.not_running())?;
+        rx.await.map_err(|_| self.not_running())
+    }
+
+    /// Scrapes every tracker of the torrent now (BEP 48 over HTTP, BEP 15
+    /// over UDP) and returns the tracker list with the fresh results in
+    /// [`TrackerStatus::scrape`].
+    ///
+    /// # Errors
+    /// [`SessionError::NotRunning`] once the torrent has stopped.
+    pub async fn scrape(&self) -> Result<Vec<TrackerStatus>, SessionError> {
+        let (tx, rx) = oneshot::channel();
+        self.commands
+            .send(Command::Scrape(tx))
             .await
             .map_err(|_| self.not_running())?;
         rx.await.map_err(|_| self.not_running())

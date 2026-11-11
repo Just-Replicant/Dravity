@@ -113,6 +113,14 @@ Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/ir
   `source`, comments and dates. `dravity_storage::create_torrent` walks a
   file or directory. The new `dravity create` command writes the
   `.torrent` and prints its info hashes.
+- **Tracker scrape (item 14):** `TrackerClient::scrape` covers HTTP (BEP 48:
+  `announce` becomes `scrape`, `http::scrape_url` and
+  `http::parse_scrape_response`) and UDP (BEP 15 action 2:
+  `udp::scrape_request` and `udp::parse_scrape_response`, reusing the
+  cached connection id). The new type is `ScrapeStats`. In the session,
+  `TorrentHandle::scrape()` and `SessionConfig::scrape_interval` (off by
+  default) fill `TrackerStatus::scrape` / `scraped`. The TUI tracker pane
+  shows scraped counts, and the CLI flag is `--scrape-interval MINUTES`.
 
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 

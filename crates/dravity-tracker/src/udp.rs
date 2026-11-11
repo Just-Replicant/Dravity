@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::error::TrackerError;
 use crate::http::{parse_compact_v4, parse_compact_v6};
-use crate::types::{AnnounceRequest, AnnounceResponse};
+use crate::types::{AnnounceRequest, AnnounceResponse, ScrapeStats};
 
 /// Magic constant identifying the protocol in a connect request.
 pub const PROTOCOL_ID: u64 = 0x0417_2710_1980;
@@ -20,7 +20,11 @@ pub const MAX_PACKET_LEN: usize = 30 * 1024;
 
 const ACTION_CONNECT: u32 = 0;
 const ACTION_ANNOUNCE: u32 = 1;
+const ACTION_SCRAPE: u32 = 2;
 const ACTION_ERROR: u32 = 3;
+
+/// Most info hashes in one UDP scrape (BEP 15: about 74 fit a packet).
+pub const MAX_SCRAPE_HASHES: usize = 74;
 
 /// Encodes a 16-byte connect request.
 #[must_use]
@@ -55,6 +59,70 @@ pub fn announce_request(connection_id: u64, transaction_id: u32, req: &AnnounceR
         .unwrap_or(-1);
     out.extend_from_slice(&num_want.to_be_bytes());
     out.extend_from_slice(&req.port.to_be_bytes());
+    out
+}
+
+/// Encodes a scrape request for up to [`MAX_SCRAPE_HASHES`] info hashes
+/// (any beyond are left out).
+#[must_use]
+pub fn scrape_request(
+    connection_id: u64,
+    transaction_id: u32,
+    info_hashes: &[[u8; 20]],
+) -> Vec<u8> {
+    let hashes = info_hashes.get(..MAX_SCRAPE_HASHES).unwrap_or(info_hashes);
+    let mut out = Vec::with_capacity(16 + 20 * hashes.len());
+    out.extend_from_slice(&connection_id.to_be_bytes());
+    out.extend_from_slice(&ACTION_SCRAPE.to_be_bytes());
+    out.extend_from_slice(&transaction_id.to_be_bytes());
+    for hash in hashes {
+        out.extend_from_slice(hash);
+    }
+    out
+}
+
+/// Parses a scrape response: one entry per requested hash, in order.
+///
+/// # Errors
+/// As for [`parse_connect_response`], plus fewer entries than `count`.
+pub fn parse_scrape_response(
+    packet: &[u8],
+    transaction_id: u32,
+    count: usize,
+) -> Result<Vec<ScrapeStats>, TrackerError> {
+    if header(packet, transaction_id)? != ACTION_SCRAPE {
+        return Err(TrackerError::Malformed("unexpected UDP action"));
+    }
+    (0..count)
+        .map(|i| {
+            let at = 8 + 12 * i;
+            match (
+                u32_at(packet, at),
+                u32_at(packet, at + 4),
+                u32_at(packet, at + 8),
+            ) {
+                (Some(seeders), Some(downloaded), Some(leechers)) => Ok(ScrapeStats {
+                    seeders,
+                    leechers,
+                    downloaded,
+                }),
+                _ => Err(TrackerError::Malformed("UDP scrape response too short")),
+            }
+        })
+        .collect()
+}
+
+/// Encodes a scrape response (used by tests and fuzzing).
+#[must_use]
+pub fn encode_scrape_response(transaction_id: u32, stats: &[ScrapeStats]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + 12 * stats.len());
+    out.extend_from_slice(&ACTION_SCRAPE.to_be_bytes());
+    out.extend_from_slice(&transaction_id.to_be_bytes());
+    for s in stats {
+        for word in [s.seeders, s.downloaded, s.leechers] {
+            out.extend_from_slice(&word.to_be_bytes());
+        }
+    }
     out
 }
 
@@ -185,6 +253,30 @@ mod tests {
             key: 7,
             crypto: CryptoSupport::None,
         }
+    }
+
+    #[test]
+    fn scrape_roundtrip() {
+        let req = scrape_request(9, 77, &[[1; 20], [2; 20]]);
+        assert_eq!(req.len(), 16 + 40);
+        assert_eq!(&req[8..12], &2u32.to_be_bytes());
+        let stats = [
+            ScrapeStats {
+                seeders: 5,
+                leechers: 2,
+                downloaded: 100,
+            },
+            ScrapeStats::default(),
+        ];
+        let resp = encode_scrape_response(77, &stats);
+        assert_eq!(parse_scrape_response(&resp, 77, 2).unwrap(), stats);
+        assert!(parse_scrape_response(&resp, 78, 2).is_err());
+        assert!(parse_scrape_response(&resp, 77, 3).is_err());
+        let many = vec![[0u8; 20]; 100];
+        assert_eq!(
+            scrape_request(1, 1, &many).len(),
+            16 + 20 * MAX_SCRAPE_HASHES
+        );
     }
 
     #[test]

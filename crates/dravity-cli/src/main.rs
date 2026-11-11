@@ -206,6 +206,10 @@ struct NetworkArgs {
     /// block (fails early on a full disk).
     #[arg(long, value_name = "MODE", default_value = "none")]
     preallocate: dravity_session::PreallocateMode,
+    /// Scrape trackers every this many minutes and show their counts
+    /// (seeders, leechers, completed downloads); 0 never scrapes.
+    #[arg(long, value_name = "MINUTES", default_value_t = 0)]
+    scrape_interval: u64,
     /// When downloaded data is forced to disk: `never` (only on resume
     /// save and stop), `per-piece` (after each verified piece) or
     /// `on-complete`.
@@ -301,6 +305,8 @@ impl NetworkArgs {
         config.max_connections = (self.max_connections > 0).then_some(self.max_connections);
         config.read_cache = usize::try_from(self.read_cache).ok().filter(|&b| b > 0);
         config.preallocate = self.preallocate;
+        config.scrape_interval = (self.scrape_interval > 0)
+            .then(|| std::time::Duration::from_secs(self.scrape_interval.saturating_mul(60)));
         config.durability = self.durability;
         config.engine.download_rate_limit = self.download_limit.filter(|&r| r > 0);
         if self.no_dht {

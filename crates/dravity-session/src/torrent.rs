@@ -738,10 +738,12 @@ impl TorrentTask {
     /// Runs until the torrent stops, then flushes storage, writes resume
     /// data and acknowledges a pending stop command.
     pub(crate) async fn run(mut self) {
-        if let Some(content) = self.content.clone()
-            && let Some(state) = self.resumed_state(&content, None).await
-        {
-            self.phase = Phase::Download(Box::new(state));
+        if let Some(content) = self.content.clone() {
+            if let Some(state) = self.resumed_state(&content, None).await {
+                self.phase = Phase::Download(Box::new(state));
+            } else if let Phase::Download(state) = &mut self.phase {
+                state.set_absent_pieces(prescan(&content).await);
+            }
         }
         let mut tick = tokio::time::interval(self.ctx.config.tick_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1072,7 +1074,8 @@ impl TorrentTask {
             .with_piece_layers(info_meta.piece_length(), owned_layers(&content.metainfo))
             .with_padded_last_piece(padded_last_piece(info_meta))
             .with_missing_piece_layers(info_meta.piece_length(), missing_layers(&content.metainfo))
-            .with_priorities(&self.piece_priorities(&content)),
+            .with_priorities(&self.piece_priorities(&content))
+            .with_absent_pieces(prescan(&content).await),
         };
         self.content = Some(content);
         self.load_web_seeds();
@@ -1934,6 +1937,26 @@ fn error_chain(e: &dyn std::error::Error) -> String {
         source = inner.source();
     }
     text
+}
+
+/// The pieces a stat of every file shows cannot be on disk, so the start
+/// check need not hash them (empty when the storage has no stamps).
+async fn prescan(content: &Content) -> Vec<u32> {
+    let storage = Arc::clone(&content.storage);
+    let metainfo = Arc::clone(&content.metainfo);
+    let absent = tokio::task::spawn_blocking(move || match storage.stamps() {
+        Ok(Some(stamps)) => dravity_storage::absent_pieces(metainfo.info(), &stamps),
+        _ => Vec::new(),
+    })
+    .await
+    .unwrap_or_default();
+    if !absent.is_empty() {
+        tracing::debug!(
+            pieces = absent.len(),
+            "prescan: skipping pieces that cannot be on disk"
+        );
+    }
+    absent
 }
 
 /// Wraps `storage` in the session's read cache, if there is one.

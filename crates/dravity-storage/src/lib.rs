@@ -31,6 +31,7 @@ mod io;
 mod memory;
 mod open;
 mod pos;
+pub mod prescan;
 pub mod resume;
 #[cfg(all(feature = "uring", target_os = "linux"))]
 mod uring;
@@ -43,6 +44,7 @@ pub use error::StorageError;
 pub use file::{DEFAULT_MAX_OPEN_FILES, FileStorage};
 pub use io::{BlockingIo, FileIo, OpenFile};
 pub use memory::MemoryStorage;
+pub use prescan::absent_pieces;
 pub use resume::{FileStamp, ResumeData, ResumeError, load_resume, remove_resume, save_resume};
 #[cfg(all(feature = "uring", target_os = "linux"))]
 pub use uring::{DEFAULT_URING_ENTRIES, UringIo};

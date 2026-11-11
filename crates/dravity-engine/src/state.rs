@@ -291,6 +291,9 @@ pub struct TorrentState {
     /// known, and those being hashed.
     recheck: VecDeque<u32>,
     rechecking: HashSet<u32>,
+    /// Pieces the driver's prescan found cannot be on disk: the start
+    /// check skips them.
+    absent: Option<Bitfield>,
     /// Needed for the BEP 6 allowed fast set.
     info_hash: Option<InfoHash>,
     choker: Choker,
@@ -355,6 +358,7 @@ impl TorrentState {
             padded_last_piece: false,
             recheck: VecDeque::new(),
             rechecking: HashSet::new(),
+            absent: None,
             info_hash: None,
             choker: Choker::default(),
             bans: HashBans::default(),
@@ -510,6 +514,26 @@ impl TorrentState {
             self.bans.ban(ip);
         }
         self
+    }
+
+    /// Pieces that cannot be on disk (a file is missing or too short, see
+    /// `dravity_storage::absent_pieces`): the start check
+    /// ([`Config::check_existing`]) counts them as missing without hashing.
+    #[must_use]
+    pub fn with_absent_pieces(mut self, pieces: impl IntoIterator<Item = u32>) -> Self {
+        self.set_absent_pieces(pieces);
+        self
+    }
+
+    /// Like [`Self::with_absent_pieces`], on a built state (before
+    /// [`Event::Start`]).
+    pub fn set_absent_pieces(&mut self, pieces: impl IntoIterator<Item = u32>) {
+        let count = self.picker.layout().piece_count();
+        let mut absent = Bitfield::new(count);
+        for piece in pieces.into_iter().filter(|&p| p < count) {
+            absent.set(piece);
+        }
+        self.absent = (absent.count() > 0).then_some(absent);
     }
 
     /// The pieces of each v2 file with a piece layer: `(pieces root, first
@@ -808,7 +832,8 @@ impl TorrentState {
             return;
         };
         while check.outstanding < self.config.check_concurrency.max(1) && check.next < count {
-            if !self.picker.have().get(check.next) {
+            let skip = self.absent.as_ref().is_some_and(|a| a.get(check.next));
+            if !skip && !self.picker.have().get(check.next) {
                 out.push(Effect::HashPiece { piece: check.next });
                 check.outstanding += 1;
             }
@@ -816,6 +841,7 @@ impl TorrentState {
         }
         if check.outstanding == 0 && check.next >= count {
             self.check = None;
+            self.absent = None;
             self.begin_download(now, out);
         }
     }

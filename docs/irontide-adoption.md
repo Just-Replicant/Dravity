@@ -17,6 +17,7 @@ sound version, with the difference explained), **open** (not started).
 | 5 | Sans-IO purity tripwire tests | done | `test: sans-IO purity tripwires` | [notes](#5-purity-tripwires) |
 | 6 | Hash on arrival | done | `perf(core,session): verify pieces as their blocks are written` | [notes](#6-hash-on-arrival) |
 | 7 | Byte-budgeted read cache (Storage middleware) | partial | `feat(storage,session): shared read cache middleware` | [notes](#7-read-cache) |
+| 8 | Verify-before-download prescan | done | `perf(storage,engine,session): prescan files before the start check` | [notes](#8-prescan) |
 
 ## Design notes
 
@@ -151,3 +152,16 @@ hashers (item 6) hold only early blocks, so a shared write pool would add
 copies, not remove them. The read side, which is where seeding gains, is
 fully implemented. Segmented LRU replaces ARC because it gives the same
 scan resistance with simpler and cheaper bookkeeping.
+
+### 8. Prescan
+
+`dravity_storage::absent_pieces(info, stamps)` is a pure function. It
+uses the file stamps that fastresume already collects (one
+`symlink_metadata` per file) and lists every piece that touches bytes
+beyond a file's length on disk. Padding files read as zeros and never
+count. When resume data cannot be used, the session runs the stamps on
+a blocking thread before `Event::Start`. The engine then skips those
+pieces in its `Checking` phase, and they simply stay missing. A
+preallocated (full-length) file gives no information, so its pieces are
+hashed as before. This is always correct, because the prescan only
+removes pieces that could not possibly verify.

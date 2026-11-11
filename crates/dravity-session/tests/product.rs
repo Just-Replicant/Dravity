@@ -503,3 +503,29 @@ async fn seeding_reads_go_through_the_shared_cache() {
     c.read_cache = None;
     assert!(Session::new(c).unwrap().read_cache_stats().is_none());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_download_is_checked_only_where_data_can_be() {
+    let (len_a, len_b) = (100_000, 120_000);
+    let (encoded, content) = make_torrent(len_a, len_b);
+    let dir = tempfile::tempdir().unwrap();
+    // Only a.bin is on disk; b.bin was never created.
+    std::fs::create_dir_all(dir.path().join("payload")).unwrap();
+    std::fs::write(dir.path().join("payload/a.bin"), &content[..len_a]).unwrap();
+    let session = Session::new(config()).unwrap();
+    let mut alerts = session.subscribe();
+    let m = metainfo(&encoded);
+    let hash = m.info_hash();
+    let handle = session
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    until(&mut alerts, hash, |a| {
+        *a == Alert::StateChanged(TorrentStatus::Downloading)
+    })
+    .await;
+    let stats = handle.progress().await.unwrap().stats;
+    // The pieces wholly inside a.bin were hashed and found; the rest were
+    // ruled out by the prescan.
+    assert_eq!(stats.pieces_have as usize, len_a / PIECE_LEN);
+    session.shutdown().await;
+}

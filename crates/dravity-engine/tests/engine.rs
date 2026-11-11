@@ -1725,3 +1725,34 @@ fn a_deferred_dial_waits_without_blame() {
     let fx = h.advance(dravity_engine::DEFERRED_DIAL_RETRY);
     assert_eq!(connects(&fx), [addr(1)]);
 }
+
+#[test]
+fn the_start_check_skips_pieces_the_prescan_ruled_out() {
+    let mut c = config();
+    c.check_existing = true;
+    c.check_concurrency = 4;
+    let mut h = Harness::new(c);
+    h.t.set_absent_pieces([0, 2, 99]);
+    let fx = h.ev(Event::Start);
+    let hashed: Vec<u32> = fx
+        .iter()
+        .filter_map(|e| match e {
+            Effect::HashPiece { piece } => Some(*piece),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hashed, [1], "only the piece that may be on disk is hashed");
+    let fx = h.ev(Event::PieceHashed { piece: 1, ok: true });
+    assert!(fx.contains(&Effect::Alert(Alert::StateChanged(
+        TorrentStatus::Downloading
+    ))));
+    assert_eq!(h.t.stats().pieces_have, 1);
+    // Every piece absent: straight to downloading.
+    let mut c = config();
+    c.check_existing = true;
+    let mut h = Harness::new(c);
+    h.t.set_absent_pieces(0..3);
+    let fx = h.ev(Event::Start);
+    assert!(!fx.iter().any(|e| matches!(e, Effect::HashPiece { .. })));
+    assert_eq!(h.t.status(), TorrentStatus::Downloading);
+}

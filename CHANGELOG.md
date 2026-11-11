@@ -72,6 +72,12 @@ Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/ir
   and invalidate; a read that raced a write is not cached. The session
   wraps the storages it creates (`SessionConfig::read_cache`, default
   64 MiB, `--read-cache`, `Session::read_cache_stats`).
+- **Verify-before-download prescan (item 8):** before the start check,
+  one `stat` per file (`Storage::stamps`) finds pieces that touch a
+  missing or short file (`dravity_storage::absent_pieces`); the engine
+  skips hashing them (`TorrentState::with_absent_pieces` /
+  `set_absent_pieces`). A new or partial download is checked in O(files)
+  plus the pieces that may be present.
 
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 

@@ -130,6 +130,7 @@ Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/ir
   magnets without metadata are never announced. The CLI enables LSD when
   it listens; `--no-lsd` turns it off.
 - **Live settings, session-wide rate limits and queueing** (irontide item 16): `Session::settings`/`apply_settings` change the session-wide download/upload limits (token buckets enforced at the socket in every peer task), the connection cap and the active-download/active-seed queue limits at runtime, all fields or none (`SettingsUpdate`, `SettingsError`, `MIN_RATE_LIMIT` = 16 KiB/s). New torrents beyond the active limits wait `queued` (`TorrentSummary::queued`, HTTP state `queued`) and start oldest first as slots free up. `GET`/`PATCH /api/v1/settings`, CLI `--global-download-limit`, `--global-upload-limit`, `--max-active-downloads`, `--max-active-seeds`, TUI keys `L`/`U`. The per-torrent engine limits are unchanged.
+- **BEP 53 select-only magnets** (irontide item 17): `Magnet::select_only` parses `so=0,2,4-6` (repeatable, at most `MAX_SELECT_RANGES` ranges, malformed lists are `MagnetError::InvalidSelection`), `Magnet::selects_file` checks an index and `to_uri` writes it back. When the metadata of such a magnet arrives, files outside the selection get `Priority::Skip`; explicit `with_file_priorities` still wins.
 
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 

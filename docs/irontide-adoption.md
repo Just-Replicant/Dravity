@@ -27,6 +27,7 @@ sound version, with the difference explained), **open** (not started).
 | 14 | Tracker scrape (BEP 48 HTTP, BEP 15 UDP) in TrackerStatus | done | `feat(tracker,session,cli): tracker scrape` | [notes](#14-tracker-scrape) |
 | 15 | Local Service Discovery (BEP 14), off for private torrents | done | `feat(lsd,session,cli): local service discovery` | [notes](#15-local-service-discovery) |
 | 16 | Live settings, session-wide rate limits and queueing | partial | `feat(session,http,cli): live settings, session rate limits and queueing` | [notes](#16-live-settings-rate-limits-and-queueing) |
+| 17 | BEP 53 select-only magnets (so=) | done | `feat(core,session): BEP 53 select-only magnets` | [notes](#17-bep-53-select-only-magnets) |
 
 ## Design notes
 
@@ -355,3 +356,10 @@ turns LSD on.
 - `queue.rs`: `plan()` is a pure function from the catalog (running, paused, queued, complete, added order) and the limits to keep/start/queue decisions, unit tested on its own. A task (`run`, about once per second, holding only a `Weak<Inner>`) learns completion from each handle's stats, then stops the newest surplus torrents (marked `queued`) and starts the oldest queued ones. Paused and failed torrents take no slot; pausing or resuming clears `queued`. `add_*` queues a new torrent at once when its class is full.
 - **Partial:** irontide also rebinds the listen port live with rollback on failure; Dravity's listen port stays a restart setting because the listeners, port mapping and LSD announces are all bound to it at start. Live settings and the queued flag are not persisted by `dravity serve` (the CLI flags apply at each start).
 - Tests: settings and queue-plan unit tests, `rate.rs` pacing tests, `tests/settings.rs` (all-or-nothing update, a 96 KiB download paced by a 32 KiB/s session limit, one-at-a-time queue then live lift and seed limit), the HTTP `settings_are_read_and_patched_all_at_once`, CLI flag tests and the TUI limit-prompt test.
+
+### 17. BEP 53 select-only magnets
+
+- Parsing lives in `dravity-core/src/magnet.rs`: comma-separated decimal indices and `a-b` ranges (no signs, spaces, empty items or reversed ranges), stored as `RangeInclusive<usize>` so `so=0-18446744073709551615` costs one entry rather than an expansion. More than 1024 ranges are refused so selection checks stay cheap.
+- The session copies the ranges into `MagnetStart`. When the magnet switches to downloading and no priorities were given, `files::selected` turns them into Normal/Skip per file (indices are the torrent's file list, the same ones `dravity info` prints, BEP 47 pads included). If no listed index exists, every file stays Normal rather than skipping the whole torrent.
+- The selection is part of the magnet URI, so a saved session restores it.
+- Tests: parser unit tests (valid lists, every malformed form, the range cap), the proptest round trip now includes `so`, a doc test for `selects_file`, `files::selected` unit test and `a_select_only_magnet_downloads_just_its_files` (a real download fetches only `b.bin`).

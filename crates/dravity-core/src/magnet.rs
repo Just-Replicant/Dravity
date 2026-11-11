@@ -1,6 +1,7 @@
-//! Magnet URI parsing and formatting (BEP 9, plus BEP 52 `btmh`).
+//! Magnet URI parsing and formatting (BEP 9, BEP 52 `btmh`, BEP 53 `so`).
 
 use std::fmt;
+use std::ops::RangeInclusive;
 use std::str::FromStr;
 
 use crate::info_hash::{InfoHash, InfoHashV2};
@@ -27,7 +28,14 @@ pub enum MagnetError {
     /// `xl` is not a non-negative integer.
     #[error("invalid exact length {0:?}")]
     InvalidLength(String),
+    /// `so` is not a list of file indices and ranges (`0,2,4-6`).
+    #[error("invalid file selection {0:?}")]
+    InvalidSelection(String),
 }
+
+/// The most ranges a `so` parameter may hold (each costs a few bytes, so
+/// a hostile link cannot make selection checks slow).
+pub const MAX_SELECT_RANGES: usize = 1024;
 
 /// A parsed magnet link.
 ///
@@ -59,6 +67,9 @@ pub struct Magnet {
     pub web_seeds: Vec<String>,
     /// Exact content length in bytes (`xl`).
     pub exact_length: Option<u64>,
+    /// BEP 53 select-only (`so`): the file indices to download, as
+    /// inclusive ranges in link order. Empty means every file.
+    pub select_only: Vec<RangeInclusive<usize>>,
 }
 
 impl Magnet {
@@ -104,6 +115,13 @@ impl Magnet {
                     let v = decode(raw, false, param)?;
                     m.exact_length = Some(v.parse().map_err(|_| MagnetError::InvalidLength(v))?);
                 }
+                "so" => {
+                    let v = decode(raw, false, param)?;
+                    m.select_only.extend(parse_selection(&v)?);
+                    if m.select_only.len() > MAX_SELECT_RANGES {
+                        return Err(MagnetError::InvalidSelection(v));
+                    }
+                }
                 _ => {}
             }
         }
@@ -146,6 +164,22 @@ impl Magnet {
             .or_else(|| self.info_hash_v2.map(|h| h.truncated()))
     }
 
+    /// Whether file `index` is to be downloaded: every file when the link
+    /// has no `so`, otherwise only the listed ones (BEP 53).
+    ///
+    /// ```
+    /// use dravity_core::Magnet;
+    ///
+    /// let m: Magnet = format!("magnet:?xt=urn:btih:{}&so=0,2-3", "ab".repeat(20))
+    ///     .parse()
+    ///     .unwrap();
+    /// assert!(m.selects_file(0) && !m.selects_file(1) && m.selects_file(3));
+    /// ```
+    #[must_use]
+    pub fn selects_file(&self, index: usize) -> bool {
+        self.select_only.is_empty() || self.select_only.iter().any(|r| r.contains(&index))
+    }
+
     /// Formats the magnet as a URI.
     #[must_use]
     pub fn to_uri(&self) -> String {
@@ -165,6 +199,20 @@ impl Magnet {
         parts.extend(self.trackers.iter().map(|t| format!("tr={}", encode(t))));
         parts.extend(self.web_seeds.iter().map(|w| format!("ws={}", encode(w))));
         parts.extend(self.peers.iter().map(|p| format!("x.pe={}", encode(p))));
+        if !self.select_only.is_empty() {
+            let ranges: Vec<String> = self
+                .select_only
+                .iter()
+                .map(|r| {
+                    if r.start() == r.end() {
+                        r.start().to_string()
+                    } else {
+                        format!("{}-{}", r.start(), r.end())
+                    }
+                })
+                .collect();
+            parts.push(format!("so={}", ranges.join(",")));
+        }
         format!("magnet:?{}", parts.join("&"))
     }
 }
@@ -191,6 +239,29 @@ fn set_once<T: PartialEq>(slot: &mut Option<T>, v: T) -> Result<(), MagnetError>
             Ok(())
         }
     }
+}
+
+/// Parses a BEP 53 `so` value: comma-separated indices and `a-b` ranges.
+fn parse_selection(v: &str) -> Result<Vec<RangeInclusive<usize>>, MagnetError> {
+    let bad = || MagnetError::InvalidSelection(v.to_owned());
+    let index = |s: &str| -> Result<usize, MagnetError> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad());
+        }
+        s.parse().map_err(|_| bad())
+    };
+    v.split(',')
+        .map(|item| match item.split_once('-') {
+            Some((a, b)) => {
+                let (a, b) = (index(a)?, index(b)?);
+                if a > b {
+                    return Err(bad());
+                }
+                Ok(a..=b)
+            }
+            None => index(item).map(|i| i..=i),
+        })
+        .collect()
 }
 
 fn push_unique(list: &mut Vec<String>, v: String) {
@@ -270,6 +341,47 @@ mod tests {
     }
 
     #[test]
+    fn select_only_bep53() {
+        let m = Magnet::parse(&format!("magnet:?xt=urn:btih:{HEX}&so=0,2,4-6&so=9")).unwrap();
+        assert_eq!(m.select_only, [0..=0, 2..=2, 4..=6, 9..=9]);
+        let selected: Vec<usize> = (0..11).filter(|&i| m.selects_file(i)).collect();
+        assert_eq!(selected, [0, 2, 4, 5, 6, 9]);
+        assert!(m.to_uri().ends_with("&so=0,2,4-6,9"), "{}", m.to_uri());
+        assert_eq!(Magnet::parse(&m.to_uri()).unwrap(), m);
+        // No `so`: every file.
+        assert!(
+            Magnet::parse(&format!("magnet:?xt=urn:btih:{HEX}"))
+                .unwrap()
+                .selects_file(7)
+        );
+        for bad in [
+            "",
+            "a",
+            "1-",
+            "-2",
+            "3-1",
+            "1,,2",
+            "1 2",
+            "+1",
+            "99999999999999999999999",
+        ] {
+            assert!(
+                matches!(
+                    Magnet::parse(&format!("magnet:?xt=urn:btih:{HEX}&so={bad}")),
+                    Err(MagnetError::InvalidSelection(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        let many = (0..=MAX_SELECT_RANGES)
+            .map(|i| (i * 2).to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            Magnet::parse(&format!("magnet:?xt=urn:btih:{HEX}&so={}", many.join(","))).is_err()
+        );
+    }
+
+    #[test]
     fn base32_and_v2() {
         let m = Magnet::parse("magnet:?xt=urn:btih:AAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQT").unwrap();
         assert_eq!(m.info_hash.unwrap().as_bytes()[1], 1);
@@ -323,6 +435,7 @@ mod tests {
             dn in proptest::option::of(arb_text()),
             trackers in proptest::collection::vec(arb_text(), 0..4),
             xl in proptest::option::of(any::<u64>()),
+            so in proptest::collection::vec((0usize..1000, 0usize..5), 0..5),
         ) {
             let mut m = Magnet::new(InfoHash::new(hash));
             m.display_name = dn;
@@ -330,6 +443,7 @@ mod tests {
                 push_unique(&mut m.trackers, t);
             }
             m.exact_length = xl;
+            m.select_only = so.into_iter().map(|(a, n)| a..=a + n).collect();
             prop_assert_eq!(Magnet::parse(&m.to_uri()).unwrap(), m);
         }
 

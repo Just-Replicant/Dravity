@@ -30,7 +30,7 @@ pub mod verify;
 
 pub use info_hash::{InfoHash, InfoHashV2, ParseHashError, PeerId};
 pub use layout::{BLOCK_SIZE, BlockRef, PieceLayout};
-pub use magnet::{Magnet, MagnetError};
+pub use magnet::{MAX_SELECT_RANGES, Magnet, MagnetError};
 pub use metainfo::{FileEntry, Info, Metainfo, MetainfoError};
 pub use path::{PathError, SafePath};
 pub use v2::MetaVersion;

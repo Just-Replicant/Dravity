@@ -320,6 +320,9 @@ pub(crate) struct MagnetStart {
     pub(crate) info_hash_v2: Option<InfoHashV2>,
     /// Web seeds from the link (`ws`), added to the torrent's.
     pub(crate) web_seeds: Vec<String>,
+    /// BEP 53 `so`: the files the link selects (empty: all). Used only
+    /// when no file priorities were given.
+    pub(crate) select_only: Vec<std::ops::RangeInclusive<usize>>,
 }
 
 /// The engine state machine currently driving the torrent.
@@ -1077,6 +1080,9 @@ impl TorrentTask {
             ),
             Err(e) => return self.fail(format!("setting up storage: {e}")),
         };
+        if self.file_priorities.is_empty() {
+            self.file_priorities = files::selected(metainfo.info(), &start.select_only);
+        }
         self.file_priorities = files::normalize(metainfo.info(), &self.file_priorities)
             .unwrap_or_else(|| {
                 tracing::warn!("file priorities do not match the metadata; using normal");

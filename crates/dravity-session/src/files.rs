@@ -6,6 +6,7 @@
 //! it). BEP 47 padding files never count.
 
 use std::io;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use dravity_core::Info;
@@ -38,6 +39,24 @@ pub(crate) fn normalize(info: &Info, priorities: &[Priority]) -> Option<Vec<Prio
         return Some(vec![Priority::Normal; count]);
     }
     (priorities.len() == count).then(|| priorities.to_vec())
+}
+
+/// File priorities for a BEP 53 selection: [`Priority::Normal`] for the
+/// selected files, [`Priority::Skip`] for the rest. Empty (every file)
+/// when nothing is selected or no listed index exists, so a bad link
+/// never skips the whole torrent.
+pub(crate) fn selected(info: &Info, ranges: &[RangeInclusive<usize>]) -> Vec<Priority> {
+    let count = info.files().len();
+    let picked: Vec<bool> = (0..count)
+        .map(|i| ranges.iter().any(|r| r.contains(&i)))
+        .collect();
+    if !picked.contains(&true) {
+        return Vec::new();
+    }
+    picked
+        .into_iter()
+        .map(|on| if on { Priority::Normal } else { Priority::Skip })
+        .collect()
 }
 
 /// Piece priorities from file priorities (one per file): the highest
@@ -161,7 +180,7 @@ mod tests {
     use dravity_core::Metainfo;
     use dravity_engine::{Bitfield, Priority};
 
-    use super::{delete_content, normalize, piece_priorities, pieces_for, progress};
+    use super::{delete_content, normalize, piece_priorities, pieces_for, progress, selected};
 
     fn torrent(files: &[(u64, bool)], piece_len: u64) -> Metainfo {
         let b = |s: &[u8]| Value::Bytes(Cow::Owned(s.to_vec()));
@@ -198,6 +217,18 @@ mod tests {
         let mut top = Dict::new();
         top.insert(key("info"), Value::Dict(info));
         Metainfo::from_bytes(&Value::Dict(top).to_vec()).unwrap()
+    }
+
+    #[test]
+    fn a_bep53_selection_skips_the_other_files() {
+        let m = torrent(&[(10, false), (10, false), (10, false)], 16);
+        assert_eq!(
+            selected(m.info(), &[0..=0, 2..=7]),
+            [Priority::Normal, Priority::Skip, Priority::Normal]
+        );
+        // Nothing listed exists: every file, never an all-skip torrent.
+        assert!(selected(m.info(), &[5..=6, 8..=9]).is_empty());
+        assert!(selected(m.info(), &[]).is_empty());
     }
 
     #[test]

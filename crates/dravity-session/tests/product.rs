@@ -562,3 +562,35 @@ async fn preallocated_durable_downloads_complete() {
     }
     seed.session.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_select_only_magnet_downloads_just_its_files() {
+    let (len_a, len_b) = (100_000, 120_000);
+    let (encoded, content) = make_torrent(len_a, len_b);
+    let seed = seed(&encoded, &content, len_a).await;
+    let hash = metainfo(&encoded).info_hash();
+    let dir = tempfile::tempdir().unwrap();
+    let leecher = Session::new(config()).unwrap();
+    let mut alerts = leecher.subscribe();
+    let magnet = Magnet::parse(&format!("magnet:?xt=urn:btih:{hash}&so=1")).unwrap();
+    let handle = leecher
+        .add_magnet(
+            &magnet,
+            AddTorrentOptions::new(dir.path()).with_peers([seed.addr]),
+        )
+        .unwrap();
+    until_finished(&mut alerts, hash).await;
+    assert_eq!(
+        std::fs::read(dir.path().join("payload/b.bin")).unwrap(),
+        &content[len_a..]
+    );
+    let files = handle.progress().await.unwrap().files.unwrap();
+    assert_eq!(files[0].priority, Priority::Skip);
+    assert!(files[0].have < PIECE_LEN as u64, "{files:?}");
+    assert_eq!(
+        leecher.list()[0].file_priorities,
+        vec![Priority::Skip, Priority::Normal]
+    );
+    leecher.shutdown().await;
+    seed.session.shutdown().await;
+}

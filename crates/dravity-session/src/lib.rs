@@ -709,6 +709,7 @@ impl Session {
                     v1: magnet.info_hash.is_some(),
                     info_hash_v2: magnet.info_hash_v2,
                     web_seeds: magnet.web_seeds.clone(),
+                    select_only: magnet.select_only.clone(),
                 });
                 (source, trackers, peers)
             }

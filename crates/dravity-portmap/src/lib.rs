@@ -1,8 +1,10 @@
-//! Router port mapping for Dravity: NAT-PMP (RFC 6886) and UPnP IGD.
+//! Router port mapping for Dravity: PCP (RFC 6887), NAT-PMP (RFC 6886)
+//! and UPnP IGD.
 //!
 //! Peers can only connect to us if the home router forwards our listening
-//! port. [`PortMapper`] asks the router to do so, NAT-PMP first (one UDP
-//! round trip to the default gateway) and UPnP IGD second, renews the
+//! port. [`PortMapper`] asks the router to do so, PCP first, then NAT-PMP
+//! (both one UDP round trip to the default gateway's port 5351) and UPnP
+//! IGD last, renews the
 //! mappings at half their lifetime and removes them when stopped. The
 //! external port is requested to equal the listen port. When NAT-PMP
 //! returns a different one, [`Status::external_port`] reports it, so the
@@ -10,12 +12,13 @@
 //! carrier-grade NAT) and only reported in [`Status`]; outgoing
 //! connections work regardless.
 //!
-//! The protocol modules ([`natpmp`], [`upnp`]) are sans-IO and fuzzed; the
+//! The protocol modules ([`pcp`], [`natpmp`], [`upnp`]) are sans-IO; the
 //! mapper task does the networking.
 
 mod gateway;
 mod http;
 pub mod natpmp;
+pub mod pcp;
 pub mod upnp;
 
 use std::io;
@@ -32,12 +35,15 @@ pub use gateway::{
 };
 pub use http::Url;
 pub use natpmp::{NatPmpError, Protocol};
+pub use pcp::PcpError;
 pub use upnp::UpnpError;
 
 /// Port mapping settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PortMapConfig {
+    /// Try PCP (before NAT-PMP, on the same gateway port).
+    pub pcp: bool,
     /// Try NAT-PMP.
     pub natpmp: bool,
     /// Try UPnP IGD.
@@ -59,6 +65,7 @@ pub struct PortMapConfig {
 impl Default for PortMapConfig {
     fn default() -> Self {
         Self {
+            pcp: true,
             natpmp: true,
             upnp: true,
             gateway: None,
@@ -83,6 +90,8 @@ pub struct Mapping {
 /// How mappings were made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
+    /// PCP.
+    Pcp,
     /// NAT-PMP.
     NatPmp,
     /// UPnP IGD.
@@ -132,6 +141,9 @@ pub enum PortMapError {
     /// NAT-PMP gateway error.
     #[error(transparent)]
     NatPmp(#[from] NatPmpError),
+    /// PCP gateway error.
+    #[error(transparent)]
+    Pcp(#[from] PcpError),
     /// UPnP device error.
     #[error(transparent)]
     Upnp(#[from] UpnpError),
@@ -193,6 +205,9 @@ impl Drop for PortMapper {
 /// Mappings made by one method, for renewing and removing.
 #[derive(Debug)]
 enum Active {
+    /// The server and the request each mapping was made with (renewals
+    /// and the delete reuse its nonce).
+    Pcp(SocketAddrV4, Vec<pcp::MapRequest>),
     NatPmp(SocketAddrV4),
     Upnp(upnp::Service),
 }
@@ -239,6 +254,15 @@ async fn map_all(
     mappings: &[Mapping],
 ) -> Result<(Active, Status), PortMapError> {
     let mut last = PortMapError::NoGateway;
+    if config.pcp {
+        match map_pcp(config, mappings).await {
+            Ok(ok) => return Ok(ok),
+            Err(e) => {
+                tracing::debug!(error = %e, "PCP failed; trying NAT-PMP");
+                last = e;
+            }
+        }
+    }
     if config.natpmp {
         match map_natpmp(config, mappings).await {
             Ok(ok) => return Ok(ok),
@@ -282,6 +306,87 @@ async fn natpmp_exchange(
         }
     }
     Err(io::Error::from(io::ErrorKind::TimedOut).into())
+}
+
+/// One PCP exchange with retransmissions (RFC 6887 §8.1.1, cut short like
+/// NAT-PMP's).
+async fn pcp_exchange(
+    server: SocketAddrV4,
+    request: &pcp::MapRequest,
+) -> Result<pcp::MapResponse, PortMapError> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+    socket.connect(server).await?;
+    let bytes = request.encode();
+    let mut buf = [0u8; 1100];
+    for delay in natpmp::RETRIES {
+        socket.send(&bytes).await?;
+        let deadline = tokio::time::Instant::now() + delay;
+        while let Ok(received) = tokio::time::timeout_at(deadline, socket.recv(&mut buf)).await {
+            let n = received?;
+            let response = pcp::decode(buf.get(..n).unwrap_or_default())?;
+            if response.answers(request) {
+                return Ok(response);
+            }
+        }
+    }
+    Err(io::Error::from(io::ErrorKind::TimedOut).into())
+}
+
+/// A fresh 12-byte nonce. Not cryptographic: it only has to differ
+/// between mappings and be hard to guess off-path (RFC 6887 §11.1).
+fn nonce() -> [u8; 12] {
+    use std::hash::{BuildHasher, Hasher};
+    let mut out = [0u8; 12];
+    for chunk in out.chunks_mut(8) {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        );
+        let bytes = h.finish().to_le_bytes();
+        let n = chunk.len();
+        chunk.copy_from_slice(bytes.get(..n).unwrap_or_default());
+    }
+    out
+}
+
+async fn map_pcp(
+    config: &PortMapConfig,
+    mappings: &[Mapping],
+) -> Result<(Active, Status), PortMapError> {
+    let server = natpmp_server(config)?;
+    let client = upnp::local_addr_towards(std::net::SocketAddr::V4(server))?;
+    let lifetime = u32::try_from(config.lifetime.as_secs()).unwrap_or(u32::MAX);
+    let mut status = Status {
+        method: Some(Method::Pcp),
+        ..Status::default()
+    };
+    let mut requests = Vec::new();
+    for mapping in mappings {
+        let request = pcp::MapRequest {
+            nonce: nonce(),
+            protocol: mapping.protocol,
+            internal_port: mapping.port,
+            external_port: mapping.port,
+            external_ip: pcp::any_external(client),
+            client_ip: client,
+            lifetime,
+        };
+        let response = pcp_exchange(server, &request).await?;
+        if let std::net::IpAddr::V4(ip) = response.external_ip
+            && !ip.is_unspecified()
+        {
+            status.external_ip = Some(ip);
+        }
+        status.mapped.push(Mapped {
+            mapping: *mapping,
+            external_port: response.external_port,
+        });
+        requests.push(request);
+    }
+    tracing::info!(?status, "ports mapped with PCP");
+    Ok((Active::Pcp(server, requests), status))
 }
 
 async fn map_natpmp(
@@ -423,6 +528,20 @@ async fn map_upnp(
 async fn unmap_all(config: &PortMapConfig, mappings: &[Mapping], active: &Active) {
     for mapping in mappings {
         let result = match active {
+            Active::Pcp(server, requests) => {
+                let Some(request) = requests
+                    .iter()
+                    .find(|r| r.protocol == mapping.protocol && r.internal_port == mapping.port)
+                else {
+                    continue;
+                };
+                let delete = pcp::MapRequest {
+                    lifetime: 0,
+                    external_port: 0,
+                    ..*request
+                };
+                pcp_exchange(*server, &delete).await.map(drop)
+            }
             Active::NatPmp(server) => {
                 let request = natpmp::Request::Map {
                     protocol: mapping.protocol,

@@ -65,6 +65,7 @@ impl From<&PortMapStatus> for PortMappingDto {
     fn from(status: &PortMapStatus) -> Self {
         Self {
             method: status.method.map(|m| match m {
+                PortMapMethod::Pcp => "pcp",
                 PortMapMethod::NatPmp => "nat-pmp",
                 PortMapMethod::Upnp => "upnp",
             }),

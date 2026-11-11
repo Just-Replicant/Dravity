@@ -31,6 +31,7 @@ sound version, with the difference explained), **open** (not started).
 | 18 | Wire extensions: upload_only, lt_donthave, super-seeding, lt_tex | done | `feat(wire,engine,session,cli): upload_only, lt_donthave, super-seeding and tracker exchange` | [notes](#18-wire-extensions) |
 | 19 | BEP 40 canonical peer priority | done | `feat(core,engine): BEP 40 canonical peer priority at the connection cap` | [notes](#19-bep-40-peer-priority) |
 | 20 | IP filter (eMule .dat, P2P, CIDR) and --ip-filter | done | `feat(session,cli): IP filter lists` | [notes](#20-ip-filter) |
+| 21 | PCP (RFC 6887) before NAT-PMP and UPnP | partial | `feat(portmap): PCP port mapping` | [notes](#21-pcp) |
 
 ## Design notes
 
@@ -388,3 +389,10 @@ turns LSD on.
 - The filter lives in the session's `BanList` next to the ban set, so the listener's existing pre-handshake check covers it with no new path. Dials check it in `TorrentTask::connect` and report `PeerConnectFailed { retry: false }`, so PEX, DHT, LSD and tracker peers in a blocked range are dropped from the pool. `set_ip_filter` swaps an `Arc` and sends every torrent `Command::Refilter`, which closes connections (including during a magnet's metadata phase) the new filter blocks. Trackers and web seeds are not filtered (they are URLs, guarded by the SSRF checks).
 - Port filtering from irontide is not added: blocklists in the wild are address-only, and the session already refuses port 0.
 - Tests: three parser unit tests (eMule levels, P2P, CIDR, IPv6, merging, malformed lines, reversed and mixed bounds, `0.0.0.0/0`), a doc test, `tests/ip_filter.rs` (a filtered peer is never dialed until the filter changes; the listener refuses filtered addresses; a live change closes an open connection) and a CLI test (unreadable file is an error; a loopback eMule range keeps the download from finishing).
+
+### 21. PCP
+
+- `pcp.rs` is a self-written codec of the 60-byte MAP request/response (24-byte header plus 36-byte MAP body). Responses must be version 2 with opcode `0x81` and result 0; version 0 means a NAT-PMP-only gateway (`PcpError::NatPmpOnly`), other result codes are reported with RFC 6887 names. A response must carry the request's nonce, protocol and port to count. The module is in the crate's purity tripwire.
+- Mapper: `map_pcp` learns our address towards the gateway, sends one MAP per mapping with its own nonce (12 bytes from `RandomState` and the clock: unique and not guessable off-path, which is all RFC 6887 §11.1 asks), records the assigned port and public IPv4 address, and keeps the requests in `Active::Pcp` so renewals happen through the normal remap cycle and the delete on stop reuses the nonce with lifetime 0. Retransmissions follow the NAT-PMP schedule. Any PCP failure falls back to NAT-PMP, so old routers behave as before.
+- **Partial:** irontide also requests IPv6 pinholes. The codec handles IPv6 client and external addresses, but the mapper only knows an IPv4 default gateway (`default_gateway`), and IPv6 needs no address translation, only a firewall pinhole on routers that block inbound; adding IPv6 gateway discovery is left for later.
+- Tests: codec unit tests (layout, success, IPv6 external address, refusal, NAT-PMP-only, malformed and truncated input), a doc test, and mapper tests against a fake PCP gateway (map, report, delete with the same nonce, one nonce per mapping) and against a NAT-PMP-only gateway (PCP tried first, NAT-PMP used).

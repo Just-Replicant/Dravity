@@ -62,7 +62,10 @@ fn the_checker_sees_io() {
 }
 
 /// The sans-IO modules: protocol state machines and codecs.
-const MODULES: &[(&str, &str)] = &[("natpmp.rs", include_str!("../src/natpmp.rs"))];
+const MODULES: &[(&str, &str)] = &[
+    ("natpmp.rs", include_str!("../src/natpmp.rs")),
+    ("pcp.rs", include_str!("../src/pcp.rs")),
+];
 
 #[test]
 fn sans_io_modules_stay_pure() {

@@ -41,6 +41,7 @@ sound version, with the difference explained), **open** (not started).
 | 28 | Pluggable network transport (Network, TransportListener, MemoryNetwork) | done | `feat(session): pluggable peer transport with an in-memory network` | [notes](#28-pluggable-network-transport) |
 | 29 | Settings single source of truth and docs/configuration.md | done | `feat(engine,session,http,cli): settings registry with a compile-time lock and generated configuration reference` | [notes](#29-settings-single-source-of-truth) |
 | 30 | Facade crate dravity (prelude, ClientBuilder, one Error) | done | `feat(dravity): facade crate with prelude, ClientBuilder and one Error` | [notes](#30-facade-crate) |
+| 31 | BEP coverage table | done | `docs: BEP coverage table with a drift test` | [notes](#31-bep-coverage-table) |
 
 ## Design notes
 
@@ -474,3 +475,9 @@ turns LSD on.
 - `Error` is `#[non_exhaustive]` and wraps `SessionError`, `MetainfoError`, `MagnetError` and `ProxyError`, plus `Io { path, source }` for unreadable `.torrent` files. All are `#[from]`, so `?` works across them.
 - Tests: a compiled doc example, and `tests/facade.rs`, where two clients built only through the facade share a torrent over the in-memory network from item 28 and each error variant is produced through the one type.
 - The binary stays in `dravity-cli` (binary name `dravity`). The library crate is `dravity`, and cargo keeps the two artifacts apart.
+
+### 31. BEP coverage table
+
+- The table was built by listing every `BEP n` citation in the source (BEPs 3–55) and checking each against the implementation. Partial rows name their gap: BEP 19 is HTTP only, BEP 32 and 42 exist in the native codec but not in the `mainline` runtime, and BEP 5 runs through `mainline`.
+- BEP 28 (tracker exchange, `lt_tex`) gets its own row, although the code calls it `lt_tex`. The not-supported list covers BEPs other clients often claim (17, 24, 33, 41, 43, 44, 51), so their absence is a stated decision rather than an oversight.
+- Drift test: `crates/dravity/tests/bep_coverage.rs` walks `crates/**/*.rs`, collects `BEP n` / `BEPn` citations, and requires a row for each. A new feature that cites a BEP must therefore update the doc. The test also checks its own citation parser.

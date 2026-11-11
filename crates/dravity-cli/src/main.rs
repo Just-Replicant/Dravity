@@ -235,6 +235,14 @@ struct NetworkArgs {
     /// queued.
     #[arg(long, value_name = "N")]
     max_active_seeds: Option<usize>,
+    /// Super-seed complete torrents (BEP 16): show each peer one piece at
+    /// a time so a first seed spreads the torrent faster.
+    #[arg(long)]
+    super_seed: bool,
+    /// Do not exchange tracker lists with peers (`lt_tex`; private
+    /// torrents never do).
+    #[arg(long)]
+    no_tracker_exchange: bool,
     /// Do not use the DHT for peer discovery.
     #[arg(long)]
     no_dht: bool,
@@ -333,6 +341,8 @@ impl NetworkArgs {
         config.upload_rate_limit = self.global_upload_limit.filter(|&r| r > 0);
         config.max_active_downloads = self.max_active_downloads;
         config.max_active_seeds = self.max_active_seeds;
+        config.engine.super_seed = self.super_seed;
+        config.engine.tracker_exchange = !self.no_tracker_exchange;
         if !self.no_lsd && config.listen.is_some() {
             config.lsd = Some(dravity_session::LsdConfig::default());
         }

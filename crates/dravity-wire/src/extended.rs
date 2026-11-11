@@ -67,6 +67,9 @@ pub struct ExtendedHandshake {
     pub ipv4: Option<Vec<u8>>,
     /// Optional compact IPv6 endpoint.
     pub ipv6: Option<Vec<u8>>,
+    /// BEP 21 `upload_only`: the sender does not want to download (a seed,
+    /// or a partial seed done with the files it wants).
+    pub upload_only: Option<bool>,
 }
 
 impl ExtendedHandshake {
@@ -93,6 +96,7 @@ impl ExtendedHandshake {
             metadata_size: optional_u64(dict, b"metadata_size", "metadata_size")?,
             ipv4: optional_bytes(dict, b"ipv4", "ipv4")?,
             ipv6: optional_bytes(dict, b"ipv6", "ipv6")?,
+            upload_only: optional_int(dict, b"upload_only", "upload_only")?.map(|v| v != 0),
         })
     }
 
@@ -143,6 +147,12 @@ impl ExtendedHandshake {
         }
         if let Some(queue) = self.request_queue {
             entries.insert(Cow::Borrowed(b"reqq"), Value::Int(i64::from(queue)));
+        }
+        if let Some(upload_only) = self.upload_only {
+            entries.insert(
+                Cow::Borrowed(b"upload_only"),
+                Value::Int(i64::from(upload_only)),
+            );
         }
         if let Some(client) = &self.client {
             entries.insert(
@@ -261,6 +271,7 @@ mod tests {
             metadata_size: Some(100),
             ipv4: Some(vec![1, 2, 3, 4, 0x1a, 0xe1]),
             ipv6: None,
+            upload_only: Some(true),
         };
         let encoded = hs.encode().unwrap();
         let decoded = ExtendedHandshake::decode(&encoded).unwrap();

@@ -638,7 +638,7 @@ impl MetadataState {
         if reserved.extension_protocol() {
             out.push(Effect::Send {
                 peer: key,
-                message: ext::our_handshake(&self.config, None, addr),
+                message: ext::our_handshake(&self.config, None, addr, false),
             });
         }
         self.peers.insert(key, peer);

@@ -128,6 +128,13 @@ pub struct Config {
     pub download_rate_limit: Option<u64>,
     /// Exchange peers with other peers (BEP 11). Disable for private torrents.
     pub pex: bool,
+    /// Exchange tracker URLs with peers (`lt_tex`). Disable for private
+    /// torrents.
+    pub tracker_exchange: bool,
+    /// BEP 16 super-seeding while the torrent is complete: peers see no
+    /// bitfield, only one piece at a time chosen from the least shared,
+    /// and get the next once they announce it. Speeds up initial seeding.
+    pub super_seed: bool,
     /// Minimum time between two PEX messages to the same peer (BEP 11: one
     /// minute).
     pub pex_interval: Duration,
@@ -257,6 +264,8 @@ impl Default for Config {
             endgame: true,
             download_rate_limit: None,
             pex: true,
+            tracker_exchange: true,
+            super_seed: false,
             pex_interval: Duration::from_secs(60),
             dht: false,
             dht_interval: Duration::from_secs(5 * 60),
@@ -623,6 +632,13 @@ pub enum Effect {
         root: Hash,
         /// One hash per piece of the file.
         layer: Vec<Hash>,
+    },
+    /// A peer shared tracker URLs we did not know (`lt_tex`). Each passed
+    /// [`dravity_wire::is_exchangeable_tracker`]; the driver may add them
+    /// to the torrent's announce list.
+    TrackersReceived {
+        /// New tracker URLs.
+        urls: Vec<String>,
     },
     /// Notify the application.
     Alert(Alert),

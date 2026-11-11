@@ -29,6 +29,9 @@ use crate::types::{
 use crate::web_seed::is_web_seed_addr;
 use crate::window::{Bdp, Window};
 
+/// Most tracker URLs kept for `lt_tex` (ours plus learned ones).
+const MAX_TRACKERS: usize = 100;
+
 /// Most peers that may hold a request for the same block (endgame and
 /// stealing): the original requester plus one more.
 const MAX_BLOCK_OWNERS: usize = 2;
@@ -129,6 +132,10 @@ struct Peer {
     choked_since: Instant,
     /// Delivery rate and base round trip, for the request depth.
     bdp: Bdp,
+    /// The piece revealed to this peer while super-seeding.
+    super_piece: Option<u32>,
+    /// Our tracker list went out (`lt_tex`).
+    tex_sent: bool,
 }
 
 impl Peer {
@@ -179,6 +186,8 @@ impl Peer {
             served: 0,
             choked_since: now,
             bdp: Bdp::default(),
+            super_piece: None,
+            tex_sent: false,
         }
     }
 
@@ -333,6 +342,12 @@ pub struct TorrentState {
     uploaded: u64,
     bytes_have: u64,
     pending_writes: usize,
+    /// Tracker URLs shared over `lt_tex` and those learned from peers.
+    trackers: Vec<String>,
+    /// The `upload_only` value our last extension handshakes carried.
+    upload_only_sent: bool,
+    /// Times each piece was revealed while super-seeding.
+    super_revealed: HashMap<u32, u32>,
 }
 
 impl TorrentState {
@@ -392,7 +407,22 @@ impl TorrentState {
             uploaded: 0,
             bytes_have,
             pending_writes: 0,
+            trackers: Vec::new(),
+            upload_only_sent: false,
+            super_revealed: HashMap::new(),
         }
+    }
+
+    /// The torrent's tracker URLs, offered to peers that speak `lt_tex`
+    /// (only those [`dravity_wire::is_exchangeable_tracker`] accepts).
+    #[must_use]
+    pub fn with_trackers(mut self, trackers: impl IntoIterator<Item = String>) -> Self {
+        for url in trackers {
+            if dravity_wire::is_exchangeable_tracker(&url) && !self.trackers.contains(&url) {
+                self.trackers.push(url);
+            }
+        }
+        self
     }
 
     /// Serves `info` (the torrent's bencoded `info` dictionary) to peers that
@@ -903,6 +933,7 @@ impl TorrentState {
     /// leaves the swarm.
     fn finish(&mut self, now: Instant, out: &mut Vec<Effect>) {
         self.set_status(TorrentStatus::Finished, out);
+        self.refresh_upload_only(now, out);
         out.push(Effect::Alert(Alert::Finished));
         let complete = self.picker.is_complete();
         if !self.config.seed {
@@ -973,6 +1004,7 @@ impl TorrentState {
     /// announces `started` again.
     fn resume_download(&mut self, now: Instant, out: &mut Vec<Effect>) {
         self.set_status(TorrentStatus::Downloading, out);
+        self.refresh_upload_only(now, out);
         if !self.started_announced {
             self.announce(now, AnnounceEvent::Started, out);
         } else if self.next_announce.is_none() {
@@ -1179,7 +1211,7 @@ impl TorrentState {
                 .info_bytes
                 .as_ref()
                 .and_then(|b| u64::try_from(b.len()).ok());
-            let hs = ext::our_handshake(&self.config, size, addr);
+            let hs = ext::our_handshake(&self.config, size, addr, self.upload_only_sent);
             Self::send(&mut peer, key, hs, now, out);
         }
         self.peers.insert(key, peer);
@@ -1218,6 +1250,15 @@ impl TorrentState {
     /// without the fast extension when we have nothing). Then the allowed
     /// fast set.
     fn send_bitfield(&mut self, now: Instant, key: PeerKey, out: &mut Vec<Effect>) {
+        if self.super_seeding() {
+            if let Some(peer) = self.peers.get_mut(&key)
+                && peer.fast
+            {
+                Self::send(peer, key, Message::HaveNone, now, out);
+            }
+            self.super_reveal(now, key, out);
+            return;
+        }
         let have = self.picker.have();
         let Some(peer) = self.peers.get_mut(&key) else {
             return;
@@ -1341,9 +1382,71 @@ impl TorrentState {
         self.pump_uploads(out);
     }
 
+    /// BEP 16 super-seeding is on and we have every piece.
+    fn super_seeding(&self) -> bool {
+        self.config.super_seed && self.picker.is_complete()
+    }
+
+    /// Reveals one piece to `key` while super-seeding: one it lacks that
+    /// we revealed least often, then the rarest in the swarm, then the
+    /// lowest index.
+    fn super_reveal(&mut self, now: Instant, key: PeerKey, out: &mut Vec<Effect>) {
+        if !self.super_seeding() {
+            return;
+        }
+        let piece_count = self.picker.layout().piece_count();
+        let Some(peer) = self.peers.get(&key) else {
+            return;
+        };
+        if peer.super_piece.is_some() {
+            return;
+        }
+        let pick = (0..piece_count)
+            .filter(|&p| !peer.has.get(p))
+            .min_by_key(|&p| {
+                (
+                    self.super_revealed.get(&p).copied().unwrap_or(0),
+                    self.picker.availability(p),
+                    p,
+                )
+            });
+        let Some(piece) = pick else {
+            return;
+        };
+        *self.super_revealed.entry(piece).or_insert(0) += 1;
+        if let Some(peer) = self.peers.get_mut(&key) {
+            peer.super_piece = Some(piece);
+            Self::send(peer, key, Message::Have { piece }, now, out);
+        }
+    }
+
+    /// Sends a fresh extension handshake when whether we download changed
+    /// (BEP 21 `upload_only`: set once every wanted piece is in).
+    fn refresh_upload_only(&mut self, now: Instant, out: &mut Vec<Effect>) {
+        let upload_only = self.status == TorrentStatus::Finished;
+        if upload_only == self.upload_only_sent {
+            return;
+        }
+        self.upload_only_sent = upload_only;
+        let size = self
+            .info_bytes
+            .as_ref()
+            .and_then(|b| u64::try_from(b.len()).ok());
+        for key in self.sorted_keys() {
+            if let Some(peer) = self.peers.get_mut(&key)
+                && peer.extended
+            {
+                let hs = ext::our_handshake(&self.config, size, peer.addr, upload_only);
+                Self::send(peer, key, hs, now, out);
+            }
+        }
+    }
+
     /// Two seeds have nothing to exchange: drop a peer that has every piece
     /// once we have them too. Returns whether it was dropped.
     fn drop_if_both_seeds(&mut self, key: PeerKey, out: &mut Vec<Effect>) -> bool {
+        // An `upload_only` partial seed is kept: it may want more pieces
+        // after a priority change, and dropping it would cost a redial.
         let both =
             self.picker.is_complete() && self.peers.get(&key).is_some_and(|p| p.has.is_full());
         if both {
@@ -1398,6 +1501,10 @@ impl TorrentState {
                 }
                 if peer.has.set(piece) {
                     self.picker.add_peer_piece(piece);
+                }
+                if peer.super_piece == Some(piece) {
+                    peer.super_piece = None;
+                    self.super_reveal(now, key, out);
                 }
                 if self.drop_if_both_seeds(key, out) {
                     return;
@@ -1510,6 +1617,15 @@ impl TorrentState {
             ext::HANDSHAKE_ID => {
                 if let Ok(hs) = ExtendedHandshake::decode(payload) {
                     peer.ext.update(&hs);
+                    if self.config.tracker_exchange
+                        && !peer.tex_sent
+                        && !self.trackers.is_empty()
+                        && let Some(id) = peer.ext.lt_tex
+                    {
+                        peer.tex_sent = true;
+                        let message = ext::tex_message(id, &self.trackers);
+                        Self::send(peer, key, message, now, out);
+                    }
                     if peer.incoming
                         && let Some(port) = hs.listen_port.filter(|&p| p != 0)
                     {
@@ -1535,6 +1651,34 @@ impl TorrentState {
                             payload,
                         };
                         Self::send(peer, key, message, now, out);
+                    }
+                }
+                false
+            }
+            ext::OUR_LT_DONTHAVE => {
+                let piece_count = self.picker.layout().piece_count();
+                match dravity_wire::decode_donthave(payload) {
+                    Some(piece) if piece < piece_count => {
+                        if peer.has.clear(piece) {
+                            self.picker.remove_peer_piece(piece);
+                        }
+                    }
+                    _ => self.disconnect(key, out),
+                }
+                false
+            }
+            ext::OUR_LT_TEX if self.config.tracker_exchange => {
+                if let Ok(tex) = dravity_wire::TrackerExchange::decode(payload) {
+                    let room = MAX_TRACKERS.saturating_sub(self.trackers.len());
+                    let urls: Vec<String> = tex
+                        .added
+                        .into_iter()
+                        .filter(|u| !self.trackers.contains(u))
+                        .take(room)
+                        .collect();
+                    if !urls.is_empty() {
+                        self.trackers.extend(urls.iter().cloned());
+                        out.push(Effect::TrackersReceived { urls });
                     }
                 }
                 false
@@ -2019,6 +2163,19 @@ impl TorrentState {
         if !ok && self.picker.mark_missing(piece) {
             let size = self.picker.layout().piece_size(piece).unwrap_or(0);
             self.bytes_have = self.bytes_have.saturating_sub(u64::from(size));
+            // BEP 54: peers stop asking for what we no longer have.
+            let payload = Bytes::copy_from_slice(&dravity_wire::encode_donthave(piece));
+            for key in self.sorted_keys() {
+                if let Some(peer) = self.peers.get_mut(&key)
+                    && let Some(id) = peer.ext.lt_donthave
+                {
+                    let message = Message::Extended {
+                        id,
+                        payload: payload.clone(),
+                    };
+                    Self::send(peer, key, message, now, out);
+                }
+            }
             out.push(Effect::Alert(Alert::HashFailed { piece }));
             self.wanted_changed(now, out);
         }
@@ -2143,9 +2300,11 @@ impl TorrentState {
         let serving = self.is_active();
         let valid = self.is_servable(block) && self.picker.have().get(block.piece);
         let max_queue = self.config.max_upload_queue;
+        let super_seeding = self.super_seeding();
         let Some(peer) = self.peers.get_mut(&key) else {
             return;
         };
+        let valid = valid && (!super_seeding || peer.super_piece == Some(block.piece));
         if peer.upload_queue.contains(&block) || peer.reading.contains(&block) {
             return;
         }
@@ -2630,7 +2789,8 @@ fn pex_flags(peer: &Peer, hints: DialHints) -> u8 {
     if peer.link.mse == Some(true) || hints.encryption == Some(true) {
         flags |= dravity_wire::PEX_ENCRYPTION;
     }
-    if peer.has.is_full() {
+    // BEP 11: "seed or partial seed"; BEP 21 `upload_only` is the latter.
+    if peer.has.is_full() || peer.ext.upload_only {
         flags |= dravity_wire::PEX_SEED;
     }
     if peer.link.utp || hints.utp == Some(true) {

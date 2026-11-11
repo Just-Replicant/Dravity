@@ -1688,3 +1688,181 @@ fn the_slot_tuner_adds_slots_while_peers_take_data() {
     assert_eq!(h.t.upload_slots(), 1);
     assert_eq!(h.t.stats().unchoked, 1);
 }
+
+fn ext_msg(id: u8, payload: &'static [u8]) -> Message {
+    Message::Extended {
+        id,
+        payload: Bytes::from_static(payload),
+    }
+}
+
+fn ext_reserved() -> Reserved {
+    Reserved::new()
+        .with_extension_protocol(true)
+        .with_fast(true)
+}
+
+#[test]
+fn a_seed_says_upload_only_and_flags_partial_seeds() {
+    let mut h = Harness::seed(config());
+    let hs = our_handshake(&h.connect(1, ext_reserved()), 1);
+    assert_eq!(hs.upload_only, Some(true));
+    assert!(hs.extension_id("lt_donthave").is_some());
+    // A partial seed (BEP 21) is kept (it may want more later) and shared
+    // with the PEX seed flag.
+    let fx = h.msg(1, ext_msg(0, b"d1:md6:ut_pexi5ee11:upload_onlyi1ee"));
+    assert!(!disconnects(&fx, 1));
+    h.connect(2, ext_reserved());
+    h.msg(2, ext_msg(0, b"d1:md6:ut_pexi5eee"));
+    let fx = h.advance(h.t.config().pex_interval);
+    let pex = sent(&fx, 2)
+        .into_iter()
+        .find_map(|m| match m {
+            Message::Extended { id: 5, payload } => Some(PexMessage::decode(&payload).unwrap()),
+            _ => None,
+        })
+        .expect("pex to peer 2");
+    let entry = pex.added.iter().find(|p| p.addr == addr(1)).unwrap();
+    assert_ne!(entry.flags.unwrap() & dravity_wire::PEX_SEED, 0);
+
+    let mut leecher = Harness::with_have(config(), &[]);
+    let hs = our_handshake(&leecher.connect(1, ext_reserved()), 1);
+    assert_eq!(hs.upload_only, None);
+    let fx = leecher.msg(1, ext_msg(0, b"d1:mde11:upload_onlyi1ee"));
+    assert!(!disconnects(&fx, 1), "a leecher still downloads from it");
+}
+
+#[test]
+fn lt_donthave_takes_a_piece_back() {
+    let mut h = Harness::with_have(config(), &[1, 2]);
+    h.connect(1, ext_reserved());
+    h.msg(1, Message::HaveNone);
+    let fx = h.msg(1, Message::Have { piece: 0 });
+    assert!(sent(&fx, 1).contains(&Message::Interested));
+    // Our id for lt_donthave is the one in our handshake.
+    let fx = h.msg(1, ext_msg(3, &[0, 0, 0, 0]));
+    assert!(sent(&fx, 1).contains(&Message::NotInterested), "{fx:?}");
+    // Out of range or malformed: the peer is dropped.
+    let fx = h.msg(1, ext_msg(3, &[0, 0, 0, 9]));
+    assert!(disconnects(&fx, 1));
+}
+
+#[test]
+fn a_failed_recheck_sends_lt_donthave() {
+    let mut h = Harness::seed(config());
+    h.connect(1, ext_reserved());
+    h.msg(1, ext_msg(0, b"d1:md11:lt_donthavei7eee"));
+    let fx = h.ev(Event::RecheckPieces { pieces: 1..2 });
+    assert!(fx.contains(&Effect::HashPiece { piece: 1 }), "{fx:?}");
+    let fx = h.ev(Event::PieceHashed {
+        piece: 1,
+        ok: false,
+    });
+    assert!(
+        sent(&fx, 1).contains(&Message::Extended {
+            id: 7,
+            payload: Bytes::from_static(&[0, 0, 0, 1]),
+        }),
+        "{fx:?}"
+    );
+}
+
+#[test]
+fn trackers_are_exchanged_with_lt_tex() {
+    let mut bits = Bitfield::new(3);
+    bits.set(0);
+    let t = TorrentState::with_have(layout(), bits, config())
+        .with_info_hash(InfoHash::new([0xaa; 20]))
+        .with_trackers([
+            "udp://ours:1/announce".to_owned(),
+            "file:///etc/passwd".to_owned(),
+        ]);
+    let mut h = Harness {
+        t,
+        now: Instant::now(),
+    };
+    h.ev(Event::Start);
+    let hs = our_handshake(&h.connect(1, ext_reserved()), 1);
+    assert!(hs.extension_id("lt_tex").is_some());
+    let fx = h.msg(1, ext_msg(0, b"d1:md6:lt_texi9eee"));
+    let ours = sent(&fx, 1)
+        .into_iter()
+        .find_map(|m| match m {
+            Message::Extended { id: 9, payload } => {
+                Some(dravity_wire::TrackerExchange::decode(&payload).unwrap())
+            }
+            _ => None,
+        })
+        .expect("our trackers");
+    assert_eq!(ours.added, ["udp://ours:1/announce"]);
+    let fx = h.msg(
+        1,
+        ext_msg(
+            4,
+            b"d5:addedl21:udp://ours:1/announce14:http://new/ann9:ftp://x/aee",
+        ),
+    );
+    assert!(
+        fx.contains(&Effect::TrackersReceived {
+            urls: vec!["http://new/ann".to_owned()],
+        }),
+        "{fx:?}"
+    );
+    // Heard once.
+    let fx = h.msg(1, ext_msg(4, b"d5:addedl14:http://new/annee"));
+    assert!(
+        !fx.iter()
+            .any(|e| matches!(e, Effect::TrackersReceived { .. }))
+    );
+
+    let mut c = config();
+    c.tracker_exchange = false;
+    let mut off = Harness::with_have(c, &[]);
+    let hs = our_handshake(&off.connect(1, ext_reserved()), 1);
+    assert!(hs.extension_id("lt_tex").is_none());
+    let fx = off.msg(1, ext_msg(4, b"d5:addedl14:http://new/annee"));
+    assert!(
+        !fx.iter()
+            .any(|e| matches!(e, Effect::TrackersReceived { .. }))
+    );
+}
+
+#[test]
+fn super_seeding_reveals_one_piece_at_a_time() {
+    let mut c = config();
+    c.super_seed = true;
+    let mut h = Harness::seed(c);
+    let first = h.accept(1, fast());
+    let msgs = sent(&first, 1);
+    assert!(msgs.contains(&Message::HaveNone), "{msgs:?}");
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, Message::HaveAll | Message::Bitfield(_)))
+    );
+    let haves = |fx: &[Effect], p| -> Vec<u32> {
+        sent(fx, p)
+            .into_iter()
+            .filter_map(|m| match m {
+                Message::Have { piece } => Some(piece),
+                _ => None,
+            })
+            .collect()
+    };
+    let one = haves(&first, 1);
+    assert_eq!(one.len(), 1);
+    // The next peer is shown a different piece.
+    let two = haves(&h.accept(2, fast()), 2);
+    assert_eq!(two.len(), 1);
+    assert_ne!(one, two);
+    // A request outside the revealed piece is refused.
+    h.msg(1, Message::Interested);
+    let other = (0..3).find(|p| *p != one[0]).unwrap();
+    let fx = h.msg(1, Message::Request(req(other, 0, BLOCK_SIZE)));
+    assert!(sent(&fx, 1).contains(&Message::Reject(req(other, 0, BLOCK_SIZE))));
+    // Once the peer has its piece, it is shown another.
+    let fx = h.msg(1, Message::Have { piece: one[0] });
+    let next = haves(&fx, 1);
+    assert_eq!(next.len(), 1);
+    assert_ne!(next, one);
+}

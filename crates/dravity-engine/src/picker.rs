@@ -450,6 +450,11 @@ impl Picker {
         }
     }
 
+    /// Records a peer's BEP 54 `lt_donthave` for `piece`.
+    pub fn remove_peer_piece(&mut self, piece: u32) {
+        self.change_availability(piece, false);
+    }
+
     /// Records a peer's `have` message for `piece`.
     pub fn add_peer_piece(&mut self, piece: u32) {
         self.change_availability(piece, true);

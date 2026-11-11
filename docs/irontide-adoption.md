@@ -28,6 +28,7 @@ sound version, with the difference explained), **open** (not started).
 | 15 | Local Service Discovery (BEP 14), off for private torrents | done | `feat(lsd,session,cli): local service discovery` | [notes](#15-local-service-discovery) |
 | 16 | Live settings, session-wide rate limits and queueing | partial | `feat(session,http,cli): live settings, session rate limits and queueing` | [notes](#16-live-settings-rate-limits-and-queueing) |
 | 17 | BEP 53 select-only magnets (so=) | done | `feat(core,session): BEP 53 select-only magnets` | [notes](#17-bep-53-select-only-magnets) |
+| 18 | Wire extensions: upload_only, lt_donthave, super-seeding, lt_tex | done | `feat(wire,engine,session,cli): upload_only, lt_donthave, super-seeding and tracker exchange` | [notes](#18-wire-extensions) |
 
 ## Design notes
 
@@ -363,3 +364,11 @@ turns LSD on.
 - The session copies the ranges into `MagnetStart`. When the magnet switches to downloading and no priorities were given, `files::selected` turns them into Normal/Skip per file (indices are the torrent's file list, the same ones `dravity info` prints, BEP 47 pads included). If no listed index exists, every file stays Normal rather than skipping the whole torrent.
 - The selection is part of the magnet URI, so a saved session restores it.
 - Tests: parser unit tests (valid lists, every malformed form, the range cap), the proptest round trip now includes `so`, a doc test for `selects_file`, `files::selected` unit test and `a_select_only_magnet_downloads_just_its_files` (a real download fetches only `b.bin`).
+
+### 18. Wire extensions
+
+- Wire (`dravity-wire/src/ext_msgs.rs`): `lt_donthave` is a 4-byte big-endian piece index; anything else drops the peer, as does an index past the end. `lt_tex` payloads are `{added: [url…]}`; decoding keeps at most 50 URLs and only `http`/`https`/`udp` ones of at most 512 bytes without whitespace or control characters, so a peer cannot plant `file:` URLs or giant strings. Tracker URLs still go through the tracker client's SSRF guard (item 1) when announced.
+- Engine: our handshake now always registers `lt_donthave` (id 3) and `lt_tex` (id 4) when enabled; the extension list is sorted. `upload_only` follows the torrent status (`Finished` means nothing more is wanted) and a change re-sends the handshake to every extended peer (BEP 10 allows repeats). A received `upload_only` marks the peer as a partial seed in the PEX flags. It is deliberately *not* a reason to disconnect: a partial seed may want more after a priority change (the session's skip-then-unskip test caught this), and the seed would otherwise cost it a redial after `peer_retry`.
+- Super-seeding is active only while the torrent is complete. Peers get `HaveNone` (fast extension) or nothing instead of a bitfield and no allowed-fast set, then one `Have` for a piece they lack, chosen by (times revealed, swarm availability, index). Requests for any other piece are rejected. When the peer announces its piece, it is shown the next one. irontide waits until a *different* peer announces the piece; Dravity reveals on the receiver's own `Have`, the simpler variant libtorrent also uses, which is safe because the reveal counter still spreads pieces.
+- Our tracker list goes out once per peer after its handshake; received URLs not yet known (at most 100 in total) are reported once with `Effect::TrackersReceived`. Learned URLs are not relayed to other peers. The session appends them as one new tier, so the torrent's own tiers keep priority and they show in `TorrentHandle::trackers`.
+- Tests: wire unit and doc tests, five engine tests in `tests/seeding.rs` (upload_only both ways, lt_donthave receive and send, lt_tex with filtering and the off switch, super-seeding reveal/reject/next) and `tests/exchange.rs` (a leecher learns the seed's tracker; private torrents do not).

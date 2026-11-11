@@ -168,6 +168,7 @@ async fn serve(
             metadata_size: script.info.as_ref().map(|i| i.len() as u64),
             ipv4: None,
             ipv6: None,
+            upload_only: None,
         };
         let payload = Bytes::from(hs.encode().unwrap());
         if framed

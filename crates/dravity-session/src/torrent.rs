@@ -230,8 +230,21 @@ impl TorrentContext {
         let mut config = self.config.engine.clone();
         config.dht = self.dht.is_some() && !private;
         config.pex = config.pex && !private;
+        config.tracker_exchange = config.tracker_exchange && !private;
         config.listen_port = self.listen_port;
         config
+    }
+
+    /// Every tracker URL of the torrent, tier by tier (shared over
+    /// `lt_tex`).
+    fn tracker_urls(&self) -> Vec<String> {
+        self.trackers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .flatten()
+            .cloned()
+            .collect()
     }
 
     /// Port reported to trackers and the DHT: the router's public TCP port
@@ -438,6 +451,7 @@ impl TorrentTask {
                 let info = Bytes::copy_from_slice(metainfo.info_bytes());
                 let state = TorrentState::new(*metainfo.info().layout(), config)
                     .with_banned_ips(ctx.bans.snapshot())
+                    .with_trackers(ctx.tracker_urls())
                     .with_piece_roots(piece_roots(&metainfo))
                     .with_info_hash(ctx.info_hash)
                     .with_info_bytes(info)
@@ -900,6 +914,7 @@ impl TorrentTask {
         config.check_existing = false;
         let state = TorrentState::with_have(*content.metainfo.info().layout(), have, config)
             .with_banned_ips(self.ctx.bans.snapshot())
+            .with_trackers(self.ctx.tracker_urls())
             .with_piece_roots(piece_roots(&content.metainfo))
             .with_info_hash(self.ctx.info_hash)
             .with_priorities(&self.piece_priorities(content));
@@ -1036,6 +1051,25 @@ impl TorrentTask {
         self.local.push_back(Event::Stop);
     }
 
+    /// Trackers a peer shared (`lt_tex`): added as one new last tier, so
+    /// the torrent's own trackers keep priority. The tracker client's SSRF
+    /// guard still applies when they are announced to.
+    fn add_exchanged_trackers(&mut self, urls: Vec<String>) {
+        let mut tiers = self
+            .ctx
+            .trackers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let fresh: Vec<String> = urls
+            .into_iter()
+            .filter(|u| !tiers.iter().flatten().any(|t| t == u))
+            .collect();
+        if !fresh.is_empty() {
+            tracing::debug!(?fresh, "trackers learned from peers");
+            tiers.push(fresh);
+        }
+    }
+
     /// Switches a magnet link from the metadata phase to downloading.
     async fn start_download(&mut self, info: Bytes, layers: PieceLayers) {
         let Phase::Metadata(_) = self.phase else {
@@ -1099,6 +1133,7 @@ impl TorrentTask {
                 self.ctx.engine_config(info_meta.is_private()),
             )
             .with_banned_ips(self.ctx.bans.snapshot())
+            .with_trackers(self.ctx.tracker_urls())
             .with_piece_roots(piece_roots(&content.metainfo))
             .with_info_hash(self.ctx.info_hash)
             .with_info_bytes(info)
@@ -1284,6 +1319,7 @@ impl TorrentTask {
                 self.metadata = Some((info, piece_layers));
             }
             Effect::PieceLayerReceived { root, layer } => self.install_piece_layer(root, layer),
+            Effect::TrackersReceived { urls } => self.add_exchanged_trackers(urls),
             Effect::Alert(alert) => {
                 if let Alert::PeerBanned { ip } = &alert {
                     self.stop_web_seed(*ip);

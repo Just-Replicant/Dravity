@@ -105,6 +105,7 @@ impl Harness {
             metadata_size: size,
             ipv4: None,
             ipv6: None,
+            upload_only: None,
         };
         fx.extend(self.msg(
             peer,
@@ -461,6 +462,7 @@ fn accepted_peers_fetch_metadata_and_are_marked_incoming() {
         metadata_size: Some(40_000),
         ipv4: None,
         ipv6: None,
+        upload_only: None,
     };
     let fx = h.msg(
         7,

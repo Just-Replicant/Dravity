@@ -19,8 +19,8 @@ use dravity_bencode::{Dict, Value};
 use dravity_core::{InfoHash, Magnet, Metainfo};
 use dravity_engine::{Alert, Priority, TorrentStatus};
 use dravity_session::{
-    AddTorrentOptions, ListenConfig, Session, SessionAlert, SessionConfig, SessionError,
-    WatchConfig,
+    AddTorrentOptions, Durability, ListenConfig, PreallocateMode, Session, SessionAlert,
+    SessionConfig, SessionError, WatchConfig,
 };
 use sha1::{Digest, Sha1};
 use tokio::sync::broadcast;
@@ -528,4 +528,37 @@ async fn a_partial_download_is_checked_only_where_data_can_be() {
     // ruled out by the prescan.
     assert_eq!(stats.pieces_have as usize, len_a / PIECE_LEN);
     session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preallocated_durable_downloads_complete() {
+    let (len_a, len_b) = (70_000, 90_000);
+    let (encoded, content) = make_torrent(len_a, len_b);
+    let seed = seed(&encoded, &content, len_a).await;
+    for (prealloc, durability) in [
+        (PreallocateMode::Full, Durability::PerPiece),
+        (PreallocateMode::Sparse, Durability::OnComplete),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config();
+        c.preallocate = prealloc;
+        c.durability = durability;
+        let leecher = Session::new(c).unwrap();
+        let mut alerts = leecher.subscribe();
+        let m = metainfo(&encoded);
+        let hash = m.info_hash();
+        leecher
+            .add_torrent(
+                m,
+                AddTorrentOptions::new(dir.path()).with_peers([seed.addr]),
+            )
+            .unwrap();
+        until_finished(&mut alerts, hash).await;
+        leecher.shutdown().await;
+        let a = std::fs::read(dir.path().join("payload/a.bin")).unwrap();
+        let b = std::fs::read(dir.path().join("payload/b.bin")).unwrap();
+        assert_eq!(a, &content[..len_a], "{prealloc:?}");
+        assert_eq!(b, &content[len_a..], "{prealloc:?}");
+    }
+    seed.session.shutdown().await;
 }

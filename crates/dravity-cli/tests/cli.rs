@@ -364,6 +364,54 @@ fn rejects_unknown_storage_backend() {
 }
 
 #[test]
+fn rejects_unknown_preallocation_and_durability() {
+    for (flag, value, hint) in [
+        ("--preallocate", "huge", "sparse"),
+        ("--durability", "always", "per-piece"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+            .args(["download", "x.torrent", flag, value])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(hint), "{stderr}");
+    }
+}
+
+#[test]
+fn download_preallocated_and_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = content();
+    let (torrent, hash) = write_torrent(dir.path(), &data);
+    let peer = seeder(data.clone(), hash);
+    let out_dir = dir.path().join("out");
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .arg("--output")
+        .arg(&out_dir)
+        .arg("--peer")
+        .arg(peer.to_string())
+        .args(["--encryption", "disabled", "--no-dht", "--no-port-mapping"])
+        .args([
+            "--preallocate",
+            "full",
+            "--durability",
+            "per-piece",
+            "--quiet",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(out_dir.join("hello.bin")).unwrap(), data);
+}
+
+#[test]
 fn rejects_bad_rate() {
     let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
         .args(["download", "x.torrent", "--download-limit", "fast"])

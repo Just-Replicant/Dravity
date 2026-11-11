@@ -92,6 +92,14 @@ Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/ir
   ones, and only then help with another peer's piece, so fewer pieces
   sit half done and a bad piece usually has a single sender (which helps
   smart banning). `Picker::release_owner`, `Picker::owner`.
+- **Preallocation and durability (item 11):** `PreallocateMode`
+  (`none`/`sparse`/`full`) sizes or reserves each file when
+  `FileStorage` creates it (`FileStorage::with_preallocate`; `full` uses
+  `fallocate` and falls back to sparse). `Durability`
+  (`never`/`per-piece`/`on-complete`) controls when data is synced:
+  `per-piece` syncs a verified piece's files before the engine counts it.
+  New `Storage::sync_range` (default: `flush`). `SessionConfig::preallocate`,
+  `SessionConfig::durability`, and the CLI flags `--preallocate` and `--durability`.
 
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 

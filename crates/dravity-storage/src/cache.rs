@@ -411,6 +411,10 @@ impl Storage for CachedStorage {
         self.inner.flush()
     }
 
+    fn sync_range(&self, offset: u64, len: u64) -> Result<(), StorageError> {
+        self.inner.sync_range(offset, len)
+    }
+
     fn stamps(&self) -> Result<Option<Vec<FileStamp>>, StorageError> {
         self.inner.stamps()
     }

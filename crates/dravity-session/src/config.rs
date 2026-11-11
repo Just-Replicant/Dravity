@@ -6,6 +6,7 @@ use std::time::Duration;
 use dravity_dht::DhtConfig;
 use dravity_mse::Policy;
 use dravity_portmap::PortMapConfig;
+use dravity_storage::{Durability, PreallocateMode};
 use dravity_tracker::ClientConfig;
 use dravity_webseed::WebSeedConfig;
 
@@ -106,6 +107,14 @@ pub struct SessionConfig {
     /// piece to many peers reads it from disk once
     /// ([`dravity_storage::CachedStorage`]). `None` turns the cache off.
     pub read_cache: Option<usize>,
+    /// How files the session creates reserve their space. `Full` fails a
+    /// full disk early and fragments less, but makes every file look
+    /// present to the startup prescan, so a fresh full-preallocated
+    /// torrent is rechecked once. Default: `None`.
+    pub preallocate: PreallocateMode,
+    /// When written data is forced to disk. Default: [`Durability::Never`]
+    /// (sync on resume save, descriptor eviction and stop only).
+    pub durability: Durability,
     /// Time allowed for the `stopped` announce when a torrent stops.
     pub stop_announce_timeout: Duration,
     /// Broadcast buffer for alerts; slow subscribers miss older alerts.
@@ -162,6 +171,8 @@ impl Default for SessionConfig {
             hash_workers: std::thread::available_parallelism().map_or(2, usize::from),
             hash_on_arrival: true,
             read_cache: Some(DEFAULT_READ_CACHE),
+            preallocate: PreallocateMode::None,
+            durability: Durability::Never,
             stop_announce_timeout: Duration::from_secs(5),
             alert_buffer: 1024,
             dht: Some(DhtConfig::default()),

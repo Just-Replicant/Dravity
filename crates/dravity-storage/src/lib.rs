@@ -24,6 +24,7 @@
 //! can skip the hash check. All calls block; the session runs them on a
 //! blocking thread pool.
 
+mod alloc;
 pub mod cache;
 mod error;
 mod file;
@@ -39,6 +40,7 @@ mod uring;
 use bytes::Bytes;
 use dravity_core::{BlockRef, Info, PieceLayout};
 
+pub use alloc::{Durability, PreallocateMode};
 pub use cache::{CacheStats, CachedStorage, ReadCache};
 pub use error::StorageError;
 pub use file::{DEFAULT_MAX_OPEN_FILES, FileStorage};
@@ -132,6 +134,17 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     /// # Errors
     /// I/O errors from the backend.
     fn flush(&self) -> Result<(), StorageError>;
+
+    /// Forces the bytes of `offset..offset + len` to disk. The default
+    /// flushes everything; file storage syncs only the files the range
+    /// touches.
+    ///
+    /// # Errors
+    /// I/O errors from the backend.
+    fn sync_range(&self, offset: u64, len: u64) -> Result<(), StorageError> {
+        let _ = (offset, len);
+        self.flush()
+    }
 
     /// A [`FileStamp`] per file for fastresume, or `None` if the backend
     /// cannot vouch for its data across restarts (the default).

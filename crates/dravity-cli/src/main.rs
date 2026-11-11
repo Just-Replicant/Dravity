@@ -147,6 +147,16 @@ struct NetworkArgs {
     /// seeding); accepts `K`/`M`/`G` suffixes, 0 turns it off.
     #[arg(long, value_name = "SIZE", value_parser = format::parse_rate, default_value = "64M")]
     read_cache: u64,
+    /// How new files reserve disk space: `none` grows them as data
+    /// arrives, `sparse` sets the length at once, `full` reserves every
+    /// block (fails early on a full disk).
+    #[arg(long, value_name = "MODE", default_value = "none")]
+    preallocate: dravity_session::PreallocateMode,
+    /// When downloaded data is forced to disk: `never` (only on resume
+    /// save and stop), `per-piece` (after each verified piece) or
+    /// `on-complete`.
+    #[arg(long, value_name = "WHEN", default_value = "never")]
+    durability: dravity_session::Durability,
     /// Download rate limit in bytes per second; accepts `K`/`M`/`G`
     /// suffixes (binary), e.g. `500K` or `2M`.
     #[arg(long, value_name = "RATE", value_parser = format::parse_rate)]
@@ -234,6 +244,8 @@ impl NetworkArgs {
         config.engine.max_peers = self.max_peers.max(1);
         config.max_connections = (self.max_connections > 0).then_some(self.max_connections);
         config.read_cache = usize::try_from(self.read_cache).ok().filter(|&b| b > 0);
+        config.preallocate = self.preallocate;
+        config.durability = self.durability;
         config.engine.download_rate_limit = self.download_limit.filter(|&r| r > 0);
         if self.no_dht {
             config.dht = None;

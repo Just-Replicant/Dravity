@@ -112,6 +112,7 @@ pub use dravity_portmap::{
     Mapped as PortMapped, Method as PortMapMethod, PortMapConfig, Protocol as PortMapProtocol,
     Status as PortMapStatus,
 };
+pub use dravity_storage::{Durability, PreallocateMode};
 pub use dravity_webseed::WebSeedConfig;
 pub use error::SessionError;
 pub use file_stream::{DEFAULT_READAHEAD, FileStream};
@@ -607,7 +608,8 @@ impl Session {
                     None => torrent::cached(
                         Arc::new(
                             FileStorage::new(&entry.download_dir, metainfo.info())?
-                                .with_io(Arc::clone(&self.inner.file_io)),
+                                .with_io(Arc::clone(&self.inner.file_io))
+                                .with_preallocate(self.inner.config.preallocate),
                         ),
                         self.inner.read_cache.as_ref(),
                     ),

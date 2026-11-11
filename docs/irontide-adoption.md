@@ -20,6 +20,7 @@ sound version, with the difference explained), **open** (not started).
 | 8 | Verify-before-download prescan | done | `perf(storage,engine,session): prescan files before the start check` | [notes](#8-prescan) |
 | 9 | BDP-adaptive request budget | done | `feat(engine): BDP request depth and a torrent request budget` | [notes](#9-bdp-request-budget) |
 | 10 | Piece reservation / extent affinity | done | `feat(engine): reserve started pieces for the peer that started them` | [notes](#10-piece-reservation) |
+| 11 | Preallocation and durability modes | done | `feat(storage,session): preallocation and durability modes` | [notes](#11-preallocation-and-durability) |
 
 ## Design notes
 
@@ -198,3 +199,28 @@ Dravity's picker already keeps a per-block state vector, which serves
 the same purpose without a fixed limit on blocks per piece, so the
 mask was not adopted. Reservation also feeds item 2: with one sender
 per piece, a hash failure needs no attribution at all.
+
+### 11. Preallocation and durability
+
+`dravity_storage::PreallocateMode` acts when `FileStorage` opens a file
+for writing. A shorter file is grown to its torrent length: `Sparse` uses
+`set_len`, and `Full` calls `fallocate` (rustix). If the filesystem
+reports `EOPNOTSUPP`, `ENOSYS` or `EINVAL`, or the platform has no
+`fallocate`, it falls back to `set_len`. A longer file is never
+truncated. Only files that receive data are created, so skipped files
+and BEP 47 padding stay off disk.
+
+`Durability` adds `Storage::sync_range(offset, len)`. Its default calls
+`flush()`. `FileStorage` syncs only the files the range touches and
+skips files that do not exist. `CachedStorage` forwards the call. With
+`PerPiece`, the hash job syncs a passing piece before it reports
+`PieceHashed`. A crash therefore cannot lose a piece the engine (and
+resume data) already counted. `OnComplete` syncs everything on
+`Alert::Finished`. `Never` keeps the old behavior: a sync on resume
+save, on descriptor eviction and on stop.
+
+Trade-off: a fully or sparsely preallocated file has its final length.
+The item 8 prescan cannot rule it out by size, so such a torrent is
+rechecked by hashing on restart without resume data. irontide
+preallocates eagerly at add time. Dravity preallocates lazily on first
+write, so a torrent with skipped files never reserves their space.

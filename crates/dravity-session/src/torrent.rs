@@ -41,8 +41,8 @@ use dravity_engine::{
     PeerLink, Priority, Stats, TorrentState, TorrentStatus,
 };
 use dravity_storage::{
-    CachedStorage, FileIo, FileStorage, ReadCache, ResumeData, Storage, block_hashes, load_resume,
-    read_block, read_blocks, save_resume, verify_piece, write_block, write_blocks,
+    CachedStorage, Durability, FileIo, FileStorage, ReadCache, ResumeData, Storage, block_hashes,
+    load_resume, read_block, read_blocks, save_resume, verify_piece, write_block, write_blocks,
 };
 use dravity_tracker::{AnnounceRequest, AnnounceResponse, TrackerClient};
 use dravity_webseed::WebSeedClient;
@@ -1047,7 +1047,11 @@ impl TorrentTask {
         let metainfo = Arc::new(metainfo);
         let storage: Arc<dyn Storage> = match FileStorage::new(&dir, metainfo.info()) {
             Ok(storage) => cached(
-                Arc::new(storage.with_io(Arc::clone(&self.ctx.file_io))),
+                Arc::new(
+                    storage
+                        .with_io(Arc::clone(&self.ctx.file_io))
+                        .with_preallocate(self.ctx.config.preallocate),
+                ),
                 self.ctx.read_cache.as_ref(),
             ),
             Err(e) => return self.fail(format!("setting up storage: {e}")),
@@ -1257,6 +1261,11 @@ impl TorrentTask {
                 if let Alert::PeerBanned { ip } = &alert {
                     self.stop_web_seed(*ip);
                     self.share_ban(*ip);
+                }
+                if matches!(alert, Alert::Finished)
+                    && self.ctx.config.durability == Durability::OnComplete
+                {
+                    self.sync_all();
                 }
                 self.alert(alert);
             }
@@ -1539,15 +1548,26 @@ impl TorrentTask {
             .and_then(|h| h.lock().unwrap_or_else(PoisonError::into_inner).take(piece));
         let pool = self.ctx.hash_pool.clone();
         let tx = self.events_tx.clone();
+        let sync = self.ctx.config.durability == Durability::PerPiece;
         self.disk.spawn(async move {
             let result = pool
                 .run(move || {
                     let info = content.metainfo.info();
                     // Blocks hashed as they were written: no read-back.
-                    if let Some(ok) = arrived.and_then(|h| h.verify(info)) {
-                        return Ok(ok);
+                    let ok = match arrived.and_then(|h| h.verify(info)) {
+                        Some(ok) => ok,
+                        None => verify_piece(content.storage.as_ref(), info, piece)?,
+                    };
+                    // Durable before the engine counts it.
+                    if ok
+                        && sync
+                        && let Some(range) = info.layout().piece_range(piece)
+                    {
+                        content
+                            .storage
+                            .sync_range(range.start, range.end - range.start)?;
                     }
-                    verify_piece(content.storage.as_ref(), info, piece)
+                    Ok::<bool, dravity_storage::StorageError>(ok)
                 })
                 .await;
             // A mismatch or a short file is "we don't have it". Any other I/O
@@ -1566,6 +1586,30 @@ impl TorrentTask {
                 },
             };
             let _ = tx.send(Input::Engine(event)).await;
+        });
+    }
+
+    /// Forces everything written so far to disk
+    /// ([`Durability::OnComplete`]).
+    fn sync_all(&mut self) {
+        let Some(content) = self.content.clone() else {
+            return;
+        };
+        let tx = self.events_tx.clone();
+        self.disk.spawn(async move {
+            let storage = Arc::clone(&content.storage);
+            let result = tokio::task::spawn_blocking(move || storage.flush()).await;
+            let error = match result {
+                Ok(Ok(())) => return,
+                Ok(Err(e)) => e.to_string(),
+                Err(e) => e.to_string(),
+            };
+            tracing::warn!(%error, "syncing the finished download failed");
+            let _ = tx
+                .send(Input::Engine(Event::StorageFailed {
+                    error: format!("syncing the finished download: {error}"),
+                }))
+                .await;
         });
     }
 

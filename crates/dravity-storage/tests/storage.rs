@@ -13,8 +13,8 @@ use bytes::Bytes;
 use dravity_bencode::{Dict, Value};
 use dravity_core::{BLOCK_SIZE, BlockRef, Metainfo};
 use dravity_storage::{
-    FileStamp, FileStorage, MemoryStorage, ResumeData, Storage, StorageError, load_resume,
-    read_block, remove_resume, save_resume, verify_piece, write_block,
+    FileStamp, FileStorage, MemoryStorage, PreallocateMode, ResumeData, Storage, StorageError,
+    load_resume, read_block, remove_resume, save_resume, verify_piece, write_block,
 };
 use sha1::{Digest, Sha1};
 
@@ -377,4 +377,49 @@ fn batched_blocks_round_trip() {
     assert!(!dir.path().join("root/.pad").exists());
     let memory = MemoryStorage::new(data.len() as u64);
     batch::batches_round_trip(&memory, &m, &data);
+}
+
+#[test]
+fn preallocation_sizes_files_at_creation() {
+    for mode in [PreallocateMode::Sparse, PreallocateMode::Full] {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, data) = torrent(
+            &[
+                (&["a"], content(3000, 1), false),
+                (&["b"], content(5000, 2), false),
+            ],
+            1024,
+        );
+        let s = FileStorage::new(dir.path(), m.info())
+            .unwrap()
+            .with_preallocate(mode);
+        // One byte into `a` creates only `a`, at full length.
+        s.write_at(0, &data[..1]).unwrap();
+        let a = dir.path().join("root/a");
+        assert_eq!(std::fs::metadata(&a).unwrap().len(), 3000, "{mode:?}");
+        assert!(!dir.path().join("root/b").exists());
+        write_all_blocks(&s, &m, &data);
+        for piece in 0..m.info().piece_count() {
+            assert!(verify_piece(&s, m.info(), piece).unwrap());
+        }
+    }
+}
+
+#[test]
+fn sync_range_syncs_only_present_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, data) = torrent(
+        &[
+            (&["a"], content(3000, 1), false),
+            (&["b"], content(5000, 2), false),
+        ],
+        1024,
+    );
+    let s = FileStorage::new(dir.path(), m.info()).unwrap();
+    // Nothing written yet: missing files are skipped, not created.
+    s.sync_range(0, 8000).unwrap();
+    assert!(!dir.path().join("root/a").exists());
+    s.write_at(2000, &data[2000..4000]).unwrap();
+    s.sync_range(2000, 2000).unwrap();
+    assert!(s.sync_range(7000, 5000).is_err());
 }

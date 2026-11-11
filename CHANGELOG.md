@@ -43,6 +43,12 @@ Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/ir
   (`Session::set_max_connections`, `max_connections`, `connection_count`).
   A loom model (`dravity-core/tests/loom_admit.rs`, CI job `loom`) checks
   the counter under every interleaving.
+- **Session-wide hash pool (item 4):** `SessionConfig::hash_workers` now
+  bounds piece hashing across the whole session instead of per torrent.
+  Checks, rechecks and smart-ban digests of every torrent share one FIFO
+  pool, so N torrents rechecking at once no longer run N × cores
+  blocking jobs. A panicking job reports a storage error and frees its
+  slot. `Session::hash_jobs_running` shows the pool's load.
 
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 

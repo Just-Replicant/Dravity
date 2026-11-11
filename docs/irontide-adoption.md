@@ -13,6 +13,7 @@ sound version, with the difference explained), **open** (not started).
 | 1 | SSRF guard for HTTP tracker announces | done | `fix(tracker): guard HTTP announces against SSRF` | [notes](#1-ssrf-guard) |
 | 2 | Session-wide smart ban | done | `feat(engine,session): session-wide smart ban` | [notes](#2-smart-ban) |
 | 3 | Global connection cap with one admit function and a loom model | done | `feat(core,session): session-wide connection cap` | [notes](#3-connection-cap) |
+| 4 | Session-wide hash pool | done | `perf(session): share one hash pool across torrents` | [notes](#4-hash-pool) |
 
 ## Design notes
 
@@ -78,3 +79,14 @@ and retries after `DEFERRED_DIAL_RETRY`. It does not start the next dial
 in the same step, which would only be deferred as well. The cap can be
 changed at runtime (`Session::set_max_connections`). Lowering it never
 closes a connection.
+
+### 4. Hash pool
+
+`dravity-session/src/hash_pool.rs` replaces the per-torrent semaphore
+with a single `HashPool` that the session owns and hands to each torrent
+through `TorrentContext`. It bounds jobs with a FIFO `tokio::Semaphore`,
+so torrents take turns. The jobs run on Tokio's blocking pool. irontide
+runs its own threads with `catch_unwind`. Dravity gets the same
+isolation from `spawn_blocking`'s `JoinError`: a panicking job reports
+`StorageFailed` and frees its slot. Dedicated threads would duplicate
+the blocking pool that storage I/O already uses.

@@ -47,12 +47,13 @@ use dravity_tracker::{AnnounceRequest, AnnounceResponse, TrackerClient};
 use dravity_webseed::WebSeedClient;
 use dravity_wire::{Message, Reserved};
 use futures_util::StreamExt;
-use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::catalog::{Catalog, EntrySource};
 use crate::config::SessionConfig;
 use crate::files::{self, FileProgress};
+use crate::hash_pool::HashPool;
 use crate::listen::{self, Registry, UtpSockets};
 use crate::peer::{self, PeerCommand, PeerParams};
 use crate::persist::Persister;
@@ -194,6 +195,8 @@ pub(crate) struct TorrentContext {
     pub(crate) catalog: Catalog,
     /// The session-wide ban list.
     pub(crate) bans: crate::bans::Bans,
+    /// The session-wide hashing pool.
+    pub(crate) hash_pool: HashPool,
     /// The session-wide connection cap: every dial takes a slot first.
     pub(crate) connections: ConnectionLimit,
     /// Session state writer, with a state directory.
@@ -367,7 +370,6 @@ pub(crate) struct TorrentTask {
     commands: mpsc::Receiver<Command>,
     /// Events produced synchronously during dispatch, handled next.
     local: VecDeque<Event>,
-    hash_slots: Arc<Semaphore>,
     /// Block writes and upload reads waiting to go to storage together
     /// (see [`MAX_IO_BATCH`]).
     pending_writes: Vec<(BlockRef, Bytes)>,
@@ -442,7 +444,6 @@ impl TorrentTask {
             }
         };
         let (events_tx, events_rx) = mpsc::channel(ctx.config.event_queue.max(1));
-        let hash_slots = Arc::new(Semaphore::new(ctx.config.hash_workers.max(1)));
         let mut task = Self {
             ctx,
             phase,
@@ -460,7 +461,6 @@ impl TorrentTask {
             events_rx,
             commands,
             local: VecDeque::new(),
-            hash_slots,
             pending_writes: Vec::new(),
             pending_reads: Vec::new(),
             background: JoinSet::new(),
@@ -1509,33 +1509,26 @@ impl TorrentTask {
             tracing::warn!(piece, "hash request before metadata");
             return;
         };
-        let slots = Arc::clone(&self.hash_slots);
+        let pool = self.ctx.hash_pool.clone();
         let tx = self.events_tx.clone();
         self.disk.spawn(async move {
-            let Ok(_permit) = slots.acquire_owned().await else {
-                return;
-            };
-            let result = tokio::task::spawn_blocking(move || {
-                verify_piece(content.storage.as_ref(), content.metainfo.info(), piece)
-            })
-            .await;
+            let result = pool
+                .run(move || verify_piece(content.storage.as_ref(), content.metainfo.info(), piece))
+                .await;
             // A mismatch or a short file is "we don't have it". Any other I/O
             // error would otherwise reset the piece and download it forever.
             let event = match result {
-                Ok(Ok(ok)) => Event::PieceHashed { piece, ok },
-                Ok(Err(e)) if e.is_missing_data() => Event::PieceHashed { piece, ok: false },
-                Ok(Err(e)) => {
+                Some(Ok(ok)) => Event::PieceHashed { piece, ok },
+                Some(Err(e)) if e.is_missing_data() => Event::PieceHashed { piece, ok: false },
+                Some(Err(e)) => {
                     tracing::warn!(piece, error = %e, "piece hash failed");
                     Event::StorageFailed {
                         error: format!("hashing piece {piece}: {e}"),
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(piece, error = %e, "piece hash task failed");
-                    Event::StorageFailed {
-                        error: format!("hashing piece {piece}: {e}"),
-                    }
-                }
+                None => Event::StorageFailed {
+                    error: format!("hashing piece {piece}: the hash job failed"),
+                },
             };
             let _ = tx.send(Input::Engine(event)).await;
         });
@@ -1551,19 +1544,14 @@ impl TorrentTask {
             });
             return;
         };
-        let slots = Arc::clone(&self.hash_slots);
+        let pool = self.ctx.hash_pool.clone();
         let tx = self.events_tx.clone();
         self.disk.spawn(async move {
-            let Ok(_permit) = slots.acquire_owned().await else {
-                return;
-            };
-            let hashes = tokio::task::spawn_blocking(move || {
-                block_hashes(content.storage.as_ref(), content.metainfo.info(), piece)
-            })
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default();
+            let hashes = pool
+                .run(move || block_hashes(content.storage.as_ref(), content.metainfo.info(), piece))
+                .await
+                .and_then(Result::ok)
+                .unwrap_or_default();
             let _ = tx
                 .send(Input::Engine(Event::BlockHashes { piece, hashes }))
                 .await;

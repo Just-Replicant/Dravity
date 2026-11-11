@@ -78,6 +78,7 @@ mod config;
 mod error;
 mod file_stream;
 mod files;
+mod hash_pool;
 mod listen;
 mod peer;
 pub mod persist;
@@ -250,6 +251,8 @@ struct Inner {
     bans: bans::Bans,
     /// The session-wide cap on open peer connections.
     connections: ConnectionLimit,
+    /// Piece hashing for every torrent, within `hash_workers`.
+    hash_pool: hash_pool::HashPool,
     /// Session state writer, started with the first torrent.
     persist: OnceLock<Persister>,
     /// Bound sockets, until the first torrent starts the accept tasks
@@ -351,6 +354,7 @@ impl Session {
         let (alerts, _) = broadcast::channel(config.alert_buffer.max(1));
         let stop = CancellationToken::new();
         let connections = ConnectionLimit::new(config.max_connections);
+        let hash_pool = hash_pool::HashPool::new(config.hash_workers);
         Ok(Self {
             inner: Arc::new(Inner {
                 config: Arc::new(config),
@@ -365,6 +369,7 @@ impl Session {
                 catalog: Arc::new(Mutex::new(HashMap::new())),
                 bans: Arc::default(),
                 connections,
+                hash_pool,
                 persist: OnceLock::new(),
                 listener: Mutex::new(listener),
                 listen_port,
@@ -647,6 +652,7 @@ impl Session {
             catalog: Arc::clone(&self.inner.catalog),
             bans: Arc::clone(&self.inner.bans),
             connections: self.inner.connections.clone(),
+            hash_pool: self.inner.hash_pool.clone(),
             persist: self.inner.persister().cloned(),
             port_map: self
                 .inner
@@ -704,6 +710,13 @@ impl Session {
     #[must_use]
     pub fn connection_count(&self) -> usize {
         self.inner.connections.live()
+    }
+
+    /// Piece-hash jobs running now, across every torrent (at most
+    /// [`SessionConfig::hash_workers`]).
+    #[must_use]
+    pub fn hash_jobs_running(&self) -> usize {
+        self.inner.hash_pool.busy()
     }
 
     /// The session-wide connection cap now in force.

@@ -89,7 +89,8 @@ pub struct SessionConfig {
     /// listener closes new connections and dials wait. `None` removes the
     /// cap.
     pub max_connections: Option<usize>,
-    /// Concurrent piece-hash jobs per torrent.
+    /// Concurrent piece-hash jobs across the whole session (piece checks,
+    /// rechecks and smart-ban block digests of every torrent share them).
     pub hash_workers: usize,
     /// Time allowed for the `stopped` announce when a torrent stops.
     pub stop_announce_timeout: Duration,

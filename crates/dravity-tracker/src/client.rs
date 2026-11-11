@@ -1,10 +1,13 @@
 //! Async announce over HTTP(S) and UDP.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use dravity_core::net::is_public;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use reqwest::redirect::{Attempt, Policy};
 use rustls_platform_verifier::BuilderVerifierExt;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex as AsyncMutex;
@@ -12,7 +15,7 @@ use url::Url;
 
 use crate::error::TrackerError;
 use crate::types::{AnnounceRequest, AnnounceResponse};
-use crate::{http, udp};
+use crate::{guard, http, udp};
 
 /// Timeouts and retry policy for [`TrackerClient`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +29,11 @@ pub struct ClientConfig {
     pub udp_retries: u32,
     /// `User-Agent` for HTTP announces.
     pub user_agent: String,
+    /// Apply the SSRF checks of [`crate::guard`] (default `true`): local
+    /// trackers need an `/announce` path, and redirects stay on `http(s)`,
+    /// never downgrade and never move from a non-local tracker to a
+    /// non-public address (literal or resolved).
+    pub ssrf_mitigation: bool,
 }
 
 impl Default for ClientConfig {
@@ -35,6 +43,7 @@ impl Default for ClientConfig {
             udp_timeout: Duration::from_secs(15),
             udp_retries: 2,
             user_agent: concat!("Dravity/", env!("CARGO_PKG_VERSION")).to_owned(),
+            ssrf_mitigation: true,
         }
     }
 }
@@ -76,6 +85,92 @@ pub struct TrackerClient {
     http: reqwest::Client,
     config: ClientConfig,
     endpoints: Arc<Mutex<HashMap<SocketAddr, UdpEndpoint>>>,
+    trusted: Arc<TrustedHosts>,
+}
+
+/// Most host names remembered as announce origins; the set is cleared when
+/// it grows past this (names are re-added on their next announce).
+const MAX_TRUSTED_HOSTS: usize = 1024;
+
+/// Host names that appeared in an announce URL itself (not in a redirect).
+///
+/// Only these may resolve to non-public addresses: a LAN tracker named by
+/// the torrent works, but a public tracker cannot redirect to a name that
+/// resolves into the LAN (and DNS rebinding cannot swap the address after
+/// a check, because the filter runs in the resolver the connection uses).
+#[derive(Debug, Default)]
+struct TrustedHosts(Mutex<HashSet<String>>);
+
+impl TrustedHosts {
+    fn insert(&self, host: &str) {
+        let mut set = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if set.len() >= MAX_TRUSTED_HOSTS {
+            set.clear();
+        }
+        set.insert(host.to_ascii_lowercase());
+    }
+
+    fn contains(&self, host: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&host.to_ascii_lowercase())
+    }
+}
+
+/// The system resolver, keeping only public addresses for names that are
+/// not announce origins.
+#[derive(Debug)]
+struct GuardedResolver {
+    trusted: Arc<TrustedHosts>,
+}
+
+/// A redirect target whose every address is non-public.
+#[derive(Debug, thiserror::Error)]
+#[error("tracker host {0} resolves only to non-public addresses")]
+struct NotPublic(String);
+
+impl Resolve for GuardedResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        let trusted = self.trusted.contains(&host);
+        Box::pin(async move {
+            let found: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|a| trusted || is_public(a.ip()))
+                .collect();
+            if found.is_empty() {
+                return Err(NotPublic(host).into());
+            }
+            let addrs: Addrs = Box::new(found.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+/// The redirect policy: [`guard::check_redirect`] on every hop.
+fn redirect(attempt: Attempt<'_>) -> reqwest::redirect::Action {
+    let previous = attempt.previous();
+    let (Some(origin), Some(from)) = (previous.first(), previous.last()) else {
+        return attempt.follow();
+    };
+    let hops = previous.len().saturating_sub(1);
+    match guard::check_redirect(origin, from, attempt.url(), hops) {
+        Ok(()) => attempt.follow(),
+        Err(blocked) => attempt.error(blocked),
+    }
+}
+
+/// The [`guard::Blocked`] reason inside a reqwest error, if there is one.
+fn blocked_reason(error: &reqwest::Error) -> Option<guard::Blocked> {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = source {
+        if let Some(blocked) = e.downcast_ref::<guard::Blocked>() {
+            return Some(blocked.clone());
+        }
+        source = e.source();
+    }
+    None
 }
 
 impl TrackerClient {
@@ -91,15 +186,26 @@ impl TrackerClient {
             .with_platform_verifier()?
             .with_no_client_auth();
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let http = reqwest::Client::builder()
+        let trusted = Arc::new(TrustedHosts::default());
+        let mut builder = reqwest::Client::builder()
             .tls_backend_preconfigured(tls)
             .timeout(config.http_timeout)
-            .user_agent(config.user_agent.clone())
-            .build()?;
+            .user_agent(config.user_agent.clone());
+        if config.ssrf_mitigation {
+            builder = builder
+                .redirect(Policy::custom(redirect))
+                .dns_resolver(Arc::new(GuardedResolver {
+                    trusted: Arc::clone(&trusted),
+                }));
+        } else {
+            builder = builder.redirect(Policy::limited(guard::MAX_REDIRECTS));
+        }
+        let http = builder.build()?;
         Ok(Self {
             http,
             config,
             endpoints: Arc::default(),
+            trusted,
         })
     }
 
@@ -132,7 +238,18 @@ impl TrackerClient {
         base: &str,
         req: &AnnounceRequest,
     ) -> Result<AnnounceResponse, TrackerError> {
-        let mut response = self.http.get(http::announce_url(base, req)).send().await?;
+        let url = http::announce_url(base, req);
+        if self.config.ssrf_mitigation {
+            let parsed = Url::parse(&url).map_err(|_| TrackerError::InvalidUrl(base.to_owned()))?;
+            guard::check_announce(&parsed)?;
+            if let Some(url::Host::Domain(name)) = parsed.host() {
+                self.trusted.insert(name);
+            }
+        }
+        let mut response =
+            self.http.get(url).send().await.map_err(|e| {
+                blocked_reason(&e).map_or(TrackerError::Http(e), TrackerError::Blocked)
+            })?;
         if !response.status().is_success() {
             return Err(TrackerError::HttpStatus(response.status().as_u16()));
         }

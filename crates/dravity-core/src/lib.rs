@@ -8,6 +8,7 @@
 //! * [`layout`] — piece, block and file arithmetic.
 //! * [`merkle`] — BEP 52 SHA-256 Merkle trees (pieces roots, piece layers).
 //! * [`path`] — rejection of unsafe file paths from untrusted metainfo.
+//! * [`net`] — public/non-public address classification (SSRF checks).
 //!
 //! This crate is sans-IO: it never touches the network or filesystem.
 
@@ -18,6 +19,7 @@ pub mod layout;
 pub mod magnet;
 pub mod merkle;
 pub mod metainfo;
+pub mod net;
 pub mod path;
 mod v2;
 

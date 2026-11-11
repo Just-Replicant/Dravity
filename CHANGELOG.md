@@ -6,6 +6,21 @@ the roadmap phases until the first release.
 
 ## [Unreleased]
 
+### irontide adoption
+
+Ideas adopted from a review of the irontide engine, reimplemented for
+Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/irontide-adoption.md).
+
+- **Security (item 1):** tracker HTTP announces are SSRF-guarded
+  (`dravity_tracker::guard`, `ClientConfig::ssrf_mitigation`, default on):
+  a `localhost`/loopback tracker must use an `/announce` path; redirects
+  stay on `http(s)`, never downgrade `https`, are capped at 5, and a
+  redirect from a non-local tracker may not reach a non-public address,
+  literal or resolved (a resolver drops non-public addresses for every
+  host that is not itself an announce origin). New
+  `TrackerError::Blocked`. The address classifier moved to
+  `dravity_core::net::is_public` (`dravity_webseed::is_public` re-exports it).
+
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 
 See [`docs/phase-6.md`](docs/phase-6.md) for design notes.

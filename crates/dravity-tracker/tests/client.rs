@@ -289,3 +289,117 @@ async fn rejects_bad_urls() {
         Err(TrackerError::InvalidUrl(_))
     ));
 }
+
+/// Serves HTTP requests forever: the first `redirects` answer `302` to
+/// `location(n)`, later ones the announce body. Returns the request lines.
+async fn redirecting_tracker(
+    location: fn(SocketAddr, usize) -> String,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut n = 0;
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                let Ok(read) = sock.read(&mut buf).await else {
+                    break;
+                };
+                if read == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..read]);
+            }
+            let line = String::from_utf8_lossy(&req)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let response = if line.contains("/final/announce") {
+                let body = b"d8:intervali60e5:peers0:e";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    String::from_utf8_lossy(body)
+                )
+            } else {
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    location(addr, n)
+                )
+            };
+            n += 1;
+            let _ = sock.write_all(response.as_bytes()).await;
+        }
+    });
+    (addr, task)
+}
+
+#[tokio::test]
+async fn ssrf_local_tracker_needs_announce_path() {
+    let r = client()
+        .announce("http://127.0.0.1:9/admin", &request())
+        .await;
+    assert!(matches!(r, Err(TrackerError::Blocked(_))), "{r:?}");
+}
+
+#[tokio::test]
+async fn ssrf_redirect_within_the_lan_is_followed() {
+    let (addr, task) = redirecting_tracker(|a, _| format!("http://{a}/final/announce")).await;
+    let r = client()
+        .announce(&format!("http://{addr}/announce"), &request())
+        .await
+        .unwrap();
+    assert_eq!(r.interval, Some(Duration::from_secs(60)));
+    task.abort();
+}
+
+#[tokio::test]
+async fn ssrf_redirect_to_other_scheme_or_local_path_is_blocked() {
+    // reqwest never follows a non-HTTP scheme; the redirect is returned.
+    let (addr, task) = redirecting_tracker(|_, _| "file:///etc/passwd".to_owned()).await;
+    let r = client()
+        .announce(&format!("http://{addr}/announce"), &request())
+        .await;
+    assert!(
+        matches!(
+            r,
+            Err(TrackerError::Blocked(_) | TrackerError::HttpStatus(302))
+        ),
+        "{r:?}"
+    );
+    task.abort();
+
+    let (addr, task) = redirecting_tracker(|a, _| format!("http://{a}/admin")).await;
+    let r = client()
+        .announce(&format!("http://{addr}/announce"), &request())
+        .await;
+    assert!(matches!(r, Err(TrackerError::Blocked(_))), "{r:?}");
+    task.abort();
+}
+
+#[tokio::test]
+async fn ssrf_redirect_loop_is_cut_off() {
+    let (addr, task) = redirecting_tracker(|a, n| format!("http://{a}/announce?hop={n}")).await;
+    let r = client()
+        .announce(&format!("http://{addr}/announce"), &request())
+        .await;
+    assert!(matches!(r, Err(TrackerError::Blocked(_))), "{r:?}");
+    task.abort();
+}
+
+#[tokio::test]
+async fn ssrf_checks_can_be_disabled() {
+    let mut c = ClientConfig::default();
+    c.ssrf_mitigation = false;
+    c.http_timeout = Duration::from_secs(2);
+    let r = TrackerClient::new(c)
+        .unwrap()
+        .announce("http://127.0.0.1:9/admin", &request())
+        .await;
+    assert!(!matches!(r, Err(TrackerError::Blocked(_))), "{r:?}");
+}

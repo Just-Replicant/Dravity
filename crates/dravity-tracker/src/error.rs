@@ -39,6 +39,10 @@ pub enum TrackerError {
     /// No answer within the configured time.
     #[error("tracker timed out")]
     Timeout,
+    /// The request was refused by the SSRF checks (see [`crate::guard`]).
+    #[cfg(feature = "client")]
+    #[error("tracker request blocked: {0}")]
+    Blocked(#[from] crate::guard::Blocked),
     /// The host name did not resolve to any address.
     #[error("could not resolve tracker host `{0}`")]
     Resolve(String),

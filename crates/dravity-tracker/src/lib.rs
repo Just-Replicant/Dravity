@@ -13,6 +13,8 @@
 #[cfg(feature = "client")]
 mod client;
 mod error;
+#[cfg(feature = "client")]
+pub mod guard;
 pub mod http;
 mod types;
 pub mod udp;

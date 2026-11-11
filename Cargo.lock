@@ -723,6 +723,7 @@ version = "0.1.0"
 dependencies = [
  "dravity-bencode",
  "dravity-core",
+ "fastrand",
  "futures-util",
  "mainline",
  "sha1",

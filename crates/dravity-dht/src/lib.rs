@@ -21,6 +21,7 @@
 
 pub mod demux;
 pub mod krpc;
+pub mod native;
 pub mod routing;
 pub mod secure_id;
 pub mod store;

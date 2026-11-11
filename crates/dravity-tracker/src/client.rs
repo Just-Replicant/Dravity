@@ -34,8 +34,10 @@ pub struct ClientConfig {
     /// never downgrade and never move from a non-local tracker to a
     /// non-public address (literal or resolved).
     pub ssrf_mitigation: bool,
-    /// Send HTTP(S) announces and scrapes through this HTTP proxy
-    /// (`http://[user:pass@]host:port`). UDP trackers are not proxied.
+    /// Send HTTP(S) announces and scrapes through this proxy:
+    /// `http://`, `socks5://`, `socks5h://`, `socks4://` or `socks4a://`
+    /// (`[user:pass@]host:port`; the `h`/`a` forms resolve names at the
+    /// proxy). UDP trackers are not proxied.
     pub http_proxy: Option<String>,
 }
 

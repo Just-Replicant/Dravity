@@ -252,8 +252,8 @@ struct NetworkArgs {
     #[arg(long, value_name = "FILE")]
     ip_filter: Option<PathBuf>,
     /// Dial peers through a proxy: `socks5://[user:pass@]host:port`,
-    /// `socks4://host:port` or `http://[user:pass@]host:port` (an HTTP
-    /// proxy also carries HTTP trackers and web seeds). UDP (DHT, UDP
+    /// `socks4://host:port` or `http://[user:pass@]host:port` (it also
+    /// carries HTTP trackers and web seeds, SOCKS with remote DNS). UDP (DHT, UDP
     /// trackers, LSD) is not proxied; add `--no-dht --no-lsd` for that.
     #[arg(long, value_name = "URL")]
     proxy: Option<String>,

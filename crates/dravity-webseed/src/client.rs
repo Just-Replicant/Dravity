@@ -27,7 +27,8 @@ pub struct WebSeedConfig {
     /// must not make the client probe its network. Turn on for tests and
     /// LAN web seeds.
     pub allow_private_addresses: bool,
-    /// Fetch through this HTTP proxy (`http://[user:pass@]host:port`).
+    /// Fetch through this proxy (`http://`, `socks5h://`, `socks4a://`, …
+    /// with optional `user:pass@`).
     pub http_proxy: Option<String>,
 }
 

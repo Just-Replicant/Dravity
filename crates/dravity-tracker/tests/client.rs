@@ -474,3 +474,59 @@ async fn udp_scrape_reuses_the_connection() {
     }
     task.await.unwrap();
 }
+
+/// A SOCKS5 proxy (no auth) that is also the tracker behind it: it checks
+/// the CONNECT names the tracker host (remote DNS), then answers the
+/// tunnelled HTTP announce itself.
+#[tokio::test]
+async fn http_announce_through_socks5_resolves_at_the_proxy() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut greet = [0u8; 2];
+        sock.read_exact(&mut greet).await.unwrap();
+        assert_eq!(greet[0], 5);
+        let mut methods = vec![0u8; usize::from(greet[1])];
+        sock.read_exact(&mut methods).await.unwrap();
+        assert!(methods.contains(&0));
+        sock.write_all(&[5, 0]).await.unwrap();
+        let mut head = [0u8; 4];
+        sock.read_exact(&mut head).await.unwrap();
+        assert_eq!(head[..2], [5, 1], "CONNECT");
+        assert_eq!(head[3], 3, "a domain name, not a locally resolved IP");
+        let mut len = [0u8; 1];
+        sock.read_exact(&mut len).await.unwrap();
+        let mut name = vec![0u8; usize::from(len[0])];
+        sock.read_exact(&mut name).await.unwrap();
+        let mut port = [0u8; 2];
+        sock.read_exact(&mut port).await.unwrap();
+        sock.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        let mut req = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = sock.read(&mut buf).await.unwrap();
+            req.extend_from_slice(&buf[..n]);
+        }
+        let body = b"d8:intervali600e5:peers0:e";
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        sock.write_all(head.as_bytes()).await.unwrap();
+        sock.write_all(body).await.unwrap();
+        (String::from_utf8(name).unwrap(), u16::from_be_bytes(port))
+    });
+    let mut c = ClientConfig::default();
+    c.http_timeout = Duration::from_secs(5);
+    c.http_proxy = Some(format!("socks5h://{proxy}"));
+    let client = TrackerClient::new(c).unwrap();
+    let r = client
+        .announce("http://tracker.invalid:6969/announce", &request())
+        .await
+        .unwrap();
+    assert_eq!(r.interval, Some(Duration::from_secs(600)));
+    assert_eq!(task.await.unwrap(), ("tracker.invalid".to_owned(), 6969));
+}

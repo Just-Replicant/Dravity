@@ -120,17 +120,35 @@ impl Proxy {
         })
     }
 
-    /// The proxy as a URL for HTTP clients, if it is an HTTP proxy.
+    /// The proxy as a URL for the HTTP tracker and web seed clients.
+    ///
+    /// SOCKS proxies use the remote-DNS schemes (`socks5h://`,
+    /// `socks4a://`) so tracker and web seed host names are resolved by the
+    /// proxy and never leak to the local resolver. SOCKS4 carries no
+    /// password, so credentials are dropped for it. Always `Some` today;
+    /// the `Option` leaves room for kinds HTTP clients cannot use.
+    ///
+    /// ```
+    /// use dravity_session::proxy::Proxy;
+    ///
+    /// let p = Proxy::parse("socks5://me:pw@127.0.0.1:1080").unwrap();
+    /// assert_eq!(p.http_url().unwrap(), "socks5h://me:pw@127.0.0.1:1080");
+    /// ```
     #[must_use]
     pub fn http_url(&self) -> Option<String> {
-        (self.kind == ProxyKind::Http).then(|| match &self.auth {
+        let scheme = match self.kind {
+            ProxyKind::Http => "http",
+            ProxyKind::Socks5 => "socks5h",
+            ProxyKind::Socks4 => return Some(format!("socks4a://{}", self.server)),
+        };
+        Some(match &self.auth {
             Some((user, pass)) => format!(
-                "http://{}:{}@{}",
+                "{scheme}://{}:{}@{}",
                 percent_encode(user),
                 percent_encode(pass),
                 self.server
             ),
-            None => format!("http://{}", self.server),
+            None => format!("{scheme}://{}", self.server),
         })
     }
 }
@@ -435,7 +453,17 @@ mod tests {
             Proxy::parse("socks4://h:1").unwrap().kind,
             ProxyKind::Socks4
         );
-        assert!(Proxy::parse("socks5://h:1").unwrap().http_url().is_none());
+        assert_eq!(
+            Proxy::parse("socks5://h:1").unwrap().http_url().unwrap(),
+            "socks5h://h:1"
+        );
+        assert_eq!(
+            Proxy::parse("socks4://u:x@h:1")
+                .unwrap()
+                .http_url()
+                .unwrap(),
+            "socks4a://h:1"
+        );
         for bad in ["ftp://h:1", "socks5://h", "socks5://h:1/x", "nonsense"] {
             assert!(Proxy::parse(bad).is_err(), "{bad}");
         }

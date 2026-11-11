@@ -10,6 +10,8 @@ use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
+use crate::web_seed::is_web_seed_addr;
+
 /// Upper bound on queued plus waiting peer addresses.
 pub(crate) const MAX_POOL: usize = 2_000;
 
@@ -47,6 +49,7 @@ impl PeerPool {
             // Only drop the retry entry once we have room to queue it.
             self.retry.retain(|(_, waiting)| *waiting != addr);
             if addr.port() == 0
+                || is_web_seed_addr(addr)
                 || connected(addr)
                 || self.connecting.contains(&addr)
                 || !queued.insert(addr)
@@ -66,6 +69,7 @@ impl PeerPool {
         connected: impl Fn(SocketAddr) -> bool,
     ) {
         if addr.port() == 0
+            || is_web_seed_addr(addr)
             || connected(addr)
             || self.connecting.contains(&addr)
             || self.queue.contains(&addr)
@@ -166,12 +170,44 @@ impl PeerPool {
     }
 }
 
+/// Which of two connections between the same two endpoints (one dialed by
+/// each side, as happens over uTP, where both use their listen port) both
+/// sides keep: the one opened by the side with the lower listen port, the
+/// rule libtorrent applies. Keeping the first one instead lets each side
+/// close a different connection, leaving none.
+///
+/// Returns whether the newly joined connection replaces the existing one;
+/// `None` when the rule cannot decide (our port unknown, or equal ports),
+/// in which case the existing connection stays.
+pub(crate) fn new_duplicate_wins(
+    our_port: Option<u16>,
+    their_port: u16,
+    new_is_incoming: bool,
+) -> Option<bool> {
+    let our_port = our_port.filter(|&p| p != 0 && p != their_port)?;
+    let keep_ours = our_port < their_port;
+    Some(keep_ours != new_is_incoming)
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn the_lower_listen_port_keeps_its_outgoing_connection() {
+        // We listen on 6000, they on 7000: our dial wins on both sides.
+        assert_eq!(new_duplicate_wins(Some(6000), 7000, false), Some(true));
+        assert_eq!(new_duplicate_wins(Some(6000), 7000, true), Some(false));
+        // We listen on 7000, they on 6000: their dial wins.
+        assert_eq!(new_duplicate_wins(Some(7000), 6000, true), Some(true));
+        assert_eq!(new_duplicate_wins(Some(7000), 6000, false), Some(false));
+        // Undecidable: the first connection stays.
+        assert_eq!(new_duplicate_wins(None, 6000, true), None);
+        assert_eq!(new_duplicate_wins(Some(6000), 6000, true), None);
+    }
 
     fn addr(n: u16) -> SocketAddr {
         SocketAddr::from(([10, 0, 0, 1], n))

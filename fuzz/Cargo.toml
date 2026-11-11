@@ -21,6 +21,8 @@ dravity-utp = { path = "../crates/dravity-utp" }
 dravity-portmap = { path = "../crates/dravity-portmap" }
 dravity-session = { path = "../crates/dravity-session" }
 dravity-http = { path = "../crates/dravity-http" }
+dravity-webseed = { path = "../crates/dravity-webseed", default-features = false }
+dravity-mse = { path = "../crates/dravity-mse", default-features = false }
 
 # Standalone workspace: fuzzing needs nightly and is not part of the main build.
 [workspace]
@@ -130,6 +132,20 @@ bench = false
 [[bin]]
 name = "http_range"
 path = "fuzz_targets/http_range.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "webseed_plan"
+path = "fuzz_targets/webseed_plan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mse_handshake"
+path = "fuzz_targets/mse_handshake.rs"
 test = false
 doc = false
 bench = false

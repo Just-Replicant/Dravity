@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use dravity_core::{InfoHash, PeerId};
-use dravity_engine::PeerKey;
+use dravity_engine::{DialHints, PeerKey};
+use dravity_mse::{MseError, Policy};
 use dravity_utp::UtpSocket;
 use dravity_wire::{Handshake, Message, Reserved};
 use futures_util::{SinkExt, StreamExt};
@@ -20,7 +21,7 @@ use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, FramedParts};
 
 use crate::codec::PeerCodec;
-use crate::stream::PeerStream;
+use crate::stream::{PeerStream, RawStream};
 use crate::torrent::Input;
 
 /// Commands from the torrent owner to a peer task.
@@ -41,6 +42,9 @@ pub(crate) struct PeerParams {
     /// The uTP socket for this address family, if uTP is available.
     pub(crate) utp: Option<Arc<UtpSocket>>,
     pub(crate) prefer_utp: bool,
+    pub(crate) encryption: Policy,
+    /// What PEX flags or earlier connections say about the peer.
+    pub(crate) hints: DialHints,
 }
 
 /// Why a handshake failed.
@@ -56,6 +60,10 @@ pub(crate) enum HandshakeError {
     SelfConnection,
     #[error("torrent is too busy to take the connection")]
     Busy,
+    #[error("peer did not encrypt, and encryption is required")]
+    EncryptionRequired,
+    #[error("encryption handshake failed: {0}")]
+    Mse(#[from] MseError),
     #[error(transparent)]
     Wire(#[from] dravity_wire::WireError),
     #[error(transparent)]
@@ -66,15 +74,23 @@ impl HandshakeError {
     /// Transient failures are dialed again. A peer that is the wrong torrent,
     /// ourselves, or speaking garbage is not.
     pub(crate) fn retryable(&self) -> bool {
-        matches!(self, Self::Timeout | Self::Eof | Self::Io(_))
+        matches!(
+            self,
+            Self::Timeout | Self::Eof | Self::Io(_) | Self::Mse(MseError::Io(_))
+        )
     }
 }
 
-/// Extensions we advertise: BEP 10 (metadata exchange, PEX) and, when
-/// enabled, the fast extension (BEP 6).
-pub(crate) fn our_reserved(fast: bool) -> Reserved {
+/// Extensions we advertise: BEP 10 (metadata exchange, PEX), when enabled
+/// the fast extension (BEP 6) and, for a torrent with a v2 info-hash, BEP
+/// 52 (v2: hash requests).
+///
+/// The v2 bit is per torrent, as libtorrent sets it: libtorrent 2.x drops
+/// a plaintext connection whose handshake sets it for a v1-only torrent.
+pub(crate) fn our_reserved(fast: bool, v2: bool) -> Reserved {
     Reserved::new()
         .with_extension_protocol(true)
+        .with_v2(v2)
         .with_fast(fast)
 }
 
@@ -114,27 +130,59 @@ where
     Ok((theirs, buf))
 }
 
-/// Opens a connection and handshakes over one transport.
-async fn open(
-    transport: Transport,
-    params: &PeerParams,
-) -> Result<(PeerStream, Handshake, BytesMut), HandshakeError> {
-    let mut stream = match (transport, &params.utp) {
-        (Transport::Utp, Some(utp)) => PeerStream::Utp(utp.connect(params.addr).await?),
+/// How far a dial attempt got before it failed.
+#[derive(Debug)]
+enum Failed {
+    /// No connection at all (refused, unreachable, or timed out).
+    Connect(HandshakeError),
+    /// Connected, then the encryption or BitTorrent handshake failed.
+    Handshake(HandshakeError),
+}
+
+/// Opens a raw connection over one transport.
+async fn connect(transport: Transport, params: &PeerParams) -> std::io::Result<RawStream> {
+    Ok(match (transport, &params.utp) {
+        (Transport::Utp, Some(utp)) => RawStream::Utp(utp.connect(params.addr).await?),
         _ => {
             let tcp = TcpStream::connect(params.addr).await?;
             tcp.set_nodelay(true)?;
-            PeerStream::Tcp(tcp)
+            RawStream::Tcp(tcp)
         }
-    };
-    let (theirs, leftover) = handshake(
-        &mut stream,
-        params.info_hash,
-        params.our_id,
-        params.reserved,
-    )
-    .await?;
-    Ok((stream, theirs, leftover))
+    })
+}
+
+/// Connects over one transport, runs the MSE handshake if `encrypt`, then
+/// the BitTorrent handshake, all within the connect timeout.
+async fn open(
+    transport: Transport,
+    params: &PeerParams,
+    encrypt: bool,
+) -> Result<(PeerStream, Handshake, BytesMut), Failed> {
+    let deadline = tokio::time::Instant::now() + params.connect_timeout;
+    let raw = tokio::time::timeout_at(deadline, connect(transport, params))
+        .await
+        .map_err(|_| Failed::Connect(HandshakeError::Timeout))?
+        .map_err(|e| Failed::Connect(e.into()))?;
+    tokio::time::timeout_at(deadline, async {
+        let mut stream = if encrypt {
+            let methods = params.encryption.methods();
+            let skey = params.info_hash.as_bytes();
+            PeerStream::mse(dravity_mse::initiate(raw, skey, methods).await?)
+        } else {
+            PeerStream::plain(raw)
+        };
+        let (theirs, leftover) = handshake(
+            &mut stream,
+            params.info_hash,
+            params.our_id,
+            params.reserved,
+        )
+        .await?;
+        Ok((stream, theirs, leftover))
+    })
+    .await
+    .map_err(|_| Failed::Handshake(HandshakeError::Timeout))?
+    .map_err(Failed::Handshake)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,22 +191,89 @@ enum Transport {
     Utp,
 }
 
+/// A successful dial.
+struct Dialed {
+    stream: PeerStream,
+    theirs: Handshake,
+    leftover: BytesMut,
+    /// What the dial showed about MSE support: `Some(true)` if it completed,
+    /// `Some(false)` if the peer refused it and took a plain handshake,
+    /// `None` if MSE was not tried.
+    mse: Option<bool>,
+}
+
+/// The transports to try, in order: uTP first when the peer is known to
+/// speak it (PEX flag or an earlier uTP connection), TCP first when it is
+/// known not to, otherwise as configured. The other one is the fallback.
+const fn transports(utp: bool, hint: Option<bool>, prefer_utp: bool) -> &'static [Transport] {
+    if !utp {
+        return &[Transport::Tcp];
+    }
+    let utp_first = match hint {
+        Some(known) => known,
+        None => prefer_utp,
+    };
+    if utp_first {
+        &[Transport::Utp, Transport::Tcp]
+    } else {
+        &[Transport::Tcp, Transport::Utp]
+    }
+}
+
+/// Whether to open with MSE (`true`) or a plain handshake, and whether the
+/// other may follow on the same transport if the peer accepts the
+/// connection and then fails the first.
+///
+/// [`Policy::Enabled`] starts with MSE unless the peer is known not to do
+/// it (refused it before, or PEX said so), and then falls back to the
+/// other. [`Policy::Required`] and [`Policy::Disabled`] have no fallback.
+fn encryption_order(policy: Policy, hint: Option<bool>) -> &'static [bool] {
+    match policy {
+        Policy::Disabled => &[false],
+        Policy::Required => &[true],
+        _ if hint == Some(false) => &[false, true],
+        _ => &[true, false],
+    }
+}
+
 /// Tries the preferred transport, then the other one if the first could
 /// not connect at all (a peer that answered and refused is not retried).
-/// Each attempt gets the full connect timeout.
-async fn dial(params: &PeerParams) -> Result<(PeerStream, Handshake, BytesMut), HandshakeError> {
-    let order = match (params.utp.is_some(), params.prefer_utp) {
-        (false, _) => &[Transport::Tcp][..],
-        (true, false) => &[Transport::Tcp, Transport::Utp][..],
-        (true, true) => &[Transport::Utp, Transport::Tcp][..],
-    };
+/// On each transport, tries the encryption order of
+/// [`encryption_order`]; each attempt gets the full connect timeout.
+async fn dial(params: &PeerParams) -> Result<Dialed, HandshakeError> {
+    let attempts = encryption_order(params.encryption, params.hints.encryption);
     let mut last = HandshakeError::Timeout;
-    for &transport in order {
-        match tokio::time::timeout(params.connect_timeout, open(transport, params)).await {
-            Ok(Ok(ok)) => return Ok(ok),
-            Ok(Err(e)) if !e.retryable() => return Err(e),
-            Ok(Err(e)) => last = e,
-            Err(_) => last = HandshakeError::Timeout,
+    for &transport in transports(params.utp.is_some(), params.hints.utp, params.prefer_utp) {
+        let mut refused_mse = false;
+        let mut result = Err(Failed::Connect(HandshakeError::Timeout));
+        for (i, &encrypt) in attempts.iter().enumerate() {
+            result = open(transport, params, encrypt).await;
+            match &result {
+                Err(Failed::Handshake(e)) if i + 1 < attempts.len() => {
+                    tracing::trace!(addr = %params.addr, ?transport, encrypt, error = %e, "dial failed; trying the other handshake");
+                    refused_mse |= encrypt;
+                }
+                _ => break,
+            }
+        }
+        match result {
+            Ok((stream, theirs, leftover)) => {
+                let mse = if stream.uses_mse() {
+                    Some(true)
+                } else if refused_mse {
+                    Some(false)
+                } else {
+                    None
+                };
+                return Ok(Dialed {
+                    stream,
+                    theirs,
+                    leftover,
+                    mse,
+                });
+            }
+            Err(Failed::Connect(e) | Failed::Handshake(e)) if !e.retryable() => return Err(e),
+            Err(Failed::Connect(e) | Failed::Handshake(e)) => last = e,
         }
         tracing::trace!(addr = %params.addr, ?transport, error = %last, "dial attempt failed");
     }
@@ -172,10 +287,20 @@ pub(crate) async fn run(
     commands: mpsc::Receiver<PeerCommand>,
 ) {
     let (key, addr) = (params.key, params.addr);
-    let (stream, reserved, leftover) = match dial(&params).await {
-        Ok((stream, theirs, leftover)) => {
-            tracing::debug!(%addr, transport = stream.transport(), "peer connected");
-            (stream, theirs.reserved, leftover)
+    let (stream, reserved, leftover, mse) = match dial(&params).await {
+        Ok(Dialed {
+            stream,
+            theirs,
+            leftover,
+            mse,
+        }) => {
+            tracing::debug!(
+                %addr,
+                transport = stream.transport(),
+                encrypted = stream.encrypted(),
+                "peer connected"
+            );
+            (stream, theirs.reserved, leftover, mse)
         }
         Err(e) => {
             tracing::debug!(%addr, error = %e, "peer connection failed");
@@ -195,6 +320,8 @@ pub(crate) async fn run(
             addr,
             reserved,
             transport: stream.kind(),
+            encrypted: stream.encrypted(),
+            mse,
         })
         .await
         .is_err()
@@ -272,6 +399,25 @@ async fn serve<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dial_order_follows_hints() {
+        use Transport::{Tcp, Utp};
+        assert_eq!(transports(false, Some(true), true), [Tcp]);
+        assert_eq!(transports(true, None, true), [Utp, Tcp]);
+        assert_eq!(transports(true, None, false), [Tcp, Utp]);
+        assert_eq!(transports(true, Some(true), false), [Utp, Tcp]);
+        assert_eq!(transports(true, Some(false), true), [Tcp, Utp]);
+
+        assert_eq!(encryption_order(Policy::Disabled, Some(true)), [false]);
+        assert_eq!(encryption_order(Policy::Required, Some(false)), [true]);
+        assert_eq!(encryption_order(Policy::Enabled, None), [true, false]);
+        assert_eq!(encryption_order(Policy::Enabled, Some(true)), [true, false]);
+        assert_eq!(
+            encryption_order(Policy::Enabled, Some(false)),
+            [false, true]
+        );
+    }
 
     #[tokio::test]
     async fn handshake_checks_info_hash_and_self() {
@@ -352,10 +498,12 @@ mod tests {
             addr,
             info_hash: hash,
             our_id: PeerId::new([7; 20]),
-            reserved: our_reserved(true),
+            reserved: our_reserved(true, true),
             connect_timeout: Duration::from_secs(5),
             utp: None,
             prefer_utp: false,
+            encryption: Policy::Disabled,
+            hints: DialHints::default(),
         };
         tokio::spawn(run(params, events_tx, cmd_rx));
         assert!(matches!(events.recv().await, Some(Input::Connected { .. })));

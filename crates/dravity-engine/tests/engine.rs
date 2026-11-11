@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use dravity_core::{BLOCK_SIZE, BlockRef, PieceLayout};
 use dravity_engine::{
-    Alert, AnnounceEvent, Bitfield, Config, Effect, Event, PeerKey, TorrentState, TorrentStatus,
+    Alert, AnnounceEvent, Bitfield, Config, DialHints, Effect, Event, PeerKey, PeerLink,
+    TorrentState, TorrentStatus, is_web_seed_addr, web_seed_addr,
 };
 use dravity_wire::{BlockRequest, Message, MetadataMessage, PexMessage, PexPeer, Reserved};
 use proptest::prelude::*;
@@ -70,6 +71,7 @@ impl Harness {
             peer: PeerKey(1),
             addr: addr(1),
             reserved: Reserved::new(),
+            link: PeerLink::default(),
         });
         h
     }
@@ -157,7 +159,7 @@ fn start_announces_and_connects_tracker_peers() {
     let connects: Vec<_> = fx
         .iter()
         .filter_map(|e| match e {
-            Effect::Connect { addr } => Some(*addr),
+            Effect::Connect { addr, .. } => Some(*addr),
             _ => None,
         })
         .collect();
@@ -167,7 +169,13 @@ fn start_announces_and_connects_tracker_peers() {
         addr: addr(1),
         retry: true,
     });
-    assert_eq!(fx, vec![Effect::Connect { addr: addr(3) }]);
+    assert_eq!(
+        fx,
+        vec![Effect::Connect {
+            addr: addr(3),
+            hints: DialHints::default()
+        }]
+    );
     assert_eq!(h.t.stats().connecting, 2);
 }
 
@@ -320,11 +328,14 @@ fn failed_and_dropped_peers_are_retried() {
     assert!(
         !h.advance(Duration::from_secs(14))
             .iter()
-            .any(|e| matches!(e, Effect::Connect { addr: peer } if *peer == addr(1)))
+            .any(|e| matches!(e, Effect::Connect { addr: peer, .. } if *peer == addr(1)))
     );
     assert!(
         h.advance(Duration::from_secs(1))
-            .contains(&Effect::Connect { addr: addr(1) })
+            .contains(&Effect::Connect {
+                addr: addr(1),
+                hints: DialHints::default()
+            })
     );
 
     // A live peer that drops is dialed again; a protocol reject is not.
@@ -333,7 +344,10 @@ fn failed_and_dropped_peers_are_retried() {
     assert_eq!(h.t.stats().peers, 0);
     assert!(
         h.advance(h.t.config().peer_retry)
-            .contains(&Effect::Connect { addr: addr(1) })
+            .contains(&Effect::Connect {
+                addr: addr(1),
+                hints: DialHints::default()
+            })
     );
 
     let mut h = Harness::started_with_peer(config());
@@ -359,7 +373,10 @@ fn failed_and_dropped_peers_are_retried() {
         h.ev(Event::AddPeers {
             peers: vec![addr(4)],
         })
-        .contains(&Effect::Connect { addr: addr(4) })
+        .contains(&Effect::Connect {
+            addr: addr(4),
+            hints: DialHints::default()
+        })
     );
 
     // A handshake reject is not retried.
@@ -435,6 +452,7 @@ fn choke_releases_requests_to_other_peers() {
         peer: PeerKey(2),
         addr: addr(2),
         reserved: Reserved::new(),
+        link: PeerLink::default(),
     });
     h.msg(1, Message::HaveAll);
     h.msg(2, Message::HaveAll);
@@ -455,6 +473,7 @@ fn disconnect_releases_requests() {
         peer: PeerKey(2),
         addr: addr(2),
         reserved: Reserved::new(),
+        link: PeerLink::default(),
     });
     h.msg(2, Message::HaveAll);
     assert_eq!(requests(&h.msg(2, Message::Unchoke), 2), first);
@@ -564,6 +583,7 @@ fn check_existing_resumes_partial_download() {
         peer: PeerKey(1),
         addr: addr(1),
         reserved: Reserved::new(),
+        link: PeerLink::default(),
     });
     assert_eq!(
         fx,
@@ -613,7 +633,10 @@ fn complete_on_disk_seeds() {
         peers: vec![addr(1)],
         interval: None,
     });
-    assert!(fx.contains(&Effect::Connect { addr: addr(1) }));
+    assert!(fx.contains(&Effect::Connect {
+        addr: addr(1),
+        hints: DialHints::default()
+    }));
 }
 
 #[test]
@@ -705,7 +728,13 @@ fn add_peers_connects_without_announcing() {
     let fx = h.ev(Event::AddPeers {
         peers: vec![addr(5)],
     });
-    assert_eq!(fx, vec![Effect::Connect { addr: addr(5) }]);
+    assert_eq!(
+        fx,
+        vec![Effect::Connect {
+            addr: addr(5),
+            hints: DialHints::default()
+        }]
+    );
 }
 
 #[test]
@@ -732,7 +761,10 @@ fn peers_added_while_checking_connect_afterwards() {
         piece: 2,
         ok: false,
     });
-    assert!(fx.contains(&Effect::Connect { addr: addr(5) }));
+    assert!(fx.contains(&Effect::Connect {
+        addr: addr(5),
+        hints: DialHints::default()
+    }));
 }
 
 fn ext_handshake(entries: &str) -> Message {
@@ -771,6 +803,7 @@ fn connect(h: &mut Harness, peer: u64, reserved: Reserved) -> Vec<Effect> {
         peer: PeerKey(peer),
         addr: addr(peer as u16),
         reserved,
+        link: PeerLink::default(),
     })
 }
 
@@ -818,6 +851,7 @@ fn extension_handshake_and_metadata_serving() {
         peer: PeerKey(2),
         addr: addr(2),
         reserved: extended(),
+        link: PeerLink::default(),
     });
     bare.msg(2, ext_handshake("11:ut_metadatai3e"));
     let fx = bare.msg(2, request(0));
@@ -844,11 +878,11 @@ fn pex_adds_peers_and_reports_connections() {
         added: vec![
             PexPeer {
                 addr: addr(3),
-                flags: 0,
+                flags: Some(dravity_wire::PEX_ENCRYPTION | dravity_wire::PEX_UTP),
             },
             PexPeer {
                 addr: addr(2),
-                flags: 0,
+                flags: Some(0),
             },
         ],
         dropped: vec![],
@@ -860,8 +894,18 @@ fn pex_adds_peers_and_reports_connections() {
             payload: Bytes::from(pex.encode()),
         },
     );
-    assert!(fx.contains(&Effect::Connect { addr: addr(3) }));
-    assert!(!fx.contains(&Effect::Connect { addr: addr(2) }));
+    // Its flags come along as dial hints.
+    assert!(fx.contains(&Effect::Connect {
+        addr: addr(3),
+        hints: DialHints {
+            encryption: Some(true),
+            utp: Some(true),
+        }
+    }));
+    assert!(
+        !fx.iter()
+            .any(|e| matches!(e, Effect::Connect { addr: a, .. } if *a == addr(2)))
+    );
 
     // After the PEX interval peer 1 hears about peer 2 (not itself).
     let fx = h.advance(h.t.config().pex_interval);
@@ -872,6 +916,8 @@ fn pex_adds_peers_and_reports_connections() {
         msg.added.iter().map(|p| p.addr).collect::<Vec<_>>(),
         [addr(2)]
     );
+    // We dialed it over plain TCP and it is not a seed.
+    assert_eq!(msg.added[0].flags, Some(dravity_wire::PEX_REACHABLE));
     assert!(msg.dropped.is_empty());
     // Nothing changed: no message. Then peer 2 drops and is reported.
     assert!(sent(&h.advance(h.t.config().pex_interval), 1).is_empty());
@@ -880,6 +926,95 @@ fn pex_adds_peers_and_reports_connections() {
     let fx = h.advance(h.t.config().pex_interval);
     let (_id, payload) = only_extended(&fx, 1);
     assert_eq!(PexMessage::decode(&payload).unwrap().dropped, [addr(2)]);
+}
+
+#[test]
+fn pex_flags_describe_each_connection() {
+    use dravity_wire::{PEX_ENCRYPTION, PEX_REACHABLE, PEX_SEED, PEX_UTP};
+    let mut c = config();
+    c.max_peers = 10;
+    let mut h = Harness::new(c);
+    h.ev(Event::Start);
+    h.ev(Event::AddPeers {
+        peers: vec![addr(1), addr(2)],
+    });
+    connect(&mut h, 1, extended());
+    h.msg(1, ext_handshake("6:ut_pexi7e"));
+    // Dialed over uTP with MSE, and a seed.
+    h.ev(Event::PeerConnected {
+        peer: PeerKey(2),
+        addr: addr(2),
+        reserved: Reserved::new(),
+        link: PeerLink {
+            utp: true,
+            mse: Some(true),
+        },
+    });
+    h.msg(2, Message::HaveAll);
+    // Connected to us with MSE; its listen port comes in its handshake.
+    let incoming = SocketAddr::from(([10, 0, 0, 9], 40_000));
+    h.ev(Event::PeerAccepted {
+        peer: PeerKey(9),
+        addr: incoming,
+        reserved: extended(),
+        link: PeerLink {
+            utp: false,
+            mse: Some(true),
+        },
+    });
+    h.msg(
+        9,
+        Message::Extended {
+            id: 0,
+            payload: Bytes::from_static(b"d1:mde1:pi6889ee"),
+        },
+    );
+    let fx = h.advance(h.t.config().pex_interval);
+    let (_id, payload) = only_extended(&fx, 1);
+    let msg = PexMessage::decode(&payload).unwrap();
+    let flags = |a: SocketAddr| msg.added.iter().find(|p| p.addr == a).and_then(|p| p.flags);
+    assert_eq!(
+        flags(addr(2)),
+        Some(PEX_ENCRYPTION | PEX_SEED | PEX_UTP | PEX_REACHABLE)
+    );
+    // Not reachable: it connected to us, we did not reach it.
+    assert_eq!(
+        flags(SocketAddr::from(([10, 0, 0, 9], 6889))),
+        Some(PEX_ENCRYPTION)
+    );
+}
+
+#[test]
+fn connections_teach_how_to_dial_again() {
+    let mut c = config();
+    c.max_peers = 10;
+    let mut h = Harness::new(c);
+    h.ev(Event::Start);
+    h.ev(Event::AddPeers {
+        peers: vec![addr(1)],
+    });
+    // The peer refused MSE and we fell back to a plain handshake.
+    h.ev(Event::PeerConnected {
+        peer: PeerKey(1),
+        addr: addr(1),
+        reserved: Reserved::new(),
+        link: PeerLink {
+            utp: false,
+            mse: Some(false),
+        },
+    });
+    h.ev(Event::PeerDisconnected { peer: PeerKey(1) });
+    let fx = h.advance(h.t.config().peer_retry + Duration::from_secs(1));
+    assert!(
+        fx.contains(&Effect::Connect {
+            addr: addr(1),
+            hints: DialHints {
+                encryption: Some(false),
+                utp: None,
+            }
+        }),
+        "{fx:?}"
+    );
 }
 
 #[test]
@@ -893,7 +1028,7 @@ fn pex_accepts_more_than_fifty_peers() {
     let added: Vec<PexPeer> = (1..=60u8)
         .map(|n| PexPeer {
             addr: SocketAddr::from(([10, 1, 0, n], 6881)),
-            flags: 0,
+            flags: Some(0),
         })
         .collect();
     let fx = h.msg(
@@ -955,7 +1090,7 @@ fn pex_disabled_for_private_torrents() {
     let pex = PexMessage {
         added: vec![PexPeer {
             addr: addr(3),
-            flags: 0,
+            flags: Some(0),
         }],
         dropped: vec![],
     };
@@ -966,7 +1101,10 @@ fn pex_disabled_for_private_torrents() {
             payload: Bytes::from(pex.encode()),
         },
     );
-    assert!(!fx.contains(&Effect::Connect { addr: addr(3) }));
+    assert!(!fx.contains(&Effect::Connect {
+        addr: addr(3),
+        hints: DialHints::default()
+    }));
     let later = sent(&h.advance(Duration::from_secs(120)), 1);
     assert!(
         !later.iter().any(|m| matches!(m, Message::Extended { .. })),
@@ -1188,7 +1326,10 @@ fn dht_lookups_are_scheduled() {
         peers: vec![addr(9)],
         failed: false,
     });
-    assert!(fx.contains(&Effect::Connect { addr: addr(9) }));
+    assert!(fx.contains(&Effect::Connect {
+        addr: addr(9),
+        hints: DialHints::default()
+    }));
     let interval = h.t.config().dht_interval;
     assert!(!h.advance(interval / 2).contains(&Effect::DhtLookup));
     assert!(h.advance(interval / 2).contains(&Effect::DhtLookup));
@@ -1278,7 +1419,10 @@ fn failed_dial_during_check_is_retried() {
             addr: addr(7),
             retry: true,
         })
-        .contains(&Effect::Connect { addr: addr(7) })
+        .contains(&Effect::Connect {
+            addr: addr(7),
+            hints: DialHints::default()
+        })
     );
     h.advance(Duration::from_secs(5));
     h.ev(Event::PieceHashed {
@@ -1293,7 +1437,13 @@ fn failed_dial_during_check_is_retried() {
         piece: 2,
         ok: false,
     });
-    assert!(fx.contains(&Effect::Connect { addr: addr(7) }), "{fx:?}");
+    assert!(
+        fx.contains(&Effect::Connect {
+            addr: addr(7),
+            hints: DialHints::default()
+        }),
+        "{fx:?}"
+    );
 }
 
 #[test]
@@ -1420,11 +1570,13 @@ proptest! {
                     peer: PeerKey(p),
                     addr: addr(p as u16),
                     reserved: Reserved::new().with_extension_protocol(p % 2 == 1).with_fast(p != 2),
+                    link: PeerLink::default(),
                 }),
                 Step::Accept(p) => h.ev(Event::PeerAccepted {
                     peer: PeerKey(p),
                     addr: SocketAddr::from(([10, 0, 9, 1], 40_000 + p as u16)),
                     reserved: Reserved::new().with_extension_protocol(true).with_fast(p != 3),
+                    link: PeerLink::default(),
                 }),
                 Step::Read(p, piece, b) => {
                     let Some(block) = layout().block(piece, b) else { continue };
@@ -1466,4 +1618,79 @@ proptest! {
             prop_assert!(s.unchoked <= s.peers);
         }
     }
+}
+
+#[test]
+fn web_seeds_are_never_dialed_retried_or_shared() {
+    let mut c = config();
+    c.max_peers = 10;
+    let mut h = Harness::new(c);
+    h.ev(Event::Start);
+    // The CDN's own address is also a real BitTorrent peer.
+    let cdn = SocketAddr::from(([198, 51, 100, 7], 80));
+    h.ev(Event::AddPeers {
+        peers: vec![cdn, addr(1)],
+    });
+    // Two web seeds on that CDN: distinct synthetic addresses.
+    for (key, index) in [(20, 0), (21, 1)] {
+        let fx = h.ev(Event::PeerAccepted {
+            peer: PeerKey(key),
+            addr: web_seed_addr(index),
+            reserved: Reserved::new(),
+            link: PeerLink::default(),
+        });
+        assert!(!fx.contains(&Effect::Disconnect { peer: PeerKey(key) }));
+        h.msg(key, Message::HaveAll);
+    }
+    // The real peer at the CDN's address is not mistaken for either.
+    let fx = h.ev(Event::PeerConnected {
+        peer: PeerKey(30),
+        addr: cdn,
+        reserved: extended(),
+        link: PeerLink::default(),
+    });
+    assert!(!fx.contains(&Effect::Disconnect { peer: PeerKey(30) }));
+    assert_eq!(h.t.peers().len(), 3);
+
+    // A PEX peer advertising web seed addresses gets them ignored.
+    connect(&mut h, 1, extended());
+    h.msg(1, ext_handshake("6:ut_pexi7e"));
+    let bogus = PexMessage {
+        added: vec![PexPeer {
+            addr: web_seed_addr(5),
+            flags: Some(0x10),
+        }],
+        dropped: Vec::new(),
+    };
+    let fx = h.msg(
+        1,
+        Message::Extended {
+            id: 1,
+            payload: Bytes::from(bogus.encode()),
+        },
+    );
+    let dials = |fx: &[Effect]| {
+        fx.iter()
+            .filter_map(|e| match e {
+                Effect::Connect { addr, .. } => Some(*addr),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(dials(&fx).iter().all(|a| !is_web_seed_addr(*a)), "{fx:?}");
+
+    // Our PEX never lists them.
+    let fx = h.advance(h.t.config().pex_interval);
+    let (_id, payload) = only_extended(&fx, 1);
+    let msg = PexMessage::decode(&payload).unwrap();
+    assert!(
+        msg.added.iter().all(|p| !is_web_seed_addr(p.addr)),
+        "{msg:?}"
+    );
+    assert!(msg.added.iter().any(|p| p.addr == cdn), "{msg:?}");
+
+    // A web seed that drops is not dialed back.
+    h.ev(Event::PeerDisconnected { peer: PeerKey(20) });
+    let fx = h.advance(h.t.config().peer_retry * 3);
+    assert!(dials(&fx).iter().all(|a| !is_web_seed_addr(*a)), "{fx:?}");
 }

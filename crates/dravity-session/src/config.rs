@@ -4,10 +4,44 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use dravity_dht::DhtConfig;
+use dravity_mse::Policy;
 use dravity_portmap::PortMapConfig;
 use dravity_tracker::ClientConfig;
+use dravity_webseed::WebSeedConfig;
 
 use crate::listen::ListenConfig;
+
+/// How torrent data reaches the disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum StorageBackend {
+    /// `pread`/`pwrite` on the session's blocking thread pool.
+    #[default]
+    Blocking,
+    /// io_uring through `tokio-uring` on a dedicated thread (Linux, crate
+    /// feature `uring`). Falls back to [`Blocking`](Self::Blocking), with a
+    /// warning, when the feature is off or the kernel or a container
+    /// refuses io_uring; [`Session::storage_backend`](crate::Session::storage_backend)
+    /// reports the one in use.
+    IoUring,
+}
+
+impl StorageBackend {
+    /// Short name (`blocking`, `io_uring`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocking => "blocking",
+            Self::IoUring => "io_uring",
+        }
+    }
+}
+
+impl std::fmt::Display for StorageBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Session-wide settings. [`SessionConfig::default`] is a reasonable start.
 #[derive(Debug, Clone)]
@@ -65,6 +99,23 @@ pub struct SessionConfig {
     /// [`crate::Session::restore`] can bring them back after a restart.
     /// `None` keeps nothing.
     pub state_dir: Option<PathBuf>,
+    /// HTTP settings for web seeds (BEP 19: a torrent's `url-list`, a
+    /// magnet link's `ws`). `None` never contacts web seeds.
+    pub web_seed: Option<WebSeedConfig>,
+    /// Wait this long before trying a web seed again after it failed;
+    /// doubles with every failure in a row, up to 32 times as long.
+    pub web_seed_retry: Duration,
+    /// How file data is read and written for torrents whose storage the
+    /// session creates (not for [`AddTorrentOptions::with_storage`](crate::AddTorrentOptions::with_storage)).
+    pub storage_backend: StorageBackend,
+    /// Message Stream Encryption (MSE/PE) for peer connections over TCP and
+    /// uTP. [`Enabled`](Policy::Enabled) (the default) accepts encrypted
+    /// and plain incoming connections and dials encrypted first, redialing
+    /// in plaintext if the peer does not speak MSE;
+    /// [`Required`](Policy::Required) only makes and accepts RC4-encrypted
+    /// connections; [`Disabled`](Policy::Disabled) never encrypts. MSE is
+    /// obfuscation against traffic shaping, not authenticated security.
+    pub encryption: Policy,
 }
 
 impl Default for SessionConfig {
@@ -89,6 +140,10 @@ impl Default for SessionConfig {
             dht_lookup_timeout: Duration::from_secs(30),
             resume_dir: None,
             state_dir: None,
+            web_seed: Some(WebSeedConfig::default()),
+            web_seed_retry: Duration::from_secs(30),
+            storage_backend: StorageBackend::Blocking,
+            encryption: Policy::Enabled,
         }
     }
 }

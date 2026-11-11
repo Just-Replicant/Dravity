@@ -9,6 +9,7 @@
 
 use std::borrow::Cow;
 
+use bytes::Bytes;
 use dravity_bencode::{Dict, Value};
 use dravity_core::{BLOCK_SIZE, BlockRef, Metainfo};
 use dravity_storage::{
@@ -16,6 +17,9 @@ use dravity_storage::{
     read_block, remove_resume, save_resume, verify_piece, write_block,
 };
 use sha1::{Digest, Sha1};
+
+#[path = "common/batch.rs"]
+mod batch;
 
 fn bytes(b: &[u8]) -> Value<'static> {
     Value::Bytes(Cow::Owned(b.to_vec()))
@@ -77,7 +81,7 @@ fn write_all_blocks(storage: &dyn Storage, m: &Metainfo, content: &[u8]) {
                 storage,
                 layout,
                 b,
-                &content[start..start + b.length as usize],
+                Bytes::copy_from_slice(&content[start..start + b.length as usize]),
             )
             .unwrap();
         }
@@ -199,6 +203,17 @@ fn padding_files_are_never_created() {
         assert!(verify_piece(&s, m.info(), piece).unwrap());
     }
     assert!(!dir.path().join("root/.pad").exists());
+    // Owned reads span files and read padding as zeros.
+    assert_eq!(s.read_vec(900, 1200).unwrap(), data[900..2100]);
+    // Owned writes skip padding, like borrowed ones.
+    s.write_bytes(990, Bytes::copy_from_slice(&[7; 1020]))
+        .unwrap();
+    assert!(!dir.path().join("root/.pad").exists());
+    let mut back = vec![1; 1020];
+    s.read_at(990, &mut back).unwrap();
+    assert_eq!(&back[..10], &[7; 10]);
+    assert_eq!(&back[10..1010], &[0; 1000][..]);
+    assert_eq!(&back[1010..], &[7; 10]);
 }
 
 #[test]
@@ -258,11 +273,16 @@ fn rejects_out_of_range_and_bad_blocks() {
         length: 10,
     };
     assert!(matches!(
-        write_block(&s, layout, block, b"short"),
+        write_block(&s, layout, block, Bytes::from_static(b"short")),
         Err(StorageError::InvalidBlock(_))
     ));
     assert!(matches!(
-        write_block(&s, layout, BlockRef { piece: 1, ..block }, &[0; 10]),
+        write_block(
+            &s,
+            layout,
+            BlockRef { piece: 1, ..block },
+            Bytes::from_static(&[0; 10])
+        ),
         Err(StorageError::InvalidBlock(_))
     ));
     assert!(verify_piece(&s, m.info(), 5).is_err());
@@ -339,4 +359,22 @@ fn stamps_vouch_for_resume_data() {
     remove_resume(&path).unwrap();
     assert_eq!(load_resume(&path).unwrap(), None);
     assert_eq!(MemoryStorage::new(1).stamps().unwrap(), None);
+}
+
+#[test]
+fn batched_blocks_round_trip() {
+    let (m, data) = torrent(
+        &[
+            (&["a"], content(40_000, 1), false),
+            (&[".pad", "960"], vec![0; 960], true),
+            (&["b"], content(70_001, 2), false),
+        ],
+        16_384,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let file = FileStorage::new(dir.path(), m.info()).unwrap();
+    batch::batches_round_trip(&file, &m, &data);
+    assert!(!dir.path().join("root/.pad").exists());
+    let memory = MemoryStorage::new(data.len() as u64);
+    batch::batches_round_trip(&memory, &m, &data);
 }

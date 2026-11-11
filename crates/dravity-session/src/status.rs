@@ -15,15 +15,18 @@ pub enum Transport {
     Tcp,
     /// uTP (BEP 29).
     Utp,
+    /// An HTTP(S) web seed (BEP 19).
+    Web,
 }
 
 impl Transport {
-    /// Short lowercase name (`tcp`, `utp`).
+    /// Short lowercase name (`tcp`, `utp`, `web`).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Tcp => "tcp",
             Self::Utp => "utp",
+            Self::Web => "web",
         }
     }
 }
@@ -34,8 +37,10 @@ impl Transport {
 pub struct PeerStatus {
     /// Address, pieces, byte totals and choke/interest flags.
     pub info: PeerInfo,
-    /// TCP or uTP.
+    /// TCP, uTP, or a web seed.
     pub transport: Transport,
+    /// Whether the connection is RC4-encrypted (MSE).
+    pub encrypted: bool,
 }
 
 /// The last answer one tracker gave.
@@ -113,16 +118,21 @@ impl TrackerLog {
     }
 }
 
-/// Joins the engine's peer list with the transports the owner knows.
+/// Joins the engine's peer list with what the owner knows about each
+/// connection: its transport and whether it is encrypted.
 pub(crate) fn peers(
     infos: Vec<PeerInfo>,
-    transport: impl Fn(&PeerInfo) -> Transport,
+    connection: impl Fn(&PeerInfo) -> (Transport, bool),
 ) -> Vec<PeerStatus> {
     infos
         .into_iter()
-        .map(|info| PeerStatus {
-            transport: transport(&info),
-            info,
+        .map(|info| {
+            let (transport, encrypted) = connection(&info);
+            PeerStatus {
+                transport,
+                encrypted,
+                info,
+            }
         })
         .collect()
 }

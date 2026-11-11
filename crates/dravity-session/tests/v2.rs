@@ -1,0 +1,1337 @@
+//! BEP 52 end to end: v2-only and hybrid torrents between two sessions over
+//! loopback, v2 magnet links, both swarm ids of a hybrid torrent, and v2
+//! torrents surviving a restart. Also BEP 19 web seeds (a loopback HTTP
+//! server), whose padding-aware ranges are easiest to show on these
+//! piece-aligned multi-file torrents.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::panic
+)]
+
+use std::borrow::Cow;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use bytes::{Bytes, BytesMut};
+use dravity_bencode::{Dict, Value};
+use dravity_core::merkle;
+use dravity_core::{InfoHash, Magnet, MetaVersion, Metainfo, PeerId};
+use dravity_engine::{Alert, Bitfield, TorrentStatus, is_web_seed_addr};
+use dravity_session::{
+    AddTorrentOptions, ListenConfig, PeerCodec, Session, SessionAlert, SessionConfig,
+};
+use dravity_wire::{Handshake, Message, Reserved};
+use futures_util::{SinkExt, StreamExt};
+use sha1::{Digest, Sha1};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::broadcast;
+use tokio_util::codec::Framed;
+
+const PIECE: u32 = 32 * 1024;
+
+fn bstr(b: &[u8]) -> Value<'static> {
+    Value::Bytes(Cow::Owned(b.to_vec()))
+}
+
+fn dict(entries: Vec<(&[u8], Value<'static>)>) -> Value<'static> {
+    Value::Dict(
+        entries
+            .into_iter()
+            .map(|(k, v)| (Cow::Owned(k.to_vec()), v))
+            .collect(),
+    )
+}
+
+/// `(relative path, content)` of one file below the torrent's directory.
+type File = (Vec<&'static str>, Vec<u8>);
+
+fn content(len: usize, seed: u32) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u32 ^ seed).wrapping_mul(2_654_435_761).to_le_bytes()[2])
+        .collect()
+}
+
+/// A multi-file torrent named `payload` over `files` (sorted by path),
+/// v2-only or hybrid. Returns the encoded `.torrent`.
+fn make(files: &mut [File], hybrid: bool, web_seed: Option<&str>) -> Vec<u8> {
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut tree = Dict::new();
+    let mut layers = Dict::new();
+    let mut v1_files = Vec::new();
+    let mut stream = Vec::new();
+    let last = files.iter().rposition(|f| !f.1.is_empty());
+    for (i, (path, data)) in files.iter().enumerate() {
+        let mut leaf = vec![(&b"length"[..], Value::Int(data.len() as i64))];
+        if let Some(h) = merkle::file_hashes(data, PIECE) {
+            leaf.push((&b"pieces root"[..], bstr(&h.root)));
+            if !h.layer.is_empty() {
+                layers.insert(Cow::Owned(h.root.to_vec()), bstr(&h.layer.concat()));
+            }
+        }
+        let mut node = &mut tree;
+        for c in path {
+            let Value::Dict(next) = node
+                .entry(Cow::Owned(c.as_bytes().to_vec()))
+                .or_insert_with(|| Value::Dict(Dict::new()))
+            else {
+                unreachable!()
+            };
+            node = next;
+        }
+        node.insert(Cow::Borrowed(&b""[..]), dict(leaf));
+
+        stream.extend_from_slice(data);
+        let segs = |p: &[&str]| Value::List(p.iter().map(|c| bstr(c.as_bytes())).collect());
+        v1_files.push(dict(vec![
+            (b"length", Value::Int(data.len() as i64)),
+            (b"path", segs(path)),
+        ]));
+        let rem = data.len() % PIECE as usize;
+        if rem != 0 && Some(i) != last {
+            let pad = PIECE as usize - rem;
+            stream.resize(stream.len() + pad, 0);
+            v1_files.push(dict(vec![
+                (b"attr", bstr(b"p")),
+                (b"length", Value::Int(pad as i64)),
+                (b"path", segs(&[".pad", &pad.to_string()])),
+            ]));
+        }
+    }
+    let mut info = vec![
+        (&b"file tree"[..], Value::Dict(tree)),
+        (b"meta version", Value::Int(2)),
+        (b"name", bstr(b"payload")),
+        (b"piece length", Value::Int(i64::from(PIECE))),
+    ];
+    if hybrid {
+        let pieces: Vec<u8> = stream
+            .chunks(PIECE as usize)
+            .flat_map(|c| Sha1::digest(c).to_vec())
+            .collect();
+        info.push((b"files", Value::List(v1_files)));
+        info.push((b"pieces", bstr(&pieces)));
+    }
+    let mut top = vec![
+        (&b"info"[..], dict(info)),
+        (b"piece layers", Value::Dict(layers)),
+    ];
+    if let Some(url) = web_seed {
+        top.push((b"url-list", bstr(url.as_bytes())));
+    }
+    dict(top).to_vec()
+}
+
+fn write_files(dir: &Path, files: &[File]) {
+    for (path, data) in files {
+        let mut p = dir.join("payload");
+        for c in path {
+            p.push(c);
+        }
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, data).unwrap();
+    }
+}
+
+fn assert_files(dir: &Path, files: &[File]) {
+    // Storage creates files as data arrives, so an empty file never appears
+    // (as for v1 torrents).
+    for (path, data) in files.iter().filter(|f| !f.1.is_empty()) {
+        let mut p = dir.join("payload");
+        for c in path {
+            p.push(c);
+        }
+        assert_eq!(&std::fs::read(&p).unwrap(), data, "{}", p.display());
+    }
+    assert!(
+        !dir.join("payload/.pad").exists(),
+        "padding is never written"
+    );
+}
+
+fn sample() -> Vec<File> {
+    vec![
+        (vec!["video.bin"], content(150_000, 1)),
+        (vec!["notes.txt"], content(4_000, 2)),
+        (vec!["extra", "empty"], Vec::new()),
+        (vec!["extra", "tail.bin"], content(40_000, 3)),
+    ]
+}
+
+/// Files no larger than one piece: their pieces roots are all a v2 magnet
+/// link needs.
+fn small() -> Vec<File> {
+    vec![
+        (vec!["a.bin"], content(20_000, 4)),
+        (vec!["b.bin"], content(PIECE as usize, 5)),
+    ]
+}
+
+fn config() -> SessionConfig {
+    let mut c = SessionConfig::default();
+    c.tick_interval = Duration::from_millis(50);
+    c.stop_announce_timeout = Duration::from_secs(1);
+    c.dht = None;
+    c.listen = Some(ListenConfig::loopback(0));
+    c.port_mapping = None;
+    // The test web seeds listen on loopback.
+    if let Some(web_seed) = c.web_seed.as_mut() {
+        web_seed.allow_private_addresses = true;
+    }
+    c
+}
+
+/// Waits for an alert of `info_hash` matching `done`; returns all seen.
+async fn until(
+    rx: &mut broadcast::Receiver<SessionAlert>,
+    info_hash: InfoHash,
+    done: impl Fn(&Alert) -> bool,
+) -> Vec<Alert> {
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match rx.recv().await {
+                Ok(a) if a.info_hash == info_hash => {
+                    let stop = done(&a.alert);
+                    seen.push(a.alert);
+                    if stop {
+                        return;
+                    }
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("alert channel closed: {e}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out; alerts so far: {seen:?}"));
+    seen
+}
+
+/// A session seeding `torrent` from `files`; returns it and its port.
+async fn seed(torrent: &[u8], files: &[File], dir: &Path) -> (Session, u16) {
+    write_files(dir, files);
+    let m = Metainfo::from_bytes(torrent).unwrap();
+    let hash = m.info_hash();
+    let session = Session::new(config()).unwrap();
+    let port = session.listen_port().unwrap();
+    let mut alerts = session.subscribe();
+    session.add_torrent(m, AddTorrentOptions::new(dir)).unwrap();
+    until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    (session, port)
+}
+
+fn local(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+async fn download_between_sessions(hybrid: bool) {
+    let mut files = sample();
+    let torrent = make(&mut files, hybrid, None);
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    let expected = if hybrid {
+        MetaVersion::Hybrid
+    } else {
+        MetaVersion::V2
+    };
+    assert_eq!(m.info().version(), expected);
+    let hash = m.info_hash();
+    let seed_dir = tempfile::tempdir().unwrap();
+    let (seeder, port) = seed(&torrent, &files, seed_dir.path()).await;
+
+    let leech_dir = tempfile::tempdir().unwrap();
+    let leecher = Session::new(config()).unwrap();
+    let mut alerts = leecher.subscribe();
+    let handle = leecher
+        .add_torrent(
+            m,
+            AddTorrentOptions::new(leech_dir.path()).with_peers([local(port)]),
+        )
+        .unwrap();
+    let seen = until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert!(
+        !seen.iter().any(|a| matches!(a, Alert::HashFailed { .. })),
+        "{seen:?}"
+    );
+    assert_files(leech_dir.path(), &files);
+    let stats = handle.stats().await.unwrap();
+    assert_eq!(stats.status, TorrentStatus::Finished);
+    assert_eq!(stats.pieces_have, stats.piece_count);
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v2_only_torrent_moves_between_sessions() {
+    download_between_sessions(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hybrid_torrent_moves_between_sessions() {
+    download_between_sessions(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hybrid_torrent_answers_to_both_swarm_ids() {
+    let mut files = sample();
+    let torrent = make(&mut files, true, None);
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    let ids = m.swarm_hashes();
+    assert_eq!(ids.len(), 2);
+    let dir = tempfile::tempdir().unwrap();
+    let (session, port) = seed(&torrent, &files, dir.path()).await;
+    for id in ids {
+        let mut sock = TcpStream::connect(local(port)).await.unwrap();
+        sock.write_all(&Handshake::new(id, PeerId::new([7; 20])).to_bytes())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 68];
+        tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut buf))
+            .await
+            .expect("handshake reply")
+            .unwrap();
+        let theirs = Handshake::decode(&mut BytesMut::from(&buf[..]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(theirs.info_hash, id, "replies with the id we asked for");
+        assert!(theirs.reserved.v2(), "advertises BEP 52 support");
+    }
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v2_magnet_link_fetches_metadata_and_downloads() {
+    let mut files = small();
+    let torrent = make(&mut files, false, None);
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    let v2 = m.info_hash_v2().unwrap();
+    let hash = m.info_hash();
+    let seed_dir = tempfile::tempdir().unwrap();
+    let (seeder, port) = seed(&torrent, &files, seed_dir.path()).await;
+
+    let leecher = Session::new(config()).unwrap();
+    let mut alerts = leecher.subscribe();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let magnet = Magnet::parse(&format!(
+        "magnet:?xt=urn:btmh:1220{v2}&x.pe=127.0.0.1:{port}&ws=http%3A%2F%2Fseed.invalid%2F"
+    ))
+    .unwrap();
+    let handle = leecher
+        .add_magnet(&magnet, AddTorrentOptions::new(leech_dir.path()))
+        .unwrap();
+    assert_eq!(handle.info_hash(), hash, "the truncated v2 hash");
+    let seen = until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert!(seen.contains(&Alert::MetadataReceived), "{seen:?}");
+    assert_files(leech_dir.path(), &files);
+    let known = leecher.metainfo(hash).unwrap();
+    assert_eq!(known.info_hash_v2(), Some(v2));
+    assert_eq!(known.web_seeds(), ["http://seed.invalid/"]);
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v2_magnet_fetches_piece_layers_and_downloads_multi_piece_files() {
+    // `video.bin` spans 5 pieces and `tail.bin` 2: their piece layers are
+    // not in the metadata and come from the seed with BEP 52 hash requests.
+    let mut files = sample();
+    let torrent = make(&mut files, false, None);
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    assert_eq!(m.info().piece_layers().len(), 2);
+    let v2 = m.info_hash_v2().unwrap();
+    let hash = m.info_hash();
+    let seed_dir = tempfile::tempdir().unwrap();
+    let (seeder, port) = seed(&torrent, &files, seed_dir.path()).await;
+
+    let leecher = Session::new(config()).unwrap();
+    let mut alerts = leecher.subscribe();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let magnet = Magnet::parse(&format!(
+        "magnet:?xt=urn:btmh:1220{v2}&x.pe=127.0.0.1:{port}"
+    ))
+    .unwrap();
+    let handle = leecher
+        .add_magnet(&magnet, AddTorrentOptions::new(leech_dir.path()))
+        .unwrap();
+    let seen = until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert!(seen.contains(&Alert::MetadataReceived), "{seen:?}");
+    assert!(
+        !seen
+            .iter()
+            .any(|a| matches!(a, Alert::HashFailed { .. } | Alert::Error { .. })),
+        "{seen:?}"
+    );
+    assert_files(leech_dir.path(), &files);
+    let known = leecher.metainfo(hash).unwrap();
+    assert!(known.info().missing_piece_layers().is_empty());
+    assert_eq!(known.info().piece_layers(), m.info().piece_layers());
+    let stats = handle.stats().await.unwrap();
+    assert_eq!(stats.pieces_have, stats.piece_count);
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hybrid_magnet_fetches_piece_layers_keeps_them_and_serves_them() {
+    // A `btih` magnet of a hybrid torrent: the metadata comes with BEP 9,
+    // the layers of `video.bin` (5 pieces) and `tail.bin` (2) with BEP 52
+    // hash requests, so every piece is checked with SHA-1 and Merkle.
+    let mut files = sample();
+    let torrent = make(&mut files, true, None);
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    assert_eq!(m.info().piece_layers().len(), 2);
+    let ids = m.swarm_hashes();
+    let hash = m.info_hash();
+    let seed_dir = tempfile::tempdir().unwrap();
+    let (seeder, port) = seed(&torrent, &files, seed_dir.path()).await;
+
+    let state = tempfile::tempdir().unwrap();
+    let mut c = config();
+    c.state_dir = Some(state.path().to_path_buf());
+    let leecher = Session::new(c.clone()).unwrap();
+    let mut alerts = leecher.subscribe();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let magnet = Magnet::parse(&format!(
+        "magnet:?xt=urn:btih:{}&x.pe=127.0.0.1:{port}",
+        ids[0]
+    ))
+    .unwrap();
+    leecher
+        .add_magnet(&magnet, AddTorrentOptions::new(leech_dir.path()))
+        .unwrap();
+    let seen = until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert!(seen.contains(&Alert::MetadataReceived), "{seen:?}");
+    assert!(
+        !seen
+            .iter()
+            .any(|a| matches!(a, Alert::HashFailed { .. } | Alert::Error { .. })),
+        "{seen:?}"
+    );
+    assert_files(leech_dir.path(), &files);
+    let known = leecher.metainfo(hash).unwrap();
+    assert!(known.info().missing_piece_layers().is_empty());
+    assert_eq!(known.info().piece_layers(), m.info().piece_layers());
+    seeder.shutdown().await;
+
+    // The leecher now serves the layers: a v2-only magnet downloads from it
+    // alone (it could not check a multi-piece file without them).
+    let leech_port = leecher.listen_port().unwrap();
+    let third = Session::new(config()).unwrap();
+    let mut third_alerts = third.subscribe();
+    let third_dir = tempfile::tempdir().unwrap();
+    let v2 = m.info_hash_v2().unwrap();
+    let magnet = Magnet::parse(&format!(
+        "magnet:?xt=urn:btmh:1220{v2}&x.pe=127.0.0.1:{leech_port}"
+    ))
+    .unwrap();
+    third
+        .add_magnet(&magnet, AddTorrentOptions::new(third_dir.path()))
+        .unwrap();
+    until(&mut third_alerts, ids[1], |a| *a == Alert::Finished).await;
+    assert_files(third_dir.path(), &files);
+    third.shutdown().await;
+    leecher.shutdown().await;
+
+    // And keeps them across a restart.
+    let restarted = Session::new(c).unwrap();
+    let report = restarted.restore().await.unwrap();
+    assert_eq!(report.restored, [hash], "{report:?}");
+    let restored = restarted.metainfo(hash).unwrap();
+    assert!(restored.info().missing_piece_layers().is_empty());
+    assert_eq!(restored.info().piece_layers(), m.info().piece_layers());
+    restarted.shutdown().await;
+}
+
+/// A raw peer that has every piece of `stream` and serves it to anyone.
+async fn raw_seeder(info_hash: InfoHash, stream: Vec<u8>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stream = Arc::new(stream);
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let stream = Arc::clone(&stream);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 68];
+                if sock.read_exact(&mut buf).await.is_err() {
+                    return;
+                }
+                let theirs = Handshake::decode(&mut BytesMut::from(&buf[..]))
+                    .unwrap()
+                    .unwrap();
+                assert!(theirs.reserved.v2(), "a v2 swarm is dialed with the v2 bit");
+                let ours = Handshake::new(info_hash, PeerId::new(*b"-TS0001-rawseedrawse"))
+                    .with_reserved(Reserved::new().with_v2(true));
+                if sock.write_all(&ours.to_bytes()).await.is_err() {
+                    return;
+                }
+                let mut framed = Framed::new(sock, PeerCodec::default());
+                let pieces = stream.len().div_ceil(PIECE as usize) as u32;
+                let have = Message::Bitfield(Bitfield::full(pieces).to_bytes());
+                if framed.send(have).await.is_err() {
+                    return;
+                }
+                while let Some(Ok(message)) = framed.next().await {
+                    let reply = match message {
+                        Message::Interested => Message::Unchoke,
+                        Message::Request(r) => {
+                            let start = r.piece as usize * PIECE as usize + r.offset as usize;
+                            Message::Piece {
+                                piece: r.piece,
+                                offset: r.offset,
+                                data: Bytes::copy_from_slice(
+                                    &stream[start..start + r.length as usize],
+                                ),
+                            }
+                        }
+                        _ => continue,
+                    };
+                    if framed.send(reply).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_whose_data_passes_sha1_but_not_merkle_is_banned() {
+    // A hybrid torrent whose v1 piece hashes describe `served` while its v2
+    // tree describes other bytes: every piece the peer sends passes SHA-1
+    // and fails Merkle, so it counts as a hash failure, nothing is kept,
+    // and the peer is banned like any peer sending bad data.
+    let len = 3 * PIECE as usize + 100;
+    let served = content(len, 7);
+    let mut honest = vec![(vec!["one.bin"], served.clone())];
+    let mut other = vec![(vec!["one.bin"], content(len, 8))];
+    let honest = Value::decode(&make(&mut honest, true, None))
+        .unwrap()
+        .into_owned();
+    let Value::Dict(mut forged) = Value::decode(&make(&mut other, true, None))
+        .unwrap()
+        .into_owned()
+    else {
+        unreachable!()
+    };
+    let pieces = honest.get(b"info").unwrap().get(b"pieces").unwrap().clone();
+    let Some(Value::Dict(info)) = forged.get_mut(&b"info"[..]) else {
+        unreachable!()
+    };
+    info.insert(Cow::Borrowed(&b"pieces"[..]), pieces);
+    let m = Metainfo::from_bytes(&Value::Dict(forged).to_vec()).unwrap();
+    assert_eq!(m.info().version(), MetaVersion::Hybrid);
+    let hash = m.info_hash();
+    let peer = raw_seeder(hash, served).await;
+
+    let mut c = config();
+    c.engine.hash_fail_ban = 2;
+    let leecher = Session::new(c).unwrap();
+    let mut alerts = leecher.subscribe();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = leecher
+        .add_torrent(m, AddTorrentOptions::new(dir.path()).with_peers([peer]))
+        .unwrap();
+    let seen = until(&mut alerts, hash, |a| matches!(a, Alert::PeerBanned { .. })).await;
+    assert!(
+        seen.iter().any(|a| matches!(a, Alert::HashFailed { .. })),
+        "{seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|a| matches!(a, Alert::PieceCompleted { .. })),
+        "{seen:?}"
+    );
+    assert!(
+        seen.contains(&Alert::PeerBanned { ip: peer.ip() }),
+        "{seen:?}"
+    );
+    // Banned: disconnected and not dialed again, and nothing was kept.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(handle.peers().await.unwrap().is_empty());
+    assert_eq!(handle.stats().await.unwrap().pieces_have, 0);
+    leecher.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v2_magnet_fetches_a_piece_layer_larger_than_one_hash_request() {
+    // 520 pieces pad to 1024 hashes: two hash requests of 512, each proven
+    // with an uncle hash, over the wire between two sessions.
+    let mut files = vec![(vec!["big.bin"], content(520 * PIECE as usize - 7, 6))];
+    let torrent = make(&mut files, false, None);
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    assert_eq!(m.info().piece_layers()[0].1.len(), 520);
+    let v2 = m.info_hash_v2().unwrap();
+    let hash = m.info_hash();
+    let seed_dir = tempfile::tempdir().unwrap();
+    let (seeder, port) = seed(&torrent, &files, seed_dir.path()).await;
+
+    let leecher = Session::new(config()).unwrap();
+    let mut alerts = leecher.subscribe();
+    let leech_dir = tempfile::tempdir().unwrap();
+    let magnet = Magnet::parse(&format!(
+        "magnet:?xt=urn:btmh:1220{v2}&x.pe=127.0.0.1:{port}"
+    ))
+    .unwrap();
+    leecher
+        .add_magnet(&magnet, AddTorrentOptions::new(leech_dir.path()))
+        .unwrap();
+    let seen = until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert!(
+        !seen
+            .iter()
+            .any(|a| matches!(a, Alert::HashFailed { .. } | Alert::Error { .. })),
+        "{seen:?}"
+    );
+    assert_files(leech_dir.path(), &files);
+    let known = leecher.metainfo(hash).unwrap();
+    assert_eq!(known.info().piece_layers(), m.info().piece_layers());
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_torrents_keep_their_piece_layers_across_a_restart() {
+    let mut files = sample();
+    let torrent = make(&mut files, false, Some("http://seed.invalid/files/"));
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    let hash = m.info_hash();
+    let state = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    write_files(data.path(), &files);
+    let mut c = config();
+    c.state_dir = Some(state.path().to_path_buf());
+    {
+        let session = Session::new(c.clone()).unwrap();
+        let mut alerts = session.subscribe();
+        session
+            .add_torrent(m.clone(), AddTorrentOptions::new(data.path()))
+            .unwrap();
+        until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+        session.shutdown().await;
+    }
+    let session = Session::new(c).unwrap();
+    let mut alerts = session.subscribe();
+    let report = session.restore().await.unwrap();
+    assert_eq!(report.restored, [hash], "{report:?}");
+    let restored = session.metainfo(hash).unwrap();
+    assert_eq!(restored.info(), m.info());
+    assert!(restored.info().missing_piece_layers().is_empty());
+    assert_eq!(restored.web_seeds(), m.web_seeds());
+    until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    session.shutdown().await;
+}
+
+/// A tiny HTTP server for `root`: `GET /<path>` with a `Range` header gets
+/// `206` and those bytes, without one the whole file; anything missing (or
+/// everything, with `broken`) gets `404`. Counts requests.
+async fn http_server(root: PathBuf, broken: bool) -> (SocketAddr, Arc<AtomicUsize>) {
+    let (addr, hits, _) = http_server_with(root, broken, false, Duration::ZERO).await;
+    (addr, hits)
+}
+
+/// [`http_server`] that waits `delay` before each answer and also logs the
+/// requested paths.
+async fn http_server_with(
+    root: PathBuf,
+    broken: bool,
+    corrupt: bool,
+    delay: Duration,
+) -> (SocketAddr, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let paths = Arc::clone(&log);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&hits);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let root = root.clone();
+            let count = Arc::clone(&count);
+            let paths = Arc::clone(&paths);
+            tokio::spawn(async move {
+                // Keep-alive: answer requests until the client hangs up.
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                loop {
+                    let end = loop {
+                        if let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    };
+                    let text = String::from_utf8_lossy(&req[..end]).to_string();
+                    req.drain(..end);
+                    count.fetch_add(1, Ordering::Relaxed);
+                    let path = text.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                    paths.lock().unwrap().push(path.clone());
+                    tokio::time::sleep(delay).await;
+                    let file = std::fs::read(root.join(path.trim_start_matches('/')));
+                    let (status, body, range_header) = match file {
+                        Ok(mut data) if !broken => {
+                            if corrupt && !data.is_empty() {
+                                data[0] ^= 0xff;
+                            }
+                            let range = text.lines().find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("range: bytes=")
+                                    .map(str::to_owned)
+                            });
+                            match range {
+                                Some(r) => {
+                                    let (a, b) = r.trim().split_once('-').unwrap();
+                                    let (a, b): (usize, usize) =
+                                        (a.parse().unwrap(), b.parse().unwrap());
+                                    let total = data.len();
+                                    (
+                                        "206 Partial Content",
+                                        data[a..=b].to_vec(),
+                                        format!("content-range: bytes {a}-{b}/{total}\r\n"),
+                                    )
+                                }
+                                None => ("200 OK", data, String::new()),
+                            }
+                        }
+                        _ => ("404 Not Found", Vec::new(), String::new()),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\n{range_header}content-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    if sock.write_all(head.as_bytes()).await.is_err()
+                        || sock.write_all(&body).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, hits, log)
+}
+
+async fn download_from_web_seed(hybrid: bool) {
+    let mut files = sample();
+    let served = tempfile::tempdir().unwrap();
+    write_files(served.path(), &files);
+    let (addr, hits) = http_server(served.path().to_path_buf(), false).await;
+    let torrent = make(&mut files, hybrid, Some(&format!("http://{addr}/")));
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    assert_eq!(m.web_seeds(), [format!("http://{addr}/")]);
+    let hash = m.info_hash();
+
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(config()).unwrap();
+    let mut alerts = session.subscribe();
+    let handle = session
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    let seen = until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert!(
+        !seen.iter().any(|a| matches!(a, Alert::HashFailed { .. })),
+        "{seen:?}"
+    );
+    assert_files(dir.path(), &files);
+    assert!(hits.load(Ordering::Relaxed) > 0);
+    let stats = handle.stats().await.unwrap();
+    assert_eq!(stats.pieces_have, stats.piece_count);
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v2_only_torrent_downloads_from_a_web_seed_alone() {
+    download_from_web_seed(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hybrid_torrent_downloads_from_a_web_seed_alone() {
+    download_from_web_seed(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_web_seed_does_not_stop_a_download_from_peers() {
+    let mut files = sample();
+    let (addr, hits) = http_server(PathBuf::from("/nonexistent"), true).await;
+    let torrent = make(&mut files, true, Some(&format!("http://{addr}/")));
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    let hash = m.info_hash();
+    let seed_dir = tempfile::tempdir().unwrap();
+    let (seeder, port) = seed(&torrent, &files, seed_dir.path()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = config();
+    c.web_seed_retry = Duration::from_millis(20);
+    let leecher = Session::new(c).unwrap();
+    let mut alerts = leecher.subscribe();
+    let handle = leecher
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    // The seed fails, is retried after its back-off, and fails again.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while hits.load(Ordering::Relaxed) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the web seed is retried");
+    assert_eq!(handle.stats().await.unwrap().pieces_have, 0);
+
+    handle.add_peers([local(port)]).await.unwrap();
+    let seen = until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert!(
+        !seen.iter().any(|a| matches!(a, Alert::HashFailed { .. })),
+        "{seen:?}"
+    );
+    assert_files(dir.path(), &files);
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_seeds_can_be_turned_off() {
+    let mut files = small();
+    let served = tempfile::tempdir().unwrap();
+    write_files(served.path(), &files);
+    let (addr, hits) = http_server(served.path().to_path_buf(), false).await;
+    let torrent = make(&mut files, false, Some(&format!("http://{addr}/")));
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    let mut c = config();
+    c.web_seed = None;
+    let session = Session::new(c).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = session
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+    let stats = handle.stats().await.unwrap();
+    assert_eq!(stats.pieces_have, 0);
+    session.shutdown().await;
+}
+
+/// Percent-decodes a query value.
+fn unescape(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap();
+            out.push(u8::from_str_radix(hex, 16).unwrap());
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// An HTTP tracker that records every announced `info_hash` and returns
+/// `peer` only to announces for `only`.
+async fn recording_tracker(only: InfoHash, peer: SocketAddr) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/announce", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    let SocketAddr::V4(v4) = peer else {
+        panic!("IPv4 only")
+    };
+    let mut compact = v4.ip().octets().to_vec();
+    compact.extend_from_slice(&v4.port().to_be_bytes());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let log = Arc::clone(&log);
+            let compact = compact.clone();
+            tokio::spawn(async move {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).to_string();
+                let target = text.split_whitespace().nth(1).unwrap_or("").to_owned();
+                let hash = target
+                    .split(['?', '&'])
+                    .find_map(|kv| kv.strip_prefix("info_hash="))
+                    .map(unescape)
+                    .unwrap_or_default();
+                let peers = if hash == only.as_bytes() {
+                    compact
+                } else {
+                    Vec::new()
+                };
+                log.lock().unwrap().push(hash);
+                let body = dict(vec![
+                    (b"interval", Value::Int(1800)),
+                    (b"peers", bstr(&peers)),
+                ])
+                .to_vec();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+            });
+        }
+    });
+    (url, seen)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hybrid_torrent_announces_both_ids_to_trackers() {
+    let mut files = sample();
+    let torrent = make(&mut files, true, None);
+    let base = Metainfo::from_bytes(&torrent).unwrap();
+    let ids = base.swarm_hashes();
+    assert_eq!(ids.len(), 2);
+    let seed_dir = tempfile::tempdir().unwrap();
+    let (seeder, port) = seed(&torrent, &files, seed_dir.path()).await;
+    // The tracker hands out the seed only in the v2 swarm.
+    let (url, seen) = recording_tracker(ids[1], local(port)).await;
+    let m = Metainfo::from_info_bytes(base.info_bytes(), vec![vec![url]]).unwrap();
+    let hash = m.info_hash();
+
+    let dir = tempfile::tempdir().unwrap();
+    let leecher = Session::new(config()).unwrap();
+    let mut alerts = leecher.subscribe();
+    leecher
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert_files(dir.path(), &files);
+    let announced = seen.lock().unwrap().clone();
+    for id in &ids {
+        assert!(
+            announced.iter().any(|h| h == id.as_bytes()),
+            "{id} announced: {announced:?}"
+        );
+    }
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hybrid_magnet_answers_to_its_v2_id_once_the_metadata_arrives() {
+    let mut files = sample();
+    let torrent = make(&mut files, true, None);
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    let ids = m.swarm_hashes();
+    let seed_dir = tempfile::tempdir().unwrap();
+    let (seeder, port) = seed(&torrent, &files, seed_dir.path()).await;
+
+    let leecher = Session::new(config()).unwrap();
+    let leech_port = leecher.listen_port().unwrap();
+    let mut alerts = leecher.subscribe();
+    let dir = tempfile::tempdir().unwrap();
+    let magnet = Magnet::parse(&format!(
+        "magnet:?xt=urn:btih:{}&x.pe=127.0.0.1:{port}",
+        ids[0]
+    ))
+    .unwrap();
+    leecher
+        .add_magnet(&magnet, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    until(&mut alerts, ids[0], |a| *a == Alert::Finished).await;
+    // No restart: the v2 swarm id now reaches the same torrent.
+    let mut sock = TcpStream::connect(local(leech_port)).await.unwrap();
+    sock.write_all(&Handshake::new(ids[1], PeerId::new([8; 20])).to_bytes())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 68];
+    tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut buf))
+        .await
+        .expect("handshake reply")
+        .unwrap();
+    let theirs = Handshake::decode(&mut BytesMut::from(&buf[..]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(theirs.info_hash, ids[1]);
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+}
+
+/// A torrent whose `url-list` is `urls`.
+fn with_url_list(torrent: &[u8], urls: &[String]) -> Metainfo {
+    let Value::Dict(mut t) = Value::decode(torrent).unwrap().into_owned() else {
+        unreachable!()
+    };
+    let list = urls.iter().map(|u| bstr(u.as_bytes())).collect();
+    t.insert(Cow::Borrowed(&b"url-list"[..]), Value::List(list));
+    Metainfo::from_bytes(&Value::Dict(t).to_vec()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_web_seeds_on_one_host_both_serve() {
+    // `http://cdn/a/` and `http://cdn/b/` share an IP and port; each gets
+    // its own synthetic peer address, so both run at once.
+    let mut files = sample();
+    let served = tempfile::tempdir().unwrap();
+    write_files(&served.path().join("a"), &files);
+    write_files(&served.path().join("b"), &files);
+    let (addr, _, log) = http_server_with(
+        served.path().to_path_buf(),
+        false,
+        false,
+        Duration::from_millis(50),
+    )
+    .await;
+    let urls = [format!("http://{addr}/a/"), format!("http://{addr}/b/")];
+    let m = with_url_list(&make(&mut files, false, None), &urls);
+    assert_eq!(m.web_seeds(), urls);
+    let hash = m.info_hash();
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(config()).unwrap();
+    let mut alerts = session.subscribe();
+    let handle = session
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    let web = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let web: Vec<SocketAddr> = handle
+                .peers()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|p| p.transport == dravity_session::Transport::Web)
+                .map(|p| p.info.addr)
+                .collect();
+            if web.len() == 2 {
+                return web;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both web seeds connected at once");
+    assert_ne!(web[0], web[1]);
+    assert!(
+        web.iter().all(|a| is_web_seed_addr(*a) && *a != addr),
+        "{web:?}"
+    );
+    until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    assert_files(dir.path(), &files);
+    let log = log.lock().unwrap().clone();
+    assert!(log.iter().any(|p| p.starts_with("/a/")), "{log:?}");
+    assert!(log.iter().any(|p| p.starts_with("/b/")), "{log:?}");
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_web_seed_is_never_dialed_as_a_peer() {
+    // The web seed's server answers every HTTP request with 503. Any other
+    // connection would be a BitTorrent dial to the web server's port.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = listener.local_addr().unwrap();
+    let http = Arc::new(AtomicUsize::new(0));
+    let other = Arc::new(AtomicUsize::new(0));
+    let (h, o) = (Arc::clone(&http), Arc::clone(&other));
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let (h, o) = (Arc::clone(&h), Arc::clone(&o));
+            tokio::spawn(async move {
+                let mut first = [0u8; 4];
+                if sock.read_exact(&mut first).await.is_err() {
+                    return;
+                }
+                if &first == b"GET " {
+                    h.fetch_add(1, Ordering::Relaxed);
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 503 Busy\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                } else {
+                    o.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    let mut files = sample();
+    let m =
+        Metainfo::from_bytes(&make(&mut files, false, Some(&format!("http://{server}/")))).unwrap();
+    let mut c = config();
+    c.web_seed_retry = Duration::from_millis(100);
+    c.engine.peer_retry = Duration::from_millis(100);
+    let session = Session::new(c).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    session
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while http.load(Ordering::Relaxed) < 3 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the web seed is retried by its own back-off");
+    // Several peer retry periods later, still no BitTorrent dial.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(other.load(Ordering::Relaxed), 0);
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_web_seed_url_is_never_contacted() {
+    // The default policy refuses loopback. The URL is not retried and no
+    // connection is opened, so it never occupies a peer slot.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&hits);
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            count.fetch_add(1, Ordering::Relaxed);
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    let mut files = small();
+    let m =
+        Metainfo::from_bytes(&make(&mut files, false, Some(&format!("http://{server}/")))).unwrap();
+    let mut c = config();
+    c.web_seed.as_mut().unwrap().allow_private_addresses = false;
+    c.web_seed_retry = Duration::from_millis(40);
+    let session = Session::new(c).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = session
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+    assert!(
+        handle
+            .peers()
+            .await
+            .unwrap()
+            .iter()
+            .all(|p| p.transport != dravity_session::Transport::Web)
+    );
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_web_seed_that_fails_the_hash_check_is_not_retried() {
+    // Corrupt bytes with a matching Content-Range pass the HTTP checks and
+    // fail the piece hash. One such piece bans the synthetic address; the
+    // URL is then not fetched again.
+    let mut files = small();
+    let served = tempfile::tempdir().unwrap();
+    write_files(served.path(), &files);
+    let (addr, hits, _) =
+        http_server_with(served.path().to_path_buf(), false, true, Duration::ZERO).await;
+    let torrent = make(&mut files, false, Some(&format!("http://{addr}/")));
+    let m = Metainfo::from_bytes(&torrent).unwrap();
+    let hash = m.info_hash();
+    let mut c = config();
+    c.engine.hash_fail_ban = 2;
+    c.web_seed_retry = Duration::from_millis(50);
+    let session = Session::new(c).unwrap();
+    let mut alerts = session.subscribe();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = session
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    let seen = until(
+        &mut alerts,
+        hash,
+        |a| matches!(a, Alert::PeerBanned { ip } if is_web_seed_addr(SocketAddr::new(*ip, 0))),
+    )
+    .await;
+    assert!(
+        seen.iter().any(|a| matches!(a, Alert::HashFailed { .. })),
+        "{seen:?}"
+    );
+    // In-flight ranges may still finish. Nothing new starts after that.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let settled = hits.load(Ordering::Relaxed);
+    assert!(settled > 0);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(hits.load(Ordering::Relaxed), settled);
+    assert!(
+        handle
+            .peers()
+            .await
+            .unwrap()
+            .iter()
+            .all(|p| p.transport != dravity_session::Transport::Web)
+    );
+    session.shutdown().await;
+}
+
+/// Waits until `session` knows every piece layer of `hash`.
+async fn until_layers_known(session: &Session, hash: InfoHash) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !session
+            .metainfo(hash)
+            .is_some_and(|m| m.info().missing_piece_layers().is_empty())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the piece layer never arrived");
+}
+
+/// A hybrid `.torrent` of one 4-piece file served by a raw peer that never
+/// answers hash requests, and the same torrent without its piece layer.
+fn hybrid_without_layers(files: &mut [File]) -> (Metainfo, Metainfo) {
+    let full = Metainfo::from_bytes(&make(files, true, None)).unwrap();
+    let bare = Metainfo::from_info_bytes(full.info_bytes(), Vec::new()).unwrap();
+    assert_eq!(bare.info().version(), MetaVersion::Hybrid);
+    assert_eq!(bare.info().missing_piece_layers().len(), 1);
+    (full, bare)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hybrid_that_started_on_sha1_gets_its_layer_later_and_keeps_it() {
+    // The leecher downloads on SHA-1 alone from a peer that ignores hash
+    // requests. A peer that knows the layer shows up later: the leecher
+    // fetches it in the background, checks its pieces again (all good),
+    // persists it and serves it.
+    let len = 3 * PIECE as usize + 100;
+    let data = content(len, 3);
+    let mut files = vec![(vec!["one.bin"], data.clone())];
+    let (full, bare) = hybrid_without_layers(&mut files);
+    let hash = full.info_hash();
+    let raw = raw_seeder(hash, data).await;
+
+    let state = tempfile::tempdir().unwrap();
+    let mut c = config();
+    c.state_dir = Some(state.path().to_path_buf());
+    c.engine.request_timeout = Duration::from_secs(1);
+    let leecher = Session::new(c.clone()).unwrap();
+    let mut alerts = leecher.subscribe();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = leecher
+        .add_torrent(bare, AddTorrentOptions::new(dir.path()).with_peers([raw]))
+        .unwrap();
+    until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+    let known = leecher.metainfo(hash).unwrap();
+    assert_eq!(known.info().missing_piece_layers().len(), 1);
+
+    // A leecher that has the `.torrent` (and so the layer) but no data.
+    let other = Session::new(config()).unwrap();
+    let mut other_alerts = other.subscribe();
+    let other_dir = tempfile::tempdir().unwrap();
+    let port = leecher.listen_port().unwrap();
+    other
+        .add_torrent(
+            full.clone(),
+            AddTorrentOptions::new(other_dir.path()).with_peers([local(port)]),
+        )
+        .unwrap();
+    until_layers_known(&leecher, hash).await;
+    let known = leecher.metainfo(hash).unwrap();
+    assert_eq!(known.info().piece_layers(), full.info().piece_layers());
+    // It downloads everything from the leecher, which still has it all.
+    until(&mut other_alerts, hash, |a| *a == Alert::Finished).await;
+    assert_files(other_dir.path(), &files);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(handle.stats().await.unwrap().pieces_have, 4);
+    let mut seen = Vec::new();
+    while let Ok(a) = alerts.try_recv() {
+        seen.push(a.alert);
+    }
+    assert!(
+        !seen.iter().any(|a| matches!(a, Alert::HashFailed { .. })),
+        "{seen:?}"
+    );
+    other.shutdown().await;
+    leecher.shutdown().await;
+
+    // The layer survives a restart.
+    let restarted = Session::new(c).unwrap();
+    let report = restarted.restore().await.unwrap();
+    assert_eq!(report.restored, [hash], "{report:?}");
+    let restored = restarted.metainfo(hash).unwrap();
+    assert!(restored.info().missing_piece_layers().is_empty());
+    restarted.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pieces_a_late_layer_refutes_are_downloaded_again() {
+    // SHA-1 vouches for `served`, the v2 tree describes other bytes. On
+    // SHA-1 alone the leecher accepts everything; once the layer arrives
+    // every piece fails the re-check and is wanted again.
+    let len = 3 * PIECE as usize + 100;
+    let served = content(len, 7);
+    let mut honest = vec![(vec!["one.bin"], served.clone())];
+    let mut other = vec![(vec!["one.bin"], content(len, 8))];
+    let honest = Value::decode(&make(&mut honest, true, None))
+        .unwrap()
+        .into_owned();
+    let Value::Dict(mut forged) = Value::decode(&make(&mut other, true, None))
+        .unwrap()
+        .into_owned()
+    else {
+        unreachable!()
+    };
+    let pieces = honest.get(b"info").unwrap().get(b"pieces").unwrap().clone();
+    let Some(Value::Dict(info)) = forged.get_mut(&b"info"[..]) else {
+        unreachable!()
+    };
+    info.insert(Cow::Borrowed(&b"pieces"[..]), pieces);
+    let full = Metainfo::from_bytes(&Value::Dict(forged).to_vec()).unwrap();
+    let bare = Metainfo::from_info_bytes(full.info_bytes(), Vec::new()).unwrap();
+    let hash = full.info_hash();
+    let raw = raw_seeder(hash, served).await;
+
+    let mut c = config();
+    c.engine.request_timeout = Duration::from_secs(1);
+    let leecher = Session::new(c).unwrap();
+    let mut alerts = leecher.subscribe();
+    let dir = tempfile::tempdir().unwrap();
+    let handle = leecher
+        .add_torrent(bare, AddTorrentOptions::new(dir.path()).with_peers([raw]))
+        .unwrap();
+    until(&mut alerts, hash, |a| *a == Alert::Finished).await;
+
+    let peer = Session::new(config()).unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    let port = leecher.listen_port().unwrap();
+    peer.add_torrent(
+        full,
+        AddTorrentOptions::new(peer_dir.path()).with_peers([local(port)]),
+    )
+    .unwrap();
+    let failed = std::cell::RefCell::new(std::collections::BTreeSet::new());
+    let seen = until(&mut alerts, hash, |a| {
+        if let Alert::HashFailed { piece } = a {
+            failed.borrow_mut().insert(*piece);
+        }
+        failed.borrow().len() == 4
+    })
+    .await;
+    assert!(
+        seen.contains(&Alert::StateChanged(TorrentStatus::Downloading)),
+        "{seen:?}"
+    );
+    until_layers_known(&leecher, hash).await;
+    assert_eq!(handle.stats().await.unwrap().pieces_have, 0);
+    peer.shutdown().await;
+    leecher.shutdown().await;
+}

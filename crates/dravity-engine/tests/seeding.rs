@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use dravity_core::{BLOCK_SIZE, BlockRef, InfoHash, PieceLayout};
 use dravity_engine::{
-    Alert, AnnounceEvent, Bitfield, Config, Effect, Event, PeerKey, TorrentState, TorrentStatus,
+    Alert, AnnounceEvent, Bitfield, Config, DialHints, Effect, Event, PeerKey, PeerLink,
+    TorrentState, TorrentStatus,
 };
 use dravity_wire::{BlockRequest, ExtendedHandshake, Message, PexMessage, Reserved};
 
@@ -101,6 +102,7 @@ impl Harness {
             peer: PeerKey(peer),
             addr: addr(peer as u16),
             reserved,
+            link: PeerLink::default(),
         })
     }
 
@@ -109,6 +111,7 @@ impl Harness {
             peer: PeerKey(peer),
             addr: addr(peer as u16),
             reserved,
+            link: PeerLink::default(),
         })
     }
 
@@ -489,6 +492,7 @@ fn allowed_fast_set_follows_bep_6_for_ipv4_only() {
         peer: PeerKey(1),
         addr: at,
         reserved: fast(),
+        link: PeerLink::default(),
     });
     let mut expected = dravity_wire::allowed_fast_set(
         &InfoHash::new([0xaa; 20]),
@@ -511,6 +515,7 @@ fn allowed_fast_set_follows_bep_6_for_ipv4_only() {
         peer: PeerKey(2),
         addr: v6,
         reserved: fast(),
+        link: PeerLink::default(),
     });
     assert_eq!(sent(&fx, 2), [Message::HaveAll]);
 }
@@ -529,6 +534,7 @@ fn a_piece_completed_later_is_offered_as_allowed_fast() {
         peer: PeerKey(2),
         addr: v6,
         reserved: fast(),
+        link: PeerLink::default(),
     });
     let set = dravity_wire::allowed_fast_set(
         &InfoHash::new([0xaa; 20]),
@@ -899,15 +905,19 @@ fn the_only_sender_of_a_bad_piece_is_banned() {
         peers: vec![addr(1), SocketAddr::new(ip, 9999), addr(5)],
         interval: None,
     });
-    assert!(fx.contains(&Effect::Connect { addr: addr(5) }));
+    assert!(fx.contains(&Effect::Connect {
+        addr: addr(5),
+        hints: DialHints::default()
+    }));
     assert!(
         !fx.iter()
-            .any(|e| matches!(e, Effect::Connect { addr } if addr.ip() == ip))
+            .any(|e| matches!(e, Effect::Connect { addr, .. } if addr.ip() == ip))
     );
     let fx = h.ev(Event::PeerAccepted {
         peer: PeerKey(7),
         addr: SocketAddr::new(ip, 40_000),
         reserved: Reserved::new(),
+        link: PeerLink::default(),
     });
     assert!(disconnects(&fx, 7));
 }
@@ -995,6 +1005,7 @@ fn ipv4_mapped_address_shares_the_ban() {
         peer: PeerKey(1),
         addr: mapped,
         reserved: Reserved::new(),
+        link: PeerLink::default(),
     });
     let fx = fail_piece_zero(&mut h, &[1]);
     assert!(!disconnects(&fx, 1));
@@ -1003,6 +1014,7 @@ fn ipv4_mapped_address_shares_the_ban() {
         peer: PeerKey(2),
         addr: plain,
         reserved: Reserved::new(),
+        link: PeerLink::default(),
     });
     let fx = fail_piece_zero(&mut h, &[2]);
     assert!(fx.contains(&Effect::Alert(Alert::PeerBanned { ip: IpAddr::V4(v4) })));
@@ -1011,15 +1023,19 @@ fn ipv4_mapped_address_shares_the_ban() {
     let fx = h.ev(Event::AddPeers {
         peers: vec![plain, mapped, addr(5)],
     });
-    assert!(fx.contains(&Effect::Connect { addr: addr(5) }));
+    assert!(fx.contains(&Effect::Connect {
+        addr: addr(5),
+        hints: DialHints::default()
+    }));
     assert!(
         !fx.iter()
-            .any(|e| matches!(e, Effect::Connect { addr } if addr.ip() == IpAddr::V4(v4) || addr.ip() == mapped.ip()))
+            .any(|e| matches!(e, Effect::Connect { addr, .. } if addr.ip() == IpAddr::V4(v4) || addr.ip() == mapped.ip()))
     );
     let fx = h.ev(Event::PeerAccepted {
         peer: PeerKey(8),
         addr: SocketAddr::new(IpAddr::V6(v4.to_ipv6_mapped()), 40001),
         reserved: Reserved::new(),
+        link: PeerLink::default(),
     });
     assert!(disconnects(&fx, 8));
 }
@@ -1108,6 +1124,7 @@ fn incoming_peers_are_refused_while_idle_and_when_full() {
             peer: PeerKey(1),
             addr: addr(1),
             reserved: Reserved::new(),
+            link: PeerLink::default(),
         },
     );
     assert!(disconnects(&fx, 1), "not started");
@@ -1118,6 +1135,7 @@ fn incoming_peers_are_refused_while_idle_and_when_full() {
             peer: PeerKey(2),
             addr: addr(2),
             reserved: Reserved::new(),
+            link: PeerLink::default(),
         },
     );
     assert!(!disconnects(&fx, 2));
@@ -1127,6 +1145,7 @@ fn incoming_peers_are_refused_while_idle_and_when_full() {
             peer: PeerKey(3),
             addr: addr(3),
             reserved: Reserved::new(),
+            link: PeerLink::default(),
         },
     );
     assert!(disconnects(&fx, 3), "max_peers");
@@ -1153,11 +1172,14 @@ fn a_seed_retries_failed_dials_and_dropped_peers() {
     assert!(
         !h.advance(Duration::from_secs(14))
             .iter()
-            .any(|e| matches!(e, Effect::Connect { addr: peer } if *peer == addr(1)))
+            .any(|e| matches!(e, Effect::Connect { addr: peer, .. } if *peer == addr(1)))
     );
     assert!(
         h.advance(Duration::from_secs(1))
-            .contains(&Effect::Connect { addr: addr(1) })
+            .contains(&Effect::Connect {
+                addr: addr(1),
+                hints: DialHints::default()
+            })
     );
 
     let mut h = Harness::seed(config());
@@ -1166,7 +1188,10 @@ fn a_seed_retries_failed_dials_and_dropped_peers() {
     assert_eq!(h.t.stats().peers, 0);
     assert!(
         h.advance(h.t.config().peer_retry)
-            .contains(&Effect::Connect { addr: addr(1) })
+            .contains(&Effect::Connect {
+                addr: addr(1),
+                hints: DialHints::default()
+            })
     );
 }
 
@@ -1189,11 +1214,14 @@ fn a_retry_waiting_at_finish_is_dialed_while_seeding() {
     assert!(
         !h.advance(Duration::from_secs(19))
             .iter()
-            .any(|e| matches!(e, Effect::Connect { addr: peer } if *peer == addr(9)))
+            .any(|e| matches!(e, Effect::Connect { addr: peer, .. } if *peer == addr(9)))
     );
     assert!(
         h.advance(Duration::from_secs(1))
-            .contains(&Effect::Connect { addr: addr(9) })
+            .contains(&Effect::Connect {
+                addr: addr(9),
+                hints: DialHints::default()
+            })
     );
 }
 
@@ -1242,4 +1270,158 @@ fn a_failed_upload_read_rejects_and_keeps_seeding() {
         "without the fast extension the request is dropped"
     );
     assert_eq!(h.t.status(), TorrentStatus::Finished);
+}
+
+#[test]
+fn hash_requests_are_served_from_piece_layers() {
+    use dravity_core::merkle;
+    use dravity_wire::HashRequest;
+
+    let data: Vec<u8> = (0..300_000usize).map(|i| (i % 249) as u8).collect();
+    let piece_length = 2 * BLOCK_SIZE;
+    let tree = merkle::file_hashes(&data, piece_length).unwrap();
+    assert_eq!(tree.layer.len(), 10);
+    let mut h = Harness {
+        t: TorrentState::new(layout(), config())
+            .with_piece_layers(piece_length, [(tree.root, tree.layer.clone())]),
+        now: Instant::now(),
+    };
+    h.ev(Event::Start);
+    h.ev(Event::PeerConnected {
+        peer: PeerKey(1),
+        addr: addr(1),
+        reserved: fast().with_v2(true),
+        link: PeerLink::default(),
+    });
+    let ask = |index, length, proof_layers| HashRequest {
+        pieces_root: tree.root,
+        base_layer: 1,
+        index,
+        length,
+        proof_layers,
+    };
+    let reply = |h: &mut Harness, r: HashRequest| {
+        h.ev(Event::Message {
+            peer: PeerKey(1),
+            message: Message::HashRequest(r),
+        })
+        .into_iter()
+        .find_map(|e| match e {
+            Effect::Send {
+                message: m @ (Message::Hashes { .. } | Message::HashReject(_)),
+                ..
+            } => Some(m),
+            _ => None,
+        })
+        .unwrap()
+    };
+    // Four hashes at index 4 of 16 (padded), with proof to the root.
+    let Message::Hashes { request, hashes } = reply(&mut h, ask(4, 4, 3)) else {
+        panic!("expected hashes");
+    };
+    assert_eq!(request, ask(4, 4, 3));
+    let (chunks, rest) = hashes.as_chunks::<32>();
+    assert!(rest.is_empty());
+    assert_eq!(chunks.len() as u64, request.reply_hashes());
+    assert_eq!(&chunks[..4], &tree.layer[4..8]);
+    assert!(merkle::verify_proof(
+        &chunks[..4],
+        &chunks[4..],
+        4,
+        &tree.root
+    ));
+    // Leaves, unknown roots and malformed ranges are rejected.
+    for bad in [
+        HashRequest {
+            base_layer: 0,
+            ..ask(0, 2, 0)
+        },
+        HashRequest {
+            pieces_root: [9; 32],
+            ..ask(0, 2, 0)
+        },
+        ask(2, 4, 0),
+        ask(0, 1024, 0),
+        ask(32, 2, 0),
+    ] {
+        assert_eq!(reply(&mut h, bad), Message::HashReject(bad));
+    }
+}
+
+#[test]
+fn a_padded_last_piece_serves_whole_blocks_with_zeros() {
+    let padded = req(2, BLOCK_SIZE, BLOCK_SIZE);
+    // Not padded (v1 and hybrid): the block runs past the content.
+    let mut h = Harness::seed(config());
+    h.accept(1, fast());
+    h.msg(1, Message::Interested);
+    let fx = h.msg(1, Message::Request(padded));
+    assert!(reads(&fx).is_empty());
+    assert_eq!(sent(&fx, 1), [Message::Reject(padded)]);
+
+    // Padded (v2-only): storage reads the 10 content bytes, the peer gets
+    // the whole block, the rest zeros, as libtorrent asks for it.
+    let mut h = Harness::seed(config());
+    h.t = h.t.with_padded_last_piece(true);
+    h.accept(1, fast());
+    h.msg(1, Message::Interested);
+    let fx = h.msg(1, Message::Request(padded));
+    assert_eq!(reads(&fx), [(1, block(req(2, BLOCK_SIZE, 10)))]);
+    let fx = h.complete_reads(&fx);
+    let data = sent(&fx, 1)
+        .into_iter()
+        .find_map(|m| match m {
+            Message::Piece {
+                piece: 2,
+                offset,
+                data,
+            } if offset == BLOCK_SIZE => Some(data),
+            _ => None,
+        })
+        .expect("the padded block is sent");
+    assert_eq!(data.len(), BLOCK_SIZE as usize);
+    assert!(data[..10].iter().all(|&b| b == 1), "content first");
+    assert!(data[10..].iter().all(|&b| b == 0), "then zeros");
+    assert_eq!(h.t.stats().uploaded, u64::from(BLOCK_SIZE));
+
+    // The exact request still works, and both can be in flight at once.
+    let exact = req(2, BLOCK_SIZE, 10);
+    let fx = [
+        h.msg(1, Message::Request(exact)),
+        h.msg(1, Message::Request(padded)),
+    ]
+    .concat();
+    assert_eq!(reads(&fx).len(), 2);
+    let lengths: Vec<usize> = sent(&h.complete_reads(&fx), 1)
+        .into_iter()
+        .filter_map(|m| match m {
+            Message::Piece { data, .. } => Some(data.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lengths.len(), 2);
+    assert!(lengths.contains(&10) && lengths.contains(&(BLOCK_SIZE as usize)));
+
+    // Blocks that start in the padding, run past the piece length, or are
+    // not in the last piece are refused.
+    for bad in [
+        req(2, BLOCK_SIZE + 16, 100),
+        req(2, BLOCK_SIZE + 5, BLOCK_SIZE),
+        req(2, 0, BLOCK_SIZE + 1),
+        req(1, BLOCK_SIZE + 1, BLOCK_SIZE),
+    ] {
+        let fx = h.msg(1, Message::Request(bad));
+        assert!(reads(&fx).is_empty(), "{bad:?}");
+        assert_eq!(sent(&fx, 1), [Message::Reject(bad)], "{bad:?}");
+    }
+
+    // A failed read rejects the request as the peer sent it.
+    let fx = h.msg(1, Message::Request(padded));
+    let (_, stored) = reads(&fx)[0];
+    let fx = h.ev(Event::ReadFailed {
+        peer: PeerKey(1),
+        block: stored,
+        error: "disk".into(),
+    });
+    assert!(sent(&fx, 1).contains(&Message::Reject(padded)), "{fx:?}");
 }

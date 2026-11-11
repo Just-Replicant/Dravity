@@ -4,22 +4,28 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use dravity_core::merkle::{self, Hash, MAX_HASH_REQUEST};
 use dravity_core::{BLOCK_SIZE, BlockRef, InfoHash, PieceLayout};
 use dravity_wire::{
-    BlockRequest, ExtendedHandshake, METADATA_PIECE_LEN, Message, MetadataMessage, Reserved,
+    BlockRequest, ExtendedHandshake, HashRequest, METADATA_PIECE_LEN, Message, MetadataMessage,
+    Reserved,
 };
 
 use crate::ban::HashBans;
 use crate::bitfield::Bitfield;
 use crate::choker::{Candidate, Choker};
 use crate::ext::{self, PeerExtensions};
+use crate::hints::{HintBook, Joined};
+use crate::layers::{Answer, LayerSet};
 use crate::picker::{Picker, Priority, Received};
-use crate::pool::PeerPool;
+use crate::pool::{PeerPool, new_duplicate_wins};
 use crate::rate::TokenBucket;
 use crate::types::{
-    Alert, AnnounceEvent, Config, Effect, Event, PeerInfo, PeerKey, Stats, TorrentStatus,
+    Alert, AnnounceEvent, Config, DialHints, Effect, Event, PeerInfo, PeerKey, PeerLink, Stats,
+    TorrentStatus,
 };
+use crate::web_seed::is_web_seed_addr;
 use crate::window::Window;
 
 /// Most peers that may hold a request for the same block (endgame and
@@ -29,6 +35,9 @@ const MAX_BLOCK_OWNERS: usize = 2;
 /// Suggestions (BEP 6 `suggest`) remembered per peer.
 const MAX_SUGGESTED: usize = 16;
 
+/// Piece-layer hash requests outstanding per peer.
+const LAYER_PIPELINE: usize = 2;
+
 /// Messages that may arrive before `bitfield` / `have all` / `have none`.
 ///
 /// BEP 3 says the bitfield is the first message, but libtorrent-family clients
@@ -37,7 +46,13 @@ const MAX_SUGGESTED: usize = 16;
 fn message_defers_bitfield(message: &Message) -> bool {
     matches!(
         message,
-        Message::KeepAlive | Message::Port(_) | Message::Extended { .. } | Message::Unknown { .. }
+        Message::KeepAlive
+            | Message::Port(_)
+            | Message::Extended { .. }
+            | Message::Unknown { .. }
+            | Message::HashRequest(_)
+            | Message::Hashes { .. }
+            | Message::HashReject(_)
     )
 }
 
@@ -51,6 +66,8 @@ struct Peer {
     /// dialed, or an incoming peer's IP with the `p` of its extension
     /// handshake.
     reachable: Option<SocketAddr>,
+    /// Transport and encryption of the connection (for PEX flags).
+    link: PeerLink,
     has: Bitfield,
     /// `bitfield`, `have all`, and `have none` are still legal. Keep-alives,
     /// DHT `port`, and BEP 10 extended messages do not clear this: common
@@ -66,6 +83,8 @@ struct Peer {
     window: Window,
     /// The peer set the BEP 10 bit in its handshake.
     extended: bool,
+    /// The handshake advertised BEP 52 (hash requests).
+    v2: bool,
     /// Both sides speak the BEP 6 fast extension.
     fast: bool,
     ext: PeerExtensions,
@@ -118,6 +137,7 @@ impl Peer {
             addr,
             incoming,
             reachable: (!incoming).then_some(addr),
+            link: PeerLink::default(),
             has: Bitfield::new(piece_count),
             bitfield_ok: true,
             am_interested: false,
@@ -130,6 +150,7 @@ impl Peer {
                 cap(config.max_requests_per_peer),
             ),
             extended: reserved.extension_protocol(),
+            v2: reserved.v2(),
             fast: config.fast_extension && reserved.fast(),
             ext: PeerExtensions::default(),
             pex_known: HashSet::new(),
@@ -233,6 +254,8 @@ pub struct TorrentState {
     status: TorrentStatus,
     peers: HashMap<PeerKey, Peer>,
     pool: PeerPool,
+    /// PEX flags and connection outcomes by address.
+    hints: HintBook,
     /// Peers holding a request for each in-flight block, with request times.
     owners: HashMap<BlockRef, Vec<(PeerKey, Instant)>>,
     check: Option<Check>,
@@ -253,6 +276,20 @@ pub struct TorrentState {
     rate: Option<TokenBucket>,
     /// The bencoded `info` dictionary, served to peers with BEP 9.
     info_bytes: Option<Bytes>,
+    /// Piece length and piece layers by pieces root, served to peers with
+    /// BEP 52 hash requests.
+    piece_layers: Option<(u32, HashMap<Hash, Vec<Hash>>)>,
+    /// Piece length and the piece layers a hybrid still lacks, fetched in
+    /// the background from peers that speak BEP 52.
+    layer_fetch: Option<(u32, LayerSet)>,
+    /// Whether requests may reach into the zero padding that aligns the
+    /// last piece to a whole piece (v2-only torrents, see
+    /// [`TorrentState::with_padded_last_piece`]).
+    padded_last_piece: bool,
+    /// Verified pieces to hash again now that their file's piece layer is
+    /// known, and those being hashed.
+    recheck: VecDeque<u32>,
+    rechecking: HashSet<u32>,
     /// Needed for the BEP 6 allowed fast set.
     info_hash: Option<InfoHash>,
     choker: Choker,
@@ -291,6 +328,7 @@ impl TorrentState {
             status: TorrentStatus::Idle,
             peers: HashMap::new(),
             pool: PeerPool::default(),
+            hints: HintBook::default(),
             owners: HashMap::new(),
             check: None,
             next_announce: None,
@@ -304,6 +342,11 @@ impl TorrentState {
             next_pex: None,
             rate: None,
             info_bytes: None,
+            piece_layers: None,
+            layer_fetch: None,
+            padded_last_piece: false,
+            recheck: VecDeque::new(),
+            rechecking: HashSet::new(),
             info_hash: None,
             choker: Choker::default(),
             bans: HashBans::default(),
@@ -323,6 +366,61 @@ impl TorrentState {
     pub fn with_info_bytes(mut self, info: Bytes) -> Self {
         self.info_bytes = Some(info);
         self
+    }
+
+    /// Serves `layers` (piece layers by pieces root, for a torrent with
+    /// `piece_length`) to peers that ask with BEP 52 hash requests. Without
+    /// them every hash request is rejected.
+    #[must_use]
+    pub fn with_piece_layers(
+        mut self,
+        piece_length: u32,
+        layers: impl IntoIterator<Item = (Hash, Vec<Hash>)>,
+    ) -> Self {
+        let layers: HashMap<Hash, Vec<Hash>> = layers.into_iter().collect();
+        self.piece_layers = (!layers.is_empty()).then_some((piece_length, layers));
+        self
+    }
+
+    /// A hybrid torrent that starts without some of its piece layers (a
+    /// magnet whose swarm did not send them within `piece_layer_timeout`):
+    /// keeps asking peers that advertise BEP 52 for `roots` (each pieces
+    /// root with its number of pieces) while it downloads on SHA-1. Each
+    /// layer that arrives is checked against its root, served to peers and
+    /// reported as [`Effect::PieceLayerReceived`].
+    #[must_use]
+    pub fn with_missing_piece_layers(
+        mut self,
+        piece_length: u32,
+        roots: impl IntoIterator<Item = (Hash, u32)>,
+    ) -> Self {
+        let roots = roots
+            .into_iter()
+            .filter_map(|(root, pieces)| Some((root, usize::try_from(pieces).ok()?)));
+        self.layer_fetch = LayerSet::new(piece_length, roots).map(|set| (piece_length, set));
+        self
+    }
+
+    /// Accepts requests for the last piece that run past the end of the
+    /// content into the zeros aligning it to a whole piece, answering them
+    /// with those zeros. For v2-only torrents: BEP 52 aligns every file to
+    /// pieces, and libtorrent (qBittorrent) treats the last file as padded
+    /// too, so it asks for a whole 16 KiB block of a last piece that is
+    /// shorter. Refusing that request (as BEP 3 sizes would) left it
+    /// re-requesting the block forever and never finishing. Our own
+    /// requests never ask for padding.
+    #[must_use]
+    pub const fn with_padded_last_piece(mut self, padded: bool) -> Self {
+        self.padded_last_piece = padded;
+        self
+    }
+
+    /// Number of piece layers still being fetched in the background.
+    #[must_use]
+    pub fn missing_piece_layers(&self) -> u32 {
+        self.layer_fetch
+            .as_ref()
+            .map_or(0, |(_, set)| set.missing_layers())
     }
 
     /// The torrent's info-hash, used for the BEP 6 allowed fast set.
@@ -373,6 +471,17 @@ impl TorrentState {
     #[must_use]
     pub const fn picker(&self) -> &Picker {
         &self.picker
+    }
+
+    /// Dial hints learned before this state existed (a magnet's
+    /// [`Handover::hints`](crate::Handover::hints)).
+    #[must_use]
+    pub fn with_dial_hints(
+        mut self,
+        hints: impl IntoIterator<Item = (SocketAddr, DialHints)>,
+    ) -> Self {
+        self.hints.extend(hints);
+        self
     }
 
     /// Addresses whose TCP handshake is already in progress.
@@ -484,12 +593,37 @@ impl TorrentState {
                 peer,
                 addr,
                 reserved,
-            } => self.on_connected(now, peer, addr, reserved, false, &mut out),
+                link,
+            } => {
+                self.hints.observe(addr, link);
+                self.on_connected(
+                    now,
+                    Joined {
+                        key: peer,
+                        addr,
+                        reserved,
+                        link,
+                        incoming: false,
+                    },
+                    &mut out,
+                );
+            }
             Event::PeerAccepted {
                 peer,
                 addr,
                 reserved,
-            } => self.on_connected(now, peer, addr, reserved, true, &mut out),
+                link,
+            } => self.on_connected(
+                now,
+                Joined {
+                    key: peer,
+                    addr,
+                    reserved,
+                    link,
+                    incoming: true,
+                },
+                &mut out,
+            ),
             Event::PeerConnectFailed { addr, retry } => {
                 self.pool.dial_done(addr);
                 if retry {
@@ -522,6 +656,15 @@ impl TorrentState {
                 self.fail(format!("storage write failed: {error}"), &mut out);
             }
             Event::PieceHashed { piece, ok } => self.on_hashed(now, piece, ok, &mut out),
+            Event::RecheckPieces { pieces } => {
+                let have = self.picker.have();
+                let fresh: Vec<u32> = pieces
+                    .filter(|&p| have.get(p) && !self.rechecking.contains(&p))
+                    .filter(|p| !self.recheck.contains(p))
+                    .collect();
+                self.recheck.extend(fresh);
+                self.schedule_rechecks(&mut out);
+            }
             Event::BlockRead { peer, block, data } => {
                 self.on_block_read(now, peer, block, data, &mut out);
             }
@@ -839,6 +982,15 @@ impl TorrentState {
         peers.values().any(|p| p.addr == addr)
     }
 
+    /// The connection to `addr` that a new one the other way replaces
+    /// (see [`new_duplicate_wins`]).
+    fn duplicate_to_replace(&self, addr: SocketAddr, incoming: bool) -> Option<PeerKey> {
+        let (&old, peer) = self.peers.iter().find(|(_, p)| p.addr == addr)?;
+        (peer.incoming != incoming
+            && new_duplicate_wins(self.config.listen_port, addr.port(), incoming) == Some(true))
+        .then_some(old)
+    }
+
     fn add_to_pool(&mut self, peers: Vec<SocketAddr>) {
         // Peers given while checking are kept for when downloading starts.
         if !(self.is_active() || self.status == TorrentStatus::Checking) {
@@ -884,29 +1036,34 @@ impl TorrentState {
             let Some(addr) = self.pool.next_dial(|a| Self::is_connected(peers, a)) else {
                 break;
             };
-            out.push(Effect::Connect { addr });
+            let hints = self.hints.get(addr);
+            out.push(Effect::Connect { addr, hints });
         }
     }
 
-    fn on_connected(
-        &mut self,
-        now: Instant,
-        key: PeerKey,
-        addr: SocketAddr,
-        reserved: Reserved,
-        incoming: bool,
-        out: &mut Vec<Effect>,
-    ) {
+    fn on_connected(&mut self, now: Instant, joined: Joined, out: &mut Vec<Effect>) {
+        let Joined {
+            key,
+            addr,
+            reserved,
+            link,
+            incoming,
+        } = joined;
         if !incoming {
             self.pool.dial_done(addr);
         }
         // Peers may connect while checking: a magnet's metadata fetch hands
         // its connections over before the data check ends.
-        if self.swarm_ban.contains(&addr)
+        let refused = self.swarm_ban.contains(&addr)
             || self.bans.is_banned(addr.ip())
             || !(self.is_active() || self.status == TorrentStatus::Checking)
+            || self.peers.contains_key(&key);
+        if !refused && let Some(old) = self.duplicate_to_replace(addr, incoming) {
+            self.remove_peer(old);
+            out.push(Effect::Disconnect { peer: old });
+        }
+        if refused
             || self.peers.len() >= self.config.max_peers
-            || self.peers.contains_key(&key)
             || Self::is_connected(&self.peers, addr)
         {
             out.push(Effect::Disconnect { peer: key });
@@ -914,6 +1071,7 @@ impl TorrentState {
         }
         let piece_count = self.picker.layout().piece_count();
         let mut peer = Peer::new(addr, incoming, reserved, piece_count, &self.config, now);
+        peer.link = link;
         if peer.extended {
             let size = self
                 .info_bytes
@@ -926,6 +1084,7 @@ impl TorrentState {
         if self.status != TorrentStatus::Checking {
             self.send_bitfield(now, key, out);
         }
+        self.fill_hash_requests(now, key, out);
     }
 
     /// Cancels requests that no longer fit the window (after `reqq` shrinks
@@ -1049,6 +1208,9 @@ impl TorrentState {
             self.release_owner(key, *block);
         }
         self.picker.remove_peer_pieces(&peer.has);
+        if let Some((_, set)) = &mut self.layer_fetch {
+            set.release(key);
+        }
         self.refund_upload(refund);
         Some(peer.addr)
     }
@@ -1194,6 +1356,21 @@ impl TorrentState {
                     self.fill_connections(out);
                 }
             }
+            Message::HashRequest(request) => {
+                let reply = hash_reply(self.piece_layers.as_ref(), request);
+                Self::send(peer, key, reply, now, out);
+            }
+            Message::Hashes { request, hashes } => {
+                if !self.on_hashes(now, key, &request, &hashes, out) {
+                    return;
+                }
+            }
+            Message::HashReject(request) => {
+                let retry_at = now + self.config.request_timeout;
+                if let Some((_, set)) = &mut self.layer_fetch {
+                    set.on_reject(key, &request, retry_at);
+                }
+            }
             // Fast-extension messages from a peer without the extension and
             // DHT `port` are ignored.
             _ => {}
@@ -1201,6 +1378,7 @@ impl TorrentState {
         self.update_interest(now, key, out);
         self.trim_inflight(now, key, out);
         self.fill_requests(now, key, out);
+        self.fill_hash_requests(now, key, out);
     }
 
     /// Handles a BEP 10 message. Returns `true` if new peers were queued.
@@ -1225,7 +1403,12 @@ impl TorrentState {
                     if peer.incoming
                         && let Some(port) = hs.listen_port.filter(|&p| p != 0)
                     {
-                        peer.reachable = Some(SocketAddr::new(peer.addr.ip(), port));
+                        let reachable = SocketAddr::new(peer.addr.ip(), port);
+                        peer.reachable = Some(reachable);
+                        // An incoming MSE or uTP connection shows the peer
+                        // speaks it, wherever it listens.
+                        let link = peer.link;
+                        self.hints.observe(reachable, link);
                     }
                 }
                 false
@@ -1248,7 +1431,10 @@ impl TorrentState {
             }
             ext::OUR_UT_PEX if self.config.pex => match ext::pex_added(payload) {
                 Some(added) if !added.is_empty() => {
-                    self.add_to_pool(added);
+                    for p in &added {
+                        self.hints.learn_pex(p.addr, p.flags);
+                    }
+                    self.add_to_pool(added.iter().map(|p| p.addr).collect());
                     true
                 }
                 _ => false,
@@ -1434,6 +1620,10 @@ impl TorrentState {
     }
 
     fn on_hashed(&mut self, now: Instant, piece: u32, ok: bool, out: &mut Vec<Effect>) {
+        if self.rechecking.remove(&piece) {
+            self.on_rechecked(now, piece, ok, out);
+            return;
+        }
         if self.status == TorrentStatus::Checking {
             if let Some(check) = self.check.as_mut() {
                 check.outstanding = check.outstanding.saturating_sub(1);
@@ -1474,6 +1664,96 @@ impl TorrentState {
         self.fill_all_requests(now, out);
     }
 
+    /// Asks `key` for missing piece-layer blocks (at most
+    /// [`LAYER_PIPELINE`] outstanding) if it speaks BEP 52.
+    fn fill_hash_requests(&mut self, now: Instant, key: PeerKey, out: &mut Vec<Effect>) {
+        if !(self.is_active() || self.status == TorrentStatus::Checking) {
+            return;
+        }
+        let (Some((_, set)), Some(peer)) = (&mut self.layer_fetch, self.peers.get_mut(&key)) else {
+            return;
+        };
+        if !peer.v2 {
+            return;
+        }
+        for request in set.assign(key, now, LAYER_PIPELINE) {
+            Self::send(peer, key, Message::HashRequest(request), now, out);
+        }
+    }
+
+    /// A `hashes` reply. A proof that does not reach the pieces root bans
+    /// the peer. Returns `false` when the peer is gone.
+    fn on_hashes(
+        &mut self,
+        now: Instant,
+        key: PeerKey,
+        request: &HashRequest,
+        hashes: &[u8],
+        out: &mut Vec<Effect>,
+    ) -> bool {
+        let Some((piece_length, set)) = &mut self.layer_fetch else {
+            return true;
+        };
+        let piece_length = *piece_length;
+        match set.on_hashes(key, request, hashes) {
+            Answer::Unexpected | Answer::Accepted { completed: None } => {}
+            Answer::Invalid => {
+                if let Some(ip) = self.peers.get(&key).map(|p| p.addr.ip()) {
+                    self.ban(ip, out);
+                }
+                for key in self.sorted_keys() {
+                    self.fill_hash_requests(now, key, out);
+                }
+                return false;
+            }
+            Answer::Accepted {
+                completed: Some((root, layer)),
+            } => {
+                set.retain_incomplete();
+                if set.is_done() {
+                    self.layer_fetch = None;
+                }
+                self.piece_layers
+                    .get_or_insert_with(|| (piece_length, HashMap::new()))
+                    .1
+                    .insert(root, layer.clone());
+                out.push(Effect::PieceLayerReceived { root, layer });
+            }
+        }
+        true
+    }
+
+    /// Hashes queued [`Event::RecheckPieces`] pieces, at most
+    /// `check_concurrency` at a time (never during the initial check, which
+    /// hashes everything anyway).
+    fn schedule_rechecks(&mut self, out: &mut Vec<Effect>) {
+        if matches!(self.status, TorrentStatus::Idle | TorrentStatus::Checking) {
+            return;
+        }
+        let limit = usize::try_from(self.config.check_concurrency.max(1)).unwrap_or(usize::MAX);
+        while self.rechecking.len() < limit {
+            let Some(piece) = self.recheck.pop_front() else {
+                break;
+            };
+            if self.picker.have().get(piece) && self.rechecking.insert(piece) {
+                out.push(Effect::HashPiece { piece });
+            }
+        }
+    }
+
+    /// A verified piece hashed again with its file's new piece layer. One
+    /// that fails is downloaded again. Who sent the bad data is not known
+    /// any more, so nobody is banned for it.
+    fn on_rechecked(&mut self, now: Instant, piece: u32, ok: bool, out: &mut Vec<Effect>) {
+        if !ok && self.picker.mark_missing(piece) {
+            let size = self.picker.layout().piece_size(piece).unwrap_or(0);
+            self.bytes_have = self.bytes_have.saturating_sub(u64::from(size));
+            out.push(Effect::Alert(Alert::HashFailed { piece }));
+            self.wanted_changed(now, out);
+        }
+        self.schedule_rechecks(out);
+    }
+
     fn add_have_bytes(&mut self, piece: u32) {
         let size = self.picker.layout().piece_size(piece).unwrap_or(0);
         self.bytes_have = self.bytes_have.saturating_add(u64::from(size));
@@ -1481,6 +1761,9 @@ impl TorrentState {
 
     fn on_tick(&mut self, now: Instant, out: &mut Vec<Effect>) {
         self.bans.expire(now, self.config.hash_fail_quiet);
+        if let Some((_, set)) = &mut self.layer_fetch {
+            set.expire(now, self.config.request_timeout);
+        }
         if self.retries_peers() {
             let peers = &self.peers;
             self.pool.promote(now, |a| Self::is_connected(peers, a));
@@ -1561,6 +1844,10 @@ impl TorrentState {
             self.announce(now, event, out);
         }
         self.fill_connections(out);
+        for key in self.sorted_keys() {
+            self.fill_hash_requests(now, key, out);
+        }
+        self.schedule_rechecks(out);
         out.push(Effect::Alert(Alert::Stats(self.stats())));
     }
 
@@ -1581,8 +1868,7 @@ impl TorrentState {
             length: request.length,
         };
         let serving = self.is_active();
-        let valid =
-            self.picker.layout().is_valid_request(block) && self.picker.have().get(block.piece);
+        let valid = self.is_servable(block) && self.picker.have().get(block.piece);
         let max_queue = self.config.max_upload_queue;
         let Some(peer) = self.peers.get_mut(&key) else {
             return;
@@ -1599,6 +1885,49 @@ impl TorrentState {
         }
         peer.upload_queue.push_back(block);
         self.pump_uploads(out);
+    }
+
+    /// Whether a peer may ask for `block`: inside its piece, or (with
+    /// [`with_padded_last_piece`](Self::with_padded_last_piece)) starting
+    /// inside the last piece and ending within its piece-aligned padding.
+    fn is_servable(&self, block: BlockRef) -> bool {
+        let layout = self.picker.layout();
+        if layout.is_valid_request(block) {
+            return true;
+        }
+        let last = layout.piece_count().saturating_sub(1);
+        self.padded_last_piece
+            && block.piece == last
+            && block.length > 0
+            && block.length <= BLOCK_SIZE
+            && layout
+                .piece_size(last)
+                .is_some_and(|size| block.offset < size)
+            && u64::from(block.offset) + u64::from(block.length) <= u64::from(layout.piece_length())
+    }
+
+    /// Takes the request in `peer`'s `reading` that a read of `stored` (see
+    /// [`stored_part`]) answers: `stored` itself, or a
+    /// longer request for the same place that runs into the padding.
+    fn take_reading(&mut self, key: PeerKey, stored: BlockRef) -> Option<BlockRef> {
+        let size = self.picker.layout().piece_size(stored.piece)?;
+        let peer = self.peers.get_mut(&key)?;
+        if peer.reading.remove(&stored) {
+            return Some(stored);
+        }
+        if !self.padded_last_piece || stored.offset + stored.length != size {
+            return None;
+        }
+        let padded = peer
+            .reading
+            .iter()
+            .filter(|b| {
+                b.piece == stored.piece && b.offset == stored.offset && b.length > stored.length
+            })
+            .max_by_key(|b| b.length)
+            .copied()?;
+        peer.reading.remove(&padded);
+        Some(padded)
     }
 
     /// A peer no longer wants a block. With the fast extension a cancelled
@@ -1706,6 +2035,7 @@ impl TorrentState {
             peer.reading.insert(block);
             self.pending_reads += 1;
             self.upload_cursor = Some(key);
+            let block = stored_part(self.picker.layout(), block);
             out.push(Effect::ReadBlock { peer: key, block });
             if !peer.upload_queue.is_empty() {
                 order.push_back(key);
@@ -1722,29 +2052,31 @@ impl TorrentState {
         out: &mut Vec<Effect>,
     ) {
         self.pending_reads = self.pending_reads.saturating_sub(1);
-        let mut refund = false;
-        if let Some(peer) = self.peers.get_mut(&key) {
-            // Gone from `reading`: cancelled, choked, or the peer was
-            // dropped (those paths already refunded).
-            if peer.reading.remove(&block) {
-                if peer.may_download(block.piece) {
-                    let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
-                    peer.up_round = peer.up_round.saturating_add(len);
-                    peer.uploaded = peer.uploaded.saturating_add(len);
-                    self.uploaded = self.uploaded.saturating_add(len);
-                    let message = Message::Piece {
-                        piece: block.piece,
-                        offset: block.offset,
-                        data,
-                    };
-                    Self::send(peer, key, message, now, out);
+        // Gone from `reading`: cancelled, choked, or the peer was dropped
+        // (those paths already refunded).
+        if let Some(requested) = self.take_reading(key, block)
+            && let Some(peer) = self.peers.get_mut(&key)
+        {
+            if peer.may_download(requested.piece) {
+                // A padded request: the content read, then its zeros.
+                let data = if requested.length > block.length {
+                    pad_with_zeros(data, requested.length)
                 } else {
-                    refund = true;
-                }
+                    data
+                };
+                let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                peer.up_round = peer.up_round.saturating_add(len);
+                peer.uploaded = peer.uploaded.saturating_add(len);
+                self.uploaded = self.uploaded.saturating_add(len);
+                let message = Message::Piece {
+                    piece: requested.piece,
+                    offset: requested.offset,
+                    data,
+                };
+                Self::send(peer, key, message, now, out);
+            } else {
+                self.refund_upload(u64::from(requested.length));
             }
-        }
-        if refund {
-            self.refund_upload(u64::from(block.length));
         }
         self.pump_uploads(out);
     }
@@ -1765,17 +2097,12 @@ impl TorrentState {
             piece: block.piece,
             message: error,
         }));
-        let refund = if let Some(peer) = self.peers.get_mut(&key) {
-            // Already removed: a cancel or a choke rejected it and refunded.
-            let still = peer.reading.remove(&block);
-            if still && peer.fast {
+        // Already removed: a cancel or a choke rejected it and refunded.
+        let requested = self.take_reading(key, block);
+        if let (Some(block), Some(peer)) = (requested, self.peers.get_mut(&key)) {
+            if peer.fast {
                 Self::send(peer, key, Message::Reject(block.into()), now, out);
             }
-            still
-        } else {
-            false
-        };
-        if refund {
             self.refund_upload(u64::from(block.length));
         }
         self.pump_uploads(out);
@@ -1950,15 +2277,15 @@ impl TorrentState {
         }
         // Only addresses others can dial: an incoming peer's source port is
         // useless until its extension handshake names its listen port.
+        let hints = &self.hints;
         let connected: HashMap<SocketAddr, u8> = self
             .peers
             .values()
             .filter_map(|p| {
-                let mut flags = dravity_wire::PEX_REACHABLE;
-                if p.has.is_full() {
-                    flags |= dravity_wire::PEX_SEED;
-                }
-                p.reachable.map(|a| (a, flags))
+                // Web seeds are never shared (they have no reachable
+                // address anyway).
+                let addr = p.reachable.filter(|a| !is_web_seed_addr(*a))?;
+                Some((addr, pex_flags(p, hints.get(addr))))
             })
             .collect();
         for key in self.sorted_keys() {
@@ -1993,6 +2320,27 @@ impl TorrentState {
             Self::send(peer, key, ext::pex_message(id, &added, &dropped), now, out);
         }
     }
+}
+
+/// The BEP 11 `added.f` flags we share for a connected peer reachable at
+/// an address with `hints`.
+fn pex_flags(peer: &Peer, hints: DialHints) -> u8 {
+    let mut flags = 0;
+    // Seen on this connection, or by an earlier one of ours.
+    if peer.link.mse == Some(true) || hints.encryption == Some(true) {
+        flags |= dravity_wire::PEX_ENCRYPTION;
+    }
+    if peer.has.is_full() {
+        flags |= dravity_wire::PEX_SEED;
+    }
+    if peer.link.utp || hints.utp == Some(true) {
+        flags |= dravity_wire::PEX_UTP;
+    }
+    // Only a connection we opened proves others can open one too.
+    if !peer.incoming {
+        flags |= dravity_wire::PEX_REACHABLE;
+    }
+    flags
 }
 
 /// IPv4 address BEP 6 uses for `ip`. Mapped IPv6 addresses use the embedded
@@ -2032,6 +2380,65 @@ fn duplicate_candidate(
 }
 
 /// The answer to a `ut_metadata` request for `piece`.
+/// The answer to a BEP 52 hash request: `hashes` from a known piece layer,
+/// or `hash reject` (unknown root, a layer below the piece layer, a
+/// malformed or oversized range).
+fn hash_reply(layers: Option<&(u32, HashMap<Hash, Vec<Hash>>)>, request: HashRequest) -> Message {
+    let max = u32::try_from(MAX_HASH_REQUEST).unwrap_or(u32::MAX);
+    let proof =
+        layers
+            .filter(|_| request.is_well_formed(max))
+            .and_then(|(piece_length, layers)| {
+                let layer = layers.get(&request.pieces_root)?;
+                merkle::layer_proof(
+                    layer,
+                    *piece_length,
+                    request.base_layer,
+                    usize::try_from(request.index).ok()?,
+                    usize::try_from(request.length).ok()?,
+                    request.proof_layers,
+                )
+            });
+    match proof {
+        Some(proof) => Message::Hashes {
+            request,
+            hashes: proof
+                .base
+                .iter()
+                .chain(&proof.uncles)
+                .flatten()
+                .copied()
+                .collect::<Vec<u8>>()
+                .into(),
+        },
+        None => Message::HashReject(request),
+    }
+}
+
+/// The part of `block` that is content (what storage reads); the rest of a
+/// [padded](TorrentState::with_padded_last_piece) request is zeros.
+fn stored_part(layout: &PieceLayout, block: BlockRef) -> BlockRef {
+    let size = layout.piece_size(block.piece).unwrap_or(0);
+    let end = size.min(block.offset.saturating_add(block.length));
+    BlockRef {
+        length: end.saturating_sub(block.offset),
+        ..block
+    }
+}
+
+/// `data` extended with zeros to `length` bytes (the padding of a padded
+/// last piece).
+fn pad_with_zeros(data: Bytes, length: u32) -> Bytes {
+    let length = usize::try_from(length).unwrap_or(usize::MAX);
+    if data.len() >= length {
+        return data;
+    }
+    let mut padded = BytesMut::with_capacity(length);
+    padded.extend_from_slice(&data);
+    padded.resize(length, 0);
+    padded.freeze()
+}
+
 fn metadata_reply(info: Option<&Bytes>, piece: u32) -> MetadataMessage {
     let Some(info) = info else {
         return MetadataMessage::Reject { piece };

@@ -36,7 +36,7 @@ impl ApiError {
                 | SessionError::NotRunning(_)
                 | SessionError::NoMetadata(_) => StatusCode::CONFLICT,
                 SessionError::FileCount { .. }
-                | SessionError::MagnetWithoutV1Hash
+                | SessionError::MagnetWithoutInfoHash
                 | SessionError::StorageForMagnet => StatusCode::BAD_REQUEST,
                 SessionError::NoStateDir => StatusCode::NOT_IMPLEMENTED,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,

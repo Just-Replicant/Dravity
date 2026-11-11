@@ -24,10 +24,14 @@ pub enum SessionError {
     /// The DHT node could not be started.
     #[error(transparent)]
     Dht(#[from] dravity_dht::DhtError),
-    /// The magnet link has no v1 info-hash (`urn:btih`); v2-only magnets
-    /// are not supported yet.
-    #[error("magnet link has no v1 (btih) info-hash")]
-    MagnetWithoutV1Hash,
+    /// The magnet link has no info-hash (neither `urn:btih` nor
+    /// `urn:btmh`). [`Magnet::parse`](dravity_core::Magnet::parse) never
+    /// returns such a link.
+    #[error("magnet link has no info-hash")]
+    MagnetWithoutInfoHash,
+    /// The web seed HTTP/TLS client could not be built.
+    #[error(transparent)]
+    WebSeed(#[from] dravity_webseed::WebSeedError),
     /// The torrent is not in the session.
     #[error("torrent {0} is not in the session")]
     Unknown(InfoHash),

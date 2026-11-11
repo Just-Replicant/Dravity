@@ -723,6 +723,14 @@ mod tests {
         assert!(log.iter().any(|l| l == "metadata received"), "{log:?}");
         assert!(log.iter().any(|l| l == "finished"), "{log:?}");
         assert!(super::view::alert_text(&Alert::Finished).is_some());
+        assert_eq!(
+            super::view::alert_text(&Alert::PieceLayersStalled {
+                missing_layers: 2,
+                silent: Duration::from_secs(130),
+            })
+            .as_deref(),
+            Some("waiting for piece layers of 2 file(s): no peer sent any for 130s")
+        );
 
         let request = v.update(Action::TogglePause).unwrap();
         assert_eq!(request, Request::Pause(hash));

@@ -115,10 +115,8 @@ impl AsRef<[u8]> for InfoHash {
     }
 }
 
-/// A BitTorrent v2 info-hash (SHA-256, BEP 52).
-///
-/// Phase 0 only parses and prints it (for `urn:btmh:` magnet links); v2
-/// metainfo support is scheduled for Phase 5.
+/// A BitTorrent v2 info-hash (SHA-256 of the bencoded `info` dictionary,
+/// BEP 52).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct InfoHashV2([u8; 32]);
 
@@ -138,7 +136,14 @@ impl InfoHashV2 {
         &self.0
     }
 
-    /// The 20-byte truncation used on the v1 wire protocol for hybrid swarms.
+    /// Computes the v2 info-hash of the raw, bencoded `info` dictionary bytes.
+    #[must_use]
+    pub fn from_info_bytes(info: &[u8]) -> Self {
+        Self(sha2::Sha256::digest(info).into())
+    }
+
+    /// The 20-byte truncation used on the wire, with trackers and in the DHT
+    /// for v2 swarms.
     #[must_use]
     pub fn truncated(&self) -> InfoHash {
         let mut b = [0u8; 20];

@@ -193,6 +193,32 @@ fn multi_file_torrent_with_metadata() {
 }
 
 #[test]
+fn padding_files_may_share_a_name() {
+    let pad = |len| {
+        dict(vec![
+            ("attr", b("p")),
+            ("length", int(len)),
+            ("path", list(vec![b(".pad"), b("6")])),
+        ])
+    };
+    let files = vec![
+        file(&["a"], 10),
+        pad(6),
+        file(&["b"], 10),
+        pad(6),
+        file(&["c"], 1),
+    ];
+    let m = Metainfo::from_bytes(&torrent(multi_info("t", files, 33, 16))).unwrap();
+    assert_eq!(m.info().files().len(), 5);
+    // Real files still may not repeat.
+    let files = vec![file(&["a"], 10), pad(6), file(&["a"], 10)];
+    assert!(matches!(
+        Metainfo::from_bytes(&torrent(multi_info("t", files, 26, 16))),
+        Err(MetainfoError::DuplicatePath(_))
+    ));
+}
+
+#[test]
 fn info_hash_covers_original_bytes_not_reencoding() {
     // `name` before `length`: unsorted, so canonical re-encoding would differ.
     let mut info = b"d4:name1:a6:lengthi3e12:piece lengthi16384e6:pieces20:".to_vec();
@@ -390,7 +416,7 @@ fn rejects_structural_problems() {
                 "meta version",
                 Some(int(2)),
             ),
-            MetainfoError::UnsupportedV2Only,
+            MetainfoError::MissingFileTree,
         ),
         (
             with(base.clone(), "private", Some(int(2))),
@@ -441,10 +467,11 @@ fn zero_length_torrent_has_no_pieces() {
 }
 
 #[test]
-fn hybrid_torrent_parses_v1_part() {
-    let info = with(single_info("h", 10, 16384), "meta version", Some(int(2)));
-    let info = with(info, "file tree", Some(dict(vec![("h", dict(vec![]))])));
-    assert_eq!(parse(info).unwrap().info().total_length(), 10);
+fn a_file_tree_without_meta_version_2_is_ignored() {
+    let info = with(single_info("h", 10, 16384), "file tree", Some(int(5)));
+    let m = parse(info).unwrap();
+    assert_eq!(m.info().version(), dravity_core::MetaVersion::V1);
+    assert_eq!(m.info_hash_v2(), None);
 }
 
 proptest! {
@@ -519,4 +546,66 @@ fn from_info_bytes_matches_full_torrent() {
         ),
         Err(MetainfoError::InvalidPieceLength(0))
     ));
+}
+
+fn raw(bytes: &[u8]) -> Value<'static> {
+    Value::Bytes(Cow::Owned(bytes.to_vec()))
+}
+
+#[test]
+fn non_utf8_names_are_rejected_unless_a_utf8_variant_exists() {
+    // A v1 name that is not UTF-8: rejected, not decoded lossily.
+    let bad_name = with(single_info("x", 10, 16), "name", Some(raw(b"caf\xe9")));
+    assert_eq!(
+        parse(bad_name.clone()).unwrap_err(),
+        MetainfoError::NonUtf8Name("caf\u{fffd}".to_owned())
+    );
+    // `name.utf-8` (valid) wins.
+    let fixed = with(bad_name, "name.utf-8", Some(b("café")));
+    assert_eq!(parse(fixed).unwrap().info().name(), "café");
+
+    // Two path components that a lossy decode would merge into one name.
+    let files = vec![
+        dict(vec![("length", int(5)), ("path", list(vec![raw(b"\xff")]))]),
+        dict(vec![("length", int(5)), ("path", list(vec![raw(b"\xfe")]))]),
+    ];
+    assert!(matches!(
+        parse(multi_info("d", files, 10, 16)),
+        Err(MetainfoError::NonUtf8Name(_))
+    ));
+    // A valid `path.utf-8` is used instead of a broken `path`.
+    let files = vec![dict(vec![
+        ("length", int(5)),
+        ("path", list(vec![raw(b"\xff")])),
+        ("path.utf-8", list(vec![b("ok.bin")])),
+    ])];
+    let m = parse(multi_info("d", files, 5, 16)).unwrap();
+    assert_eq!(m.info().files()[0].path().to_string(), "ok.bin");
+    // A broken `path.utf-8` falls back to a valid `path`.
+    let files = vec![dict(vec![
+        ("length", int(5)),
+        ("path", list(vec![b("plain.bin")])),
+        ("path.utf-8", list(vec![raw(b"\xff")])),
+    ])];
+    let m = parse(multi_info("d", files, 5, 16)).unwrap();
+    assert_eq!(m.info().files()[0].path().to_string(), "plain.bin");
+}
+
+#[test]
+fn non_utf8_file_tree_keys_are_rejected() {
+    // Two v2 keys, `\xff` and `\xfe`, would both decode to U+FFFD.
+    let leaf = || dict(vec![("", dict(vec![("length", int(0))]))]);
+    let mut tree = Dict::new();
+    tree.insert(Cow::Owned(b"\xff".to_vec()), leaf());
+    tree.insert(Cow::Owned(b"\xfe".to_vec()), leaf());
+    let info = dict(vec![
+        ("file tree", Value::Dict(tree)),
+        ("meta version", int(2)),
+        ("name", b("d")),
+        ("piece length", int(16_384)),
+    ]);
+    assert_eq!(
+        parse(info).unwrap_err(),
+        MetainfoError::NonUtf8Name("\u{fffd}".to_owned())
+    );
 }

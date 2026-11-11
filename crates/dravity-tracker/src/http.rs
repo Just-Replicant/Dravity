@@ -7,7 +7,7 @@ use std::time::Duration;
 use dravity_bencode::Value;
 
 use crate::error::TrackerError;
-use crate::types::{AnnounceRequest, AnnounceResponse};
+use crate::types::{AnnounceRequest, AnnounceResponse, CryptoSupport};
 
 /// Maximum accepted HTTP response body.
 pub const MAX_RESPONSE_LEN: usize = 2 * 1024 * 1024;
@@ -16,7 +16,7 @@ pub const MAX_RESPONSE_LEN: usize = 2 * 1024 * 1024;
 ///
 /// ```
 /// use dravity_core::{InfoHash, PeerId};
-/// use dravity_tracker::{AnnounceEvent, AnnounceRequest, http::announce_url};
+/// use dravity_tracker::{AnnounceEvent, AnnounceRequest, CryptoSupport, http::announce_url};
 ///
 /// let req = AnnounceRequest {
 ///     info_hash: InfoHash::new([0xab; 20]),
@@ -28,6 +28,7 @@ pub const MAX_RESPONSE_LEN: usize = 2 * 1024 * 1024;
 ///     event: AnnounceEvent::Started,
 ///     num_want: Some(50),
 ///     key: 0x1234,
+///     crypto: CryptoSupport::None,
 /// };
 /// let url = announce_url("http://t.example/announce?passkey=x", &req);
 /// assert!(url.starts_with("http://t.example/announce?passkey=x&info_hash=%AB%AB"));
@@ -55,6 +56,11 @@ pub fn announce_url(base: &str, req: &AnnounceRequest) -> String {
         let _ = write!(url, "&numwant={n}");
     }
     let _ = write!(url, "&key={:08x}", req.key);
+    match req.crypto {
+        CryptoSupport::None => {}
+        CryptoSupport::Supported => url.push_str("&supportcrypto=1"),
+        CryptoSupport::Required => url.push_str("&supportcrypto=1&requirecrypto=1"),
+    }
     url
 }
 
@@ -175,7 +181,34 @@ fn parse_dict_peer(v: &Value<'_>) -> Option<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
+    use dravity_core::{InfoHash, PeerId};
+
     use super::*;
+    use crate::types::AnnounceEvent;
+
+    #[test]
+    fn advertises_encryption_support() {
+        let mut req = AnnounceRequest {
+            info_hash: InfoHash::new([1; 20]),
+            peer_id: PeerId::new([2; 20]),
+            port: 1,
+            uploaded: 0,
+            downloaded: 0,
+            left: 0,
+            event: AnnounceEvent::None,
+            num_want: None,
+            key: 0,
+            crypto: CryptoSupport::None,
+        };
+        let url = announce_url("http://t/a", &req);
+        assert!(!url.contains("crypto"), "{url}");
+        req.crypto = CryptoSupport::Supported;
+        let url = announce_url("http://t/a", &req);
+        assert!(url.ends_with("&key=00000000&supportcrypto=1"), "{url}");
+        req.crypto = CryptoSupport::Required;
+        let url = announce_url("http://t/a", &req);
+        assert!(url.ends_with("&supportcrypto=1&requirecrypto=1"), "{url}");
+    }
 
     #[test]
     fn parses_compact_and_dict_peers() {

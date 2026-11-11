@@ -1,0 +1,45 @@
+[package]
+name = "dravity-webseed"
+description = "Web seeds (BEP 19) for the Dravity BitTorrent engine: URL and range planning plus an HTTP client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[features]
+default = ["client"]
+# The async `WebSeedClient`. Without it only the sans-IO planner is built
+# (used by the fuzz targets).
+client = [
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:rustls-platform-verifier",
+    "dep:tokio",
+    "dep:url",
+]
+
+[dependencies]
+dravity-core.workspace = true
+reqwest = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-platform-verifier = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio = { workspace = true, optional = true, features = ["net"] }
+url = { workspace = true, optional = true }
+
+[dev-dependencies]
+dravity-bencode.workspace = true
+proptest.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "net"] }
+
+[[test]]
+name = "client"
+required-features = ["client"]
+
+[lints]
+workspace = true

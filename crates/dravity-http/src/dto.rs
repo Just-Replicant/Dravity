@@ -347,6 +347,10 @@ pub(crate) enum AlertKind {
     PeerBanned {
         ip: IpAddr,
     },
+    PieceLayersStalled {
+        missing_layers: u32,
+        silent_secs: u64,
+    },
     Error {
         message: String,
     },
@@ -367,6 +371,7 @@ impl AlertKind {
             Self::Finished => "finished",
             Self::MetadataReceived => "metadata_received",
             Self::PeerBanned { .. } => "peer_banned",
+            Self::PieceLayersStalled { .. } => "piece_layers_stalled",
             Self::Error { .. } => "error",
             Self::Other => "other",
         }
@@ -390,6 +395,13 @@ impl From<&SessionAlert> for AlertDto {
             Alert::Finished => AlertKind::Finished,
             Alert::MetadataReceived => AlertKind::MetadataReceived,
             Alert::PeerBanned { ip } => AlertKind::PeerBanned { ip: *ip },
+            Alert::PieceLayersStalled {
+                missing_layers,
+                silent,
+            } => AlertKind::PieceLayersStalled {
+                missing_layers: *missing_layers,
+                silent_secs: silent.as_secs(),
+            },
             Alert::Error { message } => AlertKind::Error {
                 message: message.clone(),
             },

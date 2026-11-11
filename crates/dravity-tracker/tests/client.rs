@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use dravity_core::{InfoHash, PeerId};
 use dravity_tracker::{
-    AnnounceEvent, AnnounceRequest, ClientConfig, TrackerClient, TrackerError, udp,
+    AnnounceEvent, AnnounceRequest, ClientConfig, CryptoSupport, TrackerClient, TrackerError, udp,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
@@ -23,6 +23,7 @@ fn request() -> AnnounceRequest {
         event: AnnounceEvent::Started,
         num_want: Some(50),
         key: 1,
+        crypto: CryptoSupport::None,
     }
 }
 

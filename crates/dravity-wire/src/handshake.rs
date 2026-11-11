@@ -22,6 +22,9 @@ impl Reserved {
     const FAST: (usize, u8) = (7, 0x04);
     /// Byte/bit of the BEP 5 DHT flag.
     const DHT: (usize, u8) = (7, 0x01);
+    /// Byte/bit of the BEP 52 v2 flag (4th most significant bit of the last
+    /// byte).
+    const V2: (usize, u8) = (7, 0x10);
 
     /// No extensions.
     #[must_use]
@@ -90,6 +93,18 @@ impl Reserved {
     #[must_use]
     pub fn with_dht(self, on: bool) -> Self {
         self.set(Self::DHT, on)
+    }
+
+    /// Whether the peer supports the BEP 52 v2 protocol (hash requests).
+    #[must_use]
+    pub fn v2(&self) -> bool {
+        self.get(Self::V2)
+    }
+
+    /// Sets the BEP 52 v2 flag.
+    #[must_use]
+    pub fn with_v2(self, on: bool) -> Self {
+        self.set(Self::V2, on)
     }
 }
 

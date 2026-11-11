@@ -1,20 +1,26 @@
-//! Fetching a magnet link's `info` dictionary from peers (BEP 9).
+//! Fetching a magnet link's `info` dictionary from peers (BEP 9), and the
+//! piece layers of a v2 or hybrid magnet with BEP 52 hash requests.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Instant;
 
 use bytes::Bytes;
-use dravity_core::InfoHash;
+use dravity_core::merkle::Hash;
+use dravity_core::{InfoHash, InfoHashV2, MetaVersion, Metainfo};
 use dravity_wire::{
-    ExtendedHandshake, METADATA_PIECE_LEN, Message, MetadataMessage, Reserved, metadata_piece_count,
+    ExtendedHandshake, HashRequest, METADATA_PIECE_LEN, Message, MetadataMessage, Reserved,
+    metadata_piece_count,
 };
 
 use crate::ext::{self, PeerExtensions};
-use crate::pool::PeerPool;
+use crate::hints::{HintBook, Joined};
+use crate::layers::{Answer, LayerSet, Piece};
+use crate::pool::{PeerPool, new_duplicate_wins};
 use crate::state::DhtSchedule;
 use crate::types::{
-    Alert, AnnounceEvent, Config, Effect, Event, PeerInfo, PeerKey, Stats, TorrentStatus,
+    Alert, AnnounceEvent, Config, DialHints, Effect, Event, PeerInfo, PeerKey, PeerLink, Stats,
+    TorrentStatus,
 };
 
 /// Metadata requests outstanding per peer.
@@ -27,38 +33,57 @@ const UNKNOWN_LEFT: u64 = 16 * 1024;
 /// Most availability messages remembered per peer for the hand-over.
 const MAX_REPLAY: usize = 100_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Piece {
-    /// Not downloaded. `avoid` is a peer that just failed this piece; other
-    /// peers may take it immediately, and that peer only after the instant.
-    Missing {
-        avoid: Option<(PeerKey, Instant)>,
-    },
-    Requested {
-        peer: PeerKey,
-        since: Instant,
-    },
-    Have,
+/// The piece layers a verified v2 or hybrid `info` still needs (BEP 52).
+#[derive(Debug)]
+struct LayerFetch {
+    /// The verified `info` bytes, reported once the layers are complete.
+    info: Bytes,
+    /// A hybrid can fall back to its SHA-1 piece hashes, so its fetch has a
+    /// deadline and only asks peers that advertise BEP 52 (a v1-only peer
+    /// of a hybrid swarm does not know the hash messages).
+    hybrid: bool,
+    /// When a hybrid stops waiting (pushed back by every answer).
+    deadline: Option<Instant>,
+    /// When the last valid `hashes` arrived (or the fetch started).
+    last_progress: Instant,
+    /// When a v2-only fetch next reports itself stalled.
+    stall_alert_at: Option<Instant>,
+    /// The layers still missing.
+    set: LayerSet,
 }
 
-impl Piece {
-    const fn is_have(self) -> bool {
-        matches!(self, Self::Have)
-    }
-
-    const fn is_requested(self) -> bool {
-        matches!(self, Self::Requested { .. })
-    }
-
-    /// Whether `key` may be asked for this piece at `now`.
-    fn can_ask(self, key: PeerKey, now: Instant) -> bool {
-        match self {
-            Self::Missing { avoid: None } => true,
-            Self::Missing {
-                avoid: Some((peer, at)),
-            } => peer != key || now >= at,
-            _ => false,
+impl LayerFetch {
+    /// What `info` still needs, or `None` when it needs nothing (or is not
+    /// a v2 or hybrid torrent whose layers can be fetched).
+    fn for_info(info: &Bytes, now: Instant, config: &Config) -> Option<Self> {
+        let metainfo = Metainfo::from_info_bytes(info, Vec::new()).ok()?;
+        let info_dict = metainfo.info();
+        let mut roots = Vec::new();
+        for root in info_dict.missing_piece_layers() {
+            let pieces = usize::try_from(info_dict.piece_layer_len(&root)?).ok()?;
+            roots.push((root, pieces));
         }
+        let set = LayerSet::new(info_dict.piece_length(), roots)?;
+        let hybrid = info_dict.version() == MetaVersion::Hybrid;
+        Some(Self {
+            info: info.clone(),
+            hybrid,
+            deadline: hybrid.then(|| now + config.piece_layer_timeout),
+            last_progress: now,
+            stall_alert_at: (!hybrid).then(|| now + config.piece_layer_stall_alert),
+            set,
+        })
+    }
+
+    /// Whether `peer` may be asked: every peer of a v2-only swarm speaks
+    /// BEP 52, a hybrid's peers only if they say so in the handshake.
+    fn can_ask(&self, reserved: Reserved) -> bool {
+        !self.hybrid || reserved.v2()
+    }
+
+    /// The verified `info` and the layers whose every block arrived.
+    fn into_complete(self) -> (Bytes, Vec<(Hash, Vec<Hash>)>) {
+        (self.info, self.set.into_complete())
     }
 }
 
@@ -68,6 +93,7 @@ struct MetaPeer {
     /// The peer connected to us.
     incoming: bool,
     reserved: Reserved,
+    link: PeerLink,
     ext: PeerExtensions,
     /// The raw extension handshake, replayed after the hand-over.
     handshake: Option<Bytes>,
@@ -88,6 +114,8 @@ pub struct HandoverPeer {
     pub addr: SocketAddr,
     /// Reserved bytes of the peer's handshake.
     pub reserved: Reserved,
+    /// Transport and encryption of the connection.
+    pub link: PeerLink,
     /// The peer connected to us: replay it as
     /// [`Event::PeerAccepted`](crate::Event::PeerAccepted) rather than
     /// [`Event::PeerConnected`](crate::Event::PeerConnected).
@@ -111,6 +139,9 @@ pub struct Handover {
     pub connecting: Vec<SocketAddr>,
     /// Addresses learned from DHT or PEX. A private torrent drops these.
     pub swarm: Vec<SocketAddr>,
+    /// What PEX flags and connections showed about addresses (for
+    /// [`TorrentState::with_dial_hints`](crate::TorrentState::with_dial_hints)).
+    pub hints: Vec<(SocketAddr, DialHints)>,
     /// Whether a `started` announce was sent and not yet rejected.
     pub started_announced: bool,
     /// A `started` announce was sent and the tracker has not answered yet.
@@ -143,6 +174,10 @@ pub struct Handover {
 #[derive(Debug)]
 pub struct MetadataState {
     info_hash: InfoHash,
+    /// `info_hash` is a v1 hash: the metadata's SHA-1 must match it.
+    check_v1: bool,
+    /// The metadata's SHA-256 must match this v2 hash (BEP 52).
+    info_hash_v2: Option<InfoHashV2>,
     config: Config,
     status: TorrentStatus,
     peers: HashMap<PeerKey, MetaPeer>,
@@ -167,16 +202,23 @@ pub struct MetadataState {
     banned: HashSet<SocketAddr>,
     /// Addresses learned from DHT or PEX (not from a tracker or the user).
     swarm: HashSet<SocketAddr>,
+    /// PEX flags and connection outcomes by address.
+    hints: HintBook,
     downloaded: u64,
     complete: bool,
+    /// Set once a v2 or hybrid `info` is verified but some of its piece layers
+    /// are still being fetched from peers.
+    layers: Option<LayerFetch>,
 }
 
 impl MetadataState {
-    /// A fetcher for `info_hash`.
+    /// A fetcher for the v1 `info_hash`.
     #[must_use]
     pub fn new(info_hash: InfoHash, config: Config) -> Self {
         Self {
             info_hash,
+            check_v1: true,
+            info_hash_v2: None,
             config,
             status: TorrentStatus::Idle,
             peers: HashMap::new(),
@@ -194,8 +236,10 @@ impl MetadataState {
             sources: HashSet::new(),
             banned: HashSet::new(),
             swarm: HashSet::new(),
+            hints: HintBook::default(),
             downloaded: 0,
             complete: false,
+            layers: None,
         }
     }
 
@@ -283,6 +327,7 @@ impl MetadataState {
                     peer: key,
                     addr: p.addr,
                     reserved: p.reserved,
+                    link: p.link,
                     incoming: p.incoming,
                     replay,
                 })
@@ -296,6 +341,7 @@ impl MetadataState {
             known,
             connecting,
             swarm,
+            hints: self.hints.entries(),
             started_announced: self.started_announced,
             started_pending: self.pending_announce == Some(AnnounceEvent::Started),
             announce_again: self.announce_again,
@@ -324,12 +370,37 @@ impl MetadataState {
                 peer,
                 addr,
                 reserved,
-            } => self.on_connected(now, peer, addr, reserved, false, &mut out),
+                link,
+            } => {
+                self.hints.observe(addr, link);
+                self.on_connected(
+                    now,
+                    Joined {
+                        key: peer,
+                        addr,
+                        reserved,
+                        link,
+                        incoming: false,
+                    },
+                    &mut out,
+                );
+            }
             Event::PeerAccepted {
                 peer,
                 addr,
                 reserved,
-            } => self.on_connected(now, peer, addr, reserved, true, &mut out),
+                link,
+            } => self.on_connected(
+                now,
+                Joined {
+                    key: peer,
+                    addr,
+                    reserved,
+                    link,
+                    incoming: true,
+                },
+                &mut out,
+            ),
             Event::PeerConnectFailed { addr, retry } => {
                 self.pool.dial_done(addr);
                 if retry {
@@ -459,6 +530,15 @@ impl MetadataState {
         });
     }
 
+    /// The connection to `addr` that a new one the other way replaces
+    /// (see [`new_duplicate_wins`]).
+    fn duplicate_to_replace(&self, addr: SocketAddr, incoming: bool) -> Option<PeerKey> {
+        let (&old, peer) = self.peers.iter().find(|(_, p)| p.addr == addr)?;
+        (peer.incoming != incoming
+            && new_duplicate_wins(self.config.listen_port, addr.port(), incoming) == Some(true))
+        .then_some(old)
+    }
+
     fn is_connected(peers: &HashMap<PeerKey, MetaPeer>, addr: SocketAddr) -> bool {
         peers.values().any(|p| p.addr == addr)
     }
@@ -502,26 +582,30 @@ impl MetadataState {
             let Some(addr) = self.pool.next_dial(|a| Self::is_connected(peers, a)) else {
                 break;
             };
-            out.push(Effect::Connect { addr });
+            let hints = self.hints.get(addr);
+            out.push(Effect::Connect { addr, hints });
         }
     }
 
-    fn on_connected(
-        &mut self,
-        now: Instant,
-        key: PeerKey,
-        addr: SocketAddr,
-        reserved: Reserved,
-        incoming: bool,
-        out: &mut Vec<Effect>,
-    ) {
+    fn on_connected(&mut self, now: Instant, joined: Joined, out: &mut Vec<Effect>) {
+        let Joined {
+            key,
+            addr,
+            reserved,
+            link,
+            incoming,
+        } = joined;
         if !incoming {
             self.pool.dial_done(addr);
         }
-        if self.banned.contains(&addr)
+        let refused = self.banned.contains(&addr)
             || self.status != TorrentStatus::FetchingMetadata
+            || self.peers.contains_key(&key);
+        if !refused && let Some(old) = self.duplicate_to_replace(addr, incoming) {
+            self.disconnect(old, out);
+        }
+        if refused
             || self.peers.len() >= self.config.max_peers
-            || self.peers.contains_key(&key)
             || Self::is_connected(&self.peers, addr)
         {
             out.push(Effect::Disconnect { peer: key });
@@ -533,6 +617,7 @@ impl MetadataState {
             addr,
             incoming,
             reserved,
+            link,
             ext: PeerExtensions::default(),
             handshake: None,
             replay: Vec::new(),
@@ -555,6 +640,9 @@ impl MetadataState {
             if matches!(piece, Piece::Requested { peer, .. } if *peer == key) {
                 *piece = Piece::Missing { avoid: None };
             }
+        }
+        if let Some(fetch) = &mut self.layers {
+            fetch.set.release(key);
         }
         Some(peer.addr)
     }
@@ -584,7 +672,7 @@ impl MetadataState {
                             piece,
                             total_size,
                             data,
-                        }) => self.on_data(key, piece, total_size, &data, out),
+                        }) => self.on_data(now, key, piece, total_size, &data, out),
                         Ok(MetadataMessage::Reject { piece }) => {
                             // One reject means this piece, not the peer: a
                             // client still fetching metadata rejects what it
@@ -608,8 +696,12 @@ impl MetadataState {
                     }
                 } else if id == ext::OUR_UT_PEX
                     && self.config.pex
-                    && let Some(added) = ext::pex_added(&payload)
+                    && let Some(pex) = ext::pex_added(&payload)
                 {
+                    for p in &pex {
+                        self.hints.learn_pex(p.addr, p.flags);
+                    }
+                    let added: Vec<SocketAddr> = pex.iter().map(|p| p.addr).collect();
                     self.note_swarm(&added, true);
                     self.add_to_pool(added);
                     self.fill_connections(out);
@@ -628,6 +720,23 @@ impl MetadataState {
                 peer.replay.insert(0, m);
             }
             m @ Message::Have { .. } if peer.replay.len() < MAX_REPLAY => peer.replay.push(m),
+            // We have no piece layers to serve yet.
+            Message::HashRequest(request) => {
+                peer.last_sent = now;
+                out.push(Effect::Send {
+                    peer: key,
+                    message: Message::HashReject(request),
+                });
+            }
+            Message::Hashes { request, hashes } => {
+                self.on_hashes(now, key, &request, &hashes, out);
+            }
+            Message::HashReject(request) => {
+                let retry_at = now + self.config.request_timeout;
+                if let Some(fetch) = &mut self.layers {
+                    fetch.set.on_reject(key, &request, retry_at);
+                }
+            }
             // Anything else is irrelevant before the download.
             _ => {}
         }
@@ -638,7 +747,7 @@ impl MetadataState {
 
     /// Adopts the metadata size the first capable peer advertises.
     fn learn_size(&mut self, key: PeerKey) {
-        if self.size.is_some() {
+        if self.size.is_some() || self.layers.is_some() {
             return;
         }
         let Some(size) = self.peers.get(&key).and_then(|p| p.ext.metadata_size) else {
@@ -675,6 +784,7 @@ impl MetadataState {
 
     fn on_data(
         &mut self,
+        now: Instant,
         key: PeerKey,
         index: u32,
         total_size: u64,
@@ -706,17 +816,63 @@ impl MetadataState {
             .downloaded
             .saturating_add(u64::try_from(data.len()).unwrap_or(0));
         if self.pieces.iter().all(|p| p.is_have()) {
-            self.verify(out);
+            self.verify(now, out);
         }
     }
 
-    fn verify(&mut self, out: &mut Vec<Effect>) {
-        if InfoHash::from_info_bytes(&self.buffer) == self.info_hash {
-            self.complete = true;
-            out.push(Effect::MetadataReceived {
-                info: Bytes::from(std::mem::take(&mut self.buffer)),
-            });
-            out.push(Effect::Alert(Alert::MetadataReceived));
+    /// A fetcher for a v2-only magnet link (`xt=urn:btmh:`): peers are
+    /// asked for the truncated hash and the metadata must have SHA-256
+    /// `info_hash`.
+    #[must_use]
+    pub fn new_v2(info_hash: InfoHashV2, config: Config) -> Self {
+        let mut state = Self::new(info_hash.truncated(), config);
+        state.check_v1 = false;
+        state.info_hash_v2 = Some(info_hash);
+        state
+    }
+
+    /// Also requires the metadata to match the v2 hash `info_hash` (a magnet
+    /// link with both `btih` and `btmh`).
+    #[must_use]
+    pub const fn with_info_hash_v2(mut self, info_hash: InfoHashV2) -> Self {
+        self.info_hash_v2 = Some(info_hash);
+        self
+    }
+
+    /// The 20-byte id peers are asked for (the truncated hash of a v2-only
+    /// magnet).
+    #[must_use]
+    pub const fn info_hash(&self) -> InfoHash {
+        self.info_hash
+    }
+
+    /// Whether the downloaded `info` bytes match every hash we know.
+    fn matches(&self, info: &[u8]) -> bool {
+        (!self.check_v1 || InfoHash::from_info_bytes(info) == self.info_hash)
+            && self
+                .info_hash_v2
+                .is_none_or(|v2| InfoHashV2::from_info_bytes(info) == v2)
+    }
+
+    fn verify(&mut self, now: Instant, out: &mut Vec<Effect>) {
+        if self.matches(&self.buffer) {
+            let info = Bytes::from(std::mem::take(&mut self.buffer));
+            self.size = None;
+            self.pieces.clear();
+            self.sources.clear();
+            // A v2-only torrent cannot check a piece of a file larger than a
+            // piece without that file's piece layer, which BEP 9 does not
+            // carry: fetch the layers from peers first. A hybrid could
+            // start on SHA-1 alone, but then it could neither check its
+            // pieces against the Merkle roots nor answer hash requests, so it
+            // waits for the layers too, up to `piece_layer_timeout` without
+            // progress (a swarm of v1-only peers never sends them).
+            if let Some(fetch) = LayerFetch::for_info(&info, now, &self.config) {
+                self.layers = Some(fetch);
+                self.fill_hash_requests(now, out);
+                return;
+            }
+            self.finish(info, Vec::new(), out);
             return;
         }
         // Someone sent garbage (or a different size). Drop every peer that
@@ -740,7 +896,90 @@ impl MetadataState {
         }
     }
 
+    fn finish(&mut self, info: Bytes, piece_layers: Vec<(Hash, Vec<Hash>)>, out: &mut Vec<Effect>) {
+        self.complete = true;
+        out.push(Effect::MetadataReceived { info, piece_layers });
+        out.push(Effect::Alert(Alert::MetadataReceived));
+    }
+
+    /// A `hashes` reply: checked against the pieces root with its uncle
+    /// hashes. A peer whose proof fails is dropped and not dialed again.
+    fn on_hashes(
+        &mut self,
+        now: Instant,
+        key: PeerKey,
+        request: &HashRequest,
+        hashes: &[u8],
+        out: &mut Vec<Effect>,
+    ) {
+        let Some(fetch) = &mut self.layers else {
+            return;
+        };
+        match fetch.set.on_hashes(key, request, hashes) {
+            Answer::Unexpected => return,
+            Answer::Invalid => {
+                if let Some(addr) = self.remove_peer(key) {
+                    self.banned.insert(addr);
+                    self.swarm.remove(&addr);
+                }
+                out.push(Effect::Disconnect { peer: key });
+                self.fill_hash_requests(now, out);
+                return;
+            }
+            Answer::Accepted { .. } => {}
+        }
+        fetch.last_progress = now;
+        if fetch.hybrid {
+            fetch.deadline = Some(now + self.config.piece_layer_timeout);
+        } else {
+            fetch.stall_alert_at = Some(now + self.config.piece_layer_stall_alert);
+        }
+        self.downloaded = self
+            .downloaded
+            .saturating_add(u64::try_from(hashes.len()).unwrap_or(0));
+        if fetch.set.is_done()
+            && let Some(done) = self.layers.take()
+        {
+            let (info, layers) = done.into_complete();
+            self.finish(info, layers, out);
+            return;
+        }
+        self.fill_hash_requests(now, out);
+    }
+
+    /// Asks connected peers for missing piece-layer blocks, at most
+    /// [`PIPELINE`] at a time per peer (see [`LayerFetch::can_ask`]).
+    fn fill_hash_requests(&mut self, now: Instant, out: &mut Vec<Effect>) {
+        if self.status != TorrentStatus::FetchingMetadata {
+            return;
+        }
+        let Some(fetch) = &mut self.layers else {
+            return;
+        };
+        let mut keys: Vec<PeerKey> = self.peers.keys().copied().collect();
+        keys.sort_unstable();
+        for key in keys {
+            let Some(peer) = self.peers.get_mut(&key) else {
+                continue;
+            };
+            if !fetch.can_ask(peer.reserved) {
+                continue;
+            }
+            for request in fetch.set.assign(key, now, PIPELINE) {
+                peer.last_sent = now;
+                out.push(Effect::Send {
+                    peer: key,
+                    message: Message::HashRequest(request),
+                });
+            }
+        }
+    }
+
     fn fill_requests(&mut self, now: Instant, out: &mut Vec<Effect>) {
+        if self.layers.is_some() {
+            self.fill_hash_requests(now, out);
+            return;
+        }
         if self.size.is_none() || self.status != TorrentStatus::FetchingMetadata {
             return;
         }
@@ -798,6 +1037,9 @@ impl MetadataState {
         // skipped until `request_timeout` has passed again, unless it is the
         // only one that can serve the piece.
         let timeout = self.config.request_timeout;
+        if let Some(fetch) = &mut self.layers {
+            fetch.set.expire(now, timeout);
+        }
         for piece in &mut self.pieces {
             if let Piece::Requested { peer, since } = *piece
                 && now.saturating_duration_since(since) >= timeout
@@ -808,6 +1050,28 @@ impl MetadataState {
             }
         }
         self.abandon_stalled_size();
+        if self.status == TorrentStatus::FetchingMetadata
+            && let Some(fetch) = self
+                .layers
+                .take_if(|f| f.deadline.is_some_and(|d| now >= d))
+        {
+            // A hybrid whose swarm stopped answering: start on SHA-1 for the
+            // files whose layer is still missing.
+            let (info, layers) = fetch.into_complete();
+            self.finish(info, layers, out);
+        }
+        if let Some(fetch) = &mut self.layers
+            && let Some(at) = fetch.stall_alert_at
+            && now >= at
+        {
+            // Say so, then keep waiting: a v2-only torrent has no other way
+            // to check its pieces.
+            fetch.stall_alert_at = Some(now + self.config.piece_layer_stall_alert);
+            out.push(Effect::Alert(Alert::PieceLayersStalled {
+                missing_layers: fetch.set.missing_layers(),
+                silent: now.saturating_duration_since(fetch.last_progress),
+            }));
+        }
         let mut keys: Vec<PeerKey> = self.peers.keys().copied().collect();
         keys.sort_unstable();
         let mut dead = Vec::new();

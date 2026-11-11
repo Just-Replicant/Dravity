@@ -25,37 +25,40 @@
 //! ([`Effect::ReadBlock`]) and reported back as [`Event::BlockRead`].
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
-use dravity_core::{BlockRef, InfoHash, Metainfo, PeerId};
+use dravity_core::merkle::Hash;
+use dravity_core::{BlockRef, Info, InfoHash, InfoHashV2, MetaVersion, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{
-    Alert, AnnounceEvent, Bitfield, Config, Effect, Event, MetadataState, PeerKey, Priority, Stats,
-    TorrentState, TorrentStatus,
+    Alert, AnnounceEvent, Bitfield, Config, DialHints, Effect, Event, MetadataState, PeerKey,
+    PeerLink, Priority, Stats, TorrentState, TorrentStatus,
 };
 use dravity_storage::{
-    FileStorage, ResumeData, Storage, load_resume, read_block, save_resume, verify_piece,
-    write_block,
+    FileIo, FileStorage, ResumeData, Storage, load_resume, read_block, read_blocks, save_resume,
+    verify_piece, write_block, write_blocks,
 };
 use dravity_tracker::{AnnounceRequest, AnnounceResponse, TrackerClient};
+use dravity_webseed::WebSeedClient;
 use dravity_wire::{Message, Reserved};
 use futures_util::StreamExt;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use crate::SessionAlert;
 use crate::catalog::{Catalog, EntrySource};
 use crate::config::SessionConfig;
 use crate::files::{self, FileProgress};
-use crate::listen::UtpSockets;
+use crate::listen::{self, Registry, UtpSockets};
 use crate::peer::{self, PeerCommand, PeerParams};
 use crate::persist::Persister;
 use crate::status::{self, PeerStatus, TrackerLog, TrackerOutcome, TrackerStatus, Transport};
 use crate::stream::PeerStream;
+use crate::web_seed::{self, WebSeedParams};
+use crate::{EncryptionPolicy, SessionAlert};
 
 /// Tracker tiers (BEP 12), shared with announce tasks so a tracker that
 /// answered moves to the front of its tier.
@@ -69,6 +72,10 @@ pub(crate) enum Input {
         addr: SocketAddr,
         reserved: Reserved,
         transport: Transport,
+        /// RC4-encrypted (MSE).
+        encrypted: bool,
+        /// What the dial showed about MSE support (see [`PeerLink::mse`]).
+        mse: Option<bool>,
     },
     ConnectFailed {
         key: PeerKey,
@@ -77,6 +84,18 @@ pub(crate) enum Input {
     },
     Disconnected {
         key: PeerKey,
+    },
+    /// A web seed resolved its host and serves the torrent (it then sends
+    /// its bitfield and an unchoke like any peer).
+    WebSeedReady {
+        key: PeerKey,
+    },
+    /// A web seed could not start. `retry` is false when the URL can never
+    /// be fetched (forbidden address, bad scheme); a DNS failure retries.
+    WebSeedFailed {
+        key: PeerKey,
+        /// Whether the owner should try the URL again after its back-off.
+        retry: bool,
     },
     Message {
         key: PeerKey,
@@ -153,6 +172,10 @@ pub(crate) struct TorrentContext {
     pub(crate) info_hash: InfoHash,
     pub(crate) trackers: Tiers,
     pub(crate) tracker: TrackerClient,
+    /// HTTP client for web seeds, unless they are disabled.
+    pub(crate) web_seed: Option<WebSeedClient>,
+    /// File I/O for storage the session creates.
+    pub(crate) file_io: Arc<dyn FileIo>,
     pub(crate) dht: Option<Dht>,
     pub(crate) peer_id: PeerId,
     pub(crate) config: Arc<SessionConfig>,
@@ -168,6 +191,9 @@ pub(crate) struct TorrentContext {
     pub(crate) persist: Option<Persister>,
     /// Router port mapping status, when mapping runs.
     pub(crate) port_map: Option<tokio::sync::watch::Receiver<dravity_portmap::Status>>,
+    /// Registers the second swarm id of a hybrid magnet once its metadata
+    /// is known.
+    pub(crate) aliases: Aliases,
 }
 
 impl TorrentContext {
@@ -192,9 +218,10 @@ impl TorrentContext {
         announce_port(mapped, self.listen_port, self.config.announce_port)
     }
 
-    /// Reserved bits of our handshake.
-    pub(crate) fn reserved(&self) -> Reserved {
-        peer::our_reserved(self.config.engine.fast_extension)
+    /// Reserved bits of our handshake; `v2` if the torrent has a v2
+    /// info-hash.
+    pub(crate) fn reserved(&self, v2: bool) -> Reserved {
+        peer::our_reserved(self.config.engine.fast_extension, v2)
     }
 
     /// Where this torrent's resume data lives, if resume is enabled.
@@ -214,8 +241,58 @@ pub(crate) enum Source {
         metainfo: Arc<Metainfo>,
         storage: Arc<dyn Storage>,
     },
-    /// A magnet link: fetch the metadata first, then download into `dir`.
-    Magnet { download_dir: PathBuf },
+    /// A magnet link: fetch the metadata first, then download.
+    Magnet(MagnetStart),
+}
+
+/// The listener's routing table and this torrent's command channel (weak:
+/// the task must not keep itself alive).
+#[derive(Debug, Clone)]
+pub(crate) struct Aliases {
+    pub(crate) registry: Registry,
+    pub(crate) tx: mpsc::WeakSender<Command>,
+}
+
+impl Aliases {
+    fn register(&self, primary: InfoHash, hashes: &[InfoHash], v2: bool) {
+        if let Some(tx) = self.tx.upgrade() {
+            listen::register_aliases(&self.registry, primary, hashes, &tx, v2);
+        }
+    }
+}
+
+/// Piece layers by pieces root (BEP 52).
+type PieceLayers = Vec<(Hash, Vec<Hash>)>;
+
+/// One web seed of a torrent.
+#[derive(Debug)]
+struct WebSeed {
+    url: String,
+    /// The synthetic peer address it is reported under
+    /// ([`dravity_engine::web_seed_addr`]), unique per URL.
+    addr: SocketAddr,
+    /// The peer slot while a task runs for it.
+    key: Option<PeerKey>,
+    /// Not started again before this.
+    retry_at: Instant,
+    /// Failures in a row (reset when data arrives).
+    failures: u32,
+    /// Not started again: banned for data that failed the hash check, or a
+    /// URL that can never be fetched.
+    stopped: bool,
+}
+
+/// What a magnet link's task needs once its metadata arrives.
+#[derive(Debug, Clone)]
+pub(crate) struct MagnetStart {
+    /// Where the content goes.
+    pub(crate) download_dir: PathBuf,
+    /// The link has a v1 hash (`btih`): the task's info-hash is that one.
+    pub(crate) v1: bool,
+    /// The link's v2 hash (`btmh`), checked as well.
+    pub(crate) info_hash_v2: Option<InfoHashV2>,
+    /// Web seeds from the link (`ws`), added to the torrent's.
+    pub(crate) web_seeds: Vec<String>,
 }
 
 /// The engine state machine currently driving the torrent.
@@ -259,13 +336,20 @@ pub(crate) struct TorrentTask {
     ctx: TorrentContext,
     phase: Phase,
     content: Option<Content>,
-    /// Download directory of a magnet link, used once metadata arrives.
-    download_dir: Option<PathBuf>,
+    /// A magnet link's download directory and extras, used once metadata
+    /// arrives.
+    magnet: Option<MagnetStart>,
     /// Verified `info` dictionary waiting to replace the metadata phase.
-    metadata: Option<Bytes>,
+    metadata: Option<(Bytes, PieceLayers)>,
     peers: HashMap<PeerKey, mpsc::Sender<PeerCommand>>,
     /// Peers connected over uTP (the rest use TCP). Pruned against `peers`.
     utp_peers: HashSet<PeerKey>,
+    /// Peers whose connection is RC4-encrypted (MSE).
+    encrypted_peers: HashSet<PeerKey>,
+    /// The torrent's web seeds (BEP 19) and their peer slots.
+    web_seeds: Vec<WebSeed>,
+    /// Web seeds the engine knows as peers.
+    web_peers: HashSet<PeerKey>,
     /// The last announce outcome per tracker URL.
     tracker_log: TrackerLog,
     next_key: u64,
@@ -275,6 +359,10 @@ pub(crate) struct TorrentTask {
     /// Events produced synchronously during dispatch, handled next.
     local: VecDeque<Event>,
     hash_slots: Arc<Semaphore>,
+    /// Block writes and upload reads waiting to go to storage together
+    /// (see [`MAX_IO_BATCH`]).
+    pending_writes: Vec<(BlockRef, Bytes)>,
+    pending_reads: Vec<(PeerKey, BlockRef)>,
     /// Announce and DHT tasks. Aborted on stop; they must not delay it.
     background: JoinSet<()>,
     /// Block writes and piece hashes. Drained on stop, before resume data
@@ -306,7 +394,7 @@ impl TorrentTask {
         commands: mpsc::Receiver<Command>,
     ) -> Self {
         let mut file_priorities = file_priorities;
-        let (phase, content, download_dir) = match source {
+        let (phase, content, magnet) = match source {
             Source::Torrent { metainfo, storage } => {
                 let config = ctx.engine_config(metainfo.info().is_private());
                 file_priorities = files::normalize(metainfo.info(), &file_priorities)
@@ -317,6 +405,12 @@ impl TorrentTask {
                 let state = TorrentState::new(*metainfo.info().layout(), config)
                     .with_info_hash(ctx.info_hash)
                     .with_info_bytes(info)
+                    .with_piece_layers(metainfo.info().piece_length(), owned_layers(&metainfo))
+                    .with_padded_last_piece(padded_last_piece(metainfo.info()))
+                    .with_missing_piece_layers(
+                        metainfo.info().piece_length(),
+                        missing_layers(&metainfo),
+                    )
                     .with_priorities(&pieces);
                 (
                     Phase::Download(Box::new(state)),
@@ -324,21 +418,31 @@ impl TorrentTask {
                     None,
                 )
             }
-            Source::Magnet { download_dir } => {
-                let state = MetadataState::new(ctx.info_hash, ctx.engine_config(false));
-                (Phase::Metadata(Box::new(state)), None, Some(download_dir))
+            Source::Magnet(start) => {
+                let config = ctx.engine_config(false);
+                let state = match (start.v1, start.info_hash_v2) {
+                    (false, Some(v2)) => MetadataState::new_v2(v2, config),
+                    (_, Some(v2)) => {
+                        MetadataState::new(ctx.info_hash, config).with_info_hash_v2(v2)
+                    }
+                    (_, None) => MetadataState::new(ctx.info_hash, config),
+                };
+                (Phase::Metadata(Box::new(state)), None, Some(start))
             }
         };
         let (events_tx, events_rx) = mpsc::channel(ctx.config.event_queue.max(1));
         let hash_slots = Arc::new(Semaphore::new(ctx.config.hash_workers.max(1)));
-        Self {
+        let mut task = Self {
             ctx,
             phase,
             content,
-            download_dir,
+            magnet,
             metadata: None,
             peers: HashMap::new(),
             utp_peers: HashSet::new(),
+            encrypted_peers: HashSet::new(),
+            web_seeds: Vec::new(),
+            web_peers: HashSet::new(),
             tracker_log: TrackerLog::default(),
             next_key: 0,
             events_tx,
@@ -346,11 +450,122 @@ impl TorrentTask {
             commands,
             local: VecDeque::new(),
             hash_slots,
+            pending_writes: Vec::new(),
+            pending_reads: Vec::new(),
             background: JoinSet::new(),
             disk: JoinSet::new(),
             file_priorities,
             waiters: HashMap::new(),
             streams: BTreeMap::new(),
+        };
+        task.load_web_seeds();
+        task
+    }
+
+    /// Takes the web seeds of the content (once it is known).
+    fn load_web_seeds(&mut self) {
+        let Some(content) = &self.content else {
+            return;
+        };
+        if self.ctx.web_seed.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        self.web_seeds = content
+            .metainfo
+            .web_seeds()
+            .iter()
+            .zip(0u32..)
+            .map(|(url, index)| WebSeed {
+                url: url.clone(),
+                addr: dravity_engine::web_seed_addr(index),
+                key: None,
+                retry_at: now,
+                failures: 0,
+                stopped: false,
+            })
+            .collect();
+    }
+
+    /// Starts web seeds that are due while the torrent downloads, and
+    /// closes them once it does not (finished, checking, paused…): a web
+    /// seed only ever gives, and holding its slot helps nobody.
+    fn maintain_web_seeds(&mut self) {
+        if self.web_seeds.is_empty() {
+            return;
+        }
+        let (Some(client), Some(content)) = (self.ctx.web_seed.clone(), self.content.clone())
+        else {
+            return;
+        };
+        let downloading = matches!(self.phase, Phase::Download(_))
+            && self.phase.status() == TorrentStatus::Downloading;
+        if !downloading {
+            let open: Vec<PeerKey> = self
+                .web_seeds
+                .iter_mut()
+                .filter_map(|s| s.key.take())
+                .collect();
+            for key in open {
+                self.peers.remove(&key);
+                if self.web_peers.remove(&key) {
+                    self.local.push_back(Event::PeerDisconnected { peer: key });
+                }
+            }
+            return;
+        }
+        let now = Instant::now();
+        for i in 0..self.web_seeds.len() {
+            let due = self
+                .web_seeds
+                .get(i)
+                .is_some_and(|s| s.key.is_none() && !s.stopped && s.retry_at <= now);
+            if !due {
+                continue;
+            }
+            let (key, rx) = self.new_peer();
+            let Some(seed) = self.web_seeds.get_mut(i) else {
+                continue;
+            };
+            seed.key = Some(key);
+            let params = WebSeedParams {
+                key,
+                url: seed.url.clone(),
+                metainfo: Arc::clone(&content.metainfo),
+                client: client.clone(),
+            };
+            tokio::spawn(web_seed::run(params, self.events_tx.clone(), rx));
+        }
+    }
+
+    /// A web seed's connection ended without us closing it: try the URL
+    /// again after a back-off that doubles with each failure in a row.
+    fn web_seed_gone(&mut self, key: PeerKey) {
+        self.web_peers.remove(&key);
+        let base = self.ctx.config.web_seed_retry;
+        let Some(seed) = self.web_seeds.iter_mut().find(|s| s.key == Some(key)) else {
+            return;
+        };
+        seed.key = None;
+        // A ban or a URL that can never work must not come back on the
+        // back-off timer: the engine would only disconnect it again.
+        if seed.stopped {
+            return;
+        }
+        seed.failures = seed.failures.saturating_add(1);
+        let factor = 1u32 << seed.failures.saturating_sub(1).min(5);
+        seed.retry_at = Instant::now() + base.saturating_mul(factor);
+    }
+
+    /// Stops the web seed reported at `ip` (a synthetic `100::/64` address).
+    /// Called when the engine bans it for data that failed the hash check.
+    fn stop_web_seed(&mut self, ip: IpAddr) {
+        if !dravity_engine::is_web_seed_addr(SocketAddr::new(ip, 0)) {
+            return;
+        }
+        if let Some(seed) = self.web_seeds.iter_mut().find(|s| s.addr.ip() == ip) {
+            seed.stopped = true;
+            tracing::debug!(url = %seed.url, %ip, "web seed stopped after a hash failure");
         }
     }
 
@@ -389,13 +604,20 @@ impl TorrentTask {
                     Phase::Download(state) => state.peers(),
                 };
                 self.utp_peers.retain(|key| self.peers.contains_key(key));
+                self.encrypted_peers
+                    .retain(|key| self.peers.contains_key(key));
                 let utp = &self.utp_peers;
+                let web = &self.web_peers;
+                let encrypted = &self.encrypted_peers;
                 let _ = reply.send(status::peers(peers, |p| {
-                    if utp.contains(&p.key) {
+                    let transport = if web.contains(&p.key) {
+                        Transport::Web
+                    } else if utp.contains(&p.key) {
                         Transport::Utp
                     } else {
                         Transport::Tcp
-                    }
+                    };
+                    (transport, encrypted.contains(&p.key))
                 }));
                 None
             }
@@ -513,6 +735,14 @@ impl TorrentTask {
                 self.handle(event).await;
                 continue;
             }
+            // Blocks go to storage together: once no more input is ready, or
+            // a batch is full.
+            if self.events_rx.is_empty()
+                || self.pending_writes.len() >= MAX_IO_BATCH
+                || self.pending_reads.len() >= MAX_IO_BATCH
+            {
+                self.flush_io();
+            }
             let event = tokio::select! {
                 command = self.commands.recv() => match command {
                     Some(Command::Stop(ack)) => {
@@ -530,9 +760,13 @@ impl TorrentTask {
                     Some(event) => event,
                     None => continue,
                 },
-                _ = tick.tick() => Event::Tick,
+                _ = tick.tick() => {
+                    self.maintain_web_seeds();
+                    Event::Tick
+                }
                 // Reap finished background work so the set does not grow.
                 Some(_) = self.background.join_next(), if !self.background.is_empty() => continue,
+                Some(_) = self.disk.join_next(), if !self.disk.is_empty() => continue,
                 () = await_port_change(&mut self.ctx.port_map) => {
                     let port = self.ctx.announce_port();
                     if port == announced_port {
@@ -545,6 +779,7 @@ impl TorrentTask {
             };
             self.handle(event).await;
         }
+        self.flush_io();
         self.peers.clear();
         self.background.shutdown().await;
         // Unblock disk tasks waiting to report, then let the writes finish.
@@ -627,7 +862,14 @@ impl TorrentTask {
         let info = info
             .cloned()
             .unwrap_or_else(|| Bytes::copy_from_slice(content.metainfo.info_bytes()));
-        Some(state.with_info_bytes(info))
+        let piece_length = content.metainfo.info().piece_length();
+        Some(
+            state
+                .with_info_bytes(info)
+                .with_piece_layers(piece_length, owned_layers(&content.metainfo))
+                .with_padded_last_piece(padded_last_piece(content.metainfo.info()))
+                .with_missing_piece_layers(piece_length, missing_layers(&content.metainfo)),
+        )
     }
 
     /// Maps peer-task inputs to engine events, keeping the peer map in sync.
@@ -638,6 +880,8 @@ impl TorrentTask {
                 addr,
                 reserved,
                 transport,
+                encrypted,
+                mse,
             } => {
                 if !self.peers.contains_key(&key) {
                     return None;
@@ -645,10 +889,17 @@ impl TorrentTask {
                 if transport == Transport::Utp {
                     self.utp_peers.insert(key);
                 }
+                if encrypted {
+                    self.encrypted_peers.insert(key);
+                }
                 Event::PeerConnected {
                     peer: key,
                     addr,
                     reserved,
+                    link: PeerLink {
+                        utp: transport == Transport::Utp,
+                        mse,
+                    },
                 }
             }
             Input::ConnectFailed { key, addr, retry } => {
@@ -657,12 +908,47 @@ impl TorrentTask {
             }
             Input::Disconnected { key } => {
                 self.utp_peers.remove(&key);
+                self.encrypted_peers.remove(&key);
+                self.web_seed_gone(key);
                 self.peers.remove(&key)?;
                 Event::PeerDisconnected { peer: key }
+            }
+            Input::WebSeedReady { key } => {
+                if !self.peers.contains_key(&key) {
+                    return None;
+                }
+                let addr = self.web_seeds.iter().find(|s| s.key == Some(key))?.addr;
+                self.web_peers.insert(key);
+                // An "incoming" peer at a synthetic, unroutable address:
+                // never dialed, retried or shared over PEX (the engine
+                // ignores `100::/64`). The web seed layer does its own
+                // back-off. No extension bits: it only answers requests.
+                Event::PeerAccepted {
+                    peer: key,
+                    addr,
+                    reserved: Reserved::new(),
+                    link: PeerLink::default(),
+                }
+            }
+            Input::WebSeedFailed { key, retry } => {
+                self.peers.remove(&key);
+                if !retry && let Some(seed) = self.web_seeds.iter_mut().find(|s| s.key == Some(key))
+                {
+                    seed.stopped = true;
+                    tracing::debug!(url = %seed.url, "web seed stopped: its URL cannot be fetched");
+                }
+                self.web_seed_gone(key);
+                return None;
             }
             Input::Message { key, message } => {
                 if !self.peers.contains_key(&key) {
                     return None;
+                }
+                if matches!(message, Message::Piece { .. })
+                    && self.web_peers.contains(&key)
+                    && let Some(seed) = self.web_seeds.iter_mut().find(|s| s.key == Some(key))
+                {
+                    seed.failures = 0;
                 }
                 Event::Message { peer: key, message }
             }
@@ -679,8 +965,8 @@ impl TorrentTask {
         for effect in effects {
             self.dispatch(effect).await;
         }
-        if let Some(info) = self.metadata.take() {
-            self.start_download(info).await;
+        if let Some((info, layers)) = self.metadata.take() {
+            self.start_download(info, layers).await;
         }
         self.wake_waiters();
     }
@@ -700,25 +986,40 @@ impl TorrentTask {
     }
 
     /// Switches a magnet link from the metadata phase to downloading.
-    async fn start_download(&mut self, info: Bytes) {
+    async fn start_download(&mut self, info: Bytes, layers: PieceLayers) {
         let Phase::Metadata(_) = self.phase else {
             return;
         };
-        let Some(dir) = self.download_dir.take() else {
+        let Some(start) = self.magnet.take() else {
             return self.fail("magnet is missing a download directory".to_owned());
         };
+        let dir = start.download_dir;
         let tiers = self
             .ctx
             .trackers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        let metainfo = match Metainfo::from_info_bytes(&info, tiers) {
-            Ok(metainfo) => Arc::new(metainfo),
+        let mut metainfo = match Metainfo::from_info_bytes(&info, tiers) {
+            Ok(metainfo) => metainfo.with_web_seeds(start.web_seeds),
             Err(e) => return self.fail(format!("invalid metadata: {e}")),
         };
+        // Layers fetched with BEP 52 hash requests (already checked against
+        // their roots by the engine; `set_piece_layer` checks again).
+        for (root, layer) in layers {
+            if let Err(e) = metainfo.set_piece_layer(&root, layer) {
+                return self.fail(format!("invalid piece layer: {e}"));
+            }
+        }
+        if metainfo.info().version() == MetaVersion::V2
+            && !metainfo.info().missing_piece_layers().is_empty()
+        {
+            // The engine only hands over a v2-only torrent with every layer.
+            return self.fail("v2-only torrent: piece layers are missing".to_owned());
+        }
+        let metainfo = Arc::new(metainfo);
         let storage: Arc<dyn Storage> = match FileStorage::new(&dir, metainfo.info()) {
-            Ok(storage) => Arc::new(storage),
+            Ok(storage) => Arc::new(storage.with_io(Arc::clone(&self.ctx.file_io))),
             Err(e) => return self.fail(format!("setting up storage: {e}")),
         };
         self.file_priorities = files::normalize(metainfo.info(), &self.file_priorities)
@@ -738,9 +1039,13 @@ impl TorrentTask {
             )
             .with_info_hash(self.ctx.info_hash)
             .with_info_bytes(info)
+            .with_piece_layers(info_meta.piece_length(), owned_layers(&content.metainfo))
+            .with_padded_last_piece(padded_last_piece(info_meta))
+            .with_missing_piece_layers(info_meta.piece_length(), missing_layers(&content.metainfo))
             .with_priorities(&self.piece_priorities(&content)),
         };
         self.content = Some(content);
+        self.load_web_seeds();
         // Swap in a throwaway (allocation-free) metadata state to take the
         // real one by value.
         let placeholder = MetadataState::new(self.ctx.info_hash, Config::default());
@@ -759,6 +1064,13 @@ impl TorrentTask {
             .with_started_pending(handover.started_pending)
             .with_announce_again(handover.announce_again)
             .with_connecting(handover.connecting.iter().copied())
+            .with_dial_hints(
+                handover
+                    .hints
+                    .iter()
+                    .copied()
+                    .filter(|(addr, _)| !swarm.contains(addr)),
+            )
             .ban_peers(swarm.iter().copied());
         self.phase = Phase::Download(Box::new(state));
         self.local.push_back(Event::Start);
@@ -774,12 +1086,14 @@ impl TorrentTask {
                     peer: peer.peer,
                     addr: peer.addr,
                     reserved: peer.reserved,
+                    link: peer.link,
                 }
             } else {
                 Event::PeerConnected {
                     peer: peer.peer,
                     addr: peer.addr,
                     reserved: peer.reserved,
+                    link: peer.link,
                 }
             });
             for message in peer.replay {
@@ -799,9 +1113,43 @@ impl TorrentTask {
         }
     }
 
-    /// A magnet's metadata arrived: the catalog (and the state directory)
-    /// now hold the torrent, so a resume or restart does not fetch it again.
+    /// A hybrid that started on SHA-1 alone got a missing piece layer from
+    /// a peer: from now on the file's pieces are checked against the Merkle
+    /// tree too. The layer is persisted with the metainfo, and the pieces
+    /// already accepted on SHA-1 alone are checked again.
+    fn install_piece_layer(&mut self, root: Hash, layer: Vec<Hash>) {
+        let Some(content) = &mut self.content else {
+            return;
+        };
+        let mut metainfo = Metainfo::clone(&content.metainfo);
+        // The engine checked the layer against its root; this checks again.
+        if let Err(e) = metainfo.set_piece_layer(&root, layer) {
+            tracing::warn!(error = %e, "ignoring a piece layer");
+            return;
+        }
+        let pieces = metainfo.info().pieces_with_root(&root);
+        tracing::info!(
+            missing = metainfo.info().missing_piece_layers().len(),
+            "piece layer received; re-checking its file"
+        );
+        let metainfo = Arc::new(metainfo);
+        content.metainfo = Arc::clone(&metainfo);
+        self.record_metadata(&metainfo);
+        for pieces in pieces {
+            self.local.push_back(Event::RecheckPieces { pieces });
+        }
+    }
+
+    /// A magnet's metadata (or a hybrid's late piece layer) arrived: the
+    /// catalog (and the state directory) now hold the torrent, so a resume
+    /// or restart does not fetch it again.
     fn record_metadata(&self, metainfo: &Arc<Metainfo>) {
+        // A hybrid magnet: peers of the other swarm can connect right away.
+        self.ctx.aliases.register(
+            self.ctx.info_hash,
+            &metainfo.swarm_hashes(),
+            metainfo.info_hash_v2().is_some(),
+        );
         let record = {
             let mut catalog = self
                 .ctx
@@ -816,14 +1164,14 @@ impl TorrentTask {
             entry.record(self.ctx.info_hash)
         };
         if let Some(persist) = &self.ctx.persist {
-            persist.save_torrent(metainfo);
+            persist.save_torrent(&self.ctx.info_hash, metainfo);
             persist.save_record(&record);
         }
     }
 
     async fn dispatch(&mut self, effect: Effect) {
         match effect {
-            Effect::Connect { addr } => self.connect(addr),
+            Effect::Connect { addr, hints } => self.connect(addr, hints),
             Effect::Send { peer, message } => {
                 let Some(tx) = self.peers.get(&peer) else {
                     return;
@@ -831,11 +1179,13 @@ impl TorrentTask {
                 if tx.try_send(PeerCommand::Send(message)).is_err() {
                     // Full (too slow) or closed: drop the peer.
                     self.peers.remove(&peer);
+                    self.web_seed_gone(peer);
                     self.local.push_back(Event::PeerDisconnected { peer });
                 }
             }
             Effect::Disconnect { peer } => {
                 self.peers.remove(&peer);
+                self.web_seed_gone(peer);
             }
             Effect::WriteBlock { block, data } => self.write(block, data),
             Effect::HashPiece { piece } => self.hash(piece),
@@ -847,25 +1197,63 @@ impl TorrentTask {
                 left,
             } => {
                 let req = self.announce_request(event, uploaded, downloaded, left);
+                // A hybrid torrent is in two swarms: trackers hear about
+                // both ids.
+                let extra: Vec<InfoHash> = self.swarm_hashes().into_iter().skip(1).collect();
                 if event == AnnounceEvent::Stopped {
                     // The task is about to exit: announce inline, bounded.
                     // Nobody can read the outcome once the task exits.
-                    let fut = announce_all(self.ctx.clone(), req);
+                    let fut = announce_all(self.ctx.clone(), req, extra);
                     let _ = tokio::time::timeout(self.ctx.config.stop_announce_timeout, fut).await;
                 } else {
                     let ctx = self.ctx.clone();
                     let tx = self.events_tx.clone();
                     self.background.spawn(async move {
-                        let (event, outcomes) = announce_all(ctx, req).await;
+                        let (event, outcomes) = announce_all(ctx, req, extra).await;
                         let _ = tx.send(Input::Announced { event, outcomes }).await;
                     });
                 }
             }
             Effect::DhtLookup => self.dht_lookup(),
-            Effect::MetadataReceived { info } => self.metadata = Some(info),
-            Effect::Alert(alert) => self.alert(alert),
+            Effect::MetadataReceived { info, piece_layers } => {
+                self.metadata = Some((info, piece_layers));
+            }
+            Effect::PieceLayerReceived { root, layer } => self.install_piece_layer(root, layer),
+            Effect::Alert(alert) => {
+                if let Alert::PeerBanned { ip } = &alert {
+                    self.stop_web_seed(*ip);
+                }
+                self.alert(alert);
+            }
             other => tracing::warn!(?other, "unhandled engine effect"),
         }
+    }
+
+    /// Whether the torrent has a v2 info-hash: its metadata says so, or
+    /// (before the metadata) its magnet link has a `btmh`. A `btih`-only
+    /// magnet does not claim v2 until the metadata shows a hybrid.
+    fn has_v2(&self) -> bool {
+        match &self.content {
+            Some(content) => content.metainfo.info_hash_v2().is_some(),
+            None => self
+                .magnet
+                .as_ref()
+                .is_some_and(|m| m.info_hash_v2.is_some()),
+        }
+    }
+
+    /// The hashes to look up and announce in the DHT: the torrent's id, and
+    /// for a hybrid torrent its truncated v2 hash as well.
+    fn swarm_hashes(&self) -> Vec<InfoHash> {
+        let mut hashes = vec![self.ctx.info_hash];
+        if let Some(content) = &self.content {
+            for h in content.metainfo.swarm_hashes() {
+                if !hashes.contains(&h) {
+                    hashes.push(h);
+                }
+            }
+        }
+        hashes
     }
 
     fn dht_lookup(&mut self) {
@@ -878,7 +1266,7 @@ impl TorrentTask {
             });
             return;
         };
-        let info_hash = self.ctx.info_hash;
+        let hashes = self.swarm_hashes();
         let timeout = self.ctx.config.dht_lookup_timeout;
         let port_map = self.ctx.port_map.clone();
         let listen_port = self.ctx.listen_port;
@@ -889,7 +1277,18 @@ impl TorrentTask {
             .is_some_and(|c| c.metainfo.info().is_private());
         let tx = self.events_tx.clone();
         self.background.spawn(async move {
-            let (peers, failed) = lookup_peers(&dht, info_hash, timeout).await;
+            // Every swarm of the torrent at once; failed only if all failed.
+            let lookups = hashes.iter().map(|h| lookup_peers(&dht, *h, timeout));
+            let mut peers: Vec<SocketAddr> = Vec::new();
+            let mut failed = true;
+            for (found, lookup_failed) in futures_util::future::join_all(lookups).await {
+                failed &= lookup_failed;
+                for addr in found {
+                    if !peers.contains(&addr) {
+                        peers.push(addr);
+                    }
+                }
+            }
             tracing::debug!(peers = peers.len(), failed, "DHT lookup done");
             let _ = tx
                 .send(Input::Engine(Event::DhtPeers { peers, failed }))
@@ -906,10 +1305,12 @@ impl TorrentTask {
                 .and_then(|rx| rx.borrow().external_port(dravity_portmap::Protocol::Tcp));
             if let Some(port) = listen_port.map(|_| announce_port(mapped, listen_port, configured))
             {
-                let announced =
-                    tokio::time::timeout(timeout, dht.announce(info_hash, Some(port))).await;
-                if let Ok(Err(e)) = announced {
-                    tracing::debug!(error = %e, "DHT announce failed");
+                for info_hash in hashes {
+                    let announced =
+                        tokio::time::timeout(timeout, dht.announce(info_hash, Some(port))).await;
+                    if let Ok(Err(e)) = announced {
+                        tracing::debug!(error = %e, "DHT announce failed");
+                    }
                 }
             }
         });
@@ -931,13 +1332,15 @@ impl TorrentTask {
         let Some(port) = self.ctx.listen_port.map(|_| self.ctx.announce_port()) else {
             return;
         };
-        let info_hash = self.ctx.info_hash;
+        let hashes = self.swarm_hashes();
         let timeout = self.ctx.config.dht_lookup_timeout;
         self.background.spawn(async move {
-            let announced =
-                tokio::time::timeout(timeout, dht.announce(info_hash, Some(port))).await;
-            if let Ok(Err(e)) = announced {
-                tracing::debug!(error = %e, "DHT announce failed");
+            for info_hash in hashes {
+                let announced =
+                    tokio::time::timeout(timeout, dht.announce(info_hash, Some(port))).await;
+                if let Ok(Err(e)) = announced {
+                    tracing::debug!(error = %e, "DHT announce failed");
+                }
             }
         });
     }
@@ -964,6 +1367,14 @@ impl TorrentTask {
         if stream.kind() == Transport::Utp {
             self.utp_peers.insert(key);
         }
+        if stream.encrypted() {
+            self.encrypted_peers.insert(key);
+        }
+        let link = PeerLink {
+            utp: stream.kind() == Transport::Utp,
+            // A plain incoming handshake says nothing about MSE support.
+            mse: stream.uses_mse().then_some(true),
+        };
         tokio::spawn(peer::run_accepted(
             key,
             addr,
@@ -976,20 +1387,33 @@ impl TorrentTask {
             peer: key,
             addr,
             reserved,
+            link,
         }
     }
 
-    fn connect(&mut self, addr: SocketAddr) {
+    fn connect(&mut self, addr: SocketAddr, hints: DialHints) {
+        if self.ctx.config.encryption == EncryptionPolicy::Required
+            && hints.encryption == Some(false)
+        {
+            // PEX or an earlier dial says the peer does not do MSE: dialing
+            // it would only fail the required handshake.
+            tracing::trace!(%addr, "skipping a peer without encryption");
+            self.local
+                .push_back(Event::PeerConnectFailed { addr, retry: false });
+            return;
+        }
         let (key, rx) = self.new_peer();
         let params = PeerParams {
             key,
             addr,
             info_hash: self.ctx.info_hash,
             our_id: self.ctx.peer_id,
-            reserved: self.ctx.reserved(),
+            reserved: self.ctx.reserved(self.has_v2()),
             connect_timeout: self.ctx.config.connect_timeout,
             utp: self.ctx.utp.for_addr(addr).cloned(),
             prefer_utp: self.ctx.config.prefer_utp,
+            encryption: self.ctx.config.encryption,
+            hints,
         };
         // Peer tasks are not in `background`: dropping their command sender
         // ends them, and they must not delay shutdown.
@@ -997,72 +1421,62 @@ impl TorrentTask {
     }
 
     fn write(&mut self, block: BlockRef, data: Bytes) {
-        let Some(content) = self.content.clone() else {
+        if self.content.is_none() {
             tracing::warn!(?block, "block write before metadata");
             return;
-        };
-        let tx = self.events_tx.clone();
-        self.disk.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                write_block(
-                    content.storage.as_ref(),
-                    content.metainfo.info().layout(),
-                    block,
-                    &data,
-                )
-            })
-            .await;
-            let event = match result {
-                Ok(Ok(())) => Event::BlockWritten { block },
-                Ok(Err(e)) => Event::WriteFailed {
-                    block,
-                    error: e.to_string(),
-                },
-                Err(e) => Event::WriteFailed {
-                    block,
-                    error: e.to_string(),
-                },
-            };
-            let _ = tx.send(Input::Engine(event)).await;
-        });
+        }
+        self.pending_writes.push((block, data));
     }
 
-    /// Reads a block a peer asked for. Reads share the disk set with writes
-    /// so a stop waits for them too.
+    /// Queues a block a peer asked for.
     fn read(&mut self, peer: PeerKey, block: BlockRef) {
-        let Some(content) = self.content.clone() else {
+        if self.content.is_none() {
             tracing::warn!(?block, "block read before metadata");
             return;
+        }
+        self.pending_reads.push((peer, block));
+    }
+
+    /// Sends the queued block writes and reads to storage, each as one
+    /// batch (io_uring submits a batch at once and merges adjacent blocks).
+    /// Reads share the disk set with writes so a stop waits for them too.
+    fn flush_io(&mut self) {
+        let Some(content) = self.content.clone() else {
+            self.pending_writes.clear();
+            self.pending_reads.clear();
+            return;
         };
-        let tx = self.events_tx.clone();
-        self.disk.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                read_block(
-                    content.storage.as_ref(),
-                    content.metainfo.info().layout(),
-                    block,
-                )
-            })
-            .await;
-            let event = match result {
-                Ok(Ok(data)) => Event::BlockRead {
-                    peer,
-                    block,
-                    data: Bytes::from(data),
-                },
-                Ok(Err(e)) => Event::ReadFailed {
-                    peer,
-                    block,
-                    error: e.to_string(),
-                },
-                Err(e) => Event::ReadFailed {
-                    peer,
-                    block,
-                    error: e.to_string(),
-                },
-            };
-            let _ = tx.send(Input::Engine(event)).await;
-        });
+        if !self.pending_writes.is_empty() {
+            let writes = std::mem::take(&mut self.pending_writes);
+            let content = content.clone();
+            let tx = self.events_tx.clone();
+            self.disk.spawn(async move {
+                let events = tokio::task::spawn_blocking(move || write_batch(&content, writes))
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "block writes panicked");
+                        Vec::new()
+                    });
+                for event in events {
+                    let _ = tx.send(Input::Engine(event)).await;
+                }
+            });
+        }
+        if !self.pending_reads.is_empty() {
+            let reads = std::mem::take(&mut self.pending_reads);
+            let tx = self.events_tx.clone();
+            self.disk.spawn(async move {
+                let events = tokio::task::spawn_blocking(move || read_batch(&content, reads))
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "block reads panicked");
+                        Vec::new()
+                    });
+                for event in events {
+                    let _ = tx.send(Input::Engine(event)).await;
+                }
+            });
+        }
     }
 
     fn hash(&mut self, piece: u32) {
@@ -1124,6 +1538,7 @@ impl TorrentTask {
             },
             num_want: Some(self.ctx.config.num_want),
             key: self.ctx.tracker_key,
+            crypto: crypto_support(self.ctx.config.encryption),
         }
     }
 }
@@ -1189,6 +1604,7 @@ fn dht_lookup_failed(timed_out: bool, peers_empty: bool, has_nodes: bool) -> boo
 async fn announce_all(
     ctx: TorrentContext,
     req: AnnounceRequest,
+    extra: Vec<InfoHash>,
 ) -> (Event, Vec<(String, TrackerOutcome)>) {
     let tiers: Vec<Vec<String>> = ctx
         .trackers
@@ -1214,6 +1630,7 @@ async fn announce_all(
             Arc::clone(&ctx.trackers),
             tier,
             req.clone(),
+            extra.clone(),
         ));
     }
     let mut merge = AnnounceMerge::default();
@@ -1266,13 +1683,36 @@ async fn announce_tier(
     tiers: Tiers,
     tier: Vec<String>,
     req: AnnounceRequest,
+    extra: Vec<InfoHash>,
 ) -> (Option<(String, AnnounceResponse)>, Vec<(String, String)>) {
     let mut errors = Vec::new();
     for url in tier {
         match client.announce(&url, &req).await {
-            Ok(response) => {
+            Ok(mut response) => {
                 tracing::debug!(%url, peers = response.peers.len(), "announce ok");
                 promote(&tiers, &url);
+                // The other swarm ids go to the tracker that answered. Their
+                // peers join the merge; their failures only get logged, the
+                // tier's outcome is the primary id's.
+                for info_hash in extra {
+                    let other = AnnounceRequest {
+                        info_hash,
+                        ..req.clone()
+                    };
+                    match client.announce(&url, &other).await {
+                        Ok(more) => {
+                            tracing::debug!(%url, %info_hash, peers = more.peers.len(), "announce ok");
+                            for peer in more.peers {
+                                if !response.peers.contains(&peer) {
+                                    response.peers.push(peer);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(%url, %info_hash, error = %error_chain(&e), "announce failed");
+                        }
+                    }
+                }
                 return (Some((url, response)), errors);
             }
             Err(e) => {
@@ -1399,6 +1839,105 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     text
 }
 
+/// Most block writes (or upload reads) sent to storage as one batch.
+const MAX_IO_BATCH: usize = 64;
+
+/// Writes `writes` as one batch. If the batch fails, each block is tried
+/// on its own so only the blocks that really failed are reported.
+fn write_batch(content: &Content, writes: Vec<(BlockRef, Bytes)>) -> Vec<Event> {
+    let layout = content.metainfo.info().layout();
+    let storage = content.storage.as_ref();
+    let blocks: Vec<BlockRef> = writes.iter().map(|(block, _)| *block).collect();
+    if writes.len() > 1 && write_blocks(storage, layout, writes.clone()).is_ok() {
+        return blocks
+            .into_iter()
+            .map(|block| Event::BlockWritten { block })
+            .collect();
+    }
+    writes
+        .into_iter()
+        .map(
+            |(block, data)| match write_block(storage, layout, block, data) {
+                Ok(()) => Event::BlockWritten { block },
+                Err(e) => Event::WriteFailed {
+                    block,
+                    error: e.to_string(),
+                },
+            },
+        )
+        .collect()
+}
+
+/// Reads `reads` as one batch. If the batch fails, each block is read on
+/// its own so only the blocks that really failed are reported.
+fn read_batch(content: &Content, reads: Vec<(PeerKey, BlockRef)>) -> Vec<Event> {
+    let layout = content.metainfo.info().layout();
+    let storage = content.storage.as_ref();
+    let blocks: Vec<BlockRef> = reads.iter().map(|(_, block)| *block).collect();
+    if reads.len() > 1
+        && let Ok(data) = read_blocks(storage, layout, &blocks)
+    {
+        return reads
+            .into_iter()
+            .zip(data)
+            .map(|((peer, block), data)| Event::BlockRead { peer, block, data })
+            .collect();
+    }
+    reads
+        .into_iter()
+        .map(|(peer, block)| match read_block(storage, layout, block) {
+            Ok(data) => Event::BlockRead {
+                peer,
+                block,
+                data: Bytes::from(data),
+            },
+            Err(e) => Event::ReadFailed {
+                peer,
+                block,
+                error: e.to_string(),
+            },
+        })
+        .collect()
+}
+
+/// The pieces roots (with their piece counts) whose layer `metainfo` still
+/// lacks, to fetch in the background.
+fn missing_layers(metainfo: &Metainfo) -> Vec<(Hash, u32)> {
+    let info = metainfo.info();
+    info.missing_piece_layers()
+        .into_iter()
+        .filter_map(|root| Some((root, info.piece_layer_len(&root)?)))
+        .collect()
+}
+
+/// Whether peers may ask for the zeros after the last piece's content (see
+/// [`TorrentState::with_padded_last_piece`]): v2-only torrents, whose files
+/// are all piece-aligned. A hybrid's last piece is sized by its v1 view.
+fn padded_last_piece(info: &Info) -> bool {
+    info.version() == MetaVersion::V2
+}
+
+/// The piece layers of `metainfo`, owned, for serving BEP 52 hash requests.
+fn owned_layers(metainfo: &Metainfo) -> PieceLayers {
+    metainfo
+        .info()
+        .piece_layers()
+        .into_iter()
+        .map(|(root, layer)| (root, layer.to_vec()))
+        .collect()
+}
+
+/// What the trackers hear about encryption under `policy` (MSE's
+/// `supportcrypto` / `requirecrypto`).
+fn crypto_support(policy: EncryptionPolicy) -> dravity_tracker::CryptoSupport {
+    match policy {
+        EncryptionPolicy::Disabled => dravity_tracker::CryptoSupport::None,
+        EncryptionPolicy::Required => dravity_tracker::CryptoSupport::Required,
+        // `Enabled`, and any later mode that still accepts encryption.
+        _ => dravity_tracker::CryptoSupport::Supported,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -1407,9 +1946,84 @@ mod tests {
     use dravity_tracker::AnnounceResponse;
 
     use super::{
-        AnnounceMerge, announce_port, announce_tier, dht_lookup_failed, error_chain, prepare_tiers,
-        promote,
+        AnnounceMerge, announce_port, announce_tier, crypto_support, dht_lookup_failed,
+        error_chain, prepare_tiers, promote,
     };
+
+    #[test]
+    fn a_failed_batch_reports_only_the_blocks_that_failed() {
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+        use dravity_core::{BlockRef, Metainfo};
+        use dravity_engine::{Event, PeerKey};
+        use dravity_storage::MemoryStorage;
+
+        use super::{Content, read_batch, write_batch};
+
+        let pieces = vec![0u8; 40];
+        let mut info = b"d6:lengthi40000e4:name1:a12:piece lengthi32768e6:pieces40:".to_vec();
+        info.extend_from_slice(&pieces);
+        info.push(b'e');
+        let metainfo = Metainfo::from_info_bytes(&info, Vec::new()).unwrap();
+        let content = Content {
+            metainfo: Arc::new(metainfo),
+            storage: Arc::new(MemoryStorage::new(40_000)),
+        };
+        let good = BlockRef {
+            piece: 0,
+            offset: 0,
+            length: 16_384,
+        };
+        let bad = BlockRef {
+            piece: 1,
+            offset: 16_384,
+            length: 16_384,
+        };
+        let data = Bytes::from(vec![7u8; 16_384]);
+        let events = write_batch(&content, vec![(good, data.clone()), (bad, data.clone())]);
+        assert_eq!(events[0], Event::BlockWritten { block: good });
+        assert!(matches!(events[1], Event::WriteFailed { block, .. } if block == bad));
+
+        let events = read_batch(&content, vec![(PeerKey(1), good), (PeerKey(2), bad)]);
+        assert_eq!(
+            events[0],
+            Event::BlockRead {
+                peer: PeerKey(1),
+                block: good,
+                data,
+            }
+        );
+        assert!(matches!(
+            events[1],
+            Event::ReadFailed {
+                peer: PeerKey(2),
+                ..
+            }
+        ));
+        assert_eq!(
+            write_batch(&content, vec![(good, Bytes::from(vec![1u8; 16_384]))]),
+            vec![Event::BlockWritten { block: good }]
+        );
+    }
+
+    #[test]
+    fn trackers_hear_the_encryption_policy() {
+        use crate::EncryptionPolicy;
+        use dravity_tracker::CryptoSupport;
+        assert_eq!(
+            crypto_support(EncryptionPolicy::Disabled),
+            CryptoSupport::None
+        );
+        assert_eq!(
+            crypto_support(EncryptionPolicy::Enabled),
+            CryptoSupport::Supported
+        );
+        assert_eq!(
+            crypto_support(EncryptionPolicy::Required),
+            CryptoSupport::Required
+        );
+    }
 
     #[test]
     fn the_mapped_port_is_announced_before_the_listen_port() {
@@ -1530,9 +2144,16 @@ mod tests {
             event: AnnounceEvent::Started,
             num_want: Some(1),
             key: 7,
+            crypto: dravity_tracker::CryptoSupport::None,
         };
-        let (answer, errors) =
-            announce_tier(client, Arc::clone(&tiers), vec![dead, good.clone()], req).await;
+        let (answer, errors) = announce_tier(
+            client,
+            Arc::clone(&tiers),
+            vec![dead, good.clone()],
+            req,
+            Vec::new(),
+        )
+        .await;
         assert_eq!(answer.expect("fallback").0, good);
         assert_eq!(errors.len(), 1, "the dead tracker was tried");
         assert_eq!(errors[0].0, dead_url);

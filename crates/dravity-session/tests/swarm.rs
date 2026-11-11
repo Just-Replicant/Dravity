@@ -22,8 +22,8 @@ use dravity_core::{InfoHash, Magnet, Metainfo, PeerId};
 use dravity_dht::{Dht, Testnet};
 use dravity_engine::{Alert, Bitfield, TorrentStatus};
 use dravity_session::{
-    AddTorrentOptions, ListenConfig, PeerCodec, Session, SessionAlert, SessionConfig,
-    TrackerOutcome, Transport,
+    AddTorrentOptions, EncryptionPolicy, ListenConfig, PeerCodec, Session, SessionAlert,
+    SessionConfig, TrackerOutcome, Transport,
 };
 use dravity_wire::{
     ExtendedHandshake, Handshake, METADATA_PIECE_LEN, Message, MetadataMessage, PexMessage,
@@ -148,6 +148,7 @@ async fn serve(
         .unwrap()
         .unwrap();
     assert_eq!(theirs.info_hash, info_hash);
+    assert!(!theirs.reserved.v2(), "no v2 bit when dialing a v1 swarm");
     let extended = theirs.reserved.extension_protocol();
     let ours = Handshake::new(info_hash, PeerId::new(*b"-TS0001-seedseedseed"))
         .with_reserved(Reserved::new().with_extension_protocol(true));
@@ -223,7 +224,10 @@ async fn serve(
                             added: script
                                 .pex
                                 .iter()
-                                .map(|&addr| PexPeer { addr, flags: 0 })
+                                .map(|&addr| PexPeer {
+                                    addr,
+                                    flags: Some(0),
+                                })
                                 .collect(),
                             dropped: Vec::new(),
                         };
@@ -520,11 +524,6 @@ async fn magnet_fetches_metadata_then_downloads() {
     assert_files(dir.path(), &content, len_a);
 
     // Unsupported inputs are rejected up front.
-    let v2_only = Magnet::parse(&format!("magnet:?xt=urn:btmh:1220{}", "ab".repeat(32))).unwrap();
-    assert!(matches!(
-        session.add_magnet(&v2_only, AddTorrentOptions::new(dir.path())),
-        Err(dravity_session::SessionError::MagnetWithoutV1Hash)
-    ));
     let storage = Arc::new(dravity_storage::MemoryStorage::new(1));
     assert!(matches!(
         session.add_magnet(
@@ -830,6 +829,9 @@ async fn incoming_connections_for_unknown_torrents_are_closed() {
     assert_eq!(theirs.info_hash, handle.info_hash());
     assert_eq!(theirs.peer_id, session.peer_id());
     assert!(theirs.reserved.fast());
+    // A v1-only torrent does not claim BEP 52 (libtorrent drops such a
+    // plaintext connection).
+    assert!(!theirs.reserved.v2(), "no v2 bit for a v1 torrent");
     session.shutdown().await;
 }
 
@@ -949,7 +951,10 @@ async fn dials_fall_back_to_utp_when_tcp_is_refused() {
     .unwrap();
     let addr = peer.local_addr();
     let dir = tempfile::tempdir().unwrap();
-    let session = Session::new(config()).unwrap();
+    // The test peer reads a plain handshake.
+    let mut c = config();
+    c.encryption = EncryptionPolicy::Disabled;
+    let session = Session::new(c).unwrap();
     let _handle = session
         .add_torrent(
             metainfo,

@@ -14,10 +14,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use dravity_core::{Magnet, Metainfo};
 use dravity_engine::{Alert, Priority, TorrentStatus};
-use dravity_session::{AddTorrentOptions, ListenConfig, Session, SessionConfig};
+use dravity_session::{
+    AddTorrentOptions, EncryptionPolicy, ListenConfig, Session, SessionConfig, StorageBackend,
+};
 use tokio::sync::broadcast::error::RecvError;
 
 /// A portable BitTorrent client.
@@ -145,6 +147,63 @@ struct NetworkArgs {
     /// Do not use the DHT for peer discovery.
     #[arg(long)]
     no_dht: bool,
+    /// Never download from HTTP web seeds (BEP 19 `url-list`, magnet `ws`).
+    #[arg(long)]
+    no_web_seeds: bool,
+    /// Let web seeds reach loopback, private (LAN) and link-local
+    /// addresses. Off by default, so a torrent cannot make Dravity probe
+    /// the local network.
+    #[arg(long, conflicts_with = "no_web_seeds")]
+    web_seeds_allow_private: bool,
+    /// How torrent data is read and written. `io-uring` needs a build with
+    /// the `uring` feature on Linux; without it, or where the kernel refuses
+    /// io_uring, blocking I/O is used and a warning is logged.
+    #[arg(long, value_enum, default_value_t = Backend::Blocking, value_name = "BACKEND")]
+    storage_backend: Backend,
+    /// Peer connection encryption (MSE/PE): `enabled` accepts both and dials
+    /// encrypted first, falling back to plaintext; `required` only makes and
+    /// accepts RC4-encrypted connections; `disabled` never encrypts.
+    #[arg(long, value_enum, default_value_t = Encryption::Enabled, value_name = "POLICY")]
+    encryption: Encryption,
+}
+
+/// `--encryption` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Encryption {
+    /// Plain BitTorrent connections only.
+    Disabled,
+    /// Encrypt when the peer can; plaintext otherwise.
+    Enabled,
+    /// RC4-encrypted connections only.
+    Required,
+}
+
+impl From<Encryption> for EncryptionPolicy {
+    fn from(encryption: Encryption) -> Self {
+        match encryption {
+            Encryption::Disabled => Self::Disabled,
+            Encryption::Enabled => Self::Enabled,
+            Encryption::Required => Self::Required,
+        }
+    }
+}
+
+/// `--storage-backend` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Backend {
+    /// Positional reads and writes on a thread pool.
+    Blocking,
+    /// io_uring (`tokio-uring`) on a dedicated thread.
+    IoUring,
+}
+
+impl From<Backend> for StorageBackend {
+    fn from(backend: Backend) -> Self {
+        match backend {
+            Backend::Blocking => Self::Blocking,
+            Backend::IoUring => Self::IoUring,
+        }
+    }
 }
 
 impl NetworkArgs {
@@ -170,6 +229,14 @@ impl NetworkArgs {
         if self.no_dht {
             config.dht = None;
         }
+        if self.no_web_seeds {
+            config.web_seed = None;
+        }
+        if let Some(web_seed) = config.web_seed.as_mut() {
+            web_seed.allow_private_addresses = self.web_seeds_allow_private;
+        }
+        config.storage_backend = self.storage_backend.into();
+        config.encryption = self.encryption.into();
         config
     }
 }
@@ -369,6 +436,15 @@ fn info(m: &Metainfo) -> Result<()> {
     let mut out = std::io::stdout().lock();
     writeln!(out, "name:       {}", i.name())?;
     writeln!(out, "info-hash:  {}", m.info_hash())?;
+    let version = match (i.version().has_v1(), i.version().has_v2()) {
+        (true, true) => "hybrid (v1 + v2)",
+        (false, true) => "v2",
+        _ => "v1",
+    };
+    writeln!(out, "version:    {version}")?;
+    if let Some(v2) = m.info_hash_v2() {
+        writeln!(out, "v2 hash:    {v2}")?;
+    }
     writeln!(
         out,
         "size:       {} ({} bytes)",
@@ -388,6 +464,9 @@ fn info(m: &Metainfo) -> Result<()> {
     )?;
     for (tier, urls) in m.trackers().iter().enumerate() {
         writeln!(out, "tracker:    [{tier}] {}", urls.join(" "))?;
+    }
+    for url in m.web_seeds() {
+        writeln!(out, "web seed:   {url}")?;
     }
     writeln!(
         out,
@@ -538,6 +617,19 @@ async fn download(
                     let _ = writeln!(std::io::stderr());
                 }
                 let _ = writeln!(std::io::stderr(), "upload: piece {piece}: {message}");
+            }
+            Alert::PieceLayersStalled {
+                missing_layers,
+                silent,
+            } => {
+                if tty {
+                    let _ = writeln!(std::io::stderr());
+                }
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "waiting for piece layers of {missing_layers} file(s): no peer has sent any for {}s (still asking)",
+                    silent.as_secs()
+                );
             }
             Alert::Finished if !complete => {
                 complete = true;

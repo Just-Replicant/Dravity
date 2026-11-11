@@ -70,17 +70,28 @@
 //!   [`MetadataState::peers`] copy what the engine keeps about each
 //!   connected peer into a [`PeerInfo`] (address, pieces, byte totals,
 //!   choke and interest flags). They add no events or effects.
+//!
+//! Advanced (Phase 6):
+//!
+//! * **v2 metadata** (BEP 52): [`MetadataState::new_v2`] fetches the `info`
+//!   dictionary of a `urn:btmh:` magnet under the truncated hash and checks
+//!   its SHA-256; [`MetadataState::with_info_hash_v2`] checks both hashes of
+//!   a hybrid magnet. Pieces are verified by the driver, so v2 and hybrid
+//!   downloads need nothing else from the engine.
 
 mod ban;
 mod bitfield;
 mod choker;
 mod ext;
+mod hints;
+mod layers;
 mod metadata;
 pub mod picker;
 mod pool;
 mod rate;
 mod state;
 mod types;
+mod web_seed;
 mod window;
 
 pub use bitfield::Bitfield;
@@ -89,5 +100,7 @@ pub use picker::{ParsePriorityError, Picker, Priority};
 pub use rate::TokenBucket;
 pub use state::TorrentState;
 pub use types::{
-    Alert, AnnounceEvent, Config, Effect, Event, PeerInfo, PeerKey, Stats, TorrentStatus,
+    Alert, AnnounceEvent, Config, DialHints, Effect, Event, PeerInfo, PeerKey, PeerLink, Stats,
+    TorrentStatus,
 };
+pub use web_seed::{is_web_seed_addr, web_seed_addr};

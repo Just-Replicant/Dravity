@@ -61,6 +61,15 @@
 //!   peers ([`PeerStatus`]: address, pieces, byte totals, flags, transport).
 //! * **Trackers**: [`TorrentHandle::trackers`] lists every tracker with the
 //!   last announce outcome the torrent saw ([`TrackerStatus`]).
+//!
+//! Advanced (Phase 6):
+//!
+//! * **BEP 52**: v2-only and hybrid `.torrent` files download and seed like
+//!   v1 ones; pieces are checked with every hash the torrent has. A v2-only
+//!   torrent is known by its truncated v2 hash. A hybrid torrent also
+//!   accepts peers of its v2 swarm and is looked up and announced in the
+//!   DHT under both hashes. `urn:btmh:` magnet links fetch and check
+//!   metadata with SHA-256; piece layers are saved with the session state.
 
 mod catalog;
 mod codec;
@@ -75,6 +84,7 @@ mod status;
 mod stream;
 mod torrent;
 pub mod watch;
+mod web_seed;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -86,17 +96,20 @@ use dravity_core::{InfoHash, Magnet, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{Alert, Priority, Stats};
 use dravity_portmap::{Mapping, PortMapper};
-use dravity_storage::{FileStorage, Storage};
+use dravity_storage::{BlockingIo, FileIo, FileStorage, Storage};
 use dravity_tracker::TrackerClient;
+use dravity_webseed::WebSeedClient;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub use codec::{CodecError, PeerCodec};
-pub use config::SessionConfig;
+pub use config::{SessionConfig, StorageBackend};
+pub use dravity_mse::Policy as EncryptionPolicy;
 pub use dravity_portmap::{
     Mapped as PortMapped, Method as PortMapMethod, PortMapConfig, Protocol as PortMapProtocol,
     Status as PortMapStatus,
 };
+pub use dravity_webseed::WebSeedConfig;
 pub use error::SessionError;
 pub use file_stream::{DEFAULT_READAHEAD, FileStream};
 pub use files::FileProgress;
@@ -106,9 +119,11 @@ pub use torrent::TorrentProgress;
 pub use watch::{WatchConfig, WatchHandle};
 
 use crate::catalog::{Catalog, Entry, EntrySource};
-use crate::listen::{Acceptor, Bound, Registry, UtpSockets};
+use crate::listen::{Acceptor, Bound, Registry, Route, UtpSockets};
 use crate::persist::{Persister, TorrentRecord};
-use crate::torrent::{Command, Source, TorrentContext, TorrentTask, prepare_tiers};
+use crate::torrent::{
+    Aliases, Command, MagnetStart, Source, TorrentContext, TorrentTask, prepare_tiers,
+};
 
 /// An engine [`Alert`] tagged with the torrent it concerns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +234,10 @@ struct Inner {
     config: Arc<SessionConfig>,
     peer_id: PeerId,
     tracker: TrackerClient,
+    web_seed: Option<WebSeedClient>,
+    /// The storage backend in use (after any fallback) and its I/O.
+    storage_backend: StorageBackend,
+    file_io: Arc<dyn FileIo>,
     dht: Option<Dht>,
     alerts: broadcast::Sender<SessionAlert>,
     /// Running torrents, by info-hash, for the listener.
@@ -261,6 +280,29 @@ impl Inner {
     }
 }
 
+/// The I/O for `wanted`, falling back to blocking I/O (with a warning) when
+/// io_uring is not compiled in or not allowed here.
+fn storage_io(wanted: StorageBackend) -> (StorageBackend, Arc<dyn FileIo>) {
+    match wanted {
+        StorageBackend::IoUring => {
+            #[cfg(all(feature = "uring", target_os = "linux"))]
+            match dravity_storage::UringIo::start() {
+                Ok(io) => return (StorageBackend::IoUring, Arc::new(io)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "io_uring is unavailable; using blocking file I/O");
+                }
+            }
+            #[cfg(not(all(feature = "uring", target_os = "linux")))]
+            tracing::warn!(
+                "this build has no io_uring support (feature `uring`, Linux); \
+                 using blocking file I/O"
+            );
+            (StorageBackend::Blocking, Arc::new(BlockingIo))
+        }
+        _ => (StorageBackend::Blocking, Arc::new(BlockingIo)),
+    }
+}
+
 /// A BitTorrent session. Cheap to clone; all clones share the torrents.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -276,8 +318,8 @@ impl Session {
     /// once the first torrent is added.
     ///
     /// # Errors
-    /// [`SessionError::Tracker`] if the tracker HTTP/TLS client cannot be
-    /// built; [`SessionError::Listen`] if no listening socket can be bound;
+    /// [`SessionError::Tracker`] or [`SessionError::WebSeed`] if the
+    /// tracker or web seed HTTP/TLS client cannot be built; [`SessionError::Listen`] if no listening socket can be bound;
     /// [`SessionError::Dht`] if the DHT socket cannot be bound.
     pub fn new(config: SessionConfig) -> Result<Self, SessionError> {
         let suffix: Vec<u8> = std::iter::repeat_with(fastrand::alphanumeric)
@@ -286,6 +328,12 @@ impl Session {
             .collect();
         let peer_id = PeerId::with_prefix(&config.peer_id_prefix, &suffix);
         let tracker = TrackerClient::new(config.tracker.clone())?;
+        let (storage_backend, file_io) = storage_io(config.storage_backend);
+        let web_seed = config
+            .web_seed
+            .as_ref()
+            .map(WebSeedClient::new)
+            .transpose()?;
         let listener = config
             .listen
             .as_ref()
@@ -301,6 +349,9 @@ impl Session {
                 config: Arc::new(config),
                 peer_id,
                 tracker,
+                web_seed,
+                storage_backend,
+                file_io,
                 dht,
                 alerts,
                 torrents: Arc::new(Mutex::new(HashMap::new())),
@@ -320,6 +371,14 @@ impl Session {
     #[must_use]
     pub fn config(&self) -> &SessionConfig {
         &self.inner.config
+    }
+
+    /// The storage backend in use: [`SessionConfig::storage_backend`], or
+    /// [`StorageBackend::Blocking`] when io_uring was asked for but is not
+    /// available.
+    #[must_use]
+    pub fn storage_backend(&self) -> StorageBackend {
+        self.inner.storage_backend
     }
 
     /// The TCP port the session accepts peers on, if it listens.
@@ -344,8 +403,9 @@ impl Session {
         let acceptor = Acceptor {
             registry: Arc::clone(&self.inner.torrents),
             our_id: self.inner.peer_id,
-            reserved: peer::our_reserved(config.engine.fast_extension),
+            reserved: peer::our_reserved(config.engine.fast_extension, false),
             handshake_timeout: config.connect_timeout.max(Duration::from_secs(1)),
+            encryption: config.encryption,
             pending: Arc::new(Semaphore::new(
                 config.listen.as_ref().map_or(1, |l| l.max_pending.max(1)),
             )),
@@ -448,9 +508,13 @@ impl Session {
     ///
     /// Must be called from within a Tokio runtime.
     ///
+    /// A v2-only magnet (`urn:btmh:` alone) is looked up under its truncated
+    /// v2 hash and its metadata is checked with SHA-256 (BEP 52). The
+    /// magnet's web seeds (`ws`) join the torrent's own.
+    ///
     /// # Errors
-    /// [`SessionError::MagnetWithoutV1Hash`] for a v2-only magnet,
-    /// [`SessionError::StorageForMagnet`] if `options` carries a custom
+    /// [`SessionError::MagnetWithoutInfoHash`] for a magnet without any
+    /// info-hash, [`SessionError::StorageForMagnet`] if `options` carries a custom
     /// storage backend, [`SessionError::Duplicate`] if the torrent is
     /// already in the session.
     pub fn add_magnet(
@@ -458,7 +522,9 @@ impl Session {
         magnet: &Magnet,
         options: AddTorrentOptions,
     ) -> Result<TorrentHandle, SessionError> {
-        let info_hash = magnet.info_hash.ok_or(SessionError::MagnetWithoutV1Hash)?;
+        let info_hash = magnet
+            .swarm_hash()
+            .ok_or(SessionError::MagnetWithoutInfoHash)?;
         if options.storage.is_some() {
             return Err(SessionError::StorageForMagnet);
         }
@@ -492,7 +558,7 @@ impl Session {
         };
         if save && let Some(persist) = self.inner.persister() {
             if let Some(metainfo) = entry.metainfo() {
-                persist.save_torrent(metainfo);
+                persist.save_torrent(&info_hash, metainfo);
             }
             persist.save_record(&entry.record(info_hash));
         }
@@ -512,12 +578,21 @@ impl Session {
 
     /// Starts a task for `entry`. Called with the catalog locked.
     fn spawn(&self, info_hash: InfoHash, entry: &mut Entry) -> Result<TorrentHandle, SessionError> {
+        let mut aliases = Vec::new();
+        let v2;
         let (source, trackers, mut peers) = match &entry.source {
             EntrySource::Torrent(metainfo) => {
                 let storage: Arc<dyn Storage> = match &entry.storage {
                     Some(storage) => Arc::clone(storage),
-                    None => Arc::new(FileStorage::new(&entry.download_dir, metainfo.info())?),
+                    None => Arc::new(
+                        FileStorage::new(&entry.download_dir, metainfo.info())?
+                            .with_io(Arc::clone(&self.inner.file_io)),
+                    ),
                 };
+                // A hybrid torrent is also known by its truncated v2 hash:
+                // peers of the v2 swarm connect with that one.
+                aliases = metainfo.swarm_hashes();
+                v2 = metainfo.info_hash_v2().is_some();
                 let source = Source::Torrent {
                     metainfo: Arc::clone(metainfo),
                     storage,
@@ -532,18 +607,25 @@ impl Session {
                     .iter()
                     .filter_map(|p| p.parse::<SocketAddr>().ok())
                     .collect();
-                let source = Source::Magnet {
+                v2 = magnet.info_hash_v2.is_some();
+                let source = Source::Magnet(MagnetStart {
                     download_dir: entry.download_dir.clone(),
-                };
+                    v1: magnet.info_hash.is_some(),
+                    info_hash_v2: magnet.info_hash_v2,
+                    web_seeds: magnet.web_seeds.clone(),
+                });
                 (source, trackers, peers)
             }
         };
         peers.extend(entry.peers.iter().copied());
         self.start_listening();
+        let (tx, rx) = mpsc::channel(64);
         let ctx = TorrentContext {
             info_hash,
             trackers: prepare_tiers(trackers),
             tracker: self.inner.tracker.clone(),
+            web_seed: self.inner.web_seed.clone(),
+            file_io: Arc::clone(&self.inner.file_io),
             dht: self.inner.dht.clone(),
             peer_id: self.inner.peer_id,
             config: Arc::clone(&self.inner.config),
@@ -560,18 +642,25 @@ impl Session {
                 .unwrap_or_else(PoisonError::into_inner)
                 .as_ref()
                 .map(PortMapper::subscribe),
+            aliases: Aliases {
+                registry: Arc::clone(&self.inner.torrents),
+                tx: tx.downgrade(),
+            },
         };
-        let (tx, rx) = mpsc::channel(64);
         if !peers.is_empty() {
             // Fresh channel with spare capacity: cannot fail.
             let _ = tx.try_send(Command::AddPeers(peers));
         }
         tokio::spawn(TorrentTask::new(ctx, source, entry.priorities.clone(), rx).run());
-        self.inner
-            .torrents
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(info_hash, tx.clone());
+        {
+            let mut registry = self
+                .inner
+                .torrents
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            registry.insert(info_hash, Route::new(tx.clone(), v2));
+        }
+        listen::register_aliases(&self.inner.torrents, info_hash, &aliases, &tx, v2);
         entry.commands = Some(tx.clone());
         Ok(TorrentHandle {
             info_hash,
@@ -590,7 +679,8 @@ impl Session {
             .unwrap_or_else(PoisonError::into_inner);
         let commands = torrents
             .get(&info_hash)
-            .filter(|tx| !tx.is_closed())?
+            .filter(|route| route.is_live())?
+            .tx
             .clone();
         Some(TorrentHandle {
             info_hash,
@@ -833,7 +923,7 @@ impl Session {
             let source = match (metainfo, &record.magnet) {
                 (Some(metainfo), _) => EntrySource::Torrent(Arc::new(metainfo)),
                 (None, Some(uri)) => match Magnet::parse(uri) {
-                    Ok(magnet) if magnet.info_hash == Some(record.info_hash) => {
+                    Ok(magnet) if magnet.swarm_hash() == Some(record.info_hash) => {
                         EntrySource::Magnet(Box::new(magnet))
                     }
                     Ok(_) => {
@@ -980,7 +1070,9 @@ fn load_state_dir(dir: &Path) -> std::io::Result<Loaded> {
         let torrent_path = path.with_extension("torrent");
         let metainfo = match persist::read_bounded(&torrent_path, persist::MAX_TORRENT_FILE) {
             Ok(bytes) => match Metainfo::from_bytes(&bytes) {
-                Ok(m) if m.info_hash() == record.info_hash => Some(m),
+                // A v2-only magnet whose metadata turned out hybrid stays
+                // under the truncated v2 hash it was added with.
+                Ok(m) if m.swarm_hashes().contains(&record.info_hash) => Some(m),
                 Ok(_) => {
                     loaded
                         .failed

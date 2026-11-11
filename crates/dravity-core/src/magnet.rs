@@ -130,6 +130,22 @@ impl Magnet {
         }
     }
 
+    /// The 20-byte swarm id to ask peers, trackers and the DHT for: the v1
+    /// info-hash, or the truncated v2 info-hash of a v2-only link (BEP 52).
+    ///
+    /// ```
+    /// use dravity_core::Magnet;
+    ///
+    /// let v2 = format!("magnet:?xt=urn:btmh:1220{}", "ab".repeat(32));
+    /// let m: Magnet = v2.parse().unwrap();
+    /// assert_eq!(m.swarm_hash().unwrap().to_hex(), "ab".repeat(20));
+    /// ```
+    #[must_use]
+    pub fn swarm_hash(&self) -> Option<InfoHash> {
+        self.info_hash
+            .or_else(|| self.info_hash_v2.map(|h| h.truncated()))
+    }
+
     /// Formats the magnet as a URI.
     #[must_use]
     pub fn to_uri(&self) -> String {

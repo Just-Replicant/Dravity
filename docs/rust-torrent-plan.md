@@ -278,7 +278,7 @@ Workspace root: `dravity` (meta) documenting the library entry via `dravity-sess
    The Phase 4 screen becomes a client: add a magnet or a `.torrent` while it is running, remove, peers, trackers, alerts, sort and filter. Still session commands and alerts only. Done: see [`docs/phase-5.md`](phase-5.md).
 
 7. **Phase 6 — Advanced**  
-   BEP 52 v2/hybrid + Merkle; web seeds (BEP 19); optional io_uring backend; protocol encryption if required.
+   BEP 52 v2/hybrid + Merkle; web seeds (BEP 19); optional io_uring backend; protocol encryption if required. Done: BEP 52 (with hash requests), BEP 19, an optional io_uring file backend (`tokio-uring`, feature `uring`) and MSE/PE encryption; see [`docs/phase-6.md`](phase-6.md).
 
 Each phase ships a usable artifact; later phases do not rewrite the sans-IO core.
 

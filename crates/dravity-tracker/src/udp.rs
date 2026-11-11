@@ -170,7 +170,7 @@ mod tests {
     use dravity_core::{InfoHash, PeerId};
 
     use super::*;
-    use crate::types::AnnounceEvent;
+    use crate::types::{AnnounceEvent, CryptoSupport};
 
     fn req() -> AnnounceRequest {
         AnnounceRequest {
@@ -183,6 +183,7 @@ mod tests {
             event: AnnounceEvent::Started,
             num_want: None,
             key: 7,
+            crypto: CryptoSupport::None,
         }
     }
 

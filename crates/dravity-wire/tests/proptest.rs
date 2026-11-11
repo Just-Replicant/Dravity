@@ -137,7 +137,7 @@ proptest! {
     ) {
         // Decoding yields IPv4 entries before IPv6 ones.
         let order = |a: &std::net::SocketAddr| a.is_ipv6();
-        let mut added: Vec<PexPeer> = added.into_iter().map(|(addr, flags)| PexPeer { addr, flags }).collect();
+        let mut added: Vec<PexPeer> = added.into_iter().map(|(addr, flags)| PexPeer { addr, flags: Some(flags) }).collect();
         added.sort_by_key(|p| order(&p.addr));
         let mut dropped = dropped;
         dropped.sort_by_key(order);

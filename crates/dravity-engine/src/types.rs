@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use dravity_core::BlockRef;
+use dravity_core::merkle::Hash;
 use dravity_wire::{Message, Reserved};
 
 use crate::picker::Priority;
@@ -89,6 +90,15 @@ pub struct Config {
     pub dht_retry: Duration,
     /// Largest `info` dictionary accepted from peers for a magnet link.
     pub max_metadata_size: u64,
+    /// How long a hybrid magnet waits for its v2 piece layers without any
+    /// layer block arriving before the download starts on SHA-1 alone for
+    /// the files still missing one (a v2-only magnet always waits: it has
+    /// no other way to check its pieces).
+    pub piece_layer_timeout: Duration,
+    /// A v2-only magnet whose piece layers have not progressed for this
+    /// long raises [`Alert::PieceLayersStalled`] (and again after each
+    /// further period of silence). It keeps waiting and asking.
+    pub piece_layer_stall_alert: Duration,
     /// A request without an answer after this long is given to other peers.
     pub request_timeout: Duration,
     /// Drop a peer that sent nothing for this long.
@@ -180,6 +190,8 @@ impl Default for Config {
             dht_interval: Duration::from_secs(5 * 60),
             dht_retry: Duration::from_secs(15),
             max_metadata_size: 8 * 1024 * 1024,
+            piece_layer_timeout: Duration::from_secs(20),
+            piece_layer_stall_alert: Duration::from_secs(120),
             request_timeout: Duration::from_secs(30),
             peer_timeout: Duration::from_secs(180),
             peer_retry: Duration::from_secs(30),
@@ -208,6 +220,60 @@ impl Default for Config {
     }
 }
 
+/// What the driver observed about a connection: shared with other peers
+/// as BEP 11 PEX flags and remembered for dialing the address again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct PeerLink {
+    /// The connection runs over uTP (BEP 29).
+    pub utp: bool,
+    /// Message Stream Encryption: `Some(true)` when the connection completed
+    /// an MSE handshake (RC4 or its plaintext method), `Some(false)` when we
+    /// offered MSE and the peer refused it, `None` when MSE was not tried.
+    pub mse: Option<bool>,
+}
+
+/// What is known about a peer before it is dialed, from BEP 11 PEX flags or
+/// an earlier connection; see [`Effect::Connect`]. `None` means unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct DialHints {
+    /// Supports Message Stream Encryption: PEX flag `0x01`, or an MSE
+    /// handshake seen (`Some(true)`) or refused (`Some(false)`).
+    pub encryption: Option<bool>,
+    /// Supports uTP: PEX flag `0x04`, or an earlier uTP connection.
+    pub utp: Option<bool>,
+}
+
+impl DialHints {
+    /// Hints from a peer's BEP 11 `added.f` flags (`None`: the sender gave
+    /// none).
+    #[must_use]
+    pub fn from_pex_flags(flags: Option<u8>) -> Self {
+        Self {
+            encryption: flags.map(|f| f & dravity_wire::PEX_ENCRYPTION != 0),
+            utp: flags.map(|f| f & dravity_wire::PEX_UTP != 0),
+        }
+    }
+
+    /// Hints from a connection we made to the peer. A uTP connection proves
+    /// uTP support; a TCP one says nothing about it.
+    #[must_use]
+    pub fn from_link(link: PeerLink) -> Self {
+        Self {
+            encryption: link.mse,
+            utp: link.utp.then_some(true),
+        }
+    }
+
+    /// `self`, with the fields it does not know taken from `other`.
+    #[must_use]
+    pub fn or(self, other: Self) -> Self {
+        Self {
+            encryption: self.encryption.or(other.encryption),
+            utp: self.utp.or(other.utp),
+        }
+    }
+}
+
 /// Something that happened, fed to [`TorrentState::update`](crate::TorrentState::update).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -227,6 +293,8 @@ pub enum Event {
         addr: SocketAddr,
         /// Reserved bytes from the peer's handshake (extension flags).
         reserved: Reserved,
+        /// Transport and encryption of the connection.
+        link: PeerLink,
     },
     /// A peer connected to us and completed its handshake for this torrent
     /// (incoming connection). The engine may refuse it with
@@ -239,6 +307,8 @@ pub enum Event {
         addr: SocketAddr,
         /// Reserved bytes from the peer's handshake (extension flags).
         reserved: Reserved,
+        /// Transport and encryption of the connection.
+        link: PeerLink,
     },
     /// An [`Effect::Connect`] attempt failed (refused, timeout, bad handshake).
     PeerConnectFailed {
@@ -281,6 +351,14 @@ pub enum Event {
         piece: u32,
         /// Whether the SHA-1 matched.
         ok: bool,
+    },
+    /// The driver installed a piece layer from
+    /// [`Effect::PieceLayerReceived`]: hash the verified pieces in `pieces`
+    /// again (each with [`Effect::HashPiece`], now against the Merkle tree
+    /// too). A piece that fails is downloaded again.
+    RecheckPieces {
+        /// The file's pieces (those not verified yet are skipped).
+        pieces: std::ops::Range<u32>,
     },
     /// A block from [`Effect::ReadBlock`] was read from storage.
     BlockRead {
@@ -369,6 +447,9 @@ pub enum Effect {
     Connect {
         /// Peer address.
         addr: SocketAddr,
+        /// What is known about the peer: which transport and encryption
+        /// to try first, or whether to dial it at all.
+        hints: DialHints,
     },
     /// Queue a message for a peer.
     Send {
@@ -421,6 +502,21 @@ pub enum Effect {
     MetadataReceived {
         /// The bencoded `info` dictionary.
         info: Bytes,
+        /// Piece layers fetched from peers with BEP 52 hash requests, by
+        /// pieces root, each verified against its root. Empty unless the
+        /// magnet link is v2-only and has files larger than a piece.
+        piece_layers: Vec<(Hash, Vec<Hash>)>,
+    },
+    /// A hybrid torrent that started on SHA-1 alone fetched a missing piece
+    /// layer from peers, verified against its pieces root. The driver adds
+    /// it to the metainfo (and persists it), then replies with
+    /// [`Event::RecheckPieces`] for the file's pieces. The engine already
+    /// serves the layer to peers' hash requests.
+    PieceLayerReceived {
+        /// The file's pieces root.
+        root: Hash,
+        /// One hash per piece of the file.
+        layer: Vec<Hash>,
     },
     /// Notify the application.
     Alert(Alert),
@@ -461,6 +557,17 @@ pub enum Alert {
     Finished,
     /// The `info` dictionary of a magnet link was received and verified.
     MetadataReceived,
+    /// A v2-only magnet's metadata is verified, but no peer has sent any of
+    /// its missing piece layers for [`Config::piece_layer_stall_alert`]
+    /// (BEP 52 hash requests). The download cannot start without them; the
+    /// torrent keeps asking every peer that connects.
+    PieceLayersStalled {
+        /// Files whose piece layer is still incomplete.
+        missing_layers: u32,
+        /// Time since the last layer data arrived (or since the metadata
+        /// was verified).
+        silent: Duration,
+    },
     /// A peer was banned for sending data that failed the hash check. Its
     /// connections are closed and its address is not used again.
     PeerBanned {

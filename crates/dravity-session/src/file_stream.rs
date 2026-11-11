@@ -136,11 +136,7 @@ impl FileStream {
             .min(MAX_CHUNK);
         let storage = Arc::clone(&self.storage);
         let data = tokio::task::spawn_blocking(move || {
-            let mut buf = vec![0u8; want];
-            storage
-                .read_at(abs, &mut buf)
-                .map(|()| buf)
-                .map_err(io::Error::other)
+            storage.read_vec(abs, want).map_err(io::Error::other)
         })
         .await
         .map_err(io::Error::other)??;

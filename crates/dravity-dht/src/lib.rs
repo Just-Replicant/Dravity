@@ -19,6 +19,10 @@
 //! # let _ = peers; Ok(()) }
 //! ```
 
+pub mod demux;
+pub mod krpc;
+pub mod secure_id;
+
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
 

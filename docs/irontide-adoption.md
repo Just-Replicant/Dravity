@@ -32,6 +32,7 @@ sound version, with the difference explained), **open** (not started).
 | 19 | BEP 40 canonical peer priority | done | `feat(core,engine): BEP 40 canonical peer priority at the connection cap` | [notes](#19-bep-40-peer-priority) |
 | 20 | IP filter (eMule .dat, P2P, CIDR) and --ip-filter | done | `feat(session,cli): IP filter lists` | [notes](#20-ip-filter) |
 | 21 | PCP (RFC 6887) before NAT-PMP and UPnP | partial | `feat(portmap): PCP port mapping` | [notes](#21-pcp) |
+| 22 | Native DHT building blocks: KRPC codec, BEP 42 ids, UDP demux | partial | `feat(dht): KRPC codec, BEP 42 secure ids and a UDP datagram classifier` | [notes](#22-native-dht-building-blocks) |
 
 ## Design notes
 
@@ -396,3 +397,11 @@ turns LSD on.
 - Mapper: `map_pcp` learns our address towards the gateway, sends one MAP per mapping with its own nonce (12 bytes from `RandomState` and the clock: unique and not guessable off-path, which is all RFC 6887 §11.1 asks), records the assigned port and public IPv4 address, and keeps the requests in `Active::Pcp` so renewals happen through the normal remap cycle and the delete on stop reuses the nonce with lifetime 0. Retransmissions follow the NAT-PMP schedule. Any PCP failure falls back to NAT-PMP, so old routers behave as before.
 - **Partial:** irontide also requests IPv6 pinholes. The codec handles IPv6 client and external addresses, but the mapper only knows an IPv4 default gateway (`default_gateway`), and IPv6 needs no address translation, only a firewall pinhole on routers that block inbound; adding IPv6 gateway discovery is left for later.
 - Tests: codec unit tests (layout, success, IPv6 external address, refusal, NAT-PMP-only, malformed and truncated input), a doc test, and mapper tests against a fake PCP gateway (map, report, delete with the same nonce, one nonce per mapping) and against a NAT-PMP-only gateway (PCP tried first, NAT-PMP used).
+
+### 22. Native DHT building blocks
+
+- `krpc.rs` decodes and encodes `ping`, `find_node`, `get_peers` and `announce_peer` queries, responses (`id`, `nodes`, `nodes6`, `values`, `token`) and errors with typed results. It keeps at most 100 nodes or peers per response and drops port-0 entries, so hostile responses stay cheap; ids must be exactly 20 bytes. The BEP 5 examples are decoded in tests and every message type round-trips.
+- `secure_id.rs` implements BEP 42 with the CRC-32C from item 19: the IPv4 mask `03 0f 3f ff` (IPv6 `01 03 07 0f 1f 3f 7f ff` on the first 8 bytes) with `r` in the top bits, 21 checked bits and the random last byte. All five BEP 42 vectors pass; private, loopback and link-local addresses are exempt as the BEP says.
+- `demux.rs` classifies by first byte: a bencoded dictionary is KRPC, a 20+ byte packet with version 1 and type 0 to 4 is uTP, and `00 00 00 0..3` with 8+ bytes is a BEP 15 tracker response. The three never overlap.
+- All three are in a new purity tripwire test for the crate.
+- **Partial, why:** the item asks to replace `mainline` with a native dual-stack DHT (routing table, lookups, BEP 43/44/51/33) on one socket shared with uTP and UDP trackers. That is several weeks of work (the comparison rated it L) and swapping a working DHT for a new one needs interop testing against the live network, which this offline environment cannot do. These modules are the tested foundation for that swap: the codec, the id rules and the socket classifier a shared socket needs.

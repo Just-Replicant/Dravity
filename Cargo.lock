@@ -709,6 +709,7 @@ dependencies = [
 name = "dravity-dht"
 version = "0.1.0"
 dependencies = [
+ "dravity-bencode",
  "dravity-core",
  "futures-util",
  "mainline",

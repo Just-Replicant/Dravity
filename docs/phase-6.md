@@ -224,6 +224,12 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   never needs them. A failed seed is retried after
   `SessionConfig::web_seed_retry` (30 s), doubling with each failure in a
   row up to 32×; data received resets the count.
+  A seed the engine bans for data that fails the hash check is not
+  retried: the ban is on its synthetic address, and starting it again
+  would only be disconnected. A URL that can never be fetched (not
+  `http`/`https`, a non-public address when those are refused, or a name
+  that resolves only to such addresses) never joins the swarm and is not
+  retried either. A name that fails DNS is retried.
   `SessionConfig::web_seed = None` (CLI `--no-web-seeds`) never contacts
   them.
 - **Sources.** The torrent's `url-list` (a string or a list) and a
@@ -467,7 +473,9 @@ which for a v2-only torrent is the truncated v2 hash (see below).
   connections keep the one the lower listen port opened, in both phases
   (`tests/peers.rs`); a padded v2 last piece is served in whole blocks.
   Session (`tests/v2.rs`): two web seeds on one host and port serve at
-  once; a failing web seed is never dialed as a peer; pieces a late layer
+  once; a failing web seed is never dialed as a peer; a loopback URL is
+  not contacted when private addresses are refused; a web seed whose
+  bytes fail the hash check is banned and not fetched again; pieces a late layer
   refutes are downloaded again; a v2 swarm is dialed with the v2 bit,
   a v1 swarm without it (`tests/swarm.rs`, also the listener's reply).
   Storage: batched writes and reads against single-block ones, across

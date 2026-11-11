@@ -132,7 +132,7 @@ for the full architecture, comparison with existing clients, and roadmap.
 - [x] PEX flags (BEP 11): encryption, seed, uTP and reachable sent from observed connections; received flags steer MSE and transport order, `Required` skips peers known not to encrypt
 - [x] MSE/PE encryption (new `dravity-mse` crate) for TCP and uTP, incoming and outgoing; `--encryption disabled|enabled|required`; `E` peer flag
 - [x] Web seeds get synthetic, unroutable addresses (`100::/64`): two seeds on one host both run, and none is ever dialed, retried as a peer or shared over PEX
-- [x] Web seed responses: `Content-Range` must match the request; redirects stay on the original host; loopback, private and link-local targets refused (checked after DNS resolution, no rebinding) unless `--web-seeds-allow-private`
+- [x] Web seed responses: `Content-Range` must match the request; redirects stay on the original host; loopback, private and link-local targets refused (checked after DNS resolution, no rebinding) unless `--web-seeds-allow-private`; a banned or permanently unusable web seed is not retried
 - [x] File names that are not valid UTF-8 are rejected (`NonUtf8Name`)
 - [x] A hybrid keeps fetching late piece layers while it downloads or seeds, and rechecks the pieces it accepted on SHA-1 alone; a stalled v2 magnet raises `PieceLayersStalled`
 - [x] io_uring batches block I/O (adjacent blocks merged into one `writev`/`readv`, one ring round trip per batch): about 5× faster block writes and reads than one call per block

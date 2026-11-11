@@ -115,6 +115,10 @@ pub struct SessionConfig {
     /// When written data is forced to disk. Default: [`Durability::Never`]
     /// (sync on resume save, descriptor eviction and stop only).
     pub durability: Durability,
+    /// Local Service Discovery (BEP 14): find peers of the same torrents on
+    /// the local network by multicast. Needs a listener; private torrents
+    /// never use it. `None` (the default) turns it off.
+    pub lsd: Option<dravity_lsd::LsdConfig>,
     /// Scrape every tracker this often (BEP 48 / BEP 15) and show the
     /// counts in [`crate::TrackerStatus::scrape`]. `None` (the default)
     /// scrapes only on [`crate::TorrentHandle::scrape`].
@@ -177,6 +181,7 @@ impl Default for SessionConfig {
             read_cache: Some(DEFAULT_READ_CACHE),
             preallocate: PreallocateMode::None,
             durability: Durability::Never,
+            lsd: None,
             scrape_interval: None,
             stop_announce_timeout: Duration::from_secs(5),
             alert_buffer: 1024,

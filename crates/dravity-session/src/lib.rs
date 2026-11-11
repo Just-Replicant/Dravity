@@ -80,6 +80,7 @@ mod file_stream;
 mod files;
 mod hash_pool;
 mod listen;
+mod lsd;
 mod peer;
 pub mod persist;
 mod status;
@@ -107,6 +108,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub use codec::{CodecError, PeerCodec};
 pub use config::{DEFAULT_MAX_CONNECTIONS, DEFAULT_READ_CACHE, SessionConfig, StorageBackend};
+pub use dravity_lsd::LsdConfig;
 pub use dravity_mse::Policy as EncryptionPolicy;
 pub use dravity_portmap::{
     Mapped as PortMapped, Method as PortMapMethod, PortMapConfig, Protocol as PortMapProtocol,
@@ -458,6 +460,14 @@ impl Session {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) =
                 Some(PortMapper::start(mapping.clone(), mappings));
+        }
+        if let (Some(lsd), Some(port)) = (&config.lsd, self.inner.listen_port) {
+            lsd::start(
+                lsd,
+                port,
+                Arc::clone(&self.inner.catalog),
+                self.inner.stop.clone(),
+            );
         }
     }
 

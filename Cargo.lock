@@ -766,6 +766,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dravity-lsd"
+version = "0.1.0"
+dependencies = [
+ "dravity-core",
+ "fastrand",
+ "socket2 0.6.5",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dravity-mse"
 version = "0.1.0"
 dependencies = [
@@ -797,6 +809,7 @@ dependencies = [
  "dravity-core",
  "dravity-dht",
  "dravity-engine",
+ "dravity-lsd",
  "dravity-mse",
  "dravity-portmap",
  "dravity-storage",

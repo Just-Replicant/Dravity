@@ -121,6 +121,14 @@ Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/ir
   `TorrentHandle::scrape()` and `SessionConfig::scrape_interval` (off by
   default) fill `TrackerStatus::scrape` / `scraped`. The TUI tracker pane
   shows scraped counts, and the CLI flag is `--scrape-interval MINUTES`.
+- **Local Service Discovery (item 15):** the new `dravity-lsd` crate has a
+  sans-IO BEP 14 codec (`codec::encode` / `codec::parse`) and an `Lsd`
+  service on `239.192.152.143:6771` and `[ff15::efc0:988f]:6771`, with
+  a per-source rate limit and a cookie that drops our own announces.
+  `SessionConfig::lsd` (off by default in the library) announces running
+  public torrents and adds discovered peers. Private torrents and
+  magnets without metadata are never announced. The CLI enables LSD when
+  it listens; `--no-lsd` turns it off.
 
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 

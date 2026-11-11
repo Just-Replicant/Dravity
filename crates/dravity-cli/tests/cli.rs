@@ -403,7 +403,7 @@ fn download_preallocated_and_durable() {
             "--quiet",
         ])
         .args(["--seed-choking", "anti-leech", "--auto-upload-slots"])
-        .args(["--scrape-interval", "30"])
+        .args(["--scrape-interval", "30", "--no-lsd"])
         .output()
         .unwrap();
     assert!(

@@ -222,6 +222,10 @@ struct NetworkArgs {
     /// Do not use the DHT for peer discovery.
     #[arg(long)]
     no_dht: bool,
+    /// Do not look for peers on the local network (BEP 14 Local Service
+    /// Discovery; private torrents never use it).
+    #[arg(long)]
+    no_lsd: bool,
     /// Never download from HTTP web seeds (BEP 19 `url-list`, magnet `ws`).
     #[arg(long)]
     no_web_seeds: bool,
@@ -309,6 +313,9 @@ impl NetworkArgs {
             .then(|| std::time::Duration::from_secs(self.scrape_interval.saturating_mul(60)));
         config.durability = self.durability;
         config.engine.download_rate_limit = self.download_limit.filter(|&r| r > 0);
+        if !self.no_lsd && config.listen.is_some() {
+            config.lsd = Some(dravity_session::LsdConfig::default());
+        }
         if self.no_dht {
             config.dht = None;
         }

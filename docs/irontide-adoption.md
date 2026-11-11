@@ -3,7 +3,8 @@
 Dravity reviewed the irontide BitTorrent engine and listed 31 ideas worth
 adopting (fixes, improvements and features). This page tracks each one.
 Every item is **reimplemented** for Dravity's sans-IO architecture; no
-irontide code is copied (irontide is GPL, Dravity is MIT/Apache-2.0).
+irontide code is copied: Dravity keeps its own authorship and design
+(it is AGPL-3.0-or-later; irontide is GPL), and only ideas carry over.
 
 Status: **done** (implemented as described), **partial** (the closest
 sound version, with the difference explained), **open** (not started).
@@ -24,6 +25,7 @@ sound version, with the difference explained), **open** (not started).
 | 12 | Seed choking variants and an upload slot tuner | done | `feat(engine): seed choking modes and an upload slot tuner` | [notes](#12-seed-choking-and-slot-tuner) |
 | 13 | Torrent creation (v1/v2/hybrid, BEP 47 pads, auto piece size) and dravity create | done | `feat(core,storage,cli): torrent creation and dravity create` | [notes](#13-torrent-creation) |
 | 14 | Tracker scrape (BEP 48 HTTP, BEP 15 UDP) in TrackerStatus | done | `feat(tracker,session,cli): tracker scrape` | [notes](#14-tracker-scrape) |
+| 15 | Local Service Discovery (BEP 14), off for private torrents | done | `feat(lsd,session,cli): local service discovery` | [notes](#15-local-service-discovery) |
 
 ## Design notes
 
@@ -315,3 +317,32 @@ in the background. Results go into `TrackerLog` beside the announce
 outcomes. Tests run in-process trackers: an HTTP scrape, a missing
 torrent, a URL without `announce`, two UDP scrapes on one connection id,
 and session scrapes on demand and on a schedule.
+
+### 15. Local service discovery
+
+`dravity-lsd` follows the crate pattern used for protocols. The codec
+is pure and covered by a purity tripwire. Encoding writes a `BT-SEARCH *
+HTTP/1.1` request with `Host`, `Port`, up to 20 `Infohash` headers (so a
+message stays below 1400 bytes) and a `cookie`. Parsing ignores header
+case, unknown headers and malformed or duplicate hashes, and rejects
+messages without a nonzero port or any hash.
+
+The `Lsd` service binds the multicast port with `SO_REUSEADDR` (and
+`SO_REUSEPORT` on Unix), so several clients on one host coexist. It
+joins the IPv4 group with TTL 1 and multicast loop on, and joins the
+IPv6 group when available. It drops its own announces by cookie and
+accepts at most 16 messages per source address per minute. Unicast mode
+(`LsdConfig::unicast`) sends to fixed addresses, which keeps the tests
+independent of multicast routing.
+
+The session starts LSD with the listener, since it needs a port to
+advertise. A task checks the catalog every 5 s. It announces running
+torrents that are public and whose metadata is known, each at most once
+per `interval` (default 5 min). It passes discovered peers to the
+torrent as `Command::AddPeers`, again only for public torrents.
+Magnets wait for their metadata, which tells whether they are private.
+Tests cover two services exchanging announces (split over two
+messages, own announces filtered), a leecher that finds a seed only
+through LSD and completes, and a private torrent that is never
+discovered. The library default is off, so embedders opt in. The CLI
+turns LSD on.

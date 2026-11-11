@@ -39,6 +39,7 @@ for the full architecture, comparison with existing clients, and roadmap.
 | [`dravity-http`](crates/dravity-http) | ✅ Phase 4 | axum JSON API over the session: torrents, files, priorities, streaming with `Range`, server-sent alerts, Prometheus `/metrics`, bearer token |
 | [`dravity-cli`](crates/dravity-cli) | ✅ Phase 6 | `dravity download` / `info` / `create` / `serve` for files and magnet links, seeding, file selection, a full ratatui `--tui` client (add, remove, peers, trackers, alerts); renders alerts, never drives I/O |
 | [`dravity-utp`](crates/dravity-utp) | ✅ Phase 6 | uTP (BEP 29): packet codec, sans-IO connection with LEDBAT congestion control, Tokio socket and streams |
+| [`dravity-lsd`](crates/dravity-lsd) | ✅ irontide | Local Service Discovery (BEP 14): sans-IO `BT-SEARCH` codec and a multicast service; the session skips private torrents |
 | [`dravity-portmap`](crates/dravity-portmap) | ✅ Phase 4 | Router port mapping: NAT-PMP (RFC 6886) and UPnP IGD codecs, `PortMapper` that maps, renews and removes and reports the external port |
 | [`dravity-webseed`](crates/dravity-webseed) | ✅ Phase 6 | Web seeds (BEP 19): sans-IO plan of file URLs and HTTP ranges (padding as zeros), strict ranged HTTP(S) client (rustls) |
 | [`dravity-interop`](crates/dravity-interop) | ✅ Phase 6 | Opt-in tests against qBittorrent (libtorrent) and Transmission: v1, hybrid and v2 both ways, MSE, TCP and uTP |
@@ -85,6 +86,7 @@ for the full architecture, comparison with existing clients, and roadmap.
 - [x] uTP (BEP 29) with LEDBAT in `dravity-utp`; dial fallback between TCP and uTP
 - [x] Incoming connections over TCP and uTP, IPv4 and IPv6, routed by info-hash; DHT `announce_peer`
 - [x] Port mapping with NAT-PMP and UPnP IGD in `dravity-portmap`
+- [x] Local Service Discovery (BEP 14) in `dravity-lsd`
 - [x] Per-IP bans for peers sending corrupt pieces
 - [x] Path hardening: per-platform name rules, symlink-free opens on Unix
 - [x] Tests: seeding/choker scripts + proptest, simulated lossy network for uTP, fake NAT-PMP/UPnP routers, loopback swarms (TCP, uTP, IPv6, seeding), CLI seed; fuzz targets `utp_packet`, `portmap_parse`

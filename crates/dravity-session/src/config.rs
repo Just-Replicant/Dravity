@@ -92,6 +92,12 @@ pub struct SessionConfig {
     /// Concurrent piece-hash jobs across the whole session (piece checks,
     /// rechecks and smart-ban block digests of every torrent share them).
     pub hash_workers: usize,
+    /// Verify downloaded pieces from their blocks as they are written
+    /// (incremental SHA-1, per-block SHA-256 leaves) instead of reading
+    /// each finished piece back from storage. Checks of existing data, and
+    /// pieces whose blocks arrived twice or too far out of order, are
+    /// still read back.
+    pub hash_on_arrival: bool,
     /// Time allowed for the `stopped` announce when a torrent stops.
     pub stop_announce_timeout: Duration,
     /// Broadcast buffer for alerts; slow subscribers miss older alerts.
@@ -146,6 +152,7 @@ impl Default for SessionConfig {
             event_queue: 1024,
             max_connections: Some(DEFAULT_MAX_CONNECTIONS),
             hash_workers: std::thread::available_parallelism().map_or(2, usize::from),
+            hash_on_arrival: true,
             stop_announce_timeout: Duration::from_secs(5),
             alert_buffer: 1024,
             dht: Some(DhtConfig::default()),

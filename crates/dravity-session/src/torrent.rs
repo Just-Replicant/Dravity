@@ -33,6 +33,7 @@ use std::time::Instant;
 use bytes::{Bytes, BytesMut};
 use dravity_core::admit::{ConnectionLimit, ConnectionSlot};
 use dravity_core::merkle::Hash;
+use dravity_core::verify::PieceHasher;
 use dravity_core::{BlockRef, Info, InfoHash, InfoHashV2, MetaVersion, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{
@@ -373,6 +374,9 @@ pub(crate) struct TorrentTask {
     /// Block writes and upload reads waiting to go to storage together
     /// (see [`MAX_IO_BATCH`]).
     pending_writes: Vec<(BlockRef, Bytes)>,
+    /// Hash-on-arrival state, fed by the block writes
+    /// ([`SessionConfig::hash_on_arrival`]).
+    hashers: Option<Arc<Mutex<Hashers>>>,
     pending_reads: Vec<(PeerKey, BlockRef)>,
     /// Announce and DHT tasks. Aborted on stop; they must not delay it.
     background: JoinSet<()>,
@@ -444,6 +448,10 @@ impl TorrentTask {
             }
         };
         let (events_tx, events_rx) = mpsc::channel(ctx.config.event_queue.max(1));
+        let hashers = ctx
+            .config
+            .hash_on_arrival
+            .then(|| Arc::new(Mutex::new(Hashers::default())));
         let mut task = Self {
             ctx,
             phase,
@@ -462,6 +470,7 @@ impl TorrentTask {
             commands,
             local: VecDeque::new(),
             pending_writes: Vec::new(),
+            hashers,
             pending_reads: Vec::new(),
             background: JoinSet::new(),
             disk: JoinSet::new(),
@@ -1474,14 +1483,21 @@ impl TorrentTask {
         if !self.pending_writes.is_empty() {
             let writes = std::mem::take(&mut self.pending_writes);
             let content = content.clone();
+            let hashers = self.hashers.clone();
             let tx = self.events_tx.clone();
             self.disk.spawn(async move {
-                let events = tokio::task::spawn_blocking(move || write_batch(&content, writes))
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(error = %e, "block writes panicked");
-                        Vec::new()
-                    });
+                let events = tokio::task::spawn_blocking(move || {
+                    let events = write_batch(&content, writes.clone());
+                    if let Some(hashers) = hashers {
+                        feed_hashers(&hashers, &content, &writes, &events);
+                    }
+                    events
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "block writes panicked");
+                    Vec::new()
+                });
                 for event in events {
                     let _ = tx.send(Input::Engine(event)).await;
                 }
@@ -1509,11 +1525,22 @@ impl TorrentTask {
             tracing::warn!(piece, "hash request before metadata");
             return;
         };
+        let arrived = self
+            .hashers
+            .as_ref()
+            .and_then(|h| h.lock().unwrap_or_else(PoisonError::into_inner).take(piece));
         let pool = self.ctx.hash_pool.clone();
         let tx = self.events_tx.clone();
         self.disk.spawn(async move {
             let result = pool
-                .run(move || verify_piece(content.storage.as_ref(), content.metainfo.info(), piece))
+                .run(move || {
+                    let info = content.metainfo.info();
+                    // Blocks hashed as they were written: no read-back.
+                    if let Some(ok) = arrived.and_then(|h| h.verify(info)) {
+                        return Ok(ok);
+                    }
+                    verify_piece(content.storage.as_ref(), info, piece)
+                })
                 .await;
             // A mismatch or a short file is "we don't have it". Any other I/O
             // error would otherwise reset the piece and download it forever.
@@ -1902,6 +1929,62 @@ fn error_chain(e: &dyn std::error::Error) -> String {
         source = inner.source();
     }
     text
+}
+
+/// Bytes of early blocks one torrent's hashers may hold while they wait to
+/// be fed in order. A piece that would go over falls back to read-back.
+const MAX_HASH_PENDING: usize = 32 * 1024 * 1024;
+
+/// Hash-on-arrival state of one torrent: a [`PieceHasher`] per piece being
+/// written.
+#[derive(Debug, Default)]
+struct Hashers {
+    pieces: HashMap<u32, PieceHasher<Bytes>>,
+    /// Sum of the hashers' pending bytes.
+    pending: usize,
+}
+
+impl Hashers {
+    /// Takes the hasher of `piece` (its blocks are all written).
+    fn take(&mut self, piece: u32) -> Option<PieceHasher<Bytes>> {
+        let h = self.pieces.remove(&piece)?;
+        self.pending = self.pending.saturating_sub(h.pending_bytes());
+        Some(h)
+    }
+}
+
+/// Feeds the blocks of `writes` that were written (per `events`) to their
+/// pieces' hashers.
+fn feed_hashers(
+    hashers: &Mutex<Hashers>,
+    content: &Content,
+    writes: &[(BlockRef, Bytes)],
+    events: &[Event],
+) {
+    let info = content.metainfo.info();
+    let mut hashers = hashers.lock().unwrap_or_else(PoisonError::into_inner);
+    for (block, data) in writes {
+        if !events.contains(&Event::BlockWritten { block: *block }) {
+            continue;
+        }
+        let Hashers { pieces, pending } = &mut *hashers;
+        let Some(h) = (match pieces.entry(block.piece) {
+            std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                PieceHasher::new(info, block.piece).map(|h| e.insert(h))
+            }
+        }) else {
+            continue;
+        };
+        let before = h.pending_bytes();
+        let usable = h.add(block.offset, data.clone());
+        *pending = (*pending + h.pending_bytes()).saturating_sub(before);
+        if usable && *pending > MAX_HASH_PENDING {
+            // Too many early blocks: this piece is read back instead.
+            *pending = pending.saturating_sub(h.pending_bytes());
+            pieces.remove(&block.piece);
+        }
+    }
 }
 
 /// Most block writes (or upload reads) sent to storage as one batch.

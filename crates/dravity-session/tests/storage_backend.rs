@@ -169,3 +169,84 @@ async fn torrents_move_between_io_uring_and_blocking_sessions() {
     round_trip(StorageBackend::IoUring, StorageBackend::Blocking).await;
     round_trip(StorageBackend::Blocking, StorageBackend::IoUring).await;
 }
+
+/// Memory storage that counts the bytes read from it.
+#[derive(Debug)]
+struct CountingStorage {
+    inner: dravity_storage::MemoryStorage,
+    read: std::sync::atomic::AtomicU64,
+}
+
+impl dravity_storage::Storage for CountingStorage {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), dravity_storage::StorageError> {
+        self.inner.write_at(offset, data)
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), dravity_storage::StorageError> {
+        self.read
+            .fetch_add(buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.inner.read_at(offset, buf)
+    }
+    fn flush(&self) -> Result<(), dravity_storage::StorageError> {
+        self.inner.flush()
+    }
+}
+
+/// Downloads into counting memory storage and returns the bytes read back.
+async fn bytes_read_back(hash_on_arrival: bool) -> u64 {
+    let (m, files) = torrent();
+    let seed_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(seed_dir.path().join("pair")).unwrap();
+    for (name, data) in &files {
+        std::fs::write(seed_dir.path().join("pair").join(name), data).unwrap();
+    }
+    let seeder = Session::new(config(StorageBackend::Blocking)).unwrap();
+    let port = seeder.listen_port().unwrap();
+    let seeding = wait_finished(&seeder, &m);
+    seeder
+        .add_torrent(m.clone(), AddTorrentOptions::new(seed_dir.path()))
+        .unwrap();
+    seeding.await;
+
+    let mut c = config(StorageBackend::Blocking);
+    c.hash_on_arrival = hash_on_arrival;
+    c.engine.check_existing = false;
+    c.engine.seed = false;
+    let leecher = Session::new(c).unwrap();
+    let storage = std::sync::Arc::new(CountingStorage {
+        inner: dravity_storage::MemoryStorage::new(m.info().total_length()),
+        read: std::sync::atomic::AtomicU64::new(0),
+    });
+    let done = wait_finished(&leecher, &m);
+    let dir = tempfile::tempdir().unwrap();
+    leecher
+        .add_torrent(
+            m.clone(),
+            AddTorrentOptions::new(dir.path())
+                .with_storage(storage.clone())
+                .with_peers([SocketAddr::from(([127, 0, 0, 1], port))]),
+        )
+        .unwrap();
+    done.await;
+    let stream: Vec<u8> = files.iter().flat_map(|f| f.1.clone()).collect();
+    let mut back = vec![0; stream.len()];
+    dravity_storage::Storage::read_at(storage.as_ref(), 0, &mut back).unwrap();
+    assert_eq!(back, stream);
+    let read = storage.read.load(std::sync::atomic::Ordering::Relaxed) - stream.len() as u64;
+    leecher.shutdown().await;
+    seeder.shutdown().await;
+    read
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downloaded_pieces_are_verified_without_reading_them_back() {
+    let total = torrent().0.info().total_length();
+    assert_eq!(bytes_read_back(true).await, 0);
+    assert_eq!(
+        bytes_read_back(false).await,
+        total,
+        "read-back reads it all"
+    );
+}

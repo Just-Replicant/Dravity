@@ -15,6 +15,7 @@ sound version, with the difference explained), **open** (not started).
 | 3 | Global connection cap with one admit function and a loom model | done | `feat(core,session): session-wide connection cap` | [notes](#3-connection-cap) |
 | 4 | Session-wide hash pool | done | `perf(session): share one hash pool across torrents` | [notes](#4-hash-pool) |
 | 5 | Sans-IO purity tripwire tests | done | `test: sans-IO purity tripwires` | [notes](#5-purity-tripwires) |
+| 6 | Hash on arrival | done | `perf(core,session): verify pieces as their blocks are written` | [notes](#6-hash-on-arrival) |
 
 ## Design notes
 
@@ -104,3 +105,25 @@ these tokens: tokio, `.await`, `async fn`/`async move`, socket types,
 `SystemTime::now`, reqwest and rustix. It skips comments, because doc
 examples may show a clock, and the trailing `mod tests`. A self-test
 proves the checker catches a violation.
+
+### 6. Hash on arrival
+
+`dravity_core::verify::PieceHasher<B>` takes a piece's blocks in any
+order. SHA-1 must see the bytes in order, so the hasher holds a block
+that arrives early until the gap before it closes. A block is exactly
+one 16 KiB v2 leaf, so the SHA-256 leaves are hashed when each block
+arrives, and the final Merkle step only combines 32-byte hashes.
+`verify` and `Info::check_piece` both go through a single digest check
+(`Info::check_digests`), so the two paths cannot disagree. A proptest
+compares them over random block orders, v2 and hybrid layouts, and
+corruptions.
+
+The session feeds the hashers on the blocking write threads, only for
+blocks the storage reported as written, before the `BlockWritten`
+events go out. The hasher is therefore complete by the time the engine
+asks for `HashPiece`. A block added twice breaks the hasher, because
+storage holds the later copy and the hasher cannot vouch for it. Those
+pieces, pieces whose early blocks would push the torrent over 32 MiB,
+and all checks of existing data fall back to reading the piece back.
+A storage test counts the bytes read and shows that a download reads
+back nothing (before this change it read back the whole torrent).

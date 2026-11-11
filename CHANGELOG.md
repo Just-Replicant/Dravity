@@ -56,6 +56,15 @@ Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/ir
   for every file of `dravity-core`, `-engine`, `-wire` and `-bencode`,
   fail the build when a sans-IO module mentions tokio, `.await`, sockets,
   `std::fs`, threads or the clock (comments and unit tests excepted).
+- **Hash on arrival (item 6):** downloaded pieces are verified from their
+  blocks as they are written: `dravity_core::verify::PieceHasher` feeds
+  SHA-1 in order (holding early blocks) and hashes each block's SHA-256
+  leaf at once, then checks with the same rules as `Info::check_piece`
+  (now built on a shared digest check). The session feeds it on the write
+  threads and answers `Effect::HashPiece` without reading the piece back
+  (`SessionConfig::hash_on_arrival`, default on). Rechecks, duplicate
+  blocks and pieces whose early blocks exceed 32 MiB per torrent still
+  read back. Hybrids no longer hash a piece twice from disk.
 
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 

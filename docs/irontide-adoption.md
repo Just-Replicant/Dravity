@@ -33,6 +33,7 @@ sound version, with the difference explained), **open** (not started).
 | 20 | IP filter (eMule .dat, P2P, CIDR) and --ip-filter | done | `feat(session,cli): IP filter lists` | [notes](#20-ip-filter) |
 | 21 | PCP (RFC 6887) before NAT-PMP and UPnP | partial | `feat(portmap): PCP port mapping` | [notes](#21-pcp) |
 | 22 | Native DHT building blocks: KRPC codec, BEP 42 ids, UDP demux | partial | `feat(dht): KRPC codec, BEP 42 secure ids and a UDP datagram classifier` | [notes](#22-native-dht-building-blocks) |
+| 23 | Proxy support: SOCKS4, SOCKS5, HTTP CONNECT | partial | `feat(session,tracker,webseed,cli): dial peers through SOCKS4/5 and HTTP CONNECT proxies` | [notes](#23-proxy-support) |
 
 ## Design notes
 
@@ -405,3 +406,11 @@ turns LSD on.
 - `demux.rs` classifies by first byte: a bencoded dictionary is KRPC, a 20+ byte packet with version 1 and type 0 to 4 is uTP, and `00 00 00 0..3` with 8+ bytes is a BEP 15 tracker response. The three never overlap.
 - All three are in a new purity tripwire test for the crate.
 - **Partial, why:** the item asks to replace `mainline` with a native dual-stack DHT (routing table, lookups, BEP 43/44/51/33) on one socket shared with uTP and UDP trackers. That is several weeks of work (the comparison rated it L) and swapping a working DHT for a new one needs interop testing against the live network, which this offline environment cannot do. These modules are the tested foundation for that swap: the codec, the id rules and the socket classifier a shared socket needs.
+
+### 23. Proxy support
+
+- `dravity-session/src/proxy.rs` keeps the protocol bytes in plain functions (`socks4_request`/`socks4_reply`, `socks5_greeting`/`socks5_auth`/`socks5_request`/`socks5_reply_len`, `http_connect_request`/`http_connect_reply`, `udp_header`/`parse_udp_header`), tested without sockets, and `proxy::connect` drives them over a `TcpStream`. The HTTP reply is read byte by byte (capped at 8 KiB) so no peer bytes after the header are swallowed. `Proxy::parse` takes `socks4://`, `socks5://` and `http://` URLs with percent-encoded credentials; `Debug` never prints the password.
+- Peer dials go through the proxy in `peer::connect` when it is set. uTP is skipped (a TCP proxy cannot carry it), and failures surface as ordinary connect failures so the engine's retry and back-off logic is unchanged.
+- Tracker and web seed clients take an explicit `http_proxy` via `reqwest::Proxy::all`. The session fills both from an HTTP `SessionConfig::proxy` unless they already set their own. The web seed client keeps `no_proxy()` otherwise, and the tracker client keeps reqwest's default.
+- Tests: five unit tests on the byte formats (SOCKS4/5 requests and replies, RFC 7617 Basic example, UDP header round trip, URL parsing and refusal), a doc test, `tests/proxy.rs` (a full download through an in-process SOCKS5-with-auth, SOCKS4 and HTTP CONNECT proxy, checking the proxy saw only the seed; a refused SOCKS5 password means no connection), and a CLI test for a bad `--proxy` URL.
+- **Partial, why:** (1) SOCKS proxies do not carry HTTP trackers or web seeds, because reqwest's `socks` feature needs the `tokio-socks` crate, which is not available in this offline build. Use an HTTP proxy for those. (2) UDP is not proxied: DHT, UDP trackers, LSD and incoming uTP still go direct. The UDP ASSOCIATE codec is the groundwork for a relay. (3) No I2P/SAM, which the comparison rated L. Incoming connections are never proxied, which matches libtorrent's behaviour for SOCKS without BIND.

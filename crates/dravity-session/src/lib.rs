@@ -84,6 +84,7 @@ mod listen;
 mod lsd;
 mod peer;
 pub mod persist;
+pub mod proxy;
 mod queue;
 mod rate;
 mod settings;
@@ -357,12 +358,22 @@ impl Session {
             .map(|c| u8::try_from(c).unwrap_or(b'x'))
             .collect();
         let peer_id = PeerId::with_prefix(&config.peer_id_prefix, &suffix);
-        let tracker = TrackerClient::new(config.tracker.clone())?;
+        let proxy_url = config.proxy.as_ref().and_then(proxy::Proxy::http_url);
+        let mut tracker_config = config.tracker.clone();
+        if tracker_config.http_proxy.is_none() {
+            tracker_config.http_proxy.clone_from(&proxy_url);
+        }
+        let tracker = TrackerClient::new(tracker_config)?;
         let (storage_backend, file_io) = storage_io(config.storage_backend);
         let web_seed = config
             .web_seed
-            .as_ref()
-            .map(WebSeedClient::new)
+            .clone()
+            .map(|mut web_seed| {
+                if web_seed.http_proxy.is_none() {
+                    web_seed.http_proxy.clone_from(&proxy_url);
+                }
+                WebSeedClient::new(&web_seed)
+            })
             .transpose()?;
         let listener = config
             .listen

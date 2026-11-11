@@ -442,6 +442,20 @@ fn rejects_a_global_limit_below_the_minimum() {
 }
 
 #[test]
+fn a_bad_proxy_url_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (torrent, _) = write_torrent(dir.path(), &content());
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .args(["--proxy", "ftp://proxy.example:21"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--proxy"));
+}
+
+#[test]
 fn an_ip_filter_blocking_the_seed_stops_the_download() {
     let dir = tempfile::tempdir().unwrap();
     let data = content();

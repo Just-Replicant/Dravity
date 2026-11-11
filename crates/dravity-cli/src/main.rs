@@ -247,6 +247,12 @@ struct NetworkArgs {
     /// PeerGuardian P2P text, or one address, range or CIDR per line).
     #[arg(long, value_name = "FILE")]
     ip_filter: Option<PathBuf>,
+    /// Dial peers through a proxy: `socks5://[user:pass@]host:port`,
+    /// `socks4://host:port` or `http://[user:pass@]host:port` (an HTTP
+    /// proxy also carries HTTP trackers and web seeds). UDP (DHT, UDP
+    /// trackers, LSD) is not proxied; add `--no-dht --no-lsd` for that.
+    #[arg(long, value_name = "URL")]
+    proxy: Option<String>,
     /// Do not use the DHT for peer discovery.
     #[arg(long)]
     no_dht: bool,
@@ -356,6 +362,10 @@ impl NetworkArgs {
                 );
             }
             config.ip_filter = Some(std::sync::Arc::new(filter));
+        }
+        if let Some(url) = &self.proxy {
+            config.proxy =
+                Some(dravity_session::proxy::Proxy::parse(url).context("parsing --proxy")?);
         }
         config.engine.tracker_exchange = !self.no_tracker_exchange;
         if !self.no_lsd && config.listen.is_some() {

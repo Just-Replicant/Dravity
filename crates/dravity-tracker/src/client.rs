@@ -34,6 +34,9 @@ pub struct ClientConfig {
     /// never downgrade and never move from a non-local tracker to a
     /// non-public address (literal or resolved).
     pub ssrf_mitigation: bool,
+    /// Send HTTP(S) announces and scrapes through this HTTP proxy
+    /// (`http://[user:pass@]host:port`). UDP trackers are not proxied.
+    pub http_proxy: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -44,6 +47,7 @@ impl Default for ClientConfig {
             udp_retries: 2,
             user_agent: concat!("Dravity/", env!("CARGO_PKG_VERSION")).to_owned(),
             ssrf_mitigation: true,
+            http_proxy: None,
         }
     }
 }
@@ -213,6 +217,9 @@ impl TrackerClient {
                 }));
         } else {
             builder = builder.redirect(Policy::limited(guard::MAX_REDIRECTS));
+        }
+        if let Some(url) = &config.http_proxy {
+            builder = builder.proxy(reqwest::Proxy::all(url.as_str())?);
         }
         let http = builder.build()?;
         Ok(Self {

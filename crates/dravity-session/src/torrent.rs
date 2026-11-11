@@ -1552,6 +1552,7 @@ impl TorrentTask {
             encryption: self.ctx.config.encryption,
             hints,
             rates: self.ctx.rates.clone(),
+            proxy: self.ctx.config.proxy.clone().map(Arc::new),
         };
         // Peer tasks are not in `background`: dropping their command sender
         // ends them, and they must not delay shutdown.

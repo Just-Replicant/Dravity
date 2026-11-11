@@ -130,6 +130,11 @@ pub struct SessionConfig {
     /// ([`crate::IpFilter`]); replace it at runtime with
     /// [`crate::Session::set_ip_filter`].
     pub ip_filter: Option<std::sync::Arc<crate::IpFilter>>,
+    /// Dial peers through this proxy (TCP only: uTP is skipped while a
+    /// proxy is set). An HTTP proxy also carries HTTP(S) tracker and web
+    /// seed requests. UDP traffic (DHT, UDP trackers, LSD) and incoming
+    /// connections are not proxied. `None` (the default) connects directly.
+    pub proxy: Option<crate::proxy::Proxy>,
     /// Local Service Discovery (BEP 14): find peers of the same torrents on
     /// the local network by multicast. Needs a listener; private torrents
     /// never use it. `None` (the default) turns it off.
@@ -201,6 +206,7 @@ impl Default for SessionConfig {
             max_active_downloads: None,
             max_active_seeds: None,
             ip_filter: None,
+            proxy: None,
             lsd: None,
             scrape_interval: None,
             stop_announce_timeout: Duration::from_secs(5),

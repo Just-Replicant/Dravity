@@ -49,6 +49,8 @@ pub(crate) struct PeerParams {
     pub(crate) hints: DialHints,
     /// The session-wide rate limits.
     pub(crate) rates: RateLimits,
+    /// Dial through this proxy (TCP only) instead of directly.
+    pub(crate) proxy: Option<Arc<crate::proxy::Proxy>>,
 }
 
 /// Why a handshake failed.
@@ -145,6 +147,16 @@ enum Failed {
 
 /// Opens a raw connection over one transport.
 async fn connect(transport: Transport, params: &PeerParams) -> std::io::Result<RawStream> {
+    if let Some(proxy) = &params.proxy {
+        let tcp = crate::proxy::connect(proxy, params.addr)
+            .await
+            .map_err(|e| match e {
+                crate::proxy::ProxyError::Io(io) => io,
+                other => std::io::Error::new(std::io::ErrorKind::ConnectionRefused, other),
+            })?;
+        tcp.set_nodelay(true)?;
+        return Ok(RawStream::Tcp(tcp));
+    }
     Ok(match (transport, &params.utp) {
         (Transport::Utp, Some(utp)) => RawStream::Utp(utp.connect(params.addr).await?),
         _ => {
@@ -543,6 +555,7 @@ mod tests {
             encryption: Policy::Disabled,
             hints: DialHints::default(),
             rates: RateLimits::new(None, None),
+            proxy: None,
         };
         tokio::spawn(run(
             params,

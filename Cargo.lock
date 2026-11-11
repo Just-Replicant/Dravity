@@ -682,6 +682,7 @@ dependencies = [
  "dravity-engine",
  "dravity-http",
  "dravity-session",
+ "dravity-storage",
  "dravity-wire",
  "ratatui",
  "sha1",

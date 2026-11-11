@@ -26,6 +26,7 @@
 
 mod alloc;
 pub mod cache;
+pub mod create;
 mod error;
 mod file;
 mod io;
@@ -42,6 +43,7 @@ use dravity_core::{BlockRef, Info, PieceLayout};
 
 pub use alloc::{Durability, PreallocateMode};
 pub use cache::{CacheStats, CachedStorage, ReadCache};
+pub use create::{CreateTorrentError, create_torrent};
 pub use error::StorageError;
 pub use file::{DEFAULT_MAX_OPEN_FILES, FileStorage};
 pub use io::{BlockingIo, FileIo, OpenFile};

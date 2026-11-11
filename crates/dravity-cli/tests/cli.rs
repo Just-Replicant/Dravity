@@ -709,3 +709,66 @@ fn serve_watches_serves_the_api_and_restores_its_torrents() {
     assert!(body.contains(&hash.to_hex()), "{body}");
     interrupt(&mut child);
 }
+
+#[test]
+fn create_writes_a_torrent_that_info_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("share");
+    std::fs::create_dir_all(src.join("docs")).unwrap();
+    std::fs::write(src.join("a.bin"), content()).unwrap();
+    std::fs::write(src.join("docs/readme.txt"), b"hello").unwrap();
+    let out_file = dir.path().join("share.torrent");
+    let run = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_dravity"))
+            .arg("create")
+            .arg(&src)
+            .arg("--output")
+            .arg(&out_file)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let out = run(&[
+        "--tracker",
+        "http://t1/announce,http://t2/announce",
+        "--tracker",
+        "udp://t3:80",
+        "--web-seed",
+        "http://ws/",
+        "--private",
+        "--source",
+        "X",
+        "--piece-length",
+        "32K",
+        "--no-date",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("v2 hash:"), "{stdout}");
+    let m = Metainfo::from_bytes(&std::fs::read(&out_file).unwrap()).unwrap();
+    assert_eq!(m.info().name(), "share");
+    assert_eq!(m.info().piece_length(), 32 * 1024);
+    assert!(m.info().is_private());
+    assert_eq!(m.announce_list().len(), 2);
+    assert_eq!(m.web_seeds(), ["http://ws/"]);
+    assert!(m.creation_date().is_none());
+    // An existing file is kept unless --force.
+    let again = run(&["--torrent-version", "v1"]);
+    assert!(!again.status.success());
+    let forced = run(&["--torrent-version", "v1", "--force"]);
+    assert!(forced.status.success());
+    let m = Metainfo::from_bytes(&std::fs::read(&out_file).unwrap()).unwrap();
+    assert!(m.info_hash_v2().is_none());
+    assert!(m.creation_date().is_some());
+    // `info` reads it back.
+    let info = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("info")
+        .arg(&out_file)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.stdout).contains("share"));
+}

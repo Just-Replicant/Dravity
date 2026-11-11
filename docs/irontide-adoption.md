@@ -22,6 +22,7 @@ sound version, with the difference explained), **open** (not started).
 | 10 | Piece reservation / extent affinity | done | `feat(engine): reserve started pieces for the peer that started them` | [notes](#10-piece-reservation) |
 | 11 | Preallocation and durability modes | done | `feat(storage,session): preallocation and durability modes` | [notes](#11-preallocation-and-durability) |
 | 12 | Seed choking variants and an upload slot tuner | done | `feat(engine): seed choking modes and an upload slot tuner` | [notes](#12-seed-choking-and-slot-tuner) |
+| 13 | Torrent creation (v1/v2/hybrid, BEP 47 pads, auto piece size) and dravity create | done | `feat(core,storage,cli): torrent creation and dravity create` | [notes](#13-torrent-creation) |
 
 ## Design notes
 
@@ -252,3 +253,40 @@ Unit tests cover each ranking and the tuner arithmetic. Scripted engine
 tests cover the round-robin hand-over and tuner growth and shrinkage.
 irontide's own variants use randomness for ties. Dravity keeps the
 choker deterministic, as it already did for the optimistic unchoke.
+
+### 13. Torrent creation
+
+`TorrentCreator::new(name, files, single, options)` sorts files by path.
+BEP 52 orders the file tree that way, and a hybrid's v1 list must
+match it. The caller feeds the bytes in `files()` order, split
+anywhere. The creator streams both hashes:
+
+* SHA-1 over the v1 content stream. Zeros are fed for BEP 47 pads
+  (`.pad/<n>`, `attr = "p"`), which follow every unaligned file except
+  the last.
+* SHA-256 leaves per 16 KiB block for each file. The piece layer comes
+  from `merkle::root_padded`, and the pieces root from
+  `merkle::root_from_layer`. A file of at most one piece has no layer.
+  An empty file has no root.
+
+`finish()` encodes the info dictionary and the root dictionary
+(`announce`, `announce-list`, `url-list`, `piece layers`, comment,
+creator and date) with `dravity_bencode::Value`. Paths are checked with
+Dravity's own portable component rules, so every torrent it creates is
+one it can download. The automatic piece length is the smallest power
+of two from 16 KiB to 16 MiB that keeps the piece count at about 1500
+or fewer.
+
+The core does no I/O, so the sans-IO tripwire still covers it.
+`dravity_storage::create_torrent` walks the tree. It skips symlinks,
+which could point outside it, rejects non-UTF-8 names, reads in 1 MiB
+chunks, and fails if a file changes size during hashing.
+
+Tests check every piece of v1, v2 and hybrid output with
+`Info::check_piece`. Roots are compared with `merkle::file_hashes`. A
+proptest shows that any split of the input gives the same info
+dictionary. A storage test verifies a created directory torrent with
+`FileStorage`. A CLI test covers trackers, tiers, `--private`,
+`--source`, `--no-date` and `--force`. Hashing is single-threaded.
+irontide hashes in parallel; this can come later because the creator
+is sans-IO and its v1 and v2 streams are independent.

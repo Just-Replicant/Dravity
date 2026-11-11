@@ -104,6 +104,51 @@ enum Command {
         #[command(flatten)]
         network: NetworkArgs,
     },
+    /// Create a `.torrent` file from a file or directory.
+    Create {
+        /// The file or directory to share.
+        path: PathBuf,
+        /// Where to write the torrent (defaults to `<NAME>.torrent`).
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// `v1`, `v2` (BEP 52) or `hybrid` (both, one swarm).
+        #[arg(
+            long = "torrent-version",
+            value_name = "VERSION",
+            default_value = "hybrid"
+        )]
+        version: dravity_core::create::CreateVersion,
+        /// Piece length, a power of two of at least 16K (default: chosen
+        /// from the total size).
+        #[arg(long, value_name = "SIZE", value_parser = format::parse_rate)]
+        piece_length: Option<u64>,
+        /// Tracker URL (repeatable). Each flag is its own tier; separate
+        /// URLs with commas to put them in one tier.
+        #[arg(short, long = "tracker", value_name = "URL")]
+        trackers: Vec<String>,
+        /// Web seed URL (repeatable, BEP 19).
+        #[arg(short = 'w', long = "web-seed", value_name = "URL")]
+        web_seeds: Vec<String>,
+        /// Mark the torrent private (no DHT, PEX or local discovery).
+        #[arg(long)]
+        private: bool,
+        /// Pad files to piece boundaries in a v1 torrent too (BEP 47).
+        #[arg(long)]
+        pad: bool,
+        /// Free-form comment.
+        #[arg(long)]
+        comment: Option<String>,
+        /// `source` tag, which gives the same files a distinct info hash
+        /// per private tracker.
+        #[arg(long)]
+        source: Option<String>,
+        /// Leave out the creation date (reproducible output).
+        #[arg(long)]
+        no_date: bool,
+        /// Replace an existing output file.
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Show what a `.torrent` file or `magnet:` link contains.
     Info {
         /// Path to a `.torrent` file, or a `magnet:` link.
@@ -344,6 +389,48 @@ fn check_terminal(tui: bool) -> Result<()> {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Create {
+            path,
+            output,
+            version,
+            piece_length,
+            trackers,
+            web_seeds,
+            private,
+            pad,
+            comment,
+            source,
+            no_date,
+            force,
+        } => {
+            let mut options = dravity_core::create::CreateOptions::new(version);
+            options.piece_length = piece_length
+                .map(|l| u32::try_from(l).context("piece length is too large"))
+                .transpose()?;
+            options.trackers = trackers
+                .iter()
+                .map(|t| {
+                    t.split(',')
+                        .map(str::trim)
+                        .filter(|u| !u.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .collect();
+            options.web_seeds = web_seeds;
+            options.private = private;
+            options.pad_files = pad;
+            options.comment = comment;
+            options.source = source;
+            options.created_by = Some(concat!("dravity/", env!("CARGO_PKG_VERSION")).to_owned());
+            if !no_date {
+                options.creation_date = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|d| i64::try_from(d.as_secs()).ok());
+            }
+            create(&path, output, force, options)
+        }
         Command::Info { torrent } => match load(&torrent)? {
             Input::File(m) => info(&m),
             Input::Magnet(m) => magnet_info(&m),
@@ -460,6 +547,47 @@ fn magnet_info(m: &Magnet) -> Result<()> {
         writeln!(out, "peer:       {peer}")?;
     }
     writeln!(out, "(files are known once the metadata is fetched)")?;
+    Ok(())
+}
+
+/// `dravity create`: hashes `path` and writes the torrent.
+fn create(
+    path: &Path,
+    output: Option<PathBuf>,
+    force: bool,
+    options: dravity_core::create::CreateOptions,
+) -> Result<()> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("{}", path.display()))?;
+    let bytes = dravity_storage::create_torrent(&path, options, |_| {})
+        .with_context(|| format!("creating a torrent of {}", path.display()))?;
+    let m = Metainfo::from_bytes(&bytes).context("the created torrent does not parse")?;
+    let output = output.unwrap_or_else(|| PathBuf::from(format!("{}.torrent", m.info().name())));
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true);
+    if force {
+        open.create(true).truncate(true);
+    } else {
+        open.create_new(true);
+    }
+    let mut file = open
+        .open(&output)
+        .with_context(|| format!("writing {}", output.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("writing {}", output.display()))?;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "created:    {}", output.display())?;
+    writeln!(out, "info-hash:  {}", m.info_hash())?;
+    if let Some(v2) = m.info_hash_v2() {
+        writeln!(out, "v2 hash:    {v2}")?;
+    }
+    writeln!(
+        out,
+        "pieces:     {} x {}",
+        m.info().piece_count(),
+        format::bytes(u64::from(m.info().piece_length()))
+    )?;
     Ok(())
 }
 

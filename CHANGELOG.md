@@ -106,6 +106,13 @@ Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/ir
   seeding. `Config::upload_slots_auto` re-derives the slot count every
   round from measured upload rates. `TorrentState::upload_slots`. The
   CLI flags are `--seed-choking` and `--auto-upload-slots`.
+- **Torrent creation (item 13):** `dravity_core::create::TorrentCreator`
+  is a sans-IO creator for v1, v2 and hybrid torrents. It handles BEP 47
+  padding (always for hybrids, optional for v1), automatic piece length
+  (`auto_piece_length`), trackers in tiers, web seeds, `private`,
+  `source`, comments and dates. `dravity_storage::create_torrent` walks a
+  file or directory. The new `dravity create` command writes the
+  `.torrent` and prints its info hashes.
 
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 

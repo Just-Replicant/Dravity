@@ -37,7 +37,7 @@ for the full architecture, comparison with existing clients, and roadmap.
 | [`dravity-dht`](crates/dravity-dht) | ✅ Phase 2 | Mainline DHT (BEP 5) peer lookups and announces, wrapping [`mainline`](https://crates.io/crates/mainline) |
 | [`dravity-session`](crates/dravity-session) | ✅ Phase 6 | The only I/O driver: per-torrent owner task on Tokio, peer tasks, TCP/uTP listener (IPv4 + IPv6), disk/hash offload, uploads, magnets, DHT, port mapping, fastresume, BEP 12 tiers, alerts; file priorities, streaming `FileStream`, pause/resume/remove, persisted state + restore, watch folder; peer and tracker reads; v2/hybrid torrents (both swarms of a hybrid, on the DHT, trackers and listener), web seeds as virtual peers, storage backend selection, MSE/PE encryption policies with PEX-informed dialing |
 | [`dravity-http`](crates/dravity-http) | ✅ Phase 4 | axum JSON API over the session: torrents, files, priorities, streaming with `Range`, server-sent alerts, Prometheus `/metrics`, bearer token |
-| [`dravity-cli`](crates/dravity-cli) | ✅ Phase 6 | `dravity download` / `info` / `serve` for files and magnet links, seeding, file selection, a full ratatui `--tui` client (add, remove, peers, trackers, alerts); renders alerts, never drives I/O |
+| [`dravity-cli`](crates/dravity-cli) | ✅ Phase 6 | `dravity download` / `info` / `create` / `serve` for files and magnet links, seeding, file selection, a full ratatui `--tui` client (add, remove, peers, trackers, alerts); renders alerts, never drives I/O |
 | [`dravity-utp`](crates/dravity-utp) | ✅ Phase 6 | uTP (BEP 29): packet codec, sans-IO connection with LEDBAT congestion control, Tokio socket and streams |
 | [`dravity-portmap`](crates/dravity-portmap) | ✅ Phase 4 | Router port mapping: NAT-PMP (RFC 6886) and UPnP IGD codecs, `PortMapper` that maps, renews and removes and reports the external port |
 | [`dravity-webseed`](crates/dravity-webseed) | ✅ Phase 6 | Web seeds (BEP 19): sans-IO plan of file URLs and HTTP ranges (padding as zeros), strict ranged HTTP(S) client (rustls) |
@@ -195,6 +195,8 @@ cargo run --release -p dravity-cli -- serve --download-dir downloads --tui
 DRAVITY_TOKEN=change-me cargo run --release -p dravity-cli -- serve \
     --download-dir downloads --watch torrents
 curl -H 'Authorization: Bearer change-me' localhost:9091/api/v1/torrents
+# make a hybrid (v1 + v2) torrent of a directory, with a tracker and a web seed
+cargo run --release -p dravity-cli -- create ./share -t http://tracker/announce -w https://host/share/
 ```
 
 `dravity serve` keeps its state in `<download-dir>/.dravity` (`--state-dir`

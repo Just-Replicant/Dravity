@@ -36,6 +36,7 @@ sound version, with the difference explained), **open** (not started).
 | 23 | Proxy support: SOCKS4, SOCKS5, HTTP CONNECT | partial | `feat(session,tracker,webseed,cli): dial peers through SOCKS4/5 and HTTP CONNECT proxies` | [notes](#23-proxy-support) |
 | 24 | Peer extras: GeoIP country, DSCP marking, persistent web-seed stats | done | `feat(session,cli): GeoIP peer countries, DSCP marking and persistent web seed back-off` | [notes](#24-peer-extras) |
 | 25 | BEP 55 holepunch (ut_holepunch) | done | `feat(wire,engine,cli): BEP 55 ut_holepunch relaying and rendezvous` | [notes](#25-bep-55-holepunch) |
+| 26 | BEP 52 conformance vector suite | done | `test(core): BEP 52 conformance vectors from an independent reference` | [notes](#26-bep-52-conformance-vectors) |
 
 ## Design notes
 
@@ -433,3 +434,10 @@ turns LSD on.
 - PEX: we set flag `0x08` for connected peers whose handshake lists `ut_holepunch`.
 - Scope: only the download/seed state relays. The metadata phase of a magnet does not, because its peers are short-lived. Whether a punch gets through a real NAT cannot be tested on loopback, so the tests check the protocol exchange, not NAT traversal.
 - Tests: a codec round-trip and refusal test plus a doc test, and two engine tests: the relay pairs two peers and returns each error code, and a failed dial asks the PEX source once and dials over uTP on `Connect`, with the feature off when disabled. The CLI test now passes `--no-holepunch`.
+
+### 26. BEP 52 conformance vectors
+
+- The vectors are not produced by Dravity. `tests/data/bep52_vectors.py` is a separate, deliberately naive implementation written from the BEP text: it builds the full tree with 32 zero-byte padding leaves, and builds each piece-layer hash from the piece's leaves padded to a full piece. Its output is pasted in as `VECTORS`, and the script is kept so the vectors can be regenerated.
+- Sizes: 1, 100, 16383, 16384, 16385, 32767, 32768, 32769, 65536, 65537, 3 leaves + 5 bytes, 7 leaves, and 9 leaves + 1 byte, each at three piece lengths. That covers files under one leaf, an exact leaf, one byte over, an exact piece, a short last piece, and leaf counts that are not a power of two.
+- Checks: `merkle::file_hashes` (root and layer), `root_from_layer` agreeing with the root, `pad_hash(0)` being zeros and `pad_hash(1)` being SHA-256 of 64 zero bytes, and an empty file having no root. Real multi-file v2 torrents are built with `TorrentCreator` and their `pieces root`s and `piece layers` compared with the vectors. Single-piece files must have no layer, and the v2 info hash must equal SHA-256 of `info_bytes()`.
+- All three tests passed on the first run apart from a test bug: v2 files are aligned to pieces, so the stream model shows padding entries, and the test now skips them. No library change was needed.

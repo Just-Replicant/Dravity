@@ -14,11 +14,13 @@ publish.workspace = true
 [dependencies]
 dravity-bencode.workspace = true
 dravity-core.workspace = true
+ed25519-dalek.workspace = true
 fastrand.workspace = true
 futures-util.workspace = true
 mainline.workspace = true
 sha1.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
+tracing.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

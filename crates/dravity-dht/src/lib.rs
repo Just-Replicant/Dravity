@@ -19,7 +19,9 @@
 //! # let _ = peers; Ok(()) }
 //! ```
 
+pub mod bloom;
 pub mod demux;
+pub mod items;
 pub mod krpc;
 pub mod native;
 pub mod routing;
@@ -175,7 +177,13 @@ impl Dht {
             config.bind_address.unwrap_or(Ipv4Addr::UNSPECIFIED),
             config.port.unwrap_or(0),
         ))?;
-        let node = native::NativeDht::from_std(socket, NATIVE_QUERY_TIMEOUT)?;
+        let node = native::NativeDht::from_std(
+            socket,
+            native::NativeConfig {
+                timeout: NATIVE_QUERY_TIMEOUT,
+                ..native::NativeConfig::default()
+            },
+        )?;
         let bootstrap = std::sync::Arc::new(
             config
                 .bootstrap

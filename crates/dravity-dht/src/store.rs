@@ -64,7 +64,7 @@ impl Tokens {
 /// Peers announced to us, per info-hash, bounded in both directions.
 #[derive(Debug, Clone)]
 pub struct PeerStore {
-    peers: HashMap<[u8; 20], Vec<(SocketAddr, Instant)>>,
+    peers: HashMap<[u8; 20], Vec<(SocketAddr, Instant, bool)>>,
     max_hashes: usize,
     max_per_hash: usize,
 }
@@ -82,45 +82,99 @@ impl PeerStore {
     }
 
     /// Records `peer` for `info_hash` (refreshing it if known). A new
-    /// info-hash beyond the limit, or a new peer beyond the per-hash
-    /// limit, replaces the oldest entry only once expired entries are gone.
+    /// info-hash beyond the limit is dropped; a new peer beyond the
+    /// per-hash limit replaces the oldest one.
     pub fn announce(&mut self, info_hash: [u8; 20], peer: SocketAddr, now: Instant) {
+        self.announce_as(info_hash, peer, false, now);
+    }
+
+    /// [`Self::announce`], recording whether the peer is a seed (BEP 33).
+    pub fn announce_as(&mut self, info_hash: [u8; 20], peer: SocketAddr, seed: bool, now: Instant) {
         self.expire(now);
         if !self.peers.contains_key(&info_hash) && self.peers.len() >= self.max_hashes {
             return;
         }
         let list = self.peers.entry(info_hash).or_default();
-        if let Some(entry) = list.iter_mut().find(|(addr, _)| *addr == peer) {
+        if let Some(entry) = list.iter_mut().find(|(addr, _, _)| *addr == peer) {
             entry.1 = now;
+            entry.2 = seed;
             return;
         }
         if list.len() >= self.max_per_hash {
-            if let Some(oldest) = list.iter_mut().min_by_key(|(_, at)| *at) {
-                *oldest = (peer, now);
+            if let Some(oldest) = list.iter_mut().min_by_key(|(_, at, _)| *at) {
+                *oldest = (peer, now, seed);
             }
             return;
         }
-        list.push((peer, now));
+        list.push((peer, now, seed));
+    }
+
+    /// The BEP 33 bloom filters of live seeds and downloaders for
+    /// `info_hash`.
+    #[must_use]
+    pub fn blooms(
+        &self,
+        info_hash: &[u8; 20],
+        now: Instant,
+    ) -> (crate::bloom::Bloom, crate::bloom::Bloom) {
+        let (mut seeds, mut peers) = (crate::bloom::Bloom::new(), crate::bloom::Bloom::new());
+        for (addr, at, seed) in self.peers.get(info_hash).into_iter().flatten() {
+            if now.saturating_duration_since(*at) < PEER_TTL {
+                if *seed { &mut seeds } else { &mut peers }.insert(addr.ip());
+            }
+        }
+        (seeds, peers)
+    }
+
+    /// Info-hashes stored.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// `true` with nothing stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
+
+    /// Up to `max` stored info-hashes (BEP 51), starting at the
+    /// `start`-th one (the caller passes a random number so repeated
+    /// samples differ).
+    #[must_use]
+    pub fn sample(&self, max: usize, start: usize) -> Vec<[u8; 20]> {
+        let mut all: Vec<&[u8; 20]> = self.peers.keys().collect();
+        all.sort_unstable();
+        let n = all.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        (0..max.min(n))
+            .filter_map(|i| all.get((start + i) % n).map(|h| **h))
+            .collect()
     }
 
     /// Up to `max` live peers for `info_hash`, newest first.
     #[must_use]
     pub fn peers(&self, info_hash: &[u8; 20], now: Instant, max: usize) -> Vec<SocketAddr> {
-        let mut live: Vec<&(SocketAddr, Instant)> = self
+        let mut live: Vec<&(SocketAddr, Instant, bool)> = self
             .peers
             .get(info_hash)
             .into_iter()
             .flatten()
-            .filter(|(_, at)| now.saturating_duration_since(*at) < PEER_TTL)
+            .filter(|(_, at, _)| now.saturating_duration_since(*at) < PEER_TTL)
             .collect();
-        live.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
-        live.into_iter().take(max).map(|(addr, _)| *addr).collect()
+        live.sort_by_key(|(_, at, _)| std::cmp::Reverse(*at));
+        live.into_iter()
+            .take(max)
+            .map(|(addr, _, _)| *addr)
+            .collect()
     }
 
     /// Drops expired peers and empty info-hashes.
     pub fn expire(&mut self, now: Instant) {
         self.peers.retain(|_, list| {
-            list.retain(|(_, at)| now.saturating_duration_since(*at) < PEER_TTL);
+            list.retain(|(_, at, _)| now.saturating_duration_since(*at) < PEER_TTL);
             !list.is_empty()
         });
     }

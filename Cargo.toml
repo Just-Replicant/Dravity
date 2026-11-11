@@ -37,6 +37,7 @@ anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "tracing"] }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+ed25519-dalek = "3"
 fastrand = "2"
 # OS randomness for MSE keys and padding.
 getrandom = "0.4"

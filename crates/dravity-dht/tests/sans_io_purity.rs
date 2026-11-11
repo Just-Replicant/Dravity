@@ -48,7 +48,9 @@ fn the_checker_sees_io() {
 #[test]
 fn the_codecs_stay_pure() {
     for (name, source) in [
+        ("bloom.rs", include_str!("../src/bloom.rs")),
         ("demux.rs", include_str!("../src/demux.rs")),
+        ("items.rs", include_str!("../src/items.rs")),
         ("krpc.rs", include_str!("../src/krpc.rs")),
         ("routing.rs", include_str!("../src/routing.rs")),
         ("secure_id.rs", include_str!("../src/secure_id.rs")),

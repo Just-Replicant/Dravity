@@ -57,10 +57,7 @@ async fn peers_announced_on_one_node_are_found_from_another() {
 }
 
 async fn exchange(socket: &UdpSocket, to: SocketAddr, query: Query) -> Body {
-    let message = Message {
-        transaction: b"aa".to_vec(),
-        body: Body::Query { id: [9; 20], query },
-    };
+    let message = Message::new(b"aa".to_vec(), Body::Query { id: [9; 20], query });
     socket.send_to(&message.encode(), to).await.unwrap();
     let mut buf = [0u8; 2048];
     let (n, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
@@ -165,4 +162,142 @@ async fn the_dht_facade_runs_the_native_node() {
         vec![SocketAddr::from(([127, 0, 0, 1], 6001))]
     );
     assert_eq!(a.local_addr().await.ip(), std::net::Ipv4Addr::LOCALHOST);
+}
+
+async fn node_at(ip: [u8; 4]) -> NativeDht {
+    NativeDht::bind(SocketAddr::from((ip, 0)), TIMEOUT)
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scrape_sample_and_items_work_across_the_swarm() {
+    let nodes = swarm(16).await;
+    let seed = nodes[0].local_addr().unwrap();
+    let hash = [0x33; 20];
+    // BEP 33 counts addresses: announce from distinct loopback IPs.
+    for (i, is_seed) in [(2u8, true), (3, true), (4, true), (5, false), (6, false)] {
+        let n = node_at([127, 0, 0, i]).await;
+        n.bootstrap(&[seed]).await;
+        let (_, accepted) = n.announce_as(hash, Some(6881), is_seed).await;
+        assert!(accepted >= 1);
+    }
+    let scrape = nodes[9].scrape(hash).await;
+    assert_eq!(scrape.seeds.estimate(), 3);
+    assert_eq!(scrape.peers.estimate(), 2);
+
+    // BEP 51: the announced hash shows up in samples near it.
+    let samples = nodes[4].sample_infohashes(hash).await;
+    assert!(samples.contains(&hash), "{samples:?}");
+
+    // BEP 44 immutable: stored by one node, fetched (and hash-checked) by another.
+    let (target, stored) = nodes[2].put_immutable(b"12:Hello World!").await;
+    assert!(stored >= 1);
+    assert_eq!(
+        nodes[11].get_immutable(target).await.as_deref(),
+        Some(&b"12:Hello World!"[..])
+    );
+    assert_eq!(nodes[11].get_immutable([0xee; 20]).await, None);
+
+    // BEP 44 mutable: a newer sequence number replaces the value.
+    let key = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+    let public = key.verifying_key().to_bytes();
+    assert!(nodes[3].put_mutable(&key, b"salt", 1, b"3:one").await.1 >= 1);
+    assert!(nodes[5].put_mutable(&key, b"salt", 2, b"3:two").await.1 >= 1);
+    assert_eq!(
+        nodes[13].get_mutable(&public, b"salt").await,
+        Some((2, b"3:two".to_vec()))
+    );
+    // An older one is refused, so the value stays.
+    nodes[6].put_mutable(&key, b"salt", 1, b"3:old").await;
+    assert_eq!(
+        nodes[14].get_mutable(&public, b"salt").await,
+        Some((2, b"3:two".to_vec()))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_nodes_query_but_are_not_remembered_or_answering() {
+    let nodes = swarm(4).await;
+    let seed = nodes[0].local_addr().unwrap();
+    let mut config = dravity_dht::native::NativeConfig::default();
+    config.timeout = TIMEOUT;
+    config.read_only = true;
+    let ro = NativeDht::bind_with("127.0.0.1:0".parse().unwrap(), config)
+        .await
+        .unwrap();
+    assert!(ro.bootstrap(&[seed]).await >= 1, "it learns the network");
+    let ro_addr = ro.local_addr().unwrap();
+    for n in &nodes {
+        assert!(
+            !n.nodes().contains(&ro_addr),
+            "BEP 43: not in routing tables"
+        );
+    }
+    let us = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let ping = Message::new(
+        b"p1".to_vec(),
+        Body::Query {
+            id: [1; 20],
+            query: Query::Ping,
+        },
+    );
+    us.send_to(&ping.encode(), ro_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), us.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "a read-only node answers nobody"
+    );
+}
+
+#[tokio::test]
+async fn a_bep42_id_is_taken_once_nodes_report_our_address() {
+    // A fake node that tells every querier it is at a public address.
+    let fake = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let fake_addr = fake.local_addr().unwrap();
+    let public: SocketAddr = "124.31.75.21:6881".parse().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, from) = fake.recv_from(&mut buf).await.unwrap();
+            let q = Message::decode(&buf[..n]).unwrap();
+            let mut reply = Message::new(
+                q.transaction,
+                Body::Response {
+                    id: [0x10; 20],
+                    nodes: Vec::new(),
+                    values: Vec::new(),
+                    token: None,
+                },
+            );
+            reply.ext.ip = Some(public);
+            fake.send_to(&reply.encode(), from).await.unwrap();
+        }
+    });
+    let node = NativeDht::bind("127.0.0.1:0".parse().unwrap(), TIMEOUT)
+        .await
+        .unwrap();
+    node.bootstrap(&[fake_addr]).await;
+    assert_eq!(node.external_ip(), Some(public.ip()));
+    assert!(dravity_dht::secure_id::is_secure(&node.id(), public.ip()));
+    // The node answers with the querier's address (BEP 42 `ip`).
+    let us = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let ping = Message::new(
+        b"p2".to_vec(),
+        Body::Query {
+            id: [1; 20],
+            query: Query::Ping,
+        },
+    );
+    us.send_to(&ping.encode(), node.local_addr().unwrap())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 512];
+    let (n, _) = us.recv_from(&mut buf).await.unwrap();
+    assert_eq!(
+        Message::decode(&buf[..n]).unwrap().ext.ip,
+        Some(us.local_addr().unwrap())
+    );
 }

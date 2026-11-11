@@ -554,6 +554,7 @@ dependencies = [
  "fiat-crypto",
  "rustc_version",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -723,12 +724,14 @@ version = "0.1.0"
 dependencies = [
  "dravity-bencode",
  "dravity-core",
+ "ed25519-dalek",
  "fastrand",
  "futures-util",
  "mainline",
  "sha1",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -943,6 +946,7 @@ dependencies = [
  "ed25519",
  "sha2",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]

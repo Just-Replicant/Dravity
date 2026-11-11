@@ -688,6 +688,7 @@ dependencies = [
  "sha1",
  "tempfile",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

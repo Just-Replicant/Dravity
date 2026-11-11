@@ -79,6 +79,7 @@ mod error;
 mod file_stream;
 mod files;
 mod hash_pool;
+mod ip_filter;
 mod listen;
 mod lsd;
 mod peer;
@@ -123,6 +124,7 @@ pub use dravity_webseed::WebSeedConfig;
 pub use error::SessionError;
 pub use file_stream::{DEFAULT_READAHEAD, FileStream};
 pub use files::FileProgress;
+pub use ip_filter::{EMULE_BLOCK_LEVEL, IpFilter, IpFilterError};
 pub use listen::ListenConfig;
 pub use settings::{LiveSettings, MIN_RATE_LIMIT, SettingsError, SettingsUpdate};
 pub use status::{PeerStatus, ScrapeOutcome, TrackerOutcome, TrackerStatus, Transport};
@@ -382,6 +384,7 @@ impl Session {
             max_active_downloads: config.max_active_downloads,
             max_active_seeds: config.max_active_seeds,
         };
+        let ip_filter = config.ip_filter.clone().unwrap_or_default();
         // The config goes through the same checks as a live update.
         SettingsUpdate::from(live).applied_to(LiveSettings::default())?;
         let rates = rate::RateLimits::new(config.upload_rate_limit, config.download_rate_limit);
@@ -397,7 +400,7 @@ impl Session {
                 alerts,
                 torrents: Arc::new(Mutex::new(HashMap::new())),
                 catalog: Arc::new(Mutex::new(HashMap::new())),
-                bans: Arc::default(),
+                bans: Arc::new(bans::BanList::with_filter(Arc::clone(&ip_filter))),
                 connections,
                 hash_pool,
                 read_cache,
@@ -863,6 +866,25 @@ impl Session {
     /// Returns whether it was banned.
     pub fn unban_ip(&self, ip: IpAddr) -> bool {
         self.inner.bans.remove(ip)
+    }
+
+    /// Replaces the IP filter: blocked addresses are refused by the
+    /// listener and never dialed, and open connections to them are closed
+    /// now. An empty filter blocks nothing.
+    pub fn set_ip_filter(&self, filter: IpFilter) {
+        self.inner.bans.set_filter(Arc::new(filter));
+        for entry in self.inner.catalog().values() {
+            if let Some(tx) = &entry.commands {
+                let _ = tx.try_send(Command::Refilter);
+            }
+        }
+    }
+
+    /// The IP filter in force ([`SessionConfig::ip_filter`] or the last
+    /// [`set_ip_filter`](Self::set_ip_filter)).
+    #[must_use]
+    pub fn ip_filter(&self) -> Arc<IpFilter> {
+        self.inner.bans.filter()
     }
 
     /// Addresses banned in this session, sorted.

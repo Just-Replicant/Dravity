@@ -30,6 +30,7 @@ dravity-session.workspace = true
 dravity-storage.workspace = true
 ratatui.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]

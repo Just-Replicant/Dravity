@@ -12,6 +12,8 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::{Arc, PoisonError, RwLock};
 
+use crate::IpFilter;
+
 /// Shared handle to the session's ban list.
 pub(crate) type Bans = Arc<BanList>;
 
@@ -20,6 +22,8 @@ pub(crate) type Bans = Arc<BanList>;
 #[derive(Debug, Default)]
 pub(crate) struct BanList {
     ips: RwLock<HashSet<IpAddr>>,
+    /// The user's IP filter ([`crate::Session::set_ip_filter`]).
+    filter: RwLock<Arc<IpFilter>>,
 }
 
 /// The key an address is banned under: IPv4-mapped IPv6 is its IPv4 address.
@@ -31,6 +35,14 @@ pub(crate) fn canonical(ip: IpAddr) -> IpAddr {
 }
 
 impl BanList {
+    /// An empty ban list with `filter` in force.
+    pub(crate) fn with_filter(filter: Arc<IpFilter>) -> Self {
+        Self {
+            ips: RwLock::default(),
+            filter: RwLock::new(filter),
+        }
+    }
+
     /// Bans `ip`. Returns whether it was not banned before.
     pub(crate) fn insert(&self, ip: IpAddr) -> bool {
         self.ips
@@ -47,12 +59,23 @@ impl BanList {
             .remove(&canonical(ip))
     }
 
-    /// Whether `ip` is banned.
+    /// Whether `ip` is banned or blocked by the IP filter.
     pub(crate) fn contains(&self, ip: IpAddr) -> bool {
         self.ips
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .contains(&canonical(ip))
+            || self.filter().is_blocked(ip)
+    }
+
+    /// The IP filter in force.
+    pub(crate) fn filter(&self) -> Arc<IpFilter> {
+        Arc::clone(&self.filter.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Replaces the IP filter.
+    pub(crate) fn set_filter(&self, filter: Arc<IpFilter>) {
+        *self.filter.write().unwrap_or_else(PoisonError::into_inner) = filter;
     }
 
     /// Every banned address, sorted.

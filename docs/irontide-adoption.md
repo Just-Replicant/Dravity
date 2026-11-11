@@ -30,6 +30,7 @@ sound version, with the difference explained), **open** (not started).
 | 17 | BEP 53 select-only magnets (so=) | done | `feat(core,session): BEP 53 select-only magnets` | [notes](#17-bep-53-select-only-magnets) |
 | 18 | Wire extensions: upload_only, lt_donthave, super-seeding, lt_tex | done | `feat(wire,engine,session,cli): upload_only, lt_donthave, super-seeding and tracker exchange` | [notes](#18-wire-extensions) |
 | 19 | BEP 40 canonical peer priority | done | `feat(core,engine): BEP 40 canonical peer priority at the connection cap` | [notes](#19-bep-40-peer-priority) |
+| 20 | IP filter (eMule .dat, P2P, CIDR) and --ip-filter | done | `feat(session,cli): IP filter lists` | [notes](#20-ip-filter) |
 
 ## Design notes
 
@@ -380,3 +381,10 @@ turns LSD on.
 - Engine: `external_ip` comes from the latest `yourip` in an extension handshake (unspecified and loopback ignored, so loopback tests are unchanged). At the cap, `on_connected` compares the newcomer with the connected peer of lowest rank (using its reachable address) and evicts that peer only if the newcomer ranks strictly higher; the ranking is deterministic, so two peers cannot flap. While our address is unknown the old behaviour (refuse the newcomer) stays.
 - Dial order stays FIFO: when below the cap every queued address is dialed anyway, and at the cap no dial is made, so ranking the queue would change nothing; the eviction path is where BEP 40 matters.
 - Tests: vectors, symmetry, same-host ports, mapped addresses, IPv6 symmetry, and `at_the_cap_a_higher_bep40_priority_replaces_the_lowest` (unknown address refuses, lower rank refused, higher rank replaces).
+
+### 20. IP filter
+
+- `dravity-session/src/ip_filter.rs` is pure parsing and lookup: lines are tried as eMule (`range , level , description`), then as a bare range, then as P2P (`description:range`, split at the last colon so descriptions may contain colons or dashes). eMule octets may carry leading zeros, which `Ipv4Addr::from_str` refuses, so octets are parsed by hand. Ranges are kept as `(u32, u32)` and `(u128, u128)` intervals, sorted and merged (adjacent ranges too), and looked up with a binary search; IPv4-mapped IPv6 is checked as IPv4. Unreadable lines are counted (`skipped()`), and a file with no usable line at all is an error so a wrong path or format is not silently an empty filter. Files are read lossily so a description in a legacy encoding does not drop its range.
+- The filter lives in the session's `BanList` next to the ban set, so the listener's existing pre-handshake check covers it with no new path. Dials check it in `TorrentTask::connect` and report `PeerConnectFailed { retry: false }`, so PEX, DHT, LSD and tracker peers in a blocked range are dropped from the pool. `set_ip_filter` swaps an `Arc` and sends every torrent `Command::Refilter`, which closes connections (including during a magnet's metadata phase) the new filter blocks. Trackers and web seeds are not filtered (they are URLs, guarded by the SSRF checks).
+- Port filtering from irontide is not added: blocklists in the wild are address-only, and the session already refuses port 0.
+- Tests: three parser unit tests (eMule levels, P2P, CIDR, IPv6, merging, malformed lines, reversed and mixed bounds, `0.0.0.0/0`), a doc test, `tests/ip_filter.rs` (a filtered peer is never dialed until the filter changes; the listener refuses filtered addresses; a live change closes an open connection) and a CLI test (unreadable file is an error; a loopback eMule range keeps the download from finishing).

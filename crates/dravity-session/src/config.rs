@@ -126,6 +126,10 @@ pub struct SessionConfig {
     pub max_active_downloads: Option<usize>,
     /// Torrents seeding at once; later ones wait in the queue.
     pub max_active_seeds: Option<usize>,
+    /// Address ranges whose peers are refused and never dialed
+    /// ([`crate::IpFilter`]); replace it at runtime with
+    /// [`crate::Session::set_ip_filter`].
+    pub ip_filter: Option<std::sync::Arc<crate::IpFilter>>,
     /// Local Service Discovery (BEP 14): find peers of the same torrents on
     /// the local network by multicast. Needs a listener; private torrents
     /// never use it. `None` (the default) turns it off.
@@ -196,6 +200,7 @@ impl Default for SessionConfig {
             upload_rate_limit: None,
             max_active_downloads: None,
             max_active_seeds: None,
+            ip_filter: None,
             lsd: None,
             scrape_interval: None,
             stop_announce_timeout: Duration::from_secs(5),

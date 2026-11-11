@@ -442,6 +442,56 @@ fn rejects_a_global_limit_below_the_minimum() {
 }
 
 #[test]
+fn an_ip_filter_blocking_the_seed_stops_the_download() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = content();
+    let (torrent, hash) = write_torrent(dir.path(), &data);
+    let peer = seeder(data, hash);
+    let bad = dir.path().join("bad.dat");
+    std::fs::write(&bad, "nothing here\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .arg("--ip-filter")
+        .arg(&bad)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("IP filter"));
+    let filter = dir.path().join("ipfilter.dat");
+    std::fs::write(
+        &filter,
+        "127.000.000.000 - 127.255.255.255 , 000 , loopback\n",
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .arg("--output")
+        .arg(dir.path().join("out"))
+        .arg("--peer")
+        .arg(peer.to_string())
+        .args(["--no-dht", "--no-port-mapping", "--no-lsd", "--quiet"])
+        .arg("--ip-filter")
+        .arg(&filter)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the download cannot finish"
+    );
+    child.kill().unwrap();
+    let _ = child.wait();
+    assert_ne!(
+        std::fs::read(dir.path().join("out/hello.bin")).ok(),
+        Some(content())
+    );
+}
+
+#[test]
 fn rejects_bad_rate() {
     let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
         .args(["download", "x.torrent", "--download-limit", "fast"])

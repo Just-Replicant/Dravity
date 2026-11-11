@@ -181,6 +181,8 @@ pub(crate) enum Command {
     Stop(oneshot::Sender<()>),
     /// An address was banned elsewhere in the session.
     BanIp(IpAddr),
+    /// The IP filter changed: close connections it now blocks.
+    Refilter,
 }
 
 /// Shared, immutable inputs of a torrent task.
@@ -653,6 +655,21 @@ impl TorrentTask {
             }
             Command::AddPeers(peers) => Some(Event::AddPeers { peers }),
             Command::BanIp(ip) => Some(Event::BanIp { ip }),
+            Command::Refilter => {
+                let peers = match &self.phase {
+                    Phase::Metadata(state) => state.peers(),
+                    Phase::Download(state) => state.peers(),
+                };
+                let filter = self.ctx.bans.filter();
+                for p in peers.iter().filter(|p| filter.is_blocked(p.addr.ip())) {
+                    tracing::debug!(addr = %p.addr, "blocked by the IP filter; closing");
+                    self.peers.remove(&p.key);
+                    self.web_seed_gone(p.key);
+                    self.local
+                        .push_back(Event::PeerDisconnected { peer: p.key });
+                }
+                None
+            }
             Command::Peers(reply) => {
                 let peers = match &self.phase {
                     Phase::Metadata(state) => state.peers(),
@@ -1507,6 +1524,12 @@ impl TorrentTask {
             // PEX or an earlier dial says the peer does not do MSE: dialing
             // it would only fail the required handshake.
             tracing::trace!(%addr, "skipping a peer without encryption");
+            self.local
+                .push_back(Event::PeerConnectFailed { addr, retry: false });
+            return;
+        }
+        if self.ctx.bans.filter().is_blocked(addr.ip()) {
+            tracing::trace!(%addr, "blocked by the IP filter; not dialing");
             self.local
                 .push_back(Event::PeerConnectFailed { addr, retry: false });
             return;

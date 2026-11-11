@@ -243,6 +243,10 @@ struct NetworkArgs {
     /// torrents never do).
     #[arg(long)]
     no_tracker_exchange: bool,
+    /// Refuse peers in the ranges of this blocklist (eMule `ipfilter.dat`,
+    /// PeerGuardian P2P text, or one address, range or CIDR per line).
+    #[arg(long, value_name = "FILE")]
+    ip_filter: Option<PathBuf>,
     /// Do not use the DHT for peer discovery.
     #[arg(long)]
     no_dht: bool,
@@ -311,7 +315,7 @@ impl From<Backend> for StorageBackend {
 
 impl NetworkArgs {
     /// A session configuration with these options.
-    fn config(&self) -> SessionConfig {
+    fn config(&self) -> Result<SessionConfig> {
         let mut config = SessionConfig::default();
         config.announce_port = self.port;
         config.listen = (!self.no_listen).then(|| {
@@ -342,6 +346,17 @@ impl NetworkArgs {
         config.max_active_downloads = self.max_active_downloads;
         config.max_active_seeds = self.max_active_seeds;
         config.engine.super_seed = self.super_seed;
+        if let Some(path) = &self.ip_filter {
+            let filter = dravity_session::IpFilter::from_file(path)
+                .with_context(|| format!("loading the IP filter {}", path.display()))?;
+            if filter.skipped() > 0 {
+                tracing::warn!(
+                    skipped = filter.skipped(),
+                    "IP filter lines that hold no range were skipped"
+                );
+            }
+            config.ip_filter = Some(std::sync::Arc::new(filter));
+        }
         config.engine.tracker_exchange = !self.no_tracker_exchange;
         if !self.no_lsd && config.listen.is_some() {
             config.lsd = Some(dravity_session::LsdConfig::default());
@@ -357,7 +372,7 @@ impl NetworkArgs {
         }
         config.storage_backend = self.storage_backend.into();
         config.encryption = self.encryption.into();
-        config
+        Ok(config)
     }
 }
 
@@ -507,7 +522,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 Input::Magnet(_) => Vec::new(),
             };
-            let mut config = network.config();
+            let mut config = network.config()?;
             config.engine.seed = seed;
             config.resume_dir = if no_resume {
                 None
@@ -540,7 +555,7 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             check_terminal(tui)?;
             let state_dir = state_dir.unwrap_or_else(|| download_dir.join(".dravity"));
-            let mut config = network.config();
+            let mut config = network.config()?;
             config.engine.seed = !no_seed;
             config.state_dir = Some(state_dir.join("torrents"));
             config.resume_dir = Some(state_dir.join("resume"));

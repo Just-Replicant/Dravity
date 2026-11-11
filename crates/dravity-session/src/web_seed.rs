@@ -7,10 +7,13 @@
 //! with every piece and unchoked, takes `request` and `cancel` commands, and
 //! answers requests with `piece` messages. Contiguous requests are fetched
 //! with one HTTP range (up to [`MAX_BATCH`] bytes) while further commands
-//! keep arriving. Any HTTP failure ends the task; the owner tries the URL
-//! again later. Data is verified like every other piece.
+//! keep arriving. A transient HTTP failure ends the task; the owner tries
+//! the URL again later. A URL that can never be fetched (not `http`/`https`,
+//! or a non-public address when those are refused) is reported once and
+//! not retried. Data is verified like every other piece.
 
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -46,10 +49,18 @@ pub(crate) async fn run(
     mut commands: mpsc::Receiver<PeerCommand>,
 ) {
     let key = params.key;
-    if !resolves(&params.url).await {
-        tracing::debug!(url = %params.url, "web seed host did not resolve");
-        let _ = events.send(Input::WebSeedFailed { key }).await;
-        return;
+    match gate(&params.client, &params.url).await {
+        Gate::Go => {}
+        Gate::Later => {
+            let _ = events.send(Input::WebSeedFailed { key, retry: true }).await;
+            return;
+        }
+        Gate::Never => {
+            let _ = events
+                .send(Input::WebSeedFailed { key, retry: false })
+                .await;
+            return;
+        }
     }
     let info = params.metainfo.info();
     let all = Message::Bitfield(full_bitfield(info.piece_count()));
@@ -208,16 +219,43 @@ fn full_bitfield(pieces: u32) -> Bytes {
     Bytes::from(bits)
 }
 
-/// Whether the web seed's host resolves at all (a cheap check before the
-/// task reports itself; the HTTP client decides which addresses it may
-/// actually use).
-async fn resolves(url: &str) -> bool {
+/// How far a web seed gets before it joins the swarm.
+enum Gate {
+    /// The URL is fetchable; report the peer.
+    Go,
+    /// The host did not resolve. The owner retries later.
+    Later,
+    /// The URL can never be fetched. The owner does not retry.
+    Never,
+}
+
+/// Refuses a URL before it occupies a peer slot. A name that resolves only
+/// to non-public addresses is permanent when the client refuses those
+/// addresses; a DNS failure is not.
+async fn gate(client: &WebSeedClient, url: &str) -> Gate {
+    if let Err(e) = client.validate_url(url) {
+        tracing::debug!(url, error = %e, "web seed URL refused");
+        return Gate::Never;
+    }
     let Some((host, port)) = dravity_webseed::plan::host_port(url) else {
-        return false;
+        return Gate::Never;
     };
-    tokio::net::lookup_host((host.as_str(), port))
-        .await
-        .is_ok_and(|mut addrs| addrs.next().is_some())
+    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host.as_str(), port)).await {
+        Ok(found) => found.collect(),
+        Err(e) => {
+            tracing::debug!(url, error = %e, "web seed host did not resolve");
+            return Gate::Later;
+        }
+    };
+    if addrs.is_empty() {
+        tracing::debug!(url, "web seed host did not resolve");
+        return Gate::Later;
+    }
+    if !client.allows_private() && addrs.iter().all(|a| !dravity_webseed::is_public(a.ip())) {
+        tracing::debug!(url, "web seed host resolves only to non-public addresses");
+        return Gate::Never;
+    }
+    Gate::Go
 }
 
 #[cfg(test)]

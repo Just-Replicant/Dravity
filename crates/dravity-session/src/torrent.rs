@@ -25,7 +25,7 @@
 //! ([`Effect::ReadBlock`]) and reported back as [`Event::BlockRead`].
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -90,9 +90,12 @@ pub(crate) enum Input {
     WebSeedReady {
         key: PeerKey,
     },
-    /// A web seed could not start (its host did not resolve).
+    /// A web seed could not start. `retry` is false when the URL can never
+    /// be fetched (forbidden address, bad scheme); a DNS failure retries.
     WebSeedFailed {
         key: PeerKey,
+        /// Whether the owner should try the URL again after its back-off.
+        retry: bool,
     },
     Message {
         key: PeerKey,
@@ -274,6 +277,9 @@ struct WebSeed {
     retry_at: Instant,
     /// Failures in a row (reset when data arrives).
     failures: u32,
+    /// Not started again: banned for data that failed the hash check, or a
+    /// URL that can never be fetched.
+    stopped: bool,
 }
 
 /// What a magnet link's task needs once its metadata arrives.
@@ -476,6 +482,7 @@ impl TorrentTask {
                 key: None,
                 retry_at: now,
                 failures: 0,
+                stopped: false,
             })
             .collect();
     }
@@ -512,7 +519,7 @@ impl TorrentTask {
             let due = self
                 .web_seeds
                 .get(i)
-                .is_some_and(|s| s.key.is_none() && s.retry_at <= now);
+                .is_some_and(|s| s.key.is_none() && !s.stopped && s.retry_at <= now);
             if !due {
                 continue;
             }
@@ -536,11 +543,29 @@ impl TorrentTask {
     fn web_seed_gone(&mut self, key: PeerKey) {
         self.web_peers.remove(&key);
         let base = self.ctx.config.web_seed_retry;
-        if let Some(seed) = self.web_seeds.iter_mut().find(|s| s.key == Some(key)) {
-            seed.key = None;
-            seed.failures = seed.failures.saturating_add(1);
-            let factor = 1u32 << seed.failures.saturating_sub(1).min(5);
-            seed.retry_at = Instant::now() + base.saturating_mul(factor);
+        let Some(seed) = self.web_seeds.iter_mut().find(|s| s.key == Some(key)) else {
+            return;
+        };
+        seed.key = None;
+        // A ban or a URL that can never work must not come back on the
+        // back-off timer: the engine would only disconnect it again.
+        if seed.stopped {
+            return;
+        }
+        seed.failures = seed.failures.saturating_add(1);
+        let factor = 1u32 << seed.failures.saturating_sub(1).min(5);
+        seed.retry_at = Instant::now() + base.saturating_mul(factor);
+    }
+
+    /// Stops the web seed reported at `ip` (a synthetic `100::/64` address).
+    /// Called when the engine bans it for data that failed the hash check.
+    fn stop_web_seed(&mut self, ip: IpAddr) {
+        if !dravity_engine::is_web_seed_addr(SocketAddr::new(ip, 0)) {
+            return;
+        }
+        if let Some(seed) = self.web_seeds.iter_mut().find(|s| s.addr.ip() == ip) {
+            seed.stopped = true;
+            tracing::debug!(url = %seed.url, %ip, "web seed stopped after a hash failure");
         }
     }
 
@@ -905,8 +930,13 @@ impl TorrentTask {
                     link: PeerLink::default(),
                 }
             }
-            Input::WebSeedFailed { key } => {
+            Input::WebSeedFailed { key, retry } => {
                 self.peers.remove(&key);
+                if !retry && let Some(seed) = self.web_seeds.iter_mut().find(|s| s.key == Some(key))
+                {
+                    seed.stopped = true;
+                    tracing::debug!(url = %seed.url, "web seed stopped: its URL cannot be fetched");
+                }
                 self.web_seed_gone(key);
                 return None;
             }
@@ -1189,7 +1219,12 @@ impl TorrentTask {
                 self.metadata = Some((info, piece_layers));
             }
             Effect::PieceLayerReceived { root, layer } => self.install_piece_layer(root, layer),
-            Effect::Alert(alert) => self.alert(alert),
+            Effect::Alert(alert) => {
+                if let Alert::PeerBanned { ip } = &alert {
+                    self.stop_web_seed(*ip);
+                }
+                self.alert(alert);
+            }
             other => tracing::warn!(?other, "unhandled engine effect"),
         }
     }

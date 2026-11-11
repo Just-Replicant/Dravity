@@ -1292,6 +1292,7 @@ impl TorrentState {
             self.release_owner(key, *block);
         }
         self.picker.remove_peer_pieces(&peer.has);
+        self.picker.release_owner(key.0);
         if let Some((_, set)) = &mut self.layer_fetch {
             set.release(key);
         }
@@ -1395,6 +1396,8 @@ impl TorrentState {
                         self.release_owner(key, block);
                     }
                 }
+                // Its reserved pieces go to peers that can serve them.
+                self.picker.release_owner(key.0);
             }
             Message::Unchoke => peer.peer_choking = false,
             Message::Interested => {
@@ -1679,7 +1682,7 @@ impl TorrentState {
             }
             let block = match self
                 .picker
-                .pick_with_hint(has, peer.suggested.make_contiguous())
+                .pick_for(key.0, has, peer.suggested.make_contiguous())
             {
                 Some(block) => block,
                 None => match duplicate_candidate(

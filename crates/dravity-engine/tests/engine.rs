@@ -1781,3 +1781,26 @@ fn the_request_budget_bounds_requests_across_peers() {
     let fx = h.msg(1, data_for(asked[0][0]));
     assert_eq!(requests(&fx, 1).len(), 1);
 }
+
+#[test]
+fn each_peer_fills_its_own_pieces() {
+    let mut c = config();
+    c.initial_requests_per_peer = 2;
+    c.max_requests_per_peer = 2;
+    // Four blocks per piece: without reservation peer 2 would take the
+    // two blocks of peer 1's piece that are still missing.
+    let big = PieceLayout::new(4 * BLOCK_SIZE, 3 * 4 * u64::from(BLOCK_SIZE)).unwrap();
+    let mut h = Harness::new(c.clone());
+    h.t = TorrentState::new(big, c);
+    h.ev(Event::Start);
+    let mut pieces = Vec::new();
+    for p in 1..=2 {
+        connect(&mut h, p, Reserved::new().with_fast(true));
+        h.msg(p, Message::HaveAll);
+        let asked = requests(&h.msg(p, Message::Unchoke), p);
+        assert_eq!(asked.len(), 2);
+        assert!(asked.iter().all(|r| r.piece == asked[0].piece), "{asked:?}");
+        pieces.push(asked[0].piece);
+    }
+    assert_ne!(pieces[0], pieces[1], "no piece is split between the peers");
+}

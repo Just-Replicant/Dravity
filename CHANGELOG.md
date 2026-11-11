@@ -86,6 +86,12 @@ Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/ir
   `Config::request_budget` (1024 blocks) bounds outstanding requests
   across all peers of a torrent. Rate and RTT are measured from the
   engine's own events, so it stays sans-IO.
+- **Piece reservation (item 10):** `Picker::pick_for(owner, ..)` reserves
+  each started piece for the peer that started it. Peers continue their
+  own pieces, take over unowned ones (owner left or choked us), start new
+  ones, and only then help with another peer's piece, so fewer pieces
+  sit half done and a bad piece usually has a single sender (which helps
+  smart banning). `Picker::release_owner`, `Picker::owner`.
 
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use dravity_core::{BLOCK_SIZE, BlockRef, InfoHash, PieceLayout};
 use dravity_engine::{
-    Alert, AnnounceEvent, Bitfield, Config, DialHints, Effect, Event, PeerKey, PeerLink,
+    Alert, AnnounceEvent, Bitfield, Config, DialHints, Effect, Event, PeerKey, PeerLink, Priority,
     TorrentState, TorrentStatus,
 };
 use dravity_wire::{BlockRequest, ExtendedHandshake, Message, PexMessage, Reserved};
@@ -848,6 +848,13 @@ fn seed_false_leaves_the_swarm_when_done() {
 /// Downloads all of piece 0 from `senders` (alternating), then fails it.
 fn fail_piece_zero(h: &mut Harness, senders: &[u64]) -> Vec<Effect> {
     let blocks = [req(0, 0, BLOCK_SIZE), req(0, BLOCK_SIZE, BLOCK_SIZE)];
+    if senders.len() > 1 {
+        // Piece reservation gives each peer its own piece; with only piece
+        // 0 wanted, the peers share it.
+        h.ev(Event::SetPriorities {
+            priorities: vec![Priority::Normal, Priority::Skip, Priority::Skip],
+        });
+    }
     for p in senders {
         h.msg(*p, Message::HaveAll);
         h.msg(*p, Message::Unchoke);

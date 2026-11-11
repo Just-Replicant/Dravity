@@ -19,6 +19,7 @@ sound version, with the difference explained), **open** (not started).
 | 7 | Byte-budgeted read cache (Storage middleware) | partial | `feat(storage,session): shared read cache middleware` | [notes](#7-read-cache) |
 | 8 | Verify-before-download prescan | done | `perf(storage,engine,session): prescan files before the start check` | [notes](#8-prescan) |
 | 9 | BDP-adaptive request budget | done | `feat(engine): BDP request depth and a torrent request budget` | [notes](#9-bdp-request-budget) |
+| 10 | Piece reservation / extent affinity | done | `feat(engine): reserve started pieces for the peer that started them` | [notes](#10-piece-reservation) |
 
 ## Design notes
 
@@ -183,3 +184,17 @@ from stale numbers. `Config::request_budget` caps outstanding requests
 across the torrent. The scripted tests cover the budget split across
 peers and the existing timeout and `reqq` behavior. Unit tests cover the
 BDP arithmetic, minimum-RTT expiry and the hand-back after a loss.
+
+### 10. Piece reservation
+
+Each started piece in the picker records the peer that owns it.
+`pick_for` picks in this order: urgent pieces (streaming), the peer's
+own pieces, unowned started pieces, a new piece (rarest first, honoring
+`suggest` hints), and only then another peer's piece. The last step is
+what keeps the final pieces quick, much like endgame. A peer that
+disconnects or chokes us releases its reservations. A failed piece
+resets its owner. irontide tracks blocks with a 256-bit chunk mask.
+Dravity's picker already keeps a per-block state vector, which serves
+the same purpose without a fixed limit on blocks per piece, so the
+mask was not adopted. Reservation also feeds item 2: with one sender
+per piece, a hash failure needs no attribution at all.

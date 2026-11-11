@@ -142,6 +142,13 @@ pub struct SessionConfig {
     /// Country database for [`crate::PeerStatus::country`]
     /// ([`crate::GeoIp`]). `None` (the default) reports no countries.
     pub geoip: Option<std::sync::Arc<crate::GeoIp>>,
+    /// Carry peer connections over this [`crate::transport::Network`]
+    /// instead of TCP and uTP sockets (e.g. a
+    /// [`crate::transport::MemoryNetwork`] host in tests). When set,
+    /// [`listen`](Self::listen) is ignored: the session listens on the
+    /// network, and its listener's port is [`crate::Session::listen_port`].
+    /// `None` (the default) uses real sockets.
+    pub network: Option<std::sync::Arc<dyn crate::transport::Network>>,
     /// Local Service Discovery (BEP 14): find peers of the same torrents on
     /// the local network by multicast. Needs a listener; private torrents
     /// never use it. `None` (the default) turns it off.
@@ -216,6 +223,7 @@ impl Default for SessionConfig {
             proxy: None,
             peer_dscp: None,
             geoip: None,
+            network: None,
             lsd: None,
             scrape_interval: None,
             stop_announce_timeout: Duration::from_secs(5),

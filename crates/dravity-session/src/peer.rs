@@ -53,6 +53,8 @@ pub(crate) struct PeerParams {
     pub(crate) proxy: Option<Arc<crate::proxy::Proxy>>,
     /// DSCP mark for the TCP connection.
     pub(crate) dscp: Option<u8>,
+    /// Dial over this network instead of sockets.
+    pub(crate) network: Option<Arc<dyn crate::transport::Network>>,
 }
 
 /// Why a handshake failed.
@@ -149,6 +151,9 @@ enum Failed {
 
 /// Opens a raw connection over one transport.
 async fn connect(transport: Transport, params: &PeerParams) -> std::io::Result<RawStream> {
+    if let Some(network) = &params.network {
+        return Ok(RawStream::Boxed(network.dial(params.addr).await?));
+    }
     if let Some(proxy) = &params.proxy {
         let tcp = crate::proxy::connect(proxy, params.addr)
             .await
@@ -561,6 +566,7 @@ mod tests {
             rates: RateLimits::new(None, None),
             proxy: None,
             dscp: None,
+            network: None,
         };
         tokio::spawn(run(
             params,

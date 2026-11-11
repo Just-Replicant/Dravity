@@ -1603,6 +1603,7 @@ impl TorrentTask {
             rates: self.ctx.rates.clone(),
             proxy: self.ctx.config.proxy.clone().map(Arc::new),
             dscp: self.ctx.config.peer_dscp,
+            network: self.ctx.config.network.clone(),
         };
         // Peer tasks are not in `background`: dropping their command sender
         // ends them, and they must not delay shutdown.

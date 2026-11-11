@@ -38,6 +38,7 @@ sound version, with the difference explained), **open** (not started).
 | 25 | BEP 55 holepunch (ut_holepunch) | done | `feat(wire,engine,cli): BEP 55 ut_holepunch relaying and rendezvous` | [notes](#25-bep-55-holepunch) |
 | 26 | BEP 52 conformance vector suite | done | `test(core): BEP 52 conformance vectors from an independent reference` | [notes](#26-bep-52-conformance-vectors) |
 | 27 | More loom models: shared rate bucket, live cap changes | done | `test(core,session): loom models for the shared rate bucket and live cap changes` | [notes](#27-more-loom-models) |
+| 28 | Pluggable network transport (Network, TransportListener, MemoryNetwork) | done | `feat(session): pluggable peer transport with an in-memory network` | [notes](#28-pluggable-network-transport) |
 
 ## Design notes
 
@@ -449,3 +450,10 @@ turns LSD on.
 - Models: (1) two takes of 500 bytes at 1000 B/s at the same instant: in every interleaving the waits are exactly 0.5 s and 1 s and the debt is exactly 1000. (2) `set_rate` racing `take`: the new rate always wins, the debt is exactly the taken bytes, and the wait is priced at the rate that held the lock. (3) `set_max(Some(0))` racing `try_admit`: once the setter has joined, no admit succeeds, the count never exceeds the old cap, and every slot returns.
 - Found while writing them: two callers can reach the lock with timestamps out of order. The old code set `last = now` regardless, so a later caller with an earlier timestamp moved the clock back and the next caller was credited the same interval twice. `last` now only moves forward, and a unit test covers it.
 - dcheck's loom step (`--test 'loom_*'`) picks up the new file automatically.
+
+### 28. Pluggable network transport
+
+- The traits are object-safe (boxed futures), so a `SessionConfig` holds an `Arc<dyn Network>` and stays `Clone`. `listen` is synchronous, so `Session::new` can report `listen_port` straight away, and it is called once. Streams are `Box<dyn PeerIo>` (any `AsyncRead + AsyncWrite + Send + Unpin + Debug`) and enter the existing pipeline as `RawStream::Boxed`. MSE, the BitTorrent handshake, rate limits, bans and the connection cap all apply unchanged; status reports these connections as TCP.
+- With a network set, `SessionConfig::listen` is ignored: no TCP or uTP sockets are bound, so there is no port mapping or LSD announce for them, and dials skip uTP and proxies. Trackers, web seeds, the DHT and LSD keep their own sockets, so in-memory tests turn them off (`dht = None`, `lsd = None`, `port_mapping = None`).
+- `MemoryNetwork::host(ip)` gives each session a host address. Its listener gets a port from a shared counter, and a dial delivers one end of a 256 KiB duplex pipe to the listener together with the dialer's address. `set_unreachable` makes dials to an address fail like a NAT or firewall would, and dropping a listener unregisters it, so later dials are refused.
+- Tests: a transport unit test (dial, accept, data, unreachable, listener gone), and `tests/memory_swarm.rs`, where one seed and three leechers download over memory only and the seed sees only memory addresses, and an unreachable seed blocks the download until the fault is lifted. Both run in about 0.6 s. The existing loopback swarm tests stay, since they cover the real TCP/uTP paths.

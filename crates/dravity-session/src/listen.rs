@@ -369,6 +369,33 @@ async fn accept_loop(listener: TcpListener, acceptor: Acceptor, stop: Cancellati
     }
 }
 
+/// Accepts peers from a [`crate::transport::Network`] listener until
+/// `stop` is cancelled.
+pub(crate) fn start_network(
+    mut listener: Box<dyn crate::transport::TransportListener>,
+    acceptor: &Acceptor,
+    stop: &CancellationToken,
+) {
+    let acceptor = acceptor.clone();
+    let stop = stop.clone();
+    tracing::info!(addr = %listener.local_addr(), "accepting peers over a custom network");
+    tokio::spawn(async move {
+        loop {
+            let accepted = tokio::select! {
+                () = stop.cancelled() => return,
+                accepted = listener.accept() => accepted,
+            };
+            match accepted {
+                Ok((stream, addr)) => handle(RawStream::Boxed(stream), addr, &acceptor),
+                Err(e) => {
+                    tracing::debug!(error = %e, "network accept failed; listener closed");
+                    return;
+                }
+            }
+        }
+    });
+}
+
 /// Handshakes an accepted connection and hands it to its torrent.
 async fn route(
     stream: RawStream,

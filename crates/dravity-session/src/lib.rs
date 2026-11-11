@@ -93,6 +93,7 @@ mod settings;
 mod status;
 mod stream;
 mod torrent;
+pub mod transport;
 pub mod watch;
 mod web_seed;
 
@@ -278,6 +279,8 @@ struct Inner {
     /// Bound sockets, until the first torrent starts the accept tasks
     /// (which need a Tokio runtime).
     listener: Mutex<Option<Bound>>,
+    /// The [`SessionConfig::network`] listener, until accepting starts.
+    net_listener: Mutex<Option<Box<dyn transport::TransportListener>>>,
     listen_port: Option<u16>,
     /// uTP sockets, once the listener started.
     utp: OnceLock<UtpSockets>,
@@ -379,13 +382,26 @@ impl Session {
                 WebSeedClient::new(&web_seed)
             })
             .transpose()?;
-        let listener = config
-            .listen
+        let net_listener = config
+            .network
             .as_ref()
-            .map(listen::bind)
+            .map(|net| net.listen())
             .transpose()
             .map_err(SessionError::Listen)?;
-        let listen_port = listener.as_ref().map(|bound| bound.port);
+        let listener = if net_listener.is_some() {
+            None
+        } else {
+            config
+                .listen
+                .as_ref()
+                .map(listen::bind)
+                .transpose()
+                .map_err(SessionError::Listen)?
+        };
+        let listen_port = net_listener
+            .as_ref()
+            .map(|l| l.local_addr().port())
+            .or_else(|| listener.as_ref().map(|bound| bound.port));
         let dht = config.dht.as_ref().map(Dht::new).transpose()?;
         let (alerts, _) = broadcast::channel(config.alert_buffer.max(1));
         let stop = CancellationToken::new();
@@ -428,6 +444,7 @@ impl Session {
                 read_cache,
                 persist: OnceLock::new(),
                 listener: Mutex::new(listener),
+                net_listener: Mutex::new(net_listener),
                 listen_port,
                 utp: OnceLock::new(),
                 port_mapper: Mutex::new(None),
@@ -463,15 +480,21 @@ impl Session {
     /// Starts accepting on the bound sockets (once; needs the runtime that
     /// `add_torrent` runs in).
     fn start_listening(&self) {
-        let Some(bound) = self
+        let bound = self
             .inner
             .listener
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        else {
+            .take();
+        let net_listener = self
+            .inner
+            .net_listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if bound.is_none() && net_listener.is_none() {
             return;
-        };
+        }
         let config = &self.inner.config;
         let acceptor = Acceptor {
             registry: Arc::clone(&self.inner.torrents),
@@ -485,6 +508,12 @@ impl Session {
             bans: Arc::clone(&self.inner.bans),
             connections: self.inner.connections.clone(),
             dscp: config.peer_dscp,
+        };
+        if let Some(net_listener) = net_listener {
+            listen::start_network(net_listener, &acceptor, &self.inner.stop);
+        }
+        let Some(bound) = bound else {
+            return;
         };
         match listen::start(bound, &acceptor, &self.inner.stop) {
             Ok(utp) => {

@@ -830,6 +830,23 @@ impl TorrentState {
                 self.picker.set_urgent(pieces);
                 self.wanted_changed(now, &mut out);
             }
+            Event::SetListenPort { port } => {
+                self.config.listen_port = port;
+                let size = self
+                    .info_bytes
+                    .as_ref()
+                    .and_then(|b| u64::try_from(b.len()).ok());
+                let upload_only = self.upload_only_sent;
+                for key in self.sorted_keys() {
+                    if let Some(peer) = self.peers.get_mut(&key)
+                        && peer.extended
+                    {
+                        let hs = ext::our_handshake(&self.config, size, peer.addr, upload_only);
+                        Self::send(peer, key, hs, now, &mut out);
+                    }
+                }
+                self.reannounce(now, &mut out);
+            }
             Event::Reannounce => self.reannounce(now, &mut out),
             Event::AnnounceFailed { error } => {
                 if self.pending_announce == Some(AnnounceEvent::Started) {

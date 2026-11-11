@@ -1085,6 +1085,27 @@ fn extension_handshake_advertises_port_queue_and_your_ip() {
 }
 
 #[test]
+fn a_new_listen_port_is_sent_in_a_fresh_extension_handshake() {
+    let mut c = config();
+    c.listen_port = Some(51_413);
+    let mut h = Harness::with_have(c, &[]);
+    h.connect(1, Reserved::new().with_extension_protocol(true));
+    h.connect(2, Reserved::new());
+    let fx =
+        h.t.update(h.now, Event::SetListenPort { port: Some(6_000) });
+    assert_eq!(our_handshake(&fx, 1).listen_port, Some(6_000));
+    assert!(
+        sent(&fx, 2)
+            .iter()
+            .all(|m| !matches!(m, Message::Extended { .. })),
+        "a peer without BEP 10 gets no extension message"
+    );
+    // Later connections advertise it too.
+    let fx = h.connect(3, Reserved::new().with_extension_protocol(true));
+    assert_eq!(our_handshake(&fx, 3).listen_port, Some(6_000));
+}
+
+#[test]
 fn incoming_peers_are_shared_by_their_listen_port() {
     let mut h = Harness::with_have(config(), &[]);
     let ext = Reserved::new().with_extension_protocol(true);

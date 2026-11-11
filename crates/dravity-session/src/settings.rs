@@ -27,6 +27,37 @@ pub struct LiveSettings {
 
 /// File in the state directory holding the last applied live settings.
 pub(crate) const SETTINGS_FILE: &str = "settings.bencode";
+/// Where a port moved with `Session::set_listen_port` is kept.
+pub(crate) const LISTEN_FILE: &str = "listen.bencode";
+
+/// `{port, version: 1}` for [`LISTEN_FILE`].
+pub(crate) fn encode_listen_port(port: u16) -> Vec<u8> {
+    use std::borrow::Cow;
+    let mut d = dravity_bencode::Dict::new();
+    d.insert(
+        Cow::Borrowed(b"port".as_slice()),
+        dravity_bencode::Value::Int(i64::from(port)),
+    );
+    d.insert(
+        Cow::Borrowed(b"version".as_slice()),
+        dravity_bencode::Value::Int(1),
+    );
+    dravity_bencode::Value::Dict(d).to_vec()
+}
+
+/// The port in a [`LISTEN_FILE`], if it is valid (version 1, 1..=65535).
+pub(crate) fn decode_listen_port(bytes: &[u8]) -> Option<u16> {
+    let value = dravity_bencode::Value::decode(bytes).ok()?;
+    let d = value.as_dict()?;
+    if d.get(b"version".as_slice())
+        .and_then(dravity_bencode::Value::as_int)
+        != Some(1)
+    {
+        return None;
+    }
+    let port = d.get(b"port".as_slice())?.as_int()?;
+    u16::try_from(port).ok().filter(|&p| p != 0)
+}
 
 impl LiveSettings {
     /// Bencodes the settings; an unlimited (`None`) field is left out.

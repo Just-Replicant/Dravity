@@ -447,6 +447,11 @@ impl MetadataState {
                 out.push(Effect::Alert(Alert::TrackerError { message: error }));
                 self.settle_reannounce(now, &mut out);
             }
+            Event::SetListenPort { port } => {
+                // New connections advertise it; metadata peers are brief.
+                self.config.listen_port = port;
+                self.reannounce(now, &mut out);
+            }
             Event::Reannounce => self.reannounce(now, &mut out),
             Event::AddPeers { peers } => {
                 self.note_swarm(&peers, false);

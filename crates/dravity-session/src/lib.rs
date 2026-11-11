@@ -508,10 +508,10 @@ impl Session {
     /// retired, so a port that cannot be bound leaves everything as it
     /// was. Connections already open stay open. Router port mapping and
     /// LSD restart on the new port, and every running torrent re-announces
-    /// it to its trackers and the DHT. Torrents keep advertising the old
-    /// port in the `p` field of extension handshakes until they restart.
-    /// The new port is not persisted: the configured one applies at the
-    /// next start.
+    /// it to its trackers and the DHT, and sends connected peers a fresh
+    /// extension handshake with the new `p`. With a
+    /// [`SessionConfig::state_dir`] the port is saved and
+    /// [`Session::restore`] moves the listener back to it.
     ///
     /// # Errors
     /// [`SessionError::Listen`] if the session does not listen on sockets
@@ -536,6 +536,12 @@ impl Session {
         wanted.port = port;
         let bound = listen::bind(&wanted).map_err(SessionError::Listen)?;
         let new_port = bound.port;
+        if let Some(dir) = &config.state_dir {
+            let path = dir.join(settings::LISTEN_FILE);
+            if let Err(e) = persist::write_atomic(&path, &settings::encode_listen_port(new_port)) {
+                tracing::warn!(path = %path.display(), error = %e, "cannot save the listen port");
+            }
+        }
         let acceptor = {
             let mut pending = self
                 .inner
@@ -1380,6 +1386,25 @@ impl Session {
             restored: Vec::new(),
             failed: loaded.failed,
         };
+        // A listen port moved in an earlier run comes back first, so the
+        // restored torrents announce it.
+        if let Some(dir) = &self.inner.config.state_dir {
+            let path = dir.join(settings::LISTEN_FILE);
+            match std::fs::read(&path) {
+                Ok(bytes) => match settings::decode_listen_port(&bytes) {
+                    Some(port) => {
+                        if let Err(e) = self.set_listen_port(port).await {
+                            report.failed.push((path, e.to_string()));
+                        }
+                    }
+                    None => report
+                        .failed
+                        .push((path, "invalid listen port file".into())),
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => report.failed.push((path, e.to_string())),
+            }
+        }
         // Live settings changed in an earlier run come back before the
         // torrents, so queue limits apply to them.
         if let Some(dir) = &self.inner.config.state_dir {

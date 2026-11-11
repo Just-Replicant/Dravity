@@ -264,3 +264,31 @@ async fn the_listen_port_moves_before_accepting_and_without_a_listener_it_is_ref
     assert!(quiet.set_listen_port(0).await.is_err());
     assert_eq!(quiet.listen_port(), None);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_moved_listen_port_survives_a_restart() {
+    let state = tempfile::tempdir().unwrap();
+    let mut c = config();
+    c.state_dir = Some(state.path().to_path_buf());
+    let moved = {
+        let s = Session::new(c.clone()).unwrap();
+        let moved = s.set_listen_port(0).await.unwrap();
+        drop(s);
+        moved
+    };
+    // Let the old session's sockets close.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let s = Session::new(c.clone()).unwrap();
+    let report = s.restore().await.unwrap();
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert_eq!(s.listen_port(), Some(moved));
+    drop(s);
+    std::fs::write(
+        state.path().join("listen.bencode"),
+        b"d4:porti0e7:versioni1ee",
+    )
+    .unwrap();
+    let s = Session::new(c).unwrap();
+    let report = s.restore().await.unwrap();
+    assert_eq!(report.failed.len(), 1, "port 0 is refused: {report:?}");
+}

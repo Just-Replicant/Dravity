@@ -527,6 +527,14 @@ pub enum Event {
         /// Pieces, most urgent first.
         pieces: Vec<u32>,
     },
+    /// The session now accepts peers on `port`: it is sent in a fresh
+    /// extension handshake (BEP 10 allows repeating it) to connected peers
+    /// that speak the extension protocol, used for new connections, and
+    /// announced again as with [`Event::Reannounce`].
+    SetListenPort {
+        /// The new listen port (`None`: not listening).
+        port: Option<u16>,
+    },
     /// The port published to trackers and the DHT changed. When the torrent
     /// is in the swarm, announce again so peers are told the current port.
     /// An announce already in flight is followed by one more.

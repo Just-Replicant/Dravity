@@ -695,7 +695,7 @@ impl TorrentTask {
                 self.ctx.utp = update.utp;
                 self.ctx.port_map = update.port_map;
                 self.announce_dht_port();
-                Some(Event::Reannounce)
+                Some(Event::SetListenPort { port: update.port })
             }
             Command::Stats(reply) => {
                 let _ = reply.send(self.phase.stats());

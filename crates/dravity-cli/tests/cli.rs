@@ -881,3 +881,18 @@ fn create_writes_a_torrent_that_info_reads() {
         .unwrap();
     assert!(String::from_utf8_lossy(&info.stdout).contains("share"));
 }
+
+#[test]
+fn every_registered_cli_flag_exists() {
+    use dravity_session::schema::{ENGINE_SETTINGS, SESSION_SETTINGS};
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .args(["download", "--help"])
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&out.stdout);
+    for s in SESSION_SETTINGS.iter().chain(ENGINE_SETTINGS) {
+        for flag in s.cli {
+            assert!(help.contains(flag), "{flag} ({}) is not a CLI flag", s.name);
+        }
+    }
+}

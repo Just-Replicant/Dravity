@@ -89,6 +89,7 @@ pub mod proxy;
 mod qos;
 mod queue;
 mod rate;
+pub mod schema;
 mod settings;
 mod status;
 mod stream;

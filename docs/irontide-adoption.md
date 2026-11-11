@@ -39,6 +39,7 @@ sound version, with the difference explained), **open** (not started).
 | 26 | BEP 52 conformance vector suite | done | `test(core): BEP 52 conformance vectors from an independent reference` | [notes](#26-bep-52-conformance-vectors) |
 | 27 | More loom models: shared rate bucket, live cap changes | done | `test(core,session): loom models for the shared rate bucket and live cap changes` | [notes](#27-more-loom-models) |
 | 28 | Pluggable network transport (Network, TransportListener, MemoryNetwork) | done | `feat(session): pluggable peer transport with an in-memory network` | [notes](#28-pluggable-network-transport) |
+| 29 | Settings single source of truth and docs/configuration.md | done | `feat(engine,session,http,cli): settings registry with a compile-time lock and generated configuration reference` | [notes](#29-settings-single-source-of-truth) |
 
 ## Design notes
 
@@ -457,3 +458,10 @@ turns LSD on.
 - With a network set, `SessionConfig::listen` is ignored: no TCP or uTP sockets are bound, so there is no port mapping or LSD announce for them, and dials skip uTP and proxies. Trackers, web seeds, the DHT and LSD keep their own sockets, so in-memory tests turn them off (`dht = None`, `lsd = None`, `port_mapping = None`).
 - `MemoryNetwork::host(ip)` gives each session a host address. Its listener gets a port from a shared counter, and a dial delivers one end of a 256 KiB duplex pipe to the listener together with the dialer's address. `set_unreachable` makes dials to an address fail like a NAT or firewall would, and dropping a listener unregisters it, so later dials are refused.
 - Tests: a transport unit test (dial, accept, data, unreachable, listener gone), and `tests/memory_swarm.rs`, where one seed and three leechers download over memory only and the seed sees only memory addresses, and an unreachable seed blocks the download until the fault is lifted. Both run in about 0.6 s. The existing loopback swarm tests stay, since they cover the real TCP/uTP paths.
+
+### 29. Settings single source of truth
+
+- One `registry!` macro per crate turns a list of `field: Class, [flags], "summary";` lines into a `const &[Setting]` and an exhaustive `let Config { a: _, b: _, .. }` destructuring. That second part is the compile-time lock: adding, removing or renaming a field without touching the registry is a build error. The engine's registry lives in `dravity-engine`, because `Config` is `#[non_exhaustive]` and can only be destructured exhaustively inside its own crate. `Setting` and `SettingClass` are defined there too and re-exported by the session.
+- Summaries started as the first sentence of each field's rustdoc, extracted once. They now live in the registry and a test requires full sentences. The flags record which `dravity download` options set the field.
+- Drift tests: (1) `docs/configuration.md` must equal `configuration_markdown()` (`DRAVITY_BLESS=1 cargo test -p dravity-session --lib schema` rewrites it). (2) The live entries must be exactly the fields of `LiveSettings`, with an exhaustive destructure, so a new live setting has to be classified. (3) The `GET /api/v1/settings` JSON keys must equal the live registry names, which are the API names. (4) Every registered flag must appear in `dravity download --help`.
+- This turns item 16's settings into documented, checked data. It does not generate the CLI parser or the DTOs from the registry; the tests catch drift instead, which keeps clap's derive and serde's types idiomatic.

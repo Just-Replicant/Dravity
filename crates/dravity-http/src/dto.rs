@@ -506,3 +506,29 @@ impl From<SettingsPatchDto> for SettingsUpdate {
         u
     }
 }
+
+#[cfg(test)]
+mod settings_tests {
+    use dravity_session::LiveSettings;
+    use dravity_session::schema::{SESSION_SETTINGS, SettingClass};
+
+    use super::SettingsDto;
+
+    #[test]
+    fn the_settings_api_names_are_the_live_registry_names() {
+        let json = serde_json::to_value(SettingsDto::from(LiveSettings::default())).ok();
+        let mut keys: Vec<String> = json
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        keys.sort();
+        let mut live: Vec<String> = SESSION_SETTINGS
+            .iter()
+            .filter(|s| s.class == SettingClass::Live)
+            .map(|s| s.name.to_owned())
+            .collect();
+        live.sort();
+        assert_eq!(keys, live);
+    }
+}

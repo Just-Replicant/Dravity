@@ -661,6 +661,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dravity"
+version = "0.1.0"
+dependencies = [
+ "dravity-core",
+ "dravity-session",
+ "dravity-storage",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "dravity-bencode"
 version = "0.1.0"
 dependencies = [

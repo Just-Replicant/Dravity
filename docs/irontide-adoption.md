@@ -40,6 +40,7 @@ sound version, with the difference explained), **open** (not started).
 | 27 | More loom models: shared rate bucket, live cap changes | done | `test(core,session): loom models for the shared rate bucket and live cap changes` | [notes](#27-more-loom-models) |
 | 28 | Pluggable network transport (Network, TransportListener, MemoryNetwork) | done | `feat(session): pluggable peer transport with an in-memory network` | [notes](#28-pluggable-network-transport) |
 | 29 | Settings single source of truth and docs/configuration.md | done | `feat(engine,session,http,cli): settings registry with a compile-time lock and generated configuration reference` | [notes](#29-settings-single-source-of-truth) |
+| 30 | Facade crate dravity (prelude, ClientBuilder, one Error) | done | `feat(dravity): facade crate with prelude, ClientBuilder and one Error` | [notes](#30-facade-crate) |
 
 ## Design notes
 
@@ -465,3 +466,11 @@ turns LSD on.
 - Summaries started as the first sentence of each field's rustdoc, extracted once. They now live in the registry and a test requires full sentences. The flags record which `dravity download` options set the field.
 - Drift tests: (1) `docs/configuration.md` must equal `configuration_markdown()` (`DRAVITY_BLESS=1 cargo test -p dravity-session --lib schema` rewrites it). (2) The live entries must be exactly the fields of `LiveSettings`, with an exhaustive destructure, so a new live setting has to be classified. (3) The `GET /api/v1/settings` JSON keys must equal the live registry names, which are the API names. (4) Every registered flag must appear in `dravity download --help`.
 - This turns item 16's settings into documented, checked data. It does not generate the CLI parser or the DTOs from the registry; the tests catch drift instead, which keeps clap's derive and serde's types idiomatic.
+
+### 30. Facade crate
+
+- `crates/dravity` depends only on `dravity-session`, `dravity-core` and `dravity-storage` and forwards the `uring` feature. Users write `dravity::prelude::*` and `Client::builder()...build()?`. The internal crates stay reachable as `dravity::session`, `dravity::core` and `dravity::storage` for anything the facade does not wrap, so the facade never limits what can be done.
+- `ClientBuilder` wraps `SessionConfig`: the common settings get named methods, and `config(|c| ...)` changes the rest. `Client` adds `add_torrent_file`, `add_torrent_bytes` and `add_magnet` taking a path or URI and a download directory, and derefs to `Session`, so every session method is available.
+- `Error` is `#[non_exhaustive]` and wraps `SessionError`, `MetainfoError`, `MagnetError` and `ProxyError`, plus `Io { path, source }` for unreadable `.torrent` files. All are `#[from]`, so `?` works across them.
+- Tests: a compiled doc example, and `tests/facade.rs`, where two clients built only through the facade share a torrent over the in-memory network from item 28 and each error variant is produced through the one type.
+- The binary stays in `dravity-cli` (binary name `dravity`). The library crate is `dravity`, and cargo keeps the two artifacts apart.

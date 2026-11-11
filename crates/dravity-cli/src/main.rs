@@ -253,6 +253,14 @@ struct NetworkArgs {
     /// trackers, LSD) is not proxied; add `--no-dht --no-lsd` for that.
     #[arg(long, value_name = "URL")]
     proxy: Option<String>,
+    /// Show peer countries from this "IP to country" CSV database
+    /// (`start,end,country`, as db-ip lite or IP2Location LITE ship it).
+    #[arg(long, value_name = "FILE")]
+    geoip: Option<PathBuf>,
+    /// Mark peer TCP connections with this DSCP value (0-63), e.g. 8 (CS1)
+    /// so routers that honour it deprioritise BitTorrent traffic.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=63))]
+    peer_dscp: Option<u8>,
     /// Do not use the DHT for peer discovery.
     #[arg(long)]
     no_dht: bool,
@@ -367,6 +375,12 @@ impl NetworkArgs {
             config.proxy =
                 Some(dravity_session::proxy::Proxy::parse(url).context("parsing --proxy")?);
         }
+        if let Some(path) = &self.geoip {
+            let db = dravity_session::GeoIp::from_file(path)
+                .with_context(|| format!("loading the GeoIP database {}", path.display()))?;
+            config.geoip = Some(std::sync::Arc::new(db));
+        }
+        config.peer_dscp = self.peer_dscp;
         config.engine.tracker_exchange = !self.no_tracker_exchange;
         if !self.no_lsd && config.listen.is_some() {
             config.lsd = Some(dravity_session::LsdConfig::default());

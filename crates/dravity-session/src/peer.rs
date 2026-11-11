@@ -51,6 +51,8 @@ pub(crate) struct PeerParams {
     pub(crate) rates: RateLimits,
     /// Dial through this proxy (TCP only) instead of directly.
     pub(crate) proxy: Option<Arc<crate::proxy::Proxy>>,
+    /// DSCP mark for the TCP connection.
+    pub(crate) dscp: Option<u8>,
 }
 
 /// Why a handshake failed.
@@ -155,6 +157,7 @@ async fn connect(transport: Transport, params: &PeerParams) -> std::io::Result<R
                 other => std::io::Error::new(std::io::ErrorKind::ConnectionRefused, other),
             })?;
         tcp.set_nodelay(true)?;
+        crate::qos::mark(&tcp, params.dscp, params.addr);
         return Ok(RawStream::Tcp(tcp));
     }
     Ok(match (transport, &params.utp) {
@@ -162,6 +165,7 @@ async fn connect(transport: Transport, params: &PeerParams) -> std::io::Result<R
         _ => {
             let tcp = TcpStream::connect(params.addr).await?;
             tcp.set_nodelay(true)?;
+            crate::qos::mark(&tcp, params.dscp, params.addr);
             RawStream::Tcp(tcp)
         }
     })
@@ -556,6 +560,7 @@ mod tests {
             hints: DialHints::default(),
             rates: RateLimits::new(None, None),
             proxy: None,
+            dscp: None,
         };
         tokio::spawn(run(
             params,

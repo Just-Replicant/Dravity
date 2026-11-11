@@ -162,6 +162,8 @@ pub(crate) struct PeerRow {
     pub(crate) web: bool,
     /// RC4-encrypted (MSE).
     pub(crate) encrypted: bool,
+    /// Country from the GeoIP database, if one is loaded.
+    pub(crate) country: Option<dravity_session::CountryCode>,
 }
 
 impl From<&PeerStatus> for PeerRow {
@@ -183,6 +185,7 @@ impl From<&PeerStatus> for PeerRow {
             utp: p.transport == Transport::Utp,
             web: p.transport == Transport::Web,
             encrypted: p.encrypted,
+            country: p.country,
         }
     }
 }
@@ -205,6 +208,12 @@ impl PeerRow {
         .iter()
         .map(|&(on, c)| if on { c } else { '.' })
         .collect()
+    }
+
+    /// The country code, or `--` when unknown.
+    pub(crate) fn country(&self) -> String {
+        self.country
+            .map_or_else(|| "--".to_owned(), |c| c.to_string())
     }
 
     /// How much the peer has, as a percentage (`?` before the metadata).
@@ -987,7 +996,17 @@ pub(crate) mod tests {
             utp: true,
             web: false,
             encrypted: true,
+            country: dravity_session::CountryCode::new("se"),
         };
+        assert_eq!(peer.country(), "SE");
+        assert_eq!(
+            PeerRow {
+                country: None,
+                ..peer
+            }
+            .country(),
+            "--"
+        );
         assert_eq!(peer.flags(), "C.I.<U.E");
         assert_eq!(
             PeerRow {

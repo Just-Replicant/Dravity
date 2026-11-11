@@ -353,6 +353,7 @@ fn draw_peers(frame: &mut Frame<'_>, view: &View, area: Rect) {
     let rows = view.peers.iter().map(|p| {
         Row::new(vec![
             p.addr.to_string(),
+            p.country(),
             p.have(),
             format!("{}/s", format::bytes(p.down_rate)),
             format!("{}/s", format::bytes(p.up_rate)),
@@ -363,13 +364,14 @@ fn draw_peers(frame: &mut Frame<'_>, view: &View, area: Rect) {
         rows,
         [
             Constraint::Fill(1),
+            Constraint::Length(3),
             Constraint::Length(7),
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(8),
         ],
     )
-    .header(bold_row(["Address", "Has", "Down", "Up", "Flags"]))
+    .header(bold_row(["Address", "CC", "Has", "Down", "Up", "Flags"]))
     .row_highlight_style(highlight(detail_focused(view)))
     .block(detail_block(view));
     let mut state = TableState::new().with_selected(Some(view.selected_peer));
@@ -703,9 +705,11 @@ mod tests {
             utp: true,
             web: false,
             encrypted: false,
+            country: dravity_session::CountryCode::new("NL"),
         }];
         let screen = render(&v, 110, 30);
         assert!(screen.contains("10.0.0.2:6881"), "{screen}");
+        assert!(screen.contains(" NL "), "{screen}");
         assert!(screen.contains("75.0%"), "{screen}");
         assert!(screen.contains("2.0 KiB/s"), "{screen}");
         assert!(screen.contains("C.I..U."), "{screen}");

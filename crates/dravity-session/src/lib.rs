@@ -78,6 +78,7 @@ mod config;
 mod error;
 mod file_stream;
 mod files;
+mod geoip;
 mod hash_pool;
 mod ip_filter;
 mod listen;
@@ -85,6 +86,7 @@ mod lsd;
 mod peer;
 pub mod persist;
 pub mod proxy;
+mod qos;
 mod queue;
 mod rate;
 mod settings;
@@ -125,8 +127,10 @@ pub use dravity_webseed::WebSeedConfig;
 pub use error::SessionError;
 pub use file_stream::{DEFAULT_READAHEAD, FileStream};
 pub use files::FileProgress;
+pub use geoip::{CountryCode, GeoIp, GeoIpError, MAX_GEOIP_FILE};
 pub use ip_filter::{EMULE_BLOCK_LEVEL, IpFilter, IpFilterError};
 pub use listen::ListenConfig;
+pub use qos::MAX_DSCP;
 pub use settings::{LiveSettings, MIN_RATE_LIMIT, SettingsError, SettingsUpdate};
 pub use status::{PeerStatus, ScrapeOutcome, TrackerOutcome, TrackerStatus, Transport};
 pub use torrent::TorrentProgress;
@@ -398,6 +402,13 @@ impl Session {
         let ip_filter = config.ip_filter.clone().unwrap_or_default();
         // The config goes through the same checks as a live update.
         SettingsUpdate::from(live).applied_to(LiveSettings::default())?;
+        if config.peer_dscp.is_some_and(|d| d > MAX_DSCP) {
+            return Err(SettingsError::Invalid {
+                field: "peer_dscp",
+                reason: format!("must be at most {MAX_DSCP}"),
+            }
+            .into());
+        }
         let rates = rate::RateLimits::new(config.upload_rate_limit, config.download_rate_limit);
         Ok(Self {
             inner: Arc::new(Inner {
@@ -473,6 +484,7 @@ impl Session {
             )),
             bans: Arc::clone(&self.inner.bans),
             connections: self.inner.connections.clone(),
+            dscp: config.peer_dscp,
         };
         match listen::start(bound, &acceptor, &self.inner.stop) {
             Ok(utp) => {
@@ -752,6 +764,7 @@ impl Session {
             rates: self.inner.rates.clone(),
             read_cache: self.inner.read_cache.clone(),
             persist: self.inner.persister().cloned(),
+            web_seed_stats: entry.web_seeds.clone(),
             port_map: self
                 .inner
                 .port_mapper
@@ -1192,6 +1205,7 @@ impl Session {
                 queued: false,
                 complete: false,
                 added_at: record.added_at,
+                web_seeds: record.web_seeds.clone(),
                 commands: None,
             };
             match self.add_entry(record.info_hash, entry, false) {
@@ -1257,6 +1271,7 @@ fn entry(source: EntrySource, options: AddTorrentOptions) -> Entry {
         queued: false,
         complete: false,
         added_at: persist::unix_now(),
+        web_seeds: Vec::new(),
         commands: None,
     }
 }

@@ -218,6 +218,10 @@ pub(crate) struct TorrentContext {
     pub(crate) connections: ConnectionLimit,
     /// Session state writer, with a state directory.
     pub(crate) persist: Option<Persister>,
+    /// Web seed health from the previous run, applied when the web seeds
+    /// load (the catalog is locked while a task is created, so it is
+    /// passed in rather than read back).
+    pub(crate) web_seed_stats: Vec<crate::persist::WebSeedStat>,
     /// Router port mapping status, when mapping runs.
     pub(crate) port_map: Option<tokio::sync::watch::Receiver<dravity_portmap::Status>>,
     /// Registers the second swarm id of a hybrid magnet once its metadata
@@ -527,20 +531,58 @@ impl TorrentTask {
             return;
         }
         let now = Instant::now();
+        let saved = &self.ctx.web_seed_stats;
+        let unix = crate::persist::unix_now();
         self.web_seeds = content
             .metainfo
             .web_seeds()
             .iter()
             .zip(0u32..)
-            .map(|(url, index)| WebSeed {
-                url: url.clone(),
-                addr: dravity_engine::web_seed_addr(index),
-                key: None,
-                retry_at: now,
-                failures: 0,
-                stopped: false,
+            .map(|(url, index)| {
+                let stat = saved.iter().find(|s| &s.url == url);
+                let wait = stat.map_or(0, |s| s.retry_at.saturating_sub(unix));
+                WebSeed {
+                    url: url.clone(),
+                    addr: dravity_engine::web_seed_addr(index),
+                    key: None,
+                    retry_at: now + std::time::Duration::from_secs(wait),
+                    failures: stat.map_or(0, |s| s.failures),
+                    stopped: stat.is_some_and(|s| s.stopped),
+                }
             })
             .collect();
+    }
+
+    /// Stores web seed health in the catalog and the state directory.
+    fn save_web_seed_stats(&self) {
+        let now = Instant::now();
+        let unix = crate::persist::unix_now();
+        let stats: Vec<crate::persist::WebSeedStat> = self
+            .web_seeds
+            .iter()
+            .map(|s| {
+                let mut stat = crate::persist::WebSeedStat::new(s.url.clone());
+                stat.failures = s.failures;
+                stat.stopped = s.stopped;
+                stat.retry_at = unix + s.retry_at.saturating_duration_since(now).as_secs();
+                stat
+            })
+            .collect();
+        let record = {
+            let mut catalog = self
+                .ctx
+                .catalog
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(entry) = catalog.get_mut(&self.ctx.info_hash) else {
+                return;
+            };
+            entry.web_seeds = stats;
+            entry.record(self.ctx.info_hash)
+        };
+        if let Some(persist) = &self.ctx.persist {
+            persist.save_record(&record);
+        }
     }
 
     /// Starts web seeds that are due while the torrent downloads, and
@@ -606,11 +648,13 @@ impl TorrentTask {
         // A ban or a URL that can never work must not come back on the
         // back-off timer: the engine would only disconnect it again.
         if seed.stopped {
+            self.save_web_seed_stats();
             return;
         }
         seed.failures = seed.failures.saturating_add(1);
         let factor = 1u32 << seed.failures.saturating_sub(1).min(5);
         seed.retry_at = Instant::now() + base.saturating_mul(factor);
+        self.save_web_seed_stats();
     }
 
     /// Stops the web seed reported at `ip` (a synthetic `100::/64` address).
@@ -622,6 +666,7 @@ impl TorrentTask {
         if let Some(seed) = self.web_seeds.iter_mut().find(|s| s.addr.ip() == ip) {
             seed.stopped = true;
             tracing::debug!(url = %seed.url, %ip, "web seed stopped after a hash failure");
+            self.save_web_seed_stats();
         }
     }
 
@@ -681,7 +726,8 @@ impl TorrentTask {
                 let utp = &self.utp_peers;
                 let web = &self.web_peers;
                 let encrypted = &self.encrypted_peers;
-                let _ = reply.send(status::peers(peers, |p| {
+                let geoip = self.ctx.config.geoip.as_deref();
+                let _ = reply.send(status::peers(peers, geoip, |p| {
                     let transport = if web.contains(&p.key) {
                         Transport::Web
                     } else if utp.contains(&p.key) {
@@ -1023,8 +1069,10 @@ impl TorrentTask {
                 if matches!(message, Message::Piece { .. })
                     && self.web_peers.contains(&key)
                     && let Some(seed) = self.web_seeds.iter_mut().find(|s| s.key == Some(key))
+                    && seed.failures > 0
                 {
                     seed.failures = 0;
+                    self.save_web_seed_stats();
                 }
                 Event::Message { peer: key, message }
             }
@@ -1553,6 +1601,7 @@ impl TorrentTask {
             hints,
             rates: self.ctx.rates.clone(),
             proxy: self.ctx.config.proxy.clone().map(Arc::new),
+            dscp: self.ctx.config.peer_dscp,
         };
         // Peer tasks are not in `background`: dropping their command sender
         // ends them, and they must not delay shutdown.

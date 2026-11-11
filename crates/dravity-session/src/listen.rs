@@ -269,6 +269,8 @@ pub(crate) struct Acceptor {
     pub(crate) bans: crate::bans::Bans,
     /// The session-wide connection cap, shared with outgoing dials.
     pub(crate) connections: ConnectionLimit,
+    /// DSCP mark for accepted TCP connections.
+    pub(crate) dscp: Option<u8>,
 }
 
 /// Starts one accept task per socket; they end when `stop` is cancelled.
@@ -362,6 +364,7 @@ async fn accept_loop(listener: TcpListener, acceptor: Acceptor, stop: Cancellati
         if let Err(e) = stream.set_nodelay(true) {
             tracing::debug!(%addr, error = %e, "set_nodelay failed");
         }
+        crate::qos::mark(&stream, acceptor.dscp, addr);
         handle(RawStream::Tcp(stream), addr, &acceptor);
     }
 }

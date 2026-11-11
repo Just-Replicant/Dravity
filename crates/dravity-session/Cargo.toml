@@ -31,7 +31,7 @@ dravity-webseed.workspace = true
 dravity-wire.workspace = true
 fastrand.workspace = true
 futures-util.workspace = true
-socket2.workspace = true
+socket2 = { workspace = true, features = ["all"] }
 thiserror.workspace = true
 url.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "time", "sync", "macros", "io-util"] }

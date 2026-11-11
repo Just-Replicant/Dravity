@@ -42,6 +42,9 @@ pub struct PeerStatus {
     pub transport: Transport,
     /// Whether the connection is RC4-encrypted (MSE).
     pub encrypted: bool,
+    /// The peer's country, from [`crate::SessionConfig::geoip`] (never
+    /// for web seeds).
+    pub country: Option<crate::CountryCode>,
 }
 
 /// The last answer one tracker gave.
@@ -156,15 +159,20 @@ impl TrackerLog {
 /// connection: its transport and whether it is encrypted.
 pub(crate) fn peers(
     infos: Vec<PeerInfo>,
+    geoip: Option<&crate::GeoIp>,
     connection: impl Fn(&PeerInfo) -> (Transport, bool),
 ) -> Vec<PeerStatus> {
     infos
         .into_iter()
         .map(|info| {
             let (transport, encrypted) = connection(&info);
+            let country = geoip
+                .filter(|_| transport != Transport::Web)
+                .and_then(|db| db.lookup(info.addr.ip()));
             PeerStatus {
                 transport,
                 encrypted,
+                country,
                 info,
             }
         })

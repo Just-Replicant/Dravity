@@ -135,6 +135,13 @@ pub struct SessionConfig {
     /// seed requests. UDP traffic (DHT, UDP trackers, LSD) and incoming
     /// connections are not proxied. `None` (the default) connects directly.
     pub proxy: Option<crate::proxy::Proxy>,
+    /// DSCP value (0 to [`crate::MAX_DSCP`]) marked on peer TCP connections,
+    /// e.g. 8 (CS1, "lower effort") so home routers deprioritise
+    /// BitTorrent. `None` (the default) leaves the system default.
+    pub peer_dscp: Option<u8>,
+    /// Country database for [`crate::PeerStatus::country`]
+    /// ([`crate::GeoIp`]). `None` (the default) reports no countries.
+    pub geoip: Option<std::sync::Arc<crate::GeoIp>>,
     /// Local Service Discovery (BEP 14): find peers of the same torrents on
     /// the local network by multicast. Needs a listener; private torrents
     /// never use it. `None` (the default) turns it off.
@@ -207,6 +214,8 @@ impl Default for SessionConfig {
             max_active_seeds: None,
             ip_filter: None,
             proxy: None,
+            peer_dscp: None,
+            geoip: None,
             lsd: None,
             scrape_interval: None,
             stop_announce_timeout: Duration::from_secs(5),

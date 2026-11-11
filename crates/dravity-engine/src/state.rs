@@ -14,7 +14,7 @@ use dravity_wire::{
 
 use crate::ban::HashBans;
 use crate::bitfield::Bitfield;
-use crate::choker::{Candidate, Choker};
+use crate::choker::{Candidate, Choker, tuned_slots};
 use crate::ext::{self, PeerExtensions};
 use crate::hints::{HintBook, Joined};
 use crate::layers::{Answer, LayerSet};
@@ -122,6 +122,11 @@ struct Peer {
     snub_since: Option<Instant>,
     /// When the peer last held the optimistic unchoke (or connected).
     last_optimistic: Instant,
+    /// Payload bytes sent since we last unchoked the peer (round-robin
+    /// seeding).
+    served: u64,
+    /// When we last choked the peer (or it connected).
+    choked_since: Instant,
     /// Delivery rate and base round trip, for the request depth.
     bdp: Bdp,
 }
@@ -171,6 +176,8 @@ impl Peer {
             uploaded: 0,
             snub_since: None,
             last_optimistic: now,
+            served: 0,
+            choked_since: now,
             bdp: Bdp::default(),
         }
     }
@@ -306,6 +313,9 @@ pub struct TorrentState {
     /// Needed for the BEP 6 allowed fast set.
     info_hash: Option<InfoHash>,
     choker: Choker,
+    /// Regular upload slots: [`Config::upload_slots`], or the tuner's
+    /// value with [`Config::upload_slots_auto`].
+    upload_slots: usize,
     bans: HashBans,
     /// Remembered blocks of failed pieces ([`Config::smart_ban`]).
     smart: SmartBan,
@@ -343,6 +353,7 @@ impl TorrentState {
             .map(|p| u64::from(layout.piece_size(p).unwrap_or(0)))
             .sum();
         Self {
+            upload_slots: config.upload_slots,
             config,
             picker,
             status: TorrentStatus::Idle,
@@ -572,6 +583,13 @@ impl TorrentState {
     #[must_use]
     pub const fn have(&self) -> &Bitfield {
         self.picker.have()
+    }
+
+    /// Regular upload slots in use: [`Config::upload_slots`], or the
+    /// tuned value with [`Config::upload_slots_auto`].
+    #[must_use]
+    pub const fn upload_slots(&self) -> usize {
+        self.upload_slots
     }
 
     /// The torrent configuration.
@@ -2321,6 +2339,7 @@ impl TorrentState {
                 };
                 let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
                 peer.up_round = peer.up_round.saturating_add(len);
+                peer.served = peer.served.saturating_add(len);
                 peer.uploaded = peer.uploaded.saturating_add(len);
                 self.uploaded = self.uploaded.saturating_add(len);
                 let message = Message::Piece {
@@ -2368,6 +2387,7 @@ impl TorrentState {
             && peer.am_choking
         {
             peer.am_choking = false;
+            peer.served = 0;
             Self::send(peer, key, Message::Unchoke, now, out);
         }
     }
@@ -2384,6 +2404,7 @@ impl TorrentState {
                 return;
             }
             peer.am_choking = true;
+            peer.choked_since = now;
             Self::send(peer, key, Message::Choke, now, out);
             let allowed = peer.allowed_out.clone();
             let mut dropped: Vec<BlockRef> = Vec::new();
@@ -2425,6 +2446,12 @@ impl TorrentState {
         }
         let seeding = self.status == TorrentStatus::Finished;
         let snub = self.config.snub_timeout;
+        if self.config.upload_slots_auto {
+            let secs = self.config.unchoke_interval.as_secs().max(1);
+            let rates: Vec<u64> = self.peers.values().map(|p| p.up_round / secs).collect();
+            self.upload_slots = tuned_slots(&rates);
+        }
+        let pieces = u64::from(self.picker.layout().piece_count().max(1));
         let candidates: Vec<Candidate> = self
             .sorted_keys()
             .into_iter()
@@ -2437,11 +2464,17 @@ impl TorrentState {
                     snubbed: !seeding && p.is_snubbing(now, snub),
                     unchoked: !p.am_choking,
                     waiting_since: p.last_optimistic,
+                    served: p.served,
+                    choked_since: p.choked_since,
+                    progress: u32::try_from(u64::from(p.has.count()) * 1000 / pieces)
+                        .unwrap_or(1000),
                 })
             })
             .collect();
         let before = self.choker.optimistic();
-        let selected = self.choker.round(now, &self.config, &candidates);
+        let selected =
+            self.choker
+                .round(now, &self.config, self.upload_slots, seeding, &candidates);
         if let Some(key) = self.choker.optimistic().filter(|k| Some(*k) != before)
             && let Some(peer) = self.peers.get_mut(&key)
         {
@@ -2469,7 +2502,7 @@ impl TorrentState {
         if !self.is_active() {
             return;
         }
-        let limit = self.config.upload_slots + usize::from(self.config.optimistic_unchoke);
+        let limit = self.upload_slots + usize::from(self.config.optimistic_unchoke);
         let unchoked = self.peers.values().filter(|p| !p.am_choking).count();
         if unchoked >= limit {
             return;

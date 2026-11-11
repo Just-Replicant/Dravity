@@ -53,6 +53,51 @@ pub enum TorrentStatus {
     Stopped,
 }
 
+/// How a seeding torrent ranks peers for its regular upload slots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SeedChoking {
+    /// The peers we uploaded the most to last round: slots go to whoever
+    /// takes data fastest (the default).
+    #[default]
+    FastestUpload,
+    /// Peers take turns: a peer keeps its slot until it received
+    /// [`Config::round_robin_quota`] bytes, then the slot goes to the peer
+    /// that has been choked longest. Spreads a seed evenly.
+    RoundRobin,
+    /// Prefer peers that are just starting or nearly done over peers in
+    /// the middle of the download: new peers get their first pieces fast
+    /// and finishing peers complete (and seed) sooner, while peers that
+    /// only take data mid-download get less.
+    AntiLeech,
+}
+
+impl SeedChoking {
+    /// The mode's name, as [`std::str::FromStr`] reads it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FastestUpload => "fastest-upload",
+            Self::RoundRobin => "round-robin",
+            Self::AntiLeech => "anti-leech",
+        }
+    }
+}
+
+impl std::str::FromStr for SeedChoking {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "fastest-upload" | "fastest" => Ok(Self::FastestUpload),
+            "round-robin" => Ok(Self::RoundRobin),
+            "anti-leech" => Ok(Self::AntiLeech),
+            _ => Err(format!(
+                "unknown seed choking `{s}` (fastest-upload, round-robin, anti-leech)"
+            )),
+        }
+    }
+}
+
 /// Tunables for a torrent. [`Config::default`] gives sensible values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -139,6 +184,17 @@ pub struct Config {
     /// Give one extra slot to a choked peer in turn, so newcomers get data
     /// and better partners are discovered.
     pub optimistic_unchoke: bool,
+    /// How regular slots are ranked while seeding (see [`SeedChoking`]).
+    pub seed_choking: SeedChoking,
+    /// Bytes a peer receives per turn under [`SeedChoking::RoundRobin`]
+    /// before its slot passes on.
+    pub round_robin_quota: u64,
+    /// Tune [`Self::upload_slots`] every round from the measured upload
+    /// rates: one more slot for each peer that takes more than an
+    /// increasing threshold (1 KiB/s, 2 KiB/s, …), so slots grow while
+    /// extra peers still add upload and stop when they would only split
+    /// it. `upload_slots` is the starting value.
+    pub upload_slots_auto: bool,
     /// Time between two choker rounds (BEP 3 suggests ten seconds).
     pub unchoke_interval: Duration,
     /// Time between two changes of the optimistic unchoke.
@@ -221,6 +277,9 @@ impl Default for Config {
             seed: true,
             upload_slots: 4,
             optimistic_unchoke: true,
+            seed_choking: SeedChoking::FastestUpload,
+            round_robin_quota: 4 * 1024 * 1024,
+            upload_slots_auto: false,
             unchoke_interval: Duration::from_secs(10),
             optimistic_unchoke_interval: Duration::from_secs(30),
             snub_timeout: Duration::from_secs(60),

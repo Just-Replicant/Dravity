@@ -368,6 +368,7 @@ fn rejects_unknown_preallocation_and_durability() {
     for (flag, value, hint) in [
         ("--preallocate", "huge", "sparse"),
         ("--durability", "always", "per-piece"),
+        ("--seed-choking", "greedy", "round-robin"),
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
             .args(["download", "x.torrent", flag, value])

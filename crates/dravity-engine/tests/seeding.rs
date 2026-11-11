@@ -16,7 +16,7 @@ use bytes::Bytes;
 use dravity_core::{BLOCK_SIZE, BlockRef, InfoHash, PieceLayout};
 use dravity_engine::{
     Alert, AnnounceEvent, Bitfield, Config, DialHints, Effect, Event, PeerKey, PeerLink, Priority,
-    TorrentState, TorrentStatus,
+    SeedChoking, TorrentState, TorrentStatus,
 };
 use dravity_wire::{BlockRequest, ExtendedHandshake, Message, PexMessage, Reserved};
 
@@ -1629,4 +1629,62 @@ fn smart_ban_uses_v2_leaf_hashes_to_convict_at_once() {
     assert!(disconnects(&fx, 2), "peer 2 sent the corrupt block");
     assert!(!disconnects(&fx, 1));
     assert!(fx.contains(&Effect::Alert(Alert::PeerBanned { ip: addr(2).ip() })));
+}
+
+/// Serves one block of piece 0 to `peer`.
+fn serve_block(h: &mut Harness, peer: u64, offset: u32) {
+    let fx = h.msg(peer, Message::Request(req(0, offset, BLOCK_SIZE)));
+    let out = h.complete_reads(&fx);
+    assert_eq!(pieces_sent(&out, peer).len(), 1);
+}
+
+#[test]
+fn round_robin_seeding_passes_the_slot_after_the_quota() {
+    let mut c = config();
+    c.upload_slots = 1;
+    c.optimistic_unchoke = false;
+    c.seed_choking = SeedChoking::RoundRobin;
+    c.round_robin_quota = u64::from(BLOCK_SIZE);
+    let mut h = Harness::seed(c);
+    h.accept(1, Reserved::new());
+    h.accept(2, Reserved::new());
+    assert_eq!(unchoked(&h.msg(1, Message::Interested), 1), Some(true));
+    h.msg(2, Message::Interested);
+    // Peer 1 used its turn: peer 2 gets the slot although peer 1 was
+    // the fastest upload.
+    serve_block(&mut h, 1, 0);
+    let fx = h.advance(Duration::from_secs(10));
+    assert_eq!(unchoked(&fx, 1), Some(false));
+    assert_eq!(unchoked(&fx, 2), Some(true));
+    // And back again once peer 2 used its own.
+    serve_block(&mut h, 2, 0);
+    let fx = h.advance(Duration::from_secs(10));
+    assert_eq!(unchoked(&fx, 2), Some(false));
+    assert_eq!(unchoked(&fx, 1), Some(true));
+}
+
+#[test]
+fn the_slot_tuner_adds_slots_while_peers_take_data() {
+    let mut c = config();
+    c.upload_slots = 1;
+    c.optimistic_unchoke = false;
+    c.upload_slots_auto = true;
+    let mut h = Harness::seed(c);
+    for p in 1..=3 {
+        h.accept(p, Reserved::new());
+        h.msg(p, Message::Interested);
+    }
+    assert_eq!(h.t.stats().unchoked, 1);
+    // 16 KiB in a 10 s round is 1.6 KiB/s: above the first threshold.
+    serve_block(&mut h, 1, 0);
+    h.advance(Duration::from_secs(10));
+    assert_eq!(h.t.upload_slots(), 2);
+    assert_eq!(h.t.stats().unchoked, 2);
+    // A quiet round shrinks back to one probing slot.
+    h.advance(Duration::from_secs(10));
+    for p in 1..=3 {
+        h.msg(p, Message::KeepAlive);
+    }
+    assert_eq!(h.t.upload_slots(), 1);
+    assert_eq!(h.t.stats().unchoked, 1);
 }

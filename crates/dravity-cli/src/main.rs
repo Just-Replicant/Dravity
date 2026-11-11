@@ -137,6 +137,15 @@ struct NetworkArgs {
     /// Peers unchoked (uploaded to) at once, plus one optimistic slot.
     #[arg(long, default_value_t = 4, value_name = "N")]
     upload_slots: usize,
+    /// Tune the upload slots every round from measured upload rates
+    /// (`--upload-slots` is the starting value).
+    #[arg(long)]
+    auto_upload_slots: bool,
+    /// How a seed picks peers to upload to: `fastest-upload`,
+    /// `round-robin` (peers take turns) or `anti-leech` (peers just
+    /// starting or nearly done first).
+    #[arg(long, value_name = "MODE", default_value = "fastest-upload")]
+    seed_choking: dravity_engine::SeedChoking,
     /// Maximum connected peers per torrent.
     #[arg(long, default_value_t = 50)]
     max_peers: usize,
@@ -240,6 +249,8 @@ impl NetworkArgs {
             config.port_mapping = None;
         }
         config.engine.upload_slots = self.upload_slots;
+        config.engine.upload_slots_auto = self.auto_upload_slots;
+        config.engine.seed_choking = self.seed_choking;
         config.engine.upload_rate_limit = self.upload_limit.filter(|&r| r > 0);
         config.engine.max_peers = self.max_peers.max(1);
         config.max_connections = (self.max_connections > 0).then_some(self.max_connections);

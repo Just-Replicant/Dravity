@@ -100,6 +100,12 @@ Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/ir
   `per-piece` syncs a verified piece's files before the engine counts it.
   New `Storage::sync_range` (default: `flush`). `SessionConfig::preallocate`,
   `SessionConfig::durability`, and the CLI flags `--preallocate` and `--durability`.
+- **Seed choking modes and slot tuner (item 12):** `Config::seed_choking`
+  (`SeedChoking::FastestUpload`, the default, `RoundRobin` with
+  `Config::round_robin_quota`, or `AntiLeech`) ranks regular slots while
+  seeding. `Config::upload_slots_auto` re-derives the slot count every
+  round from measured upload rates. `TorrentState::upload_slots`. The
+  CLI flags are `--seed-choking` and `--auto-upload-slots`.
 
 ### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
 

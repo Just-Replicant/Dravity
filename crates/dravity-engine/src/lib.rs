@@ -102,7 +102,7 @@ pub use pool::DEFERRED_DIAL_RETRY;
 pub use rate::TokenBucket;
 pub use state::TorrentState;
 pub use types::{
-    Alert, AnnounceEvent, Config, DialHints, Effect, Event, PeerInfo, PeerKey, PeerLink, Stats,
-    TorrentStatus,
+    Alert, AnnounceEvent, Config, DialHints, Effect, Event, PeerInfo, PeerKey, PeerLink,
+    SeedChoking, Stats, TorrentStatus,
 };
 pub use web_seed::{is_web_seed_addr, web_seed_addr};

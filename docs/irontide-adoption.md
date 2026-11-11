@@ -21,6 +21,7 @@ sound version, with the difference explained), **open** (not started).
 | 9 | BDP-adaptive request budget | done | `feat(engine): BDP request depth and a torrent request budget` | [notes](#9-bdp-request-budget) |
 | 10 | Piece reservation / extent affinity | done | `feat(engine): reserve started pieces for the peer that started them` | [notes](#10-piece-reservation) |
 | 11 | Preallocation and durability modes | done | `feat(storage,session): preallocation and durability modes` | [notes](#11-preallocation-and-durability) |
+| 12 | Seed choking variants and an upload slot tuner | done | `feat(engine): seed choking modes and an upload slot tuner` | [notes](#12-seed-choking-and-slot-tuner) |
 
 ## Design notes
 
@@ -224,3 +225,30 @@ The item 8 prescan cannot rule it out by size, so such a torrent is
 rechecked by hashing on restart without resume data. irontide
 preallocates eagerly at add time. Dravity preallocates lazily on first
 write, so a torrent with skipped files never reserves their space.
+
+### 12. Seed choking and slot tuner
+
+The choker round now takes the slot count and whether the torrent seeds.
+While downloading it stays tit-for-tat. While seeding,
+`Config::seed_choking` ranks the interested, non-snubbed peers:
+
+* `FastestUpload` (the default, as before): the most bytes uploaded last
+  round.
+* `RoundRobin`: a peer keeps its slot until it has received
+  `round_robin_quota` bytes (default 4 MiB) since its unchoke. Then the
+  slot goes to the peer that has been choked longest. Peers whose turn
+  is used up rank last.
+* `AntiLeech`: rank by distance from the middle of the download
+  (`|progress - 50%|`), so new and nearly finished peers come first.
+  Ties go to the faster peer.
+
+The slot tuner (`upload_slots_auto`) follows libtorrent's rate-based
+choker. Each round it sorts peers by upload rate. It counts how many
+peers exceed a threshold that starts at 1 KiB/s and rises by 1 KiB/s per
+counted peer, then adds one probing slot. The result is clamped to
+1..=64. Between rounds, `fill_unchoke_slots` uses the tuned count.
+Everything is computed from engine counters, so it stays sans-IO.
+Unit tests cover each ranking and the tuner arithmetic. Scripted engine
+tests cover the round-robin hand-over and tuner growth and shrinkage.
+irontide's own variants use randomness for ties. Dravity keeps the
+choker deterministic, as it already did for the optimistic unchoke.

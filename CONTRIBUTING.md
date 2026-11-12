@@ -1,61 +1,43 @@
 # Contributing to Dravity
 
-Thanks for helping! A few rules keep the codebase consistent with the
-[design plan](docs/rust-torrent-plan.md).
+See the [design plan](docs/rust-torrent-plan.md).
 
 ## Ground rules
 
 1. **Sans-IO libraries.** `dravity-bencode`, `dravity-core`, `dravity-wire`,
-   `dravity-engine`, the `dravity-tracker` and `dravity-portmap` codecs and
-   the `dravity-utp` `Connection` never perform I/O, spawn
-   tasks, or read the clock (the engine takes `now` as an argument).
-   `dravity-session` owns the only production loop: poll I/O →
-   `update(Event)` → dispatch `Effect`s. Binaries send session commands and
-   read alerts; they never write that loop. `dravity-http` is such a client
-   too: it calls the public session API only.
-   I/O crates such as `dravity-dht`, the tracker client, the `dravity-utp`
-   socket and the `dravity-portmap` `PortMapper` are called by
-   the session only, and keep third-party types (e.g. `mainline`) out of
-   their public API.
-2. **Bounded queues.** Every channel is bounded. The torrent owner task must
-   never `await` a send that its own loop has to drain; use `try_send` or a
-   spawned task.
-3. **Errors:** `thiserror` enums in libraries; `anyhow` only in binaries.
-4. **No `unsafe`.** The workspace forbids it. If a future backend (e.g.
-   io_uring) truly needs it, isolate it in its own crate with a justification.
-5. **Untrusted input never panics.** Every parser gets a cargo-fuzz target and
-   property tests from day one. Use `get()`/checked arithmetic, not indexing.
-6. **Paths from metainfo are hostile.** Go through `dravity_core::path`.
+   `dravity-engine`, and the tracker, port-map, and uTP codecs do no I/O,
+   spawn no tasks, and read no clock. The engine takes `now`.
+   `dravity-session` owns the only production loop. Binaries and
+   `dravity-http` send commands and read alerts. I/O crates keep
+   third-party types out of their public API.
+2. **Bounded queues.** The torrent owner never awaits a send its own loop
+   must drain. Use `try_send` or a spawned task.
+3. **Errors.** `thiserror` in libraries. `anyhow` only in binaries.
+4. **No `unsafe`.** The workspace forbids it.
+5. **Untrusted input never panics.** Parsers get a cargo-fuzz target and
+   property tests. Use `get()` and checked arithmetic.
+6. **Metainfo paths are hostile.** Go through `dravity_core::path`.
 
-## Before opening a PR
+## Before a PR
 
 ```sh
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-cargo +nightly fuzz build          # if you touched a parser
-cargo deny check                   # if you touched dependencies
+cargo +nightly fuzz build
+cargo deny check
 ```
 
-- Public items need rustdoc (`missing_docs` is on).
-- Keep the MSRV (`rust-version` in `Cargo.toml`) unless the PR says why.
-- Add workspace dependencies in the root `Cargo.toml` `[workspace.dependencies]`.
-- Note user-visible changes in [CHANGELOG.md](CHANGELOG.md).
-- Use [Conventional Commits](https://www.conventionalcommits.org/) style
-  messages (`feat(wire): …`, `fix(core): …`).
+Public items need rustdoc. Keep the MSRV in the root `Cargo.toml` unless
+the PR says why. Add dependencies under `[workspace.dependencies]`.
+Note user-visible changes in [CHANGELOG.md](CHANGELOG.md). Commit subjects
+are `feat|fix|refactor|chore|docs(scope): …`.
 
-## Fuzzing
-
-```sh
-cargo +nightly fuzz list
-cargo +nightly fuzz run bencode_decode -- -max_total_time=300
-```
-
-Crashes land in `fuzz/artifacts/<target>/`; turn each into a regression unit
-test before fixing it.
+Crashes from `cargo +nightly fuzz run <target>` belong in a regression
+test before the fix.
 
 ## License
 
-Contributions are licensed under the GNU Affero General Public License,
-version 3.0 or later, the same terms as the rest of Dravity. See [LICENSE](LICENSE).
+Contributions use the GNU Affero General Public License, version 3.0 or
+later, the same terms as the rest of Dravity. See [LICENSE](LICENSE).

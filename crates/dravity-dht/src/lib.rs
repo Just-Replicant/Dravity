@@ -32,7 +32,7 @@ pub mod store;
 pub use relay::{Contact, Socks5Proxy};
 
 use std::collections::HashSet;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use dravity_core::InfoHash;
 use futures_util::{Stream, StreamExt};
@@ -80,6 +80,16 @@ pub struct DhtConfig {
     /// addresses and are never resolved locally. Ignored when [`Self::native`]
     /// is `false` (`mainline` has no proxy support).
     pub socks5: Option<Socks5Proxy>,
+    /// Run a second native node on an IPv6 socket (BEP 32 dual-stack).
+    /// Ignored when [`Self::native`] is `false`. The IPv6 node has its own
+    /// routing table and is bound with `IPV6_V6ONLY` so it can share
+    /// [`Self::port`] with the IPv4 node.
+    pub ipv6: bool,
+    /// Address to bind the IPv6 node; `None` binds all IPv6 interfaces.
+    pub bind_address_v6: Option<Ipv6Addr>,
+    /// UDP port for the IPv6 node; `None` uses [`Self::port`] (or any free
+    /// port).
+    pub port_v6: Option<u16>,
 }
 
 impl Default for DhtConfig {
@@ -92,6 +102,9 @@ impl Default for DhtConfig {
             max_peers: DEFAULT_MAX_PEERS,
             native: false,
             socks5: None,
+            ipv6: false,
+            bind_address_v6: None,
+            port_v6: None,
         }
     }
 }
@@ -121,6 +134,8 @@ enum Backend {
     Mainline(AsyncDht),
     Native {
         node: NativeSlot,
+        /// A second node on an IPv6 socket when [`DhtConfig::ipv6`] is set.
+        node6: Option<NativeSlot>,
         /// `host:port` entries, resolved at each (re)bootstrap unless
         /// the node is proxied (then they are sent as domain addresses).
         bootstrap: std::sync::Arc<Vec<String>>,
@@ -190,14 +205,102 @@ pub const DEFAULT_BOOTSTRAP: &[&str] = &[
 /// Per-query timeout of the native node.
 const NATIVE_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-async fn resolve(entries: &[String]) -> Vec<SocketAddr> {
+async fn resolve(entries: &[String], ipv6: bool) -> Vec<SocketAddr> {
     let mut out = Vec::new();
     for entry in entries {
         if let Ok(addrs) = tokio::net::lookup_host(entry.as_str()).await {
-            out.extend(addrs.filter(SocketAddr::is_ipv4));
+            out.extend(addrs.filter(|a| a.is_ipv6() == ipv6));
         }
     }
     out
+}
+
+fn bind_v6_only(addr: Ipv6Addr, port: u16) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_only_v6(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&SocketAddr::from((addr, port)).into())?;
+    Ok(socket.into())
+}
+
+fn spawn_relayed(
+    proxy: Socks5Proxy,
+    native_config: native::NativeConfig,
+    bootstrap: std::sync::Arc<Vec<String>>,
+) -> NativeSlot {
+    let (tx, rx) = tokio::sync::watch::channel(std::sync::Arc::new(NativePhase::Pending));
+    tokio::spawn(async move {
+        match native::NativeDht::bind_relayed(&proxy, native_config).await {
+            Ok(node) => {
+                let joining = node.clone();
+                let _ = tx.send(std::sync::Arc::new(NativePhase::Up(node)));
+                joining
+                    .bootstrap_contacts(&Contact::parse_all(&bootstrap))
+                    .await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "native DHT SOCKS5 associate failed");
+                let _ = tx.send(std::sync::Arc::new(NativePhase::Failed(
+                    error.to_string().into(),
+                )));
+            }
+        }
+    });
+    NativeSlot::Starting(rx)
+}
+
+fn spawn_direct(
+    socket: std::net::UdpSocket,
+    native_config: native::NativeConfig,
+    bootstrap: std::sync::Arc<Vec<String>>,
+    ipv6: bool,
+) -> Result<NativeSlot, DhtError> {
+    let node = native::NativeDht::from_std(socket, native_config)?;
+    let joining = node.clone();
+    tokio::spawn(async move {
+        joining.bootstrap(&resolve(&bootstrap, ipv6).await).await;
+    });
+    Ok(NativeSlot::Ready(node))
+}
+
+async fn bootstrap_slot(
+    slot: &NativeSlot,
+    bootstrap: &[String],
+    proxied: bool,
+    ipv6: bool,
+) -> bool {
+    let Some(node) = slot.wait().await else {
+        return false;
+    };
+    if proxied {
+        node.bootstrap_contacts(&Contact::parse_all(bootstrap))
+            .await
+            > 0
+    } else {
+        node.bootstrap(&resolve(bootstrap, ipv6).await).await > 0
+    }
+}
+
+async fn peers_from_slot(
+    slot: &NativeSlot,
+    info_hash: [u8; 20],
+    bootstrap: &[String],
+    proxied: bool,
+    ipv6: bool,
+) -> Vec<SocketAddr> {
+    let Some(node) = slot.wait().await else {
+        return Vec::new();
+    };
+    if node.table_len() == 0 {
+        if proxied {
+            node.bootstrap_contacts(&Contact::parse_all(bootstrap))
+                .await;
+        } else {
+            node.bootstrap(&resolve(bootstrap, ipv6).await).await;
+        }
+    }
+    node.get_peers(info_hash).await.peers
 }
 
 impl Dht {
@@ -247,50 +350,48 @@ impl Dht {
             timeout: NATIVE_QUERY_TIMEOUT,
             ..native::NativeConfig::default()
         };
-        if let Some(proxy) = config.socks5.clone() {
-            let (tx, rx) = tokio::sync::watch::channel(std::sync::Arc::new(NativePhase::Pending));
-            let entries = std::sync::Arc::clone(&bootstrap);
-            tokio::spawn(async move {
-                match native::NativeDht::bind_relayed(&proxy, native_config).await {
-                    Ok(node) => {
-                        let joining = node.clone();
-                        let _ = tx.send(std::sync::Arc::new(NativePhase::Up(node)));
-                        joining
-                            .bootstrap_contacts(&Contact::parse_all(&entries))
-                            .await;
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "native DHT SOCKS5 associate failed");
-                        let _ = tx.send(std::sync::Arc::new(NativePhase::Failed(
-                            error.to_string().into(),
-                        )));
-                    }
-                }
-            });
-            return Ok(Self {
-                inner: Backend::Native {
-                    node: NativeSlot::Starting(rx),
-                    bootstrap,
-                    proxied: true,
-                },
-                max_peers: config.max_peers.max(1),
-            });
-        }
-        let socket = std::net::UdpSocket::bind((
-            config.bind_address.unwrap_or(Ipv4Addr::UNSPECIFIED),
-            config.port.unwrap_or(0),
-        ))?;
-        let node = native::NativeDht::from_std(socket, native_config)?;
-        let joining = node.clone();
-        let entries = std::sync::Arc::clone(&bootstrap);
-        tokio::spawn(async move {
-            joining.bootstrap(&resolve(&entries).await).await;
-        });
+        let node = if let Some(proxy) = config.socks5.clone() {
+            spawn_relayed(
+                proxy,
+                native_config.clone(),
+                std::sync::Arc::clone(&bootstrap),
+            )
+        } else {
+            let socket = std::net::UdpSocket::bind((
+                config.bind_address.unwrap_or(Ipv4Addr::UNSPECIFIED),
+                config.port.unwrap_or(0),
+            ))?;
+            spawn_direct(
+                socket,
+                native_config.clone(),
+                std::sync::Arc::clone(&bootstrap),
+                false,
+            )?
+        };
+        let node6 = if config.ipv6 {
+            Some(if let Some(proxy) = config.socks5.clone() {
+                spawn_relayed(proxy, native_config, std::sync::Arc::clone(&bootstrap))
+            } else {
+                let socket = bind_v6_only(
+                    config.bind_address_v6.unwrap_or(Ipv6Addr::UNSPECIFIED),
+                    config.port_v6.or(config.port).unwrap_or(0),
+                )?;
+                spawn_direct(
+                    socket,
+                    native_config,
+                    std::sync::Arc::clone(&bootstrap),
+                    true,
+                )?
+            })
+        } else {
+            None
+        };
         Ok(Self {
             inner: Backend::Native {
-                node: NativeSlot::Ready(node),
+                node,
+                node6,
                 bootstrap,
-                proxied: false,
+                proxied: config.socks5.is_some(),
             },
             max_peers: config.max_peers.max(1),
         })
@@ -307,6 +408,18 @@ impl Dht {
         }
     }
 
+    /// Local address of the IPv6 node's UDP socket, if [`DhtConfig::ipv6`]
+    /// is on and the node is running.
+    pub async fn local_addr_v6(&self) -> Option<SocketAddr> {
+        match &self.inner {
+            Backend::Mainline(_) => None,
+            Backend::Native { node6, .. } => node6
+                .as_ref()
+                .and_then(NativeSlot::ready)
+                .and_then(|n| n.local_addr().ok()),
+        }
+    }
+
     /// Asks the network for nodes near our id. `true` if any node answered.
     ///
     /// This sends a `find_node` query. It is not a snapshot of whether
@@ -317,19 +430,17 @@ impl Dht {
             Backend::Mainline(dht) => dht.bootstrapped().await,
             Backend::Native {
                 node,
+                node6,
                 bootstrap,
                 proxied,
             } => {
-                let Some(node) = node.wait().await else {
-                    return false;
-                };
-                if *proxied {
-                    node.bootstrap_contacts(&Contact::parse_all(bootstrap))
-                        .await
-                        > 0
+                let v4 = bootstrap_slot(node, bootstrap, *proxied, false).await;
+                let v6 = if let Some(node6) = node6 {
+                    bootstrap_slot(node6, bootstrap, *proxied, true).await
                 } else {
-                    node.bootstrap(&resolve(bootstrap).await).await > 0
-                }
+                    false
+                };
+                v4 || v6
             }
         }
     }
@@ -348,10 +459,18 @@ impl Dht {
     pub async fn to_bootstrap(&self) -> Vec<String> {
         match &self.inner {
             Backend::Mainline(dht) => dht.to_bootstrap().await,
-            Backend::Native { node, .. } => node
-                .ready()
-                .map(|n| n.nodes().iter().map(ToString::to_string).collect())
-                .unwrap_or_default(),
+            Backend::Native { node, node6, .. } => {
+                let mut out: Vec<String> = node
+                    .ready()
+                    .map(|n| n.nodes().iter().map(ToString::to_string).collect())
+                    .unwrap_or_default();
+                if let Some(node6) = node6
+                    && let Some(n) = node6.ready()
+                {
+                    out.extend(n.nodes().iter().map(ToString::to_string));
+                }
+                out
+            }
         }
     }
 
@@ -379,25 +498,20 @@ impl Dht {
                 .left_stream(),
             Backend::Native {
                 node,
+                node6,
                 bootstrap,
                 proxied,
             } => {
                 let node = node.clone();
+                let node6 = node6.clone();
                 let bootstrap = std::sync::Arc::clone(bootstrap);
                 let proxied = *proxied;
                 futures_util::stream::once(async move {
-                    let Some(node) = node.wait().await else {
-                        return Vec::new();
-                    };
-                    if node.table_len() == 0 {
-                        if proxied {
-                            node.bootstrap_contacts(&Contact::parse_all(&bootstrap))
-                                .await;
-                        } else {
-                            node.bootstrap(&resolve(&bootstrap).await).await;
-                        }
+                    let hash = *info_hash.as_bytes();
+                    let mut peers = peers_from_slot(&node, hash, &bootstrap, proxied, false).await;
+                    if let Some(node6) = &node6 {
+                        peers.extend(peers_from_slot(node6, hash, &bootstrap, proxied, true).await);
                     }
-                    let mut peers = node.get_peers(*info_hash.as_bytes()).await.peers;
                     peers.retain(usable);
                     peers
                 })
@@ -442,13 +556,24 @@ impl Dht {
                 .await
                 .map(drop)
                 .map_err(|e| DhtError::Announce(e.to_string())),
-            Backend::Native { node, .. } => {
-                let Some(node) = node.wait().await else {
-                    return Err(DhtError::Announce("SOCKS5 relay is not up".to_owned()));
-                };
-                match node.announce(*info_hash.as_bytes(), port).await.1 {
-                    0 => Err(DhtError::Announce("no node accepted".to_owned())),
-                    _ => Ok(()),
+            Backend::Native { node, node6, .. } => {
+                let hash = *info_hash.as_bytes();
+                let mut accepted = 0usize;
+                let mut last_err: Option<DhtError> = None;
+                for slot in std::iter::once(node).chain(node6.as_ref()) {
+                    match slot.wait().await {
+                        Some(n) => accepted += n.announce(hash, port).await.1,
+                        None => {
+                            last_err =
+                                Some(DhtError::Announce("SOCKS5 relay is not up".to_owned()));
+                        }
+                    }
+                }
+                if accepted > 0 {
+                    Ok(())
+                } else {
+                    Err(last_err
+                        .unwrap_or_else(|| DhtError::Announce("no node accepted".to_owned())))
                 }
             }
         }

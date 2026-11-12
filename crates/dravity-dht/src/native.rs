@@ -508,6 +508,7 @@ impl NativeDht {
     ) -> (Vec<SocketAddr>, Answered) {
         let shared = &self.shared;
         let own = self.id();
+        let ipv6 = shared.socket.local_addr().is_ok_and(|a| a.is_ipv6());
         let mut candidates: Vec<Node> = shared.lock().table.closest(&target, K * 2);
         let mut queried: HashSet<[u8; 20]> = HashSet::new();
         let mut answered: Answered = Vec::new();
@@ -552,12 +553,15 @@ impl NativeDht {
                 };
                 answered.push((node, token, reply_ext));
                 for value in values {
-                    if !peers.contains(&value) {
+                    if value.is_ipv6() == ipv6 && !peers.contains(&value) {
                         peers.push(value);
                     }
                 }
                 candidates.extend(nodes.into_iter().filter(|n| {
-                    n.id != own && n.addr.port() != 0 && shared.acceptable(&n.id, n.addr.ip())
+                    n.id != own
+                        && n.addr.port() != 0
+                        && n.addr.is_ipv6() == ipv6
+                        && shared.acceptable(&n.id, n.addr.ip())
                 }));
             }
         }
@@ -610,8 +614,16 @@ impl Shared {
         tracing::debug!(%ip, "took a BEP 42 node id");
     }
 
+    /// Whether `addr` is the same address family as our socket (BEP 32:
+    /// IPv4 and IPv6 are separate DHTs).
+    fn same_family(&self, addr: SocketAddr) -> bool {
+        self.socket
+            .local_addr()
+            .is_ok_and(|local| local.is_ipv6() == addr.is_ipv6())
+    }
+
     fn insert(&self, node: Node) {
-        if self.acceptable(&node.id, node.addr.ip()) {
+        if self.same_family(node.addr) && self.acceptable(&node.id, node.addr.ip()) {
             self.lock().table.insert(node, Instant::now().into_std());
         }
     }

@@ -26,7 +26,7 @@ fails if the code cites a BEP that has no row here.
 | 27 | Private Torrents | Full | `dravity-core`, `dravity-session` | Disables DHT, PEX, LSD, tracker exchange and holepunch. |
 | 28 | Tracker exchange extension | Full | `dravity-wire::ext_msgs` (`lt_tex`), `dravity-engine`, `dravity-session` | Learned trackers form a new tier; off for private torrents. |
 | 29 | uTorrent transport protocol (uTP) | Full | `dravity-utp` | LEDBAT congestion control, selective ACK, shared listen port with TCP. |
-| 32 | BitTorrent DHT Extensions for IPv6 | Partial | `dravity-dht::krpc` | `nodes6` encoded and decoded by the native codec. The running `mainline` DHT is IPv4 only. |
+| 32 | BitTorrent DHT Extensions for IPv6 | Partial | `dravity-dht` | `nodes6` encoded and decoded by the native codec. The native DHT runs a second node on an IPv6 socket (`DhtConfig::ipv6`, CLI `--dht-ipv6`), with IPv4 and IPv6 as separate routing tables (BEP 32). The running `mainline` DHT is IPv4 only. |
 | 40 | Canonical Peer Priority | Full | `dravity-core::priority`, `dravity-engine` | CRC-32C ranking verified against the BEP's vectors; decides evictions at the peer cap. |
 | 42 | DHT Security Extension | Partial | `dravity-dht::secure_id` | Secure node ids and checks verified against the BEP's vectors. They are not applied by the `mainline` runtime. |
 | 47 | Padding files and extended file attributes | Full | `dravity-core`, `dravity-storage` | Padding files are never written; `attr` `p` honoured; hybrids always pad. |

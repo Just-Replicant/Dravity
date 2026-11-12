@@ -273,6 +273,11 @@ struct NetworkArgs {
     /// (experimental until checked against the live network).
     #[arg(long, conflicts_with = "no_dht")]
     native_dht: bool,
+    /// Run a second native DHT node on an IPv6 socket (BEP 32 dual-stack).
+    /// Implies `--native-dht`. Experimental until checked against the live
+    /// network; see `docs/irontide-adoption.md`.
+    #[arg(long, conflicts_with = "no_dht")]
+    dht_ipv6: bool,
     /// Do not look for peers on the local network (BEP 14 Local Service
     /// Discovery; private torrents never use it).
     #[arg(long)]
@@ -398,10 +403,11 @@ impl NetworkArgs {
         if self.no_dht {
             config.dht = None;
         }
-        if self.native_dht
+        if (self.native_dht || self.dht_ipv6)
             && let Some(dht) = &mut config.dht
         {
             dht.native = true;
+            dht.ipv6 = self.dht_ipv6;
         }
         if self.no_web_seeds {
             config.web_seed = None;

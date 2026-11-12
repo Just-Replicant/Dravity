@@ -729,6 +729,7 @@ dependencies = [
  "futures-util",
  "mainline",
  "sha1",
+ "socket2 0.6.5",
  "thiserror",
  "tokio",
  "tracing",

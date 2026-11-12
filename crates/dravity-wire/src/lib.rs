@@ -15,17 +15,24 @@
 //! [`Message::Unknown`]; see [`message`].
 
 mod error;
+mod ext_msgs;
 mod extended;
 mod fast;
 mod handshake;
+mod holepunch;
 pub mod message;
 mod metadata;
 mod pex;
 
 pub use error::WireError;
+pub use ext_msgs::{
+    LT_DONTHAVE, LT_TEX, MAX_TEX_TRACKERS, MAX_TEX_URL_LEN, TrackerExchange, decode_donthave,
+    encode_donthave, is_exchangeable_tracker,
+};
 pub use extended::{ExtendedError, ExtendedHandshake};
 pub use fast::{DEFAULT_ALLOWED_FAST, allowed_fast_set};
 pub use handshake::{HANDSHAKE_LEN, Handshake, PROTOCOL, Reserved};
+pub use holepunch::{Holepunch, HolepunchError, UT_HOLEPUNCH};
 pub use message::{
     BlockRequest, DEFAULT_MAX_FRAME_LEN, HashRequest, Message, MessageDecoder, MessageId,
     bitfield_bit, check_bitfield,

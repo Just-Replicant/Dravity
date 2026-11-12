@@ -1,0 +1,29 @@
+[package]
+name = "dravity"
+description = "Dravity BitTorrent client library: one dependency with a stable facade over the session, core and storage crates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[features]
+## io_uring storage backend (Linux).
+uring = ["dravity-session/uring"]
+
+[dependencies]
+dravity-core.workspace = true
+dravity-session.workspace = true
+dravity-storage.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

@@ -27,6 +27,9 @@ pub struct WebSeedConfig {
     /// must not make the client probe its network. Turn on for tests and
     /// LAN web seeds.
     pub allow_private_addresses: bool,
+    /// Fetch through this proxy (`http://`, `socks5h://`, `socks4a://`, …
+    /// with optional `user:pass@`).
+    pub http_proxy: Option<String>,
 }
 
 impl Default for WebSeedConfig {
@@ -35,6 +38,7 @@ impl Default for WebSeedConfig {
             timeout: Duration::from_secs(30),
             user_agent: concat!("Dravity/", env!("CARGO_PKG_VERSION")).to_owned(),
             allow_private_addresses: false,
+            http_proxy: None,
         }
     }
 }
@@ -183,8 +187,11 @@ impl WebSeedClient {
             .tls_backend_preconfigured(tls)
             .timeout(config.timeout)
             .user_agent(config.user_agent.clone())
-            .redirect(Policy::custom(redirect))
-            .no_proxy();
+            .redirect(Policy::custom(redirect));
+        builder = match &config.http_proxy {
+            Some(url) => builder.proxy(reqwest::Proxy::all(url.as_str())?),
+            None => builder.no_proxy(),
+        };
         if !config.allow_private_addresses {
             builder = builder.dns_resolver(Arc::new(PublicResolver));
         }

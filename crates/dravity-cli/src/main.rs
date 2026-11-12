@@ -104,6 +104,51 @@ enum Command {
         #[command(flatten)]
         network: NetworkArgs,
     },
+    /// Create a `.torrent` file from a file or directory.
+    Create {
+        /// The file or directory to share.
+        path: PathBuf,
+        /// Where to write the torrent (defaults to `<NAME>.torrent`).
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// `v1`, `v2` (BEP 52) or `hybrid` (both, one swarm).
+        #[arg(
+            long = "torrent-version",
+            value_name = "VERSION",
+            default_value = "hybrid"
+        )]
+        version: dravity_core::create::CreateVersion,
+        /// Piece length, a power of two of at least 16K (default: chosen
+        /// from the total size).
+        #[arg(long, value_name = "SIZE", value_parser = format::parse_rate)]
+        piece_length: Option<u64>,
+        /// Tracker URL (repeatable). Each flag is its own tier; separate
+        /// URLs with commas to put them in one tier.
+        #[arg(short, long = "tracker", value_name = "URL")]
+        trackers: Vec<String>,
+        /// Web seed URL (repeatable, BEP 19).
+        #[arg(short = 'w', long = "web-seed", value_name = "URL")]
+        web_seeds: Vec<String>,
+        /// Mark the torrent private (no DHT, PEX or local discovery).
+        #[arg(long)]
+        private: bool,
+        /// Pad files to piece boundaries in a v1 torrent too (BEP 47).
+        #[arg(long)]
+        pad: bool,
+        /// Free-form comment.
+        #[arg(long)]
+        comment: Option<String>,
+        /// `source` tag, which gives the same files a distinct info hash
+        /// per private tracker.
+        #[arg(long)]
+        source: Option<String>,
+        /// Leave out the creation date (reproducible output).
+        #[arg(long)]
+        no_date: bool,
+        /// Replace an existing output file.
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Show what a `.torrent` file or `magnet:` link contains.
     Info {
         /// Path to a `.torrent` file, or a `magnet:` link.
@@ -137,16 +182,106 @@ struct NetworkArgs {
     /// Peers unchoked (uploaded to) at once, plus one optimistic slot.
     #[arg(long, default_value_t = 4, value_name = "N")]
     upload_slots: usize,
-    /// Maximum connected peers.
+    /// Tune the upload slots every round from measured upload rates
+    /// (`--upload-slots` is the starting value).
+    #[arg(long)]
+    auto_upload_slots: bool,
+    /// How a seed picks peers to upload to: `fastest-upload`,
+    /// `round-robin` (peers take turns) or `anti-leech` (peers just
+    /// starting or nearly done first).
+    #[arg(long, value_name = "MODE", default_value = "fastest-upload")]
+    seed_choking: dravity_engine::SeedChoking,
+    /// Maximum connected peers per torrent.
     #[arg(long, default_value_t = 50)]
     max_peers: usize,
+    /// Maximum open peer connections across all torrents; 0 for no cap.
+    #[arg(long, default_value_t = dravity_session::DEFAULT_MAX_CONNECTIONS, value_name = "N")]
+    max_connections: usize,
+    /// Memory for recently read torrent data, shared by all torrents (helps
+    /// seeding); accepts `K`/`M`/`G` suffixes, 0 turns it off.
+    #[arg(long, value_name = "SIZE", value_parser = format::parse_rate, default_value = "64M")]
+    read_cache: u64,
+    /// How new files reserve disk space: `none` grows them as data
+    /// arrives, `sparse` sets the length at once, `full` reserves every
+    /// block (fails early on a full disk).
+    #[arg(long, value_name = "MODE", default_value = "none")]
+    preallocate: dravity_session::PreallocateMode,
+    /// Scrape trackers every this many minutes and show their counts
+    /// (seeders, leechers, completed downloads); 0 never scrapes.
+    #[arg(long, value_name = "MINUTES", default_value_t = 0)]
+    scrape_interval: u64,
+    /// When downloaded data is forced to disk: `never` (only on resume
+    /// save and stop), `per-piece` (after each verified piece) or
+    /// `on-complete`.
+    #[arg(long, value_name = "WHEN", default_value = "never")]
+    durability: dravity_session::Durability,
     /// Download rate limit in bytes per second; accepts `K`/`M`/`G`
     /// suffixes (binary), e.g. `500K` or `2M`.
     #[arg(long, value_name = "RATE", value_parser = format::parse_rate)]
     download_limit: Option<u64>,
+    /// Download rate limit for all torrents together, in bytes per second
+    /// (at least 16K); accepts `K`/`M`/`G` suffixes.
+    #[arg(long, value_name = "RATE", value_parser = format::parse_rate)]
+    global_download_limit: Option<u64>,
+    /// Upload rate limit for all torrents together, in bytes per second
+    /// (at least 16K); accepts `K`/`M`/`G` suffixes.
+    #[arg(long, value_name = "RATE", value_parser = format::parse_rate)]
+    global_upload_limit: Option<u64>,
+    /// Run at most this many unfinished torrents at once; the rest wait
+    /// queued and start, oldest first, as slots free up.
+    #[arg(long, value_name = "N")]
+    max_active_downloads: Option<usize>,
+    /// Seed at most this many finished torrents at once; the rest wait
+    /// queued.
+    #[arg(long, value_name = "N")]
+    max_active_seeds: Option<usize>,
+    /// Super-seed complete torrents (BEP 16): show each peer one piece at
+    /// a time so a first seed spreads the torrent faster.
+    #[arg(long)]
+    super_seed: bool,
+    /// Do not exchange tracker lists with peers (`lt_tex`; private
+    /// torrents never do).
+    #[arg(long)]
+    no_tracker_exchange: bool,
+    /// Do not relay or request BEP 55 holepunches (`ut_holepunch`;
+    /// private torrents never do).
+    #[arg(long)]
+    no_holepunch: bool,
+    /// Refuse peers in the ranges of this blocklist (eMule `ipfilter.dat`,
+    /// PeerGuardian P2P text, or one address, range or CIDR per line).
+    #[arg(long, value_name = "FILE")]
+    ip_filter: Option<PathBuf>,
+    /// Dial peers through a proxy: `socks5://[user:pass@]host:port`,
+    /// `socks4://host:port` or `http://[user:pass@]host:port` (it also
+    /// carries HTTP trackers and web seeds, SOCKS with remote DNS; SOCKS5
+    /// also relays UDP trackers and, with `--native-dht`, the native DHT).
+    /// LSD is not proxied; add `--no-lsd` for that.
+    #[arg(long, value_name = "URL")]
+    proxy: Option<String>,
+    /// Show peer countries from this "IP to country" CSV database
+    /// (`start,end,country`, as db-ip lite or IP2Location LITE ship it).
+    #[arg(long, value_name = "FILE")]
+    geoip: Option<PathBuf>,
+    /// Mark peer TCP connections with this DSCP value (0-63), e.g. 8 (CS1)
+    /// so routers that honour it deprioritise BitTorrent traffic.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=63))]
+    peer_dscp: Option<u8>,
     /// Do not use the DHT for peer discovery.
     #[arg(long)]
     no_dht: bool,
+    /// Run Dravity's own DHT node instead of the `mainline` one
+    /// (experimental until checked against the live network).
+    #[arg(long, conflicts_with = "no_dht")]
+    native_dht: bool,
+    /// Run a second native DHT node on an IPv6 socket (BEP 32 dual-stack).
+    /// Implies `--native-dht`. Experimental until checked against the live
+    /// network; see `docs/irontide-adoption.md`.
+    #[arg(long, conflicts_with = "no_dht")]
+    dht_ipv6: bool,
+    /// Do not look for peers on the local network (BEP 14 Local Service
+    /// Discovery; private torrents never use it).
+    #[arg(long)]
+    no_lsd: bool,
     /// Never download from HTTP web seeds (BEP 19 `url-list`, magnet `ws`).
     #[arg(long)]
     no_web_seeds: bool,
@@ -208,7 +343,7 @@ impl From<Backend> for StorageBackend {
 
 impl NetworkArgs {
     /// A session configuration with these options.
-    fn config(&self) -> SessionConfig {
+    fn config(&self) -> Result<SessionConfig> {
         let mut config = SessionConfig::default();
         config.announce_port = self.port;
         config.listen = (!self.no_listen).then(|| {
@@ -223,11 +358,56 @@ impl NetworkArgs {
             config.port_mapping = None;
         }
         config.engine.upload_slots = self.upload_slots;
+        config.engine.upload_slots_auto = self.auto_upload_slots;
+        config.engine.seed_choking = self.seed_choking;
         config.engine.upload_rate_limit = self.upload_limit.filter(|&r| r > 0);
         config.engine.max_peers = self.max_peers.max(1);
+        config.max_connections = (self.max_connections > 0).then_some(self.max_connections);
+        config.read_cache = usize::try_from(self.read_cache).ok().filter(|&b| b > 0);
+        config.preallocate = self.preallocate;
+        config.scrape_interval = (self.scrape_interval > 0)
+            .then(|| std::time::Duration::from_secs(self.scrape_interval.saturating_mul(60)));
+        config.durability = self.durability;
         config.engine.download_rate_limit = self.download_limit.filter(|&r| r > 0);
+        config.download_rate_limit = self.global_download_limit.filter(|&r| r > 0);
+        config.upload_rate_limit = self.global_upload_limit.filter(|&r| r > 0);
+        config.max_active_downloads = self.max_active_downloads;
+        config.max_active_seeds = self.max_active_seeds;
+        config.engine.super_seed = self.super_seed;
+        if let Some(path) = &self.ip_filter {
+            let filter = dravity_session::IpFilter::from_file(path)
+                .with_context(|| format!("loading the IP filter {}", path.display()))?;
+            if filter.skipped() > 0 {
+                tracing::warn!(
+                    skipped = filter.skipped(),
+                    "IP filter lines that hold no range were skipped"
+                );
+            }
+            config.ip_filter = Some(std::sync::Arc::new(filter));
+        }
+        if let Some(url) = &self.proxy {
+            config.proxy =
+                Some(dravity_session::proxy::Proxy::parse(url).context("parsing --proxy")?);
+        }
+        if let Some(path) = &self.geoip {
+            let db = dravity_session::GeoIp::from_file(path)
+                .with_context(|| format!("loading the GeoIP database {}", path.display()))?;
+            config.geoip = Some(std::sync::Arc::new(db));
+        }
+        config.peer_dscp = self.peer_dscp;
+        config.engine.tracker_exchange = !self.no_tracker_exchange;
+        config.engine.holepunch = !self.no_holepunch;
+        if !self.no_lsd && config.listen.is_some() {
+            config.lsd = Some(dravity_session::LsdConfig::default());
+        }
         if self.no_dht {
             config.dht = None;
+        }
+        if (self.native_dht || self.dht_ipv6)
+            && let Some(dht) = &mut config.dht
+        {
+            dht.native = true;
+            dht.ipv6 = self.dht_ipv6;
         }
         if self.no_web_seeds {
             config.web_seed = None;
@@ -237,7 +417,7 @@ impl NetworkArgs {
         }
         config.storage_backend = self.storage_backend.into();
         config.encryption = self.encryption.into();
-        config
+        Ok(config)
     }
 }
 
@@ -312,6 +492,48 @@ fn check_terminal(tui: bool) -> Result<()> {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Create {
+            path,
+            output,
+            version,
+            piece_length,
+            trackers,
+            web_seeds,
+            private,
+            pad,
+            comment,
+            source,
+            no_date,
+            force,
+        } => {
+            let mut options = dravity_core::create::CreateOptions::new(version);
+            options.piece_length = piece_length
+                .map(|l| u32::try_from(l).context("piece length is too large"))
+                .transpose()?;
+            options.trackers = trackers
+                .iter()
+                .map(|t| {
+                    t.split(',')
+                        .map(str::trim)
+                        .filter(|u| !u.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .collect();
+            options.web_seeds = web_seeds;
+            options.private = private;
+            options.pad_files = pad;
+            options.comment = comment;
+            options.source = source;
+            options.created_by = Some(concat!("dravity/", env!("CARGO_PKG_VERSION")).to_owned());
+            if !no_date {
+                options.creation_date = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|d| i64::try_from(d.as_secs()).ok());
+            }
+            create(&path, output, force, options)
+        }
         Command::Info { torrent } => match load(&torrent)? {
             Input::File(m) => info(&m),
             Input::Magnet(m) => magnet_info(&m),
@@ -345,7 +567,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 Input::Magnet(_) => Vec::new(),
             };
-            let mut config = network.config();
+            let mut config = network.config()?;
             config.engine.seed = seed;
             config.resume_dir = if no_resume {
                 None
@@ -378,7 +600,7 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             check_terminal(tui)?;
             let state_dir = state_dir.unwrap_or_else(|| download_dir.join(".dravity"));
-            let mut config = network.config();
+            let mut config = network.config()?;
             config.engine.seed = !no_seed;
             config.state_dir = Some(state_dir.join("torrents"));
             config.resume_dir = Some(state_dir.join("resume"));
@@ -428,6 +650,47 @@ fn magnet_info(m: &Magnet) -> Result<()> {
         writeln!(out, "peer:       {peer}")?;
     }
     writeln!(out, "(files are known once the metadata is fetched)")?;
+    Ok(())
+}
+
+/// `dravity create`: hashes `path` and writes the torrent.
+fn create(
+    path: &Path,
+    output: Option<PathBuf>,
+    force: bool,
+    options: dravity_core::create::CreateOptions,
+) -> Result<()> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("{}", path.display()))?;
+    let bytes = dravity_storage::create_torrent(&path, options, |_| {})
+        .with_context(|| format!("creating a torrent of {}", path.display()))?;
+    let m = Metainfo::from_bytes(&bytes).context("the created torrent does not parse")?;
+    let output = output.unwrap_or_else(|| PathBuf::from(format!("{}.torrent", m.info().name())));
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true);
+    if force {
+        open.create(true).truncate(true);
+    } else {
+        open.create_new(true);
+    }
+    let mut file = open
+        .open(&output)
+        .with_context(|| format!("writing {}", output.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("writing {}", output.display()))?;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "created:    {}", output.display())?;
+    writeln!(out, "info-hash:  {}", m.info_hash())?;
+    if let Some(v2) = m.info_hash_v2() {
+        writeln!(out, "v2 hash:    {v2}")?;
+    }
+    writeln!(
+        out,
+        "pieces:     {} x {}",
+        m.info().piece_count(),
+        format::bytes(u64::from(m.info().piece_length()))
+    )?;
     Ok(())
 }
 

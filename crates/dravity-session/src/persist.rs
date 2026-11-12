@@ -21,8 +21,13 @@
 //!
 //! ```text
 //! d 5:addedi<unix seconds>e 12:download-dir<path> 9:info-hash20:<hash>
-//!   [6:magnet<uri>] 6:pausedi<0|1>e 10:prioritiesl<i0..3e>...e 7:versioni1e e
+//!   [6:magnet<uri>] 6:pausedi<0|1>e 10:prioritiesl<i0..3e>...e 7:versioni1e
+//!   [9:web-seedsl d 8:failuresi<n>e 8:retry-ati<unix seconds>e
+//!     7:stoppedi<0|1>e 3:url<url> e ...e] e
 //! ```
+//!
+//! `web-seeds` lists only web seeds that failed or were stopped; records
+//! without it (older versions) load with every web seed healthy.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -72,7 +77,45 @@ pub struct TorrentRecord {
     pub paused: bool,
     /// When the torrent was added, in seconds since the Unix epoch.
     pub added_at: u64,
+    /// Web seed health, so back-off and bans survive a restart.
+    pub web_seeds: Vec<WebSeedStat>,
 }
+
+/// What the session remembers about one web seed of a torrent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WebSeedStat {
+    /// The web seed URL.
+    pub url: String,
+    /// Failures in a row.
+    pub failures: u32,
+    /// Stopped for good (bad data, or a URL that can never work).
+    pub stopped: bool,
+    /// Not retried before this, in seconds since the Unix epoch.
+    pub retry_at: u64,
+}
+
+impl WebSeedStat {
+    /// A healthy web seed at `url`.
+    #[must_use]
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            failures: 0,
+            stopped: false,
+            retry_at: 0,
+        }
+    }
+
+    /// Whether there is anything worth storing.
+    #[must_use]
+    pub const fn is_healthy(&self) -> bool {
+        self.failures == 0 && !self.stopped
+    }
+}
+
+/// Most web seed entries kept per record.
+const MAX_WEB_SEED_STATS: usize = 256;
 
 impl TorrentRecord {
     /// A record for a torrent in `download_dir`, added now, not paused.
@@ -85,6 +128,7 @@ impl TorrentRecord {
             priorities: Vec::new(),
             paused: false,
             added_at: unix_now(),
+            web_seeds: Vec::new(),
         }
     }
 
@@ -119,6 +163,29 @@ impl TorrentRecord {
             key("added"),
             Value::Int(i64::try_from(self.added_at).unwrap_or(i64::MAX)),
         );
+        let seeds: Vec<Value<'_>> = self
+            .web_seeds
+            .iter()
+            .filter(|s| !s.is_healthy())
+            .take(MAX_WEB_SEED_STATS)
+            .map(|s| {
+                let mut e = Dict::new();
+                e.insert(
+                    key("url"),
+                    Value::Bytes(Cow::Owned(s.url.as_bytes().to_vec())),
+                );
+                e.insert(key("failures"), Value::Int(i64::from(s.failures)));
+                e.insert(key("stopped"), Value::Int(i64::from(s.stopped)));
+                e.insert(
+                    key("retry-at"),
+                    Value::Int(i64::try_from(s.retry_at).unwrap_or(i64::MAX)),
+                );
+                Value::Dict(e)
+            })
+            .collect();
+        if !seeds.is_empty() {
+            d.insert(key("web-seeds"), Value::List(seeds));
+        }
         Value::Dict(d).to_vec()
     }
 
@@ -167,6 +234,26 @@ impl TorrentRecord {
             .and_then(Value::as_int)
             .and_then(|v| u64::try_from(v).ok())
             .ok_or(RecordError::Invalid("missing or negative added"))?;
+        // Optional (older records lack it); malformed entries are skipped
+        // rather than failing the whole record.
+        let web_seeds = get("web-seeds")
+            .and_then(Value::as_list)
+            .map(|list| {
+                list.iter()
+                    .take(MAX_WEB_SEED_STATS)
+                    .filter_map(|v| {
+                        let e = v.as_dict()?;
+                        let field = |k: &str| e.get(k.as_bytes());
+                        Some(WebSeedStat {
+                            url: field("url")?.as_str()?.to_owned(),
+                            failures: u32::try_from(field("failures")?.as_int()?).ok()?,
+                            stopped: field("stopped")?.as_int()? != 0,
+                            retry_at: u64::try_from(field("retry-at")?.as_int()?).ok()?,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Self {
             info_hash: InfoHash::new(hash),
             download_dir,
@@ -174,6 +261,7 @@ impl TorrentRecord {
             priorities,
             paused,
             added_at,
+            web_seeds,
         })
     }
 }
@@ -594,7 +682,7 @@ mod tests {
     use dravity_engine::Priority;
     use proptest::prelude::*;
 
-    use super::{RecordError, TorrentRecord};
+    use super::{RecordError, TorrentRecord, WebSeedStat};
 
     fn sample() -> TorrentRecord {
         TorrentRecord {
@@ -604,7 +692,36 @@ mod tests {
             priorities: vec![Priority::Skip, Priority::High],
             paused: true,
             added_at: 1_700_000_000,
+            web_seeds: vec![WebSeedStat {
+                url: "https://cdn.example/f".into(),
+                failures: 3,
+                stopped: false,
+                retry_at: 1_700_000_600,
+            }],
         }
+    }
+
+    #[test]
+    fn web_seed_stats_keep_only_unhealthy_seeds_and_tolerate_junk() {
+        let mut record = sample();
+        record
+            .web_seeds
+            .push(WebSeedStat::new("https://ok.example/f"));
+        let mut banned = WebSeedStat::new("https://bad.example/f");
+        banned.stopped = true;
+        record.web_seeds.push(banned.clone());
+        let decoded = TorrentRecord::decode(&record.encode()).unwrap();
+        assert_eq!(decoded.web_seeds.len(), 2);
+        assert_eq!(decoded.web_seeds.get(1), Some(&banned));
+        // A malformed entry is skipped; the record still loads.
+        let text = String::from_utf8(record.encode()).unwrap();
+        let junk = text.replace("8:failuresi3e", "8:failuresi-3e");
+        assert_ne!(junk, text);
+        let decoded = TorrentRecord::decode(junk.as_bytes()).unwrap();
+        assert_eq!(decoded.web_seeds, vec![banned]);
+        // Records written before web seed stats load with none.
+        let plain = TorrentRecord::new(InfoHash::new([1; 20]), "d");
+        assert!(!plain.encode().windows(9).any(|w| w == b"web-seeds"));
     }
 
     #[test]
@@ -713,6 +830,7 @@ mod tests {
                 priorities: prios.into_iter().map(|i| Priority::ALL[i]).collect(),
                 paused,
                 added_at: added,
+                web_seeds: Vec::new(),
             };
             prop_assert_eq!(TorrentRecord::decode(&record.encode()).unwrap(), record);
         }

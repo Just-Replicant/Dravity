@@ -24,7 +24,8 @@ use crossterm::event::{self, Event, KeyEvent, MouseButton, MouseEvent, MouseEven
 use dravity_core::InfoHash;
 use dravity_engine::Stats;
 use dravity_session::{
-    AddTorrentOptions, PeerStatus, PortMapProtocol, Session, TorrentProgress, TrackerStatus,
+    AddTorrentOptions, PeerStatus, PortMapProtocol, Session, SettingsUpdate, TorrentProgress,
+    TrackerStatus,
 };
 use ratatui::layout::Rect;
 use tokio::sync::{broadcast, mpsc};
@@ -32,7 +33,7 @@ use tokio::task::JoinSet;
 
 use crate::Input;
 
-use view::{Action, Focus, Header, Pane, PeerRow, Request, TrackerRow};
+use view::{Action, Direction, Focus, Header, Pane, PeerRow, Request, TrackerRow};
 pub(crate) use view::{TorrentRow, View};
 
 /// How often the screen is refreshed from the session, and how long one
@@ -328,8 +329,41 @@ async fn execute(
             Ok(()) => format!("removed {name}"),
             Err(e) => format!("{e:#}"),
         },
+        Request::SetLimit { direction, text } => match set_limit(session, direction, &text) {
+            Ok(text) => {
+                view.prompt = None;
+                text
+            }
+            Err(e) => format!("{e:#}"),
+        },
     };
     true
+}
+
+/// Applies a session-wide rate limit typed in the limit prompt.
+fn set_limit(session: &Session, direction: Direction, text: &str) -> Result<String> {
+    let text = text.trim();
+    let rate = if text.is_empty() {
+        None
+    } else {
+        Some(crate::format::parse_rate(text).map_err(anyhow::Error::msg)?).filter(|&r| r > 0)
+    };
+    let mut update = SettingsUpdate::default();
+    let what = match direction {
+        Direction::Download => {
+            update.download_rate_limit = Some(rate);
+            "download"
+        }
+        Direction::Upload => {
+            update.upload_rate_limit = Some(rate);
+            "upload"
+        }
+    };
+    session.apply_settings(update)?;
+    Ok(match rate {
+        Some(r) => format!("{what} limit {}/s", crate::format::bytes(r)),
+        None => format!("{what} limit lifted"),
+    })
 }
 
 /// Moves the selection to the torrent or file row under a left click.
@@ -518,7 +552,7 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::view::tests::view;
-    use super::view::{Action, Focus, Prompt, Request, View};
+    use super::view::{Action, Direction, Focus, Prompt, Request, View};
     use super::{Samples, click, draw, execute, rates, refresh};
 
     #[test]
@@ -627,6 +661,36 @@ mod tests {
         for c in text.chars() {
             assert_eq!(view.update(Action::Input(c)), None);
         }
+    }
+
+    /// `L` sets the session-wide download limit; a bad or too small value
+    /// keeps the prompt open, an empty line lifts the limit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_limit_prompt_sets_and_lifts_the_session_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::new(config()).unwrap();
+        let mut v = View::default();
+        for (text, ok, expect) in [
+            ("fast", false, None),
+            ("1K", false, None),
+            ("2M", true, Some(2 << 20)),
+            ("", true, None),
+        ] {
+            v.update(Action::OpenLimit(Direction::Download));
+            type_text(&mut v, text);
+            let request = v.update(Action::Submit).unwrap();
+            assert!(execute(&session, &mut v, request, dir.path()).await);
+            assert_eq!(v.prompt.is_none(), ok, "{text}: {v:?}");
+            assert_eq!(session.settings().download_rate_limit, expect, "{text}");
+            v.update(Action::Cancel);
+        }
+        v.update(Action::OpenLimit(Direction::Upload));
+        type_text(&mut v, "64K");
+        let request = v.update(Action::Submit).unwrap();
+        assert!(execute(&session, &mut v, request, dir.path()).await);
+        assert_eq!(session.settings().upload_rate_limit, Some(64 * 1024));
+        assert!(v.message.contains("upload limit"), "{}", v.message);
+        session.shutdown().await;
     }
 
     /// The path the UI takes: paste a magnet (metadata from a local seed),

@@ -68,19 +68,29 @@ impl V2File {
         self.pieces > 1
     }
 
-    /// Whether `data` (the file's part of piece `piece`) matches.
-    pub(crate) fn check(&self, piece: u32, data: &[u8], piece_length: u32) -> bool {
+    /// Whether `leaves` (the leaf hashes of the file's part of piece
+    /// `piece`) match.
+    pub(crate) fn check_leaves(&self, piece: u32, leaves: &[Hash], piece_length: u32) -> bool {
         let Some(index) = piece.checked_sub(self.first_piece) else {
             return false;
         };
-        if !self.needs_layer() {
-            return index == 0 && merkle::small_file_root(data) == Some(self.root);
+        if leaves.is_empty() {
+            return false;
         }
+        if !self.needs_layer() {
+            let Some(width) = leaves.len().checked_next_power_of_two() else {
+                return false;
+            };
+            return index == 0 && merkle::root_padded(leaves, width, 0) == Some(self.root);
+        }
+        let Some(per_piece) = merkle::leaves_per_piece(piece_length) else {
+            return false;
+        };
         let expected = self
             .layer
             .as_ref()
             .and_then(|l| l.get(usize::try_from(index).ok()?));
-        expected.is_some_and(|e| merkle::piece_hash(data, piece_length).as_ref() == Some(e))
+        expected.is_some_and(|e| merkle::root_padded(leaves, per_piece, 0).as_ref() == Some(e))
     }
 
     /// Checks a candidate piece layer against the pieces root.

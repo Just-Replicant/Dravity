@@ -6,6 +6,7 @@ use std::time::Duration;
 use dravity_dht::DhtConfig;
 use dravity_mse::Policy;
 use dravity_portmap::PortMapConfig;
+use dravity_storage::{Durability, PreallocateMode};
 use dravity_tracker::ClientConfig;
 use dravity_webseed::WebSeedConfig;
 
@@ -43,6 +44,13 @@ impl std::fmt::Display for StorageBackend {
     }
 }
 
+/// Default [`SessionConfig::max_connections`]: well under the usual
+/// 1024 file descriptor limit, with room for files and other sockets.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 500;
+
+/// Default [`SessionConfig::read_cache`]: 64 MiB.
+pub const DEFAULT_READ_CACHE: usize = 64 * 1024 * 1024;
+
 /// Session-wide settings. [`SessionConfig::default`] is a reasonable start.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -79,8 +87,80 @@ pub struct SessionConfig {
     pub peer_queue: usize,
     /// Capacity of each torrent's event queue (peer, disk, hash, tracker).
     pub event_queue: usize,
-    /// Concurrent piece-hash jobs per torrent.
+    /// Open peer connections across every torrent, dialed or accepted,
+    /// TCP or uTP (each torrent also keeps its own
+    /// [`max_peers`](dravity_engine::Config::max_peers)). At the cap the
+    /// listener closes new connections and dials wait. `None` removes the
+    /// cap.
+    pub max_connections: Option<usize>,
+    /// Concurrent piece-hash jobs across the whole session (piece checks,
+    /// rechecks and smart-ban block digests of every torrent share them).
     pub hash_workers: usize,
+    /// Verify downloaded pieces from their blocks as they are written
+    /// (incremental SHA-1, per-block SHA-256 leaves) instead of reading
+    /// each finished piece back from storage. Checks of existing data, and
+    /// pieces whose blocks arrived twice or too far out of order, are
+    /// still read back.
+    pub hash_on_arrival: bool,
+    /// Bytes of recently read torrent data kept in memory, shared by every
+    /// torrent whose storage the session creates, so seeding a popular
+    /// piece to many peers reads it from disk once
+    /// ([`dravity_storage::CachedStorage`]). `None` turns the cache off.
+    pub read_cache: Option<usize>,
+    /// How files the session creates reserve their space. `Full` fails a
+    /// full disk early and fragments less, but makes every file look
+    /// present to the startup prescan, so a fresh full-preallocated
+    /// torrent is rechecked once. Default: `None`.
+    pub preallocate: PreallocateMode,
+    /// When written data is forced to disk. Default: [`Durability::Never`]
+    /// (sync on resume save, descriptor eviction and stop only).
+    pub durability: Durability,
+    /// Session-wide download limit in bytes per second, shared by every
+    /// torrent on top of each torrent's own limit. Changeable live
+    /// ([`crate::Session::apply_settings`]).
+    pub download_rate_limit: Option<u64>,
+    /// Session-wide upload limit in bytes per second.
+    pub upload_rate_limit: Option<u64>,
+    /// Torrents downloading at once; later ones wait in the queue.
+    /// `None` (the default) is unlimited.
+    pub max_active_downloads: Option<usize>,
+    /// Torrents seeding at once; later ones wait in the queue.
+    pub max_active_seeds: Option<usize>,
+    /// Address ranges whose peers are refused and never dialed
+    /// ([`crate::IpFilter`]); replace it at runtime with
+    /// [`crate::Session::set_ip_filter`].
+    pub ip_filter: Option<std::sync::Arc<crate::IpFilter>>,
+    /// Dial peers through this proxy (TCP only: uTP is skipped while a
+    /// proxy is set). HTTP(S) tracker and web seed requests go through it
+    /// too (SOCKS with remote DNS, `socks5h`/`socks4a`), and a SOCKS5
+    /// proxy relays UDP tracker requests (UDP ASSOCIATE). When the native
+    /// DHT is on, a SOCKS5 proxy also carries its datagrams
+    /// (`DhtConfig::socks5` is set automatically unless already set). LSD
+    /// (LAN multicast only) and incoming connections are not proxied.
+    /// `None` (the default) connects directly.
+    pub proxy: Option<crate::proxy::Proxy>,
+    /// DSCP value (0 to [`crate::MAX_DSCP`]) marked on peer TCP connections,
+    /// e.g. 8 (CS1, "lower effort") so home routers deprioritise
+    /// BitTorrent. `None` (the default) leaves the system default.
+    pub peer_dscp: Option<u8>,
+    /// Country database for [`crate::PeerStatus::country`]
+    /// ([`crate::GeoIp`]). `None` (the default) reports no countries.
+    pub geoip: Option<std::sync::Arc<crate::GeoIp>>,
+    /// Carry peer connections over this [`crate::transport::Network`]
+    /// instead of TCP and uTP sockets (e.g. a
+    /// [`crate::transport::MemoryNetwork`] host in tests). When set,
+    /// [`listen`](Self::listen) is ignored: the session listens on the
+    /// network, and its listener's port is [`crate::Session::listen_port`].
+    /// `None` (the default) uses real sockets.
+    pub network: Option<std::sync::Arc<dyn crate::transport::Network>>,
+    /// Local Service Discovery (BEP 14): find peers of the same torrents on
+    /// the local network by multicast. Needs a listener; private torrents
+    /// never use it. `None` (the default) turns it off.
+    pub lsd: Option<dravity_lsd::LsdConfig>,
+    /// Scrape every tracker this often (BEP 48 / BEP 15) and show the
+    /// counts in [`crate::TrackerStatus::scrape`]. `None` (the default)
+    /// scrapes only on [`crate::TorrentHandle::scrape`].
+    pub scrape_interval: Option<Duration>,
     /// Time allowed for the `stopped` announce when a torrent stops.
     pub stop_announce_timeout: Duration,
     /// Broadcast buffer for alerts; slow subscribers miss older alerts.
@@ -133,7 +213,23 @@ impl Default for SessionConfig {
             tick_interval: Duration::from_secs(1),
             peer_queue: 256,
             event_queue: 1024,
+            max_connections: Some(DEFAULT_MAX_CONNECTIONS),
             hash_workers: std::thread::available_parallelism().map_or(2, usize::from),
+            hash_on_arrival: true,
+            read_cache: Some(DEFAULT_READ_CACHE),
+            preallocate: PreallocateMode::None,
+            durability: Durability::Never,
+            download_rate_limit: None,
+            upload_rate_limit: None,
+            max_active_downloads: None,
+            max_active_seeds: None,
+            ip_filter: None,
+            proxy: None,
+            peer_dscp: None,
+            geoip: None,
+            network: None,
+            lsd: None,
+            scrape_interval: None,
             stop_announce_timeout: Duration::from_secs(5),
             alert_buffer: 1024,
             dht: Some(DhtConfig::default()),

@@ -6,7 +6,8 @@ use std::path::PathBuf;
 
 use dravity_engine::{Alert, Priority, Stats, TorrentStatus};
 use dravity_session::{
-    FileProgress, PortMapMethod, PortMapProtocol, PortMapStatus, SessionAlert, TorrentSummary,
+    FileProgress, LiveSettings, PortMapMethod, PortMapProtocol, PortMapStatus, PortMapped,
+    SessionAlert, SettingsUpdate, TorrentSummary,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -51,6 +52,22 @@ pub(crate) struct PortMappingDto {
     external_ip: Option<IpAddr>,
     mapped: Vec<MappedDto>,
     error: Option<String>,
+    /// IPv6 firewall pinholes (PCP).
+    pinholes: Vec<MappedDto>,
+    pinhole_error: Option<String>,
+}
+
+impl From<&PortMapped> for MappedDto {
+    fn from(m: &PortMapped) -> Self {
+        Self {
+            protocol: match m.mapping.protocol {
+                PortMapProtocol::Tcp => "tcp",
+                PortMapProtocol::Udp => "udp",
+            },
+            port: m.mapping.port,
+            external_port: m.external_port,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -64,23 +81,15 @@ impl From<&PortMapStatus> for PortMappingDto {
     fn from(status: &PortMapStatus) -> Self {
         Self {
             method: status.method.map(|m| match m {
+                PortMapMethod::Pcp => "pcp",
                 PortMapMethod::NatPmp => "nat-pmp",
                 PortMapMethod::Upnp => "upnp",
             }),
             external_ip: status.external_ip.map(IpAddr::V4),
-            mapped: status
-                .mapped
-                .iter()
-                .map(|m| MappedDto {
-                    protocol: match m.mapping.protocol {
-                        PortMapProtocol::Tcp => "tcp",
-                        PortMapProtocol::Udp => "udp",
-                    },
-                    port: m.mapping.port,
-                    external_port: m.external_port,
-                })
-                .collect(),
+            mapped: status.mapped.iter().map(Into::into).collect(),
             error: status.error.clone(),
+            pinholes: status.pinholes.iter().map(Into::into).collect(),
+            pinhole_error: status.pinhole_error.clone(),
         }
     }
 }
@@ -111,12 +120,14 @@ impl From<&TorrentSummary> for TorrentDto {
     }
 }
 
-/// `running`, `paused` or `stopped` (after an error).
+/// `running`, `paused`, `queued` or `stopped` (after an error).
 pub(crate) const fn state(t: &TorrentSummary) -> &'static str {
     if t.running {
         "running"
     } else if t.paused {
         "paused"
+    } else if t.queued {
+        "queued"
     } else {
         "stopped"
     }
@@ -440,5 +451,91 @@ mod tests {
             ])
         );
         assert!(serde_json::from_str::<PriorityDto>(r#""urgent""#).is_err());
+    }
+}
+
+/// `GET /api/v1/settings`: the live settings (`null` is unlimited).
+#[derive(Debug, Serialize)]
+pub(crate) struct SettingsDto {
+    download_rate_limit: Option<u64>,
+    upload_rate_limit: Option<u64>,
+    max_connections: Option<usize>,
+    max_active_downloads: Option<usize>,
+    max_active_seeds: Option<usize>,
+}
+
+impl From<LiveSettings> for SettingsDto {
+    fn from(s: LiveSettings) -> Self {
+        Self {
+            download_rate_limit: s.download_rate_limit,
+            upload_rate_limit: s.upload_rate_limit,
+            max_connections: s.max_connections,
+            max_active_downloads: s.max_active_downloads,
+            max_active_seeds: s.max_active_seeds,
+        }
+    }
+}
+
+/// `PATCH /api/v1/settings`: a missing field is left alone, `null` lifts
+/// the limit, a number sets it. Applied all at once or not at all.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SettingsPatchDto {
+    #[serde(default, deserialize_with = "present")]
+    download_rate_limit: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "present")]
+    upload_rate_limit: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "present")]
+    max_connections: Option<Option<usize>>,
+    #[serde(default, deserialize_with = "present")]
+    max_active_downloads: Option<Option<usize>>,
+    #[serde(default, deserialize_with = "present")]
+    max_active_seeds: Option<Option<usize>>,
+}
+
+/// A field that is present: `null` becomes `Some(None)`.
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+impl From<SettingsPatchDto> for SettingsUpdate {
+    fn from(p: SettingsPatchDto) -> Self {
+        let mut u = Self::default();
+        u.download_rate_limit = p.download_rate_limit;
+        u.upload_rate_limit = p.upload_rate_limit;
+        u.max_connections = p.max_connections;
+        u.max_active_downloads = p.max_active_downloads;
+        u.max_active_seeds = p.max_active_seeds;
+        u
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use dravity_session::LiveSettings;
+    use dravity_session::schema::{SESSION_SETTINGS, SettingClass};
+
+    use super::SettingsDto;
+
+    #[test]
+    fn the_settings_api_names_are_the_live_registry_names() {
+        let json = serde_json::to_value(SettingsDto::from(LiveSettings::default())).ok();
+        let mut keys: Vec<String> = json
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        keys.sort();
+        let mut live: Vec<String> = SESSION_SETTINGS
+            .iter()
+            .filter(|s| s.class == SettingClass::Live)
+            .map(|s| s.name.to_owned())
+            .collect();
+        live.sort();
+        assert_eq!(keys, live);
     }
 }

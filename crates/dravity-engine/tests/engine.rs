@@ -1694,3 +1694,113 @@ fn web_seeds_are_never_dialed_retried_or_shared() {
     let fx = h.advance(h.t.config().peer_retry * 3);
     assert!(dials(&fx).iter().all(|a| !is_web_seed_addr(*a)), "{fx:?}");
 }
+
+fn connects(fx: &[Effect]) -> Vec<SocketAddr> {
+    fx.iter()
+        .filter_map(|e| match e {
+            Effect::Connect { addr, .. } => Some(*addr),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_deferred_dial_waits_without_blame() {
+    let mut c = config();
+    c.max_peers = 1;
+    let mut h = Harness::new(c);
+    h.ev(Event::Start);
+    let fx = h.ev(Event::AddPeers {
+        peers: vec![addr(1), addr(2)],
+    });
+    assert_eq!(connects(&fx), [addr(1)]);
+    // The session's connection cap is full: nothing else is dialed now.
+    let fx = h.ev(Event::PeerConnectDeferred { addr: addr(1) });
+    assert!(connects(&fx).is_empty(), "{fx:?}");
+    // The next tick dials the queued address; the deferred one comes back
+    // after `DEFERRED_DIAL_RETRY`.
+    let fx = h.advance(Duration::from_secs(1));
+    assert_eq!(connects(&fx), [addr(2)]);
+    h.ev(Event::PeerConnectDeferred { addr: addr(2) });
+    let fx = h.advance(dravity_engine::DEFERRED_DIAL_RETRY);
+    assert_eq!(connects(&fx), [addr(1)]);
+}
+
+#[test]
+fn the_start_check_skips_pieces_the_prescan_ruled_out() {
+    let mut c = config();
+    c.check_existing = true;
+    c.check_concurrency = 4;
+    let mut h = Harness::new(c);
+    h.t.set_absent_pieces([0, 2, 99]);
+    let fx = h.ev(Event::Start);
+    let hashed: Vec<u32> = fx
+        .iter()
+        .filter_map(|e| match e {
+            Effect::HashPiece { piece } => Some(*piece),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hashed, [1], "only the piece that may be on disk is hashed");
+    let fx = h.ev(Event::PieceHashed { piece: 1, ok: true });
+    assert!(fx.contains(&Effect::Alert(Alert::StateChanged(
+        TorrentStatus::Downloading
+    ))));
+    assert_eq!(h.t.stats().pieces_have, 1);
+    // Every piece absent: straight to downloading.
+    let mut c = config();
+    c.check_existing = true;
+    let mut h = Harness::new(c);
+    h.t.set_absent_pieces(0..3);
+    let fx = h.ev(Event::Start);
+    assert!(!fx.iter().any(|e| matches!(e, Effect::HashPiece { .. })));
+    assert_eq!(h.t.status(), TorrentStatus::Downloading);
+}
+
+#[test]
+fn the_request_budget_bounds_requests_across_peers() {
+    let blocks: u32 = 64;
+    let piece = blocks * BLOCK_SIZE;
+    let big = PieceLayout::new(piece, 4 * u64::from(piece)).unwrap();
+    let mut c = config();
+    c.initial_requests_per_peer = 8;
+    c.max_requests_per_peer = 8;
+    c.request_budget = 12;
+    let mut h = Harness::new(c.clone());
+    h.t = TorrentState::new(big, c);
+    h.ev(Event::Start);
+    let mut asked = Vec::new();
+    for p in 1..=3 {
+        connect(&mut h, p, Reserved::new().with_fast(true));
+        h.msg(p, Message::HaveAll);
+        asked.push(requests(&h.msg(p, Message::Unchoke), p));
+    }
+    let counts: Vec<usize> = asked.iter().map(Vec::len).collect();
+    assert_eq!(counts, [8, 4, 0], "the budget, not 3 x 8");
+    // A delivery frees one request's worth of budget.
+    let fx = h.msg(1, data_for(asked[0][0]));
+    assert_eq!(requests(&fx, 1).len(), 1);
+}
+
+#[test]
+fn each_peer_fills_its_own_pieces() {
+    let mut c = config();
+    c.initial_requests_per_peer = 2;
+    c.max_requests_per_peer = 2;
+    // Four blocks per piece: without reservation peer 2 would take the
+    // two blocks of peer 1's piece that are still missing.
+    let big = PieceLayout::new(4 * BLOCK_SIZE, 3 * 4 * u64::from(BLOCK_SIZE)).unwrap();
+    let mut h = Harness::new(c.clone());
+    h.t = TorrentState::new(big, c);
+    h.ev(Event::Start);
+    let mut pieces = Vec::new();
+    for p in 1..=2 {
+        connect(&mut h, p, Reserved::new().with_fast(true));
+        h.msg(p, Message::HaveAll);
+        let asked = requests(&h.msg(p, Message::Unchoke), p);
+        assert_eq!(asked.len(), 2);
+        assert!(asked.iter().all(|r| r.piece == asked[0].piece), "{asked:?}");
+        pieces.push(asked[0].piece);
+    }
+    assert_ne!(pieces[0], pieces[1], "no piece is split between the peers");
+}

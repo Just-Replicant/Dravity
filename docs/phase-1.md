@@ -37,7 +37,9 @@ Also picks up the items Phase 0 deferred to Phase 1 (see below).
   hashed only when all blocks are on storage. Late blocks for timed-out
   requests are still accepted. A failed hash resets the whole piece.
 - **Hashing and disk I/O** run on Tokio's blocking pool; hashing is limited by
-  a per-torrent semaphore (`hash_workers`, default = CPU count).
+  a per-torrent semaphore (`hash_workers`, default = CPU count). Since the
+  irontide adoption (item 4) the bound is session-wide: one pool for every
+  torrent (`dravity-session/src/hash_pool.rs`).
 - **Resume = check on start.** `check_existing` hashes existing data (bounded
   by `check_concurrency`) before announcing; missing or short files count as
   "not there" rather than errors. Fastresume without rehash is Phase 2.

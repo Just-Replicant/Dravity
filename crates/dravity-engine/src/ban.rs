@@ -25,7 +25,8 @@ struct Strike {
 /// Contributors of pieces in progress, strikes and bans.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HashBans {
-    contributors: HashMap<u32, HashSet<IpAddr>>,
+    /// Who sent each accepted block of pieces in progress, by offset.
+    contributors: HashMap<u32, HashMap<u32, IpAddr>>,
     strikes: HashMap<IpAddr, Strike>,
     banned: HashSet<IpAddr>,
 }
@@ -40,12 +41,23 @@ pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
 }
 
 impl HashBans {
-    /// `ip` sent a block of `piece`.
-    pub(crate) fn record(&mut self, piece: u32, ip: IpAddr) {
+    /// `ip` sent the block of `piece` at `offset`.
+    pub(crate) fn record(&mut self, piece: u32, offset: u32, ip: IpAddr) {
         self.contributors
             .entry(piece)
             .or_default()
-            .insert(canonical_ip(ip));
+            .insert(offset, canonical_ip(ip));
+    }
+
+    /// Takes who sent each block of `piece` (after it failed).
+    pub(crate) fn take(&mut self, piece: u32) -> HashMap<u32, IpAddr> {
+        self.contributors.remove(&piece).unwrap_or_default()
+    }
+
+    /// Bans `ip` (canonical form) without strikes, e.g. because it was
+    /// banned elsewhere in the session. Returns whether it is new.
+    pub(crate) fn ban(&mut self, ip: IpAddr) -> bool {
+        self.banned.insert(canonical_ip(ip))
     }
 
     /// `piece` passed: nobody is blamed for it.
@@ -60,6 +72,7 @@ impl HashBans {
     }
 
     /// `piece` failed. Returns the addresses banned by it, sorted.
+    #[cfg(test)]
     pub(crate) fn failed(
         &mut self,
         piece: u32,
@@ -67,10 +80,24 @@ impl HashBans {
         now: Instant,
         quiet: Duration,
     ) -> Vec<IpAddr> {
+        let senders = self.take(piece);
+        self.strike(&senders, threshold, now, quiet)
+    }
+
+    /// Strikes the distinct senders of a failed piece. Returns the
+    /// addresses banned by it, sorted.
+    pub(crate) fn strike(
+        &mut self,
+        senders: &HashMap<u32, IpAddr>,
+        threshold: u32,
+        now: Instant,
+        quiet: Duration,
+    ) -> Vec<IpAddr> {
         self.expire(now, quiet);
-        let Some(contributors) = self.contributors.remove(&piece) else {
+        let contributors: HashSet<IpAddr> = senders.values().copied().collect();
+        if contributors.is_empty() {
             return Vec::new();
-        };
+        }
         let weight = if contributors.len() == 1 { 2 } else { 1 };
         let mut banned = Vec::new();
         for ip in contributors {
@@ -121,8 +148,8 @@ mod tests {
     #[test]
     fn a_sole_contributor_is_banned_at_once() {
         let mut bans = HashBans::default();
-        bans.record(0, ip(1));
-        bans.record(0, ip(1));
+        bans.record(0, 16384, ip(1));
+        bans.record(0, 32768, ip(1));
         assert_eq!(fail(&mut bans, 0, 2), [ip(1)]);
         assert!(bans.is_banned(ip(1)));
         assert_eq!(bans.count(), 1);
@@ -131,11 +158,11 @@ mod tests {
     #[test]
     fn shared_failures_need_more_strikes() {
         let mut bans = HashBans::default();
-        bans.record(0, ip(1));
-        bans.record(0, ip(2));
+        bans.record(0, 49152, ip(1));
+        bans.record(0, 65536, ip(2));
         assert!(fail(&mut bans, 0, 2).is_empty());
-        bans.record(1, ip(1));
-        bans.record(1, ip(3));
+        bans.record(1, 81920, ip(1));
+        bans.record(1, 98304, ip(3));
         assert_eq!(fail(&mut bans, 1, 2), [ip(1)]);
         assert!(!bans.is_banned(ip(2)) && !bans.is_banned(ip(3)));
     }
@@ -143,13 +170,13 @@ mod tests {
     #[test]
     fn passed_pieces_and_threshold_zero() {
         let mut bans = HashBans::default();
-        bans.record(0, ip(1));
+        bans.record(0, 114688, ip(1));
         bans.passed(0);
         assert!(
             fail(&mut bans, 0, 2).is_empty(),
             "nothing recorded any more"
         );
-        bans.record(1, ip(1));
+        bans.record(1, 131072, ip(1));
         assert!(fail(&mut bans, 1, 0).is_empty(), "banning disabled");
         assert!(!bans.is_banned(ip(1)));
     }
@@ -159,8 +186,8 @@ mod tests {
         let v4 = Ipv4Addr::new(10, 9, 8, 7);
         let mapped = IpAddr::V6(v4.to_ipv6_mapped());
         let mut bans = HashBans::default();
-        bans.record(0, IpAddr::V4(v4));
-        bans.record(0, mapped);
+        bans.record(0, 147456, IpAddr::V4(v4));
+        bans.record(0, 163840, mapped);
         // One host, so the sole-contributor weight applies.
         assert_eq!(fail(&mut bans, 0, 2), [IpAddr::V4(v4)]);
         assert!(bans.is_banned(mapped));
@@ -176,14 +203,14 @@ mod tests {
         let t0 = Instant::now();
         let quiet = Duration::from_secs(60);
         let mut bans = HashBans::default();
-        bans.record(0, ip(1));
+        bans.record(0, 180224, ip(1));
         assert!(bans.failed(0, 4, t0, quiet).is_empty(), "two strikes");
-        bans.record(1, ip(1));
+        bans.record(1, 196608, ip(1));
         assert!(
             bans.failed(1, 4, t0 + quiet, quiet).is_empty(),
             "the first two expired"
         );
-        bans.record(2, ip(1));
+        bans.record(2, 212992, ip(1));
         assert_eq!(
             bans.failed(2, 4, t0 + quiet + Duration::from_secs(1), quiet),
             [ip(1)],

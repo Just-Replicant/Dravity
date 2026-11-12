@@ -6,16 +6,17 @@ use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap};
 
-use super::view::{Focus, Pane, Prompt, StatsRow, TrackerState, View};
+use super::view::{Direction, Focus, Pane, Prompt, StatsRow, TrackerState, View};
 use crate::format;
 
 /// Alert lines shown under the detail pane.
 pub(crate) const ALERT_LINES: u16 = 4;
 
 /// The full key list `?` shows in place of the footer.
-const HELP: [&str; 6] = [
+const HELP: [&str; 7] = [
     "torrents: a add · 1/2/3 or enter detail · space/p pause or resume · d remove · D remove and delete files",
     "          o sort (added, name, progress, down rate) · / filter by name · tab files pane",
+    "          L / U download / upload limit for all torrents (live; empty lifts it)",
     "detail:   1 files · 2 peers · 3 trackers · tab next pane · esc back · ↑↓/j k move",
     "files:    s skip · l low · n normal · h high   peers: a add a peer (host:port)",
     "peer flags: C we choke them · c they choke us · I we want · i they want · < incoming · U uTP · W web seed · E encrypted",
@@ -117,6 +118,17 @@ pub(crate) fn draw(frame: &mut Frame<'_>, view: &View) {
                     Line::from(question),
                     Line::from("enter confirms · esc cancels"),
                 ],
+            );
+        }
+        Some(Prompt::Limit { direction, text }) => {
+            let title = match direction {
+                Direction::Download => " Download limit, all torrents (e.g. 2M; empty lifts it) ",
+                Direction::Upload => " Upload limit, all torrents (e.g. 500K; empty lifts it) ",
+            };
+            popup(
+                frame,
+                title,
+                vec![Line::from(format!("{text}▏")), message_line(view)],
             );
         }
         Some(Prompt::Filter) | None => {}
@@ -341,6 +353,7 @@ fn draw_peers(frame: &mut Frame<'_>, view: &View, area: Rect) {
     let rows = view.peers.iter().map(|p| {
         Row::new(vec![
             p.addr.to_string(),
+            p.country(),
             p.have(),
             format!("{}/s", format::bytes(p.down_rate)),
             format!("{}/s", format::bytes(p.up_rate)),
@@ -351,13 +364,14 @@ fn draw_peers(frame: &mut Frame<'_>, view: &View, area: Rect) {
         rows,
         [
             Constraint::Fill(1),
+            Constraint::Length(3),
             Constraint::Length(7),
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(8),
         ],
     )
-    .header(bold_row(["Address", "Has", "Down", "Up", "Flags"]))
+    .header(bold_row(["Address", "CC", "Has", "Down", "Up", "Flags"]))
     .row_highlight_style(highlight(detail_focused(view)))
     .block(detail_block(view));
     let mut state = TableState::new().with_selected(Some(view.selected_peer));
@@ -408,6 +422,24 @@ fn draw_trackers(frame: &mut Frame<'_>, view: &View, area: Rect) {
                 "-".to_owned(),
                 format!("{} — {error}", t.url),
             ),
+        };
+        // A scrape fills in counts the announce did not report and adds
+        // the tracker's completed-download count.
+        let (seeds, leech, text) = match t.scrape {
+            Some(s) => (
+                if seeds == "-" {
+                    s.seeders.to_string()
+                } else {
+                    seeds
+                },
+                if leech == "-" {
+                    s.leechers.to_string()
+                } else {
+                    leech
+                },
+                format!("{text} · {} downloaded", s.downloaded),
+            ),
+            None => (seeds, leech, text),
         };
         Row::new(vec![
             t.tier.to_string(),
@@ -460,6 +492,7 @@ fn keys(view: &View) -> String {
     match (&view.prompt, view.focus, view.pane) {
         (Some(Prompt::Add(_)), ..) => "enter add · esc cancel".to_owned(),
         (Some(Prompt::AddPeer { .. }), ..) => "enter connect · esc cancel".to_owned(),
+        (Some(Prompt::Limit { .. }), ..) => "enter apply · esc cancel".to_owned(),
         (Some(Prompt::Confirm { .. }), ..) => "enter confirm · esc cancel".to_owned(),
         (Some(Prompt::Filter), ..) => {
             format!("filter: {}▏ · enter keep · esc clear", view.filter)
@@ -491,7 +524,9 @@ fn draw_footer(frame: &mut Frame<'_>, view: &View, area: Rect) {
     // A popup shows its own message.
     let in_popup = matches!(
         view.prompt,
-        Some(Prompt::Add(_) | Prompt::AddPeer { .. } | Prompt::Confirm { .. })
+        Some(
+            Prompt::Add(_) | Prompt::AddPeer { .. } | Prompt::Confirm { .. } | Prompt::Limit { .. }
+        )
     );
     let text = if view.message.is_empty() || in_popup {
         keys
@@ -670,9 +705,11 @@ mod tests {
             utp: true,
             web: false,
             encrypted: false,
+            country: dravity_session::CountryCode::new("NL"),
         }];
         let screen = render(&v, 110, 30);
         assert!(screen.contains("10.0.0.2:6881"), "{screen}");
+        assert!(screen.contains(" NL "), "{screen}");
         assert!(screen.contains("75.0%"), "{screen}");
         assert!(screen.contains("2.0 KiB/s"), "{screen}");
         assert!(screen.contains("C.I..U."), "{screen}");
@@ -697,16 +734,23 @@ mod tests {
                     leechers: Some(3),
                     peers: 15,
                 },
+                scrape: None,
             },
             TrackerRow {
                 tier: 0,
                 url: "http://dead/announce".to_owned(),
                 state: TrackerState::Failed("connection refused".to_owned()),
+                scrape: None,
             },
             TrackerRow {
                 tier: 1,
                 url: "udp://later:80".to_owned(),
                 state: TrackerState::Waiting,
+                scrape: Some(dravity_session::ScrapeStats {
+                    seeders: 77,
+                    leechers: 5,
+                    downloaded: 901,
+                }),
             },
         ];
         let screen = render(&v, 120, 30);
@@ -718,6 +762,12 @@ mod tests {
             "{screen}"
         );
         assert!(screen.contains("waiting"), "{screen}");
+        // A scrape fills in counts and the download total.
+        assert!(screen.contains("77"), "{screen}");
+        assert!(
+            screen.contains("udp://later:80 · 901 downloaded"),
+            "{screen}"
+        );
         assert!(screen.contains("tab files"), "{screen}");
     }
 

@@ -168,6 +168,7 @@ async fn serve(
             metadata_size: script.info.as_ref().map(|i| i.len() as u64),
             ipv4: None,
             ipv6: None,
+            upload_only: None,
         };
         let payload = Bytes::from(hs.encode().unwrap());
         if framed
@@ -555,6 +556,59 @@ async fn magnet_finds_peers_in_the_dht() {
 
     let mut c = config();
     c.dht = Some(net.config());
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(c).unwrap();
+    assert!(session.dht().is_some());
+    let mut alerts = session.subscribe();
+    let handle = session
+        .add_magnet(&Magnet::new(hash), AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    until_finished(&mut alerts, hash).await;
+    handle.stop().await;
+    assert_files(dir.path(), &content, len_a);
+}
+
+/// The same magnet download with the session on Dravity's own DHT node
+/// (`DhtConfig::native`), joined through a loopback swarm of native nodes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn magnet_finds_peers_in_the_native_dht() {
+    let (len_a, len_b) = (33_000, 1);
+    let (metainfo, content) = make_torrent(None, len_a, len_b);
+    let hash = metainfo.info_hash();
+    let seed = spawn_peer(
+        hash,
+        PeerScript {
+            content: Some(Arc::new(content.clone())),
+            info: Some(Bytes::copy_from_slice(metainfo.info_bytes())),
+            ..PeerScript::default()
+        },
+    )
+    .await;
+    let timeout = Duration::from_millis(500);
+    let mut swarm = Vec::new();
+    for _ in 0..8 {
+        swarm.push(
+            dravity_dht::native::NativeDht::bind("127.0.0.1:0".parse().unwrap(), timeout)
+                .await
+                .unwrap(),
+        );
+    }
+    let entry = swarm[0].local_addr().unwrap();
+    for node in &swarm[1..] {
+        node.bootstrap(&[entry]).await;
+    }
+    let native = || {
+        let mut d = dravity_dht::DhtConfig::with_bootstrap(vec![entry.to_string()]);
+        d.native = true;
+        d.bind_address = Some(std::net::Ipv4Addr::LOCALHOST);
+        d
+    };
+    let announcer = Dht::new(&native()).unwrap();
+    assert!(announcer.bootstrapped().await);
+    announcer.announce(hash, Some(seed.port())).await.unwrap();
+
+    let mut c = config();
+    c.dht = Some(native());
     let dir = tempfile::tempdir().unwrap();
     let session = Session::new(c).unwrap();
     assert!(session.dht().is_some());

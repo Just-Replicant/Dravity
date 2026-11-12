@@ -10,6 +10,7 @@ use bytes::Bytes;
 use dravity_core::Info;
 use dravity_core::layout::FileLayout;
 
+use crate::alloc::{PreallocateMode, preallocate};
 use crate::io::{BlockingIo, FileIo, OpenFile};
 use crate::open::open_beneath;
 use crate::{FileStamp, Storage, StorageError, check_range};
@@ -25,6 +26,8 @@ struct FileSpec {
     rel: PathBuf,
     /// BEP 47 padding files are never created; they read as zeros.
     padding: bool,
+    /// Length the torrent gives the file.
+    length: u64,
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +66,7 @@ pub struct FileStorage {
     cache: Mutex<FdCache>,
     max_open: usize,
     io: Arc<dyn FileIo>,
+    preallocate: PreallocateMode,
 }
 
 impl FileStorage {
@@ -84,6 +88,7 @@ impl FileStorage {
                     path: root.join(&rel),
                     rel,
                     padding: f.is_padding(),
+                    length: f.length(),
                 }
             })
             .collect();
@@ -99,7 +104,16 @@ impl FileStorage {
             cache: Mutex::new(FdCache::default()),
             max_open: DEFAULT_MAX_OPEN_FILES,
             io: Arc::new(BlockingIo),
+            preallocate: PreallocateMode::None,
         })
+    }
+
+    /// Reserves each file's space when it is created (see
+    /// [`PreallocateMode`]).
+    #[must_use]
+    pub fn with_preallocate(mut self, mode: PreallocateMode) -> Self {
+        self.preallocate = mode;
+        self
     }
 
     /// Performs reads and writes through `io` instead of [`BlockingIo`].
@@ -156,9 +170,14 @@ impl FileStorage {
             .files
             .get(index)
             .ok_or(StorageError::OutOfBounds { offset: 0, len: 0 })?;
+        let opened = open_beneath(&self.root, &spec.rel, create)?;
+        if create {
+            preallocate(&opened, spec.length, self.preallocate)
+                .map_err(|e| StorageError::io(&spec.path, e))?;
+        }
         let file = self
             .io
-            .adopt(open_beneath(&self.root, &spec.rel, create)?)
+            .adopt(opened)
             .map_err(|e| StorageError::io(&spec.path, e))?;
         while cache.open.len() >= self.max_open {
             let Some(evict) = cache.order.pop_front() else {
@@ -426,6 +445,36 @@ impl Storage for FileStorage {
             .zip(reads)
             .map(|(b, &(offset, len))| b.ok_or(StorageError::OutOfBounds { offset, len }))
             .collect()
+    }
+
+    fn sync_range(&self, offset: u64, len: u64) -> Result<(), StorageError> {
+        let len = usize::try_from(len).map_err(|_| StorageError::OutOfBounds {
+            offset,
+            len: usize::MAX,
+        })?;
+        let mut seen = HashSet::new();
+        for part in self.pieces(offset, len)? {
+            let Some((index, spec)) = part.file else {
+                continue;
+            };
+            if !seen.insert(index) {
+                continue;
+            }
+            let cached = self.lock().open.get(&index).cloned();
+            let file = match cached {
+                Some(file) => file,
+                None => match open_beneath(&self.root, &spec.rel, false) {
+                    Ok(file) => self
+                        .io
+                        .adopt(file)
+                        .map_err(|e| StorageError::io(&spec.path, e))?,
+                    Err(e) if e.is_missing_data() => continue,
+                    Err(e) => return Err(e),
+                },
+            };
+            self.sync_index(index, file.as_ref())?;
+        }
+        Ok(())
     }
 
     fn flush(&self) -> Result<(), StorageError> {

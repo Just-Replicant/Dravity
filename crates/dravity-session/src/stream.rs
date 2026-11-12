@@ -16,13 +16,15 @@ use crate::status::Transport;
 pub(crate) enum RawStream {
     Tcp(TcpStream),
     Utp(UtpStream),
+    /// A [`crate::transport::Network`] stream (reported as TCP).
+    Boxed(crate::transport::BoxedStream),
 }
 
 impl RawStream {
     /// The transport.
     pub(crate) const fn kind(&self) -> Transport {
         match self {
-            Self::Tcp(_) => Transport::Tcp,
+            Self::Tcp(_) | Self::Boxed(_) => Transport::Tcp,
             Self::Utp(_) => Transport::Utp,
         }
     }
@@ -120,6 +122,7 @@ impl AsyncRead for RawStream {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             Self::Utp(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Boxed(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -133,6 +136,7 @@ impl AsyncWrite for RawStream {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             Self::Utp(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Boxed(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -140,6 +144,7 @@ impl AsyncWrite for RawStream {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_flush(cx),
             Self::Utp(s) => Pin::new(s).poll_flush(cx),
+            Self::Boxed(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -147,6 +152,7 @@ impl AsyncWrite for RawStream {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             Self::Utp(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Boxed(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 
@@ -158,6 +164,7 @@ impl AsyncWrite for RawStream {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_write_vectored(cx, bufs),
             Self::Utp(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            Self::Boxed(s) => Pin::new(s).poll_write_vectored(cx, bufs),
         }
     }
 
@@ -165,6 +172,7 @@ impl AsyncWrite for RawStream {
         match self {
             Self::Tcp(s) => s.is_write_vectored(),
             Self::Utp(s) => s.is_write_vectored(),
+            Self::Boxed(s) => s.is_write_vectored(),
         }
     }
 }

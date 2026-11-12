@@ -8,6 +8,8 @@
 //!   following symbolic links, an LRU cache of open file descriptors, and
 //!   positional reads/writes (no seek per block).
 //! * [`MemoryStorage`] — a byte buffer, for tests and small torrents.
+//! * [`CachedStorage`] — a middleware that keeps recently read chunks in
+//!   a shared, byte-budgeted [`ReadCache`] (for seeding).
 //!
 //! [`FileStorage`] performs its reads and writes through a [`FileIo`], which
 //! adopts each file the storage opens as an [`OpenFile`]:
@@ -22,12 +24,16 @@
 //! can skip the hash check. All calls block; the session runs them on a
 //! blocking thread pool.
 
+mod alloc;
+pub mod cache;
+pub mod create;
 mod error;
 mod file;
 mod io;
 mod memory;
 mod open;
 mod pos;
+pub mod prescan;
 pub mod resume;
 #[cfg(all(feature = "uring", target_os = "linux"))]
 mod uring;
@@ -35,10 +41,14 @@ mod uring;
 use bytes::Bytes;
 use dravity_core::{BlockRef, Info, PieceLayout};
 
+pub use alloc::{Durability, PreallocateMode};
+pub use cache::{CacheStats, CachedStorage, ReadCache};
+pub use create::{CreateTorrentError, create_torrent};
 pub use error::StorageError;
 pub use file::{DEFAULT_MAX_OPEN_FILES, FileStorage};
 pub use io::{BlockingIo, FileIo, OpenFile};
 pub use memory::MemoryStorage;
+pub use prescan::absent_pieces;
 pub use resume::{FileStamp, ResumeData, ResumeError, load_resume, remove_resume, save_resume};
 #[cfg(all(feature = "uring", target_os = "linux"))]
 pub use uring::{DEFAULT_URING_ENTRIES, UringIo};
@@ -126,6 +136,17 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     /// # Errors
     /// I/O errors from the backend.
     fn flush(&self) -> Result<(), StorageError>;
+
+    /// Forces the bytes of `offset..offset + len` to disk. The default
+    /// flushes everything; file storage syncs only the files the range
+    /// touches.
+    ///
+    /// # Errors
+    /// I/O errors from the backend.
+    fn sync_range(&self, offset: u64, len: u64) -> Result<(), StorageError> {
+        let _ = (offset, len);
+        self.flush()
+    }
 
     /// A [`FileStamp`] per file for fastresume, or `None` if the backend
     /// cannot vouch for its data across restarts (the default).
@@ -244,6 +265,37 @@ pub fn read_block(
         }
         _ => Err(StorageError::InvalidBlock(block)),
     }
+}
+
+/// Reads piece `piece` and returns the SHA-256 leaf hash
+/// ([`dravity_core::merkle::hash_leaf`]) of each 16 KiB block, in order (the
+/// last block may be shorter). Used to find which block of a failed piece
+/// was bad (smart banning).
+///
+/// # Errors
+/// [`StorageError::InvalidBlock`] for a piece index out of range, or any
+/// read error, including missing data.
+pub fn block_hashes(
+    storage: &dyn Storage,
+    info: &Info,
+    piece: u32,
+) -> Result<Vec<dravity_core::merkle::Hash>, StorageError> {
+    let Some(range) = info.layout().piece_range(piece) else {
+        return Err(StorageError::InvalidBlock(BlockRef {
+            piece,
+            offset: 0,
+            length: 0,
+        }));
+    };
+    let len = usize::try_from(range.end - range.start).map_err(|_| StorageError::OutOfBounds {
+        offset: range.start,
+        len: usize::MAX,
+    })?;
+    let data = storage.read_vec(range.start, len)?;
+    Ok(data
+        .chunks(dravity_core::BLOCK_SIZE as usize)
+        .map(dravity_core::merkle::hash_leaf)
+        .collect())
 }
 
 /// Reads piece `piece` and checks it against the metainfo with

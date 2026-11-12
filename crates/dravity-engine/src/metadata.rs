@@ -408,6 +408,16 @@ impl MetadataState {
                 }
                 self.fill_connections(&mut out);
             }
+            Event::PeerConnectDeferred { addr } => {
+                // Not the peer's fault, and dialing the next address now
+                // would only be deferred too.
+                self.pool.dial_done(addr);
+                let peers = &self.peers;
+                self.pool
+                    .schedule_retry(now + crate::DEFERRED_DIAL_RETRY, addr, |a| {
+                        Self::is_connected(peers, a)
+                    });
+            }
             Event::PeerDisconnected { peer } => {
                 if let Some(addr) = self.remove_peer(peer) {
                     self.schedule_retry(now, addr);
@@ -436,6 +446,11 @@ impl MetadataState {
                 self.next_announce = Some(now + self.config.announce_retry);
                 out.push(Effect::Alert(Alert::TrackerError { message: error }));
                 self.settle_reannounce(now, &mut out);
+            }
+            Event::SetListenPort { port } => {
+                // New connections advertise it; metadata peers are brief.
+                self.config.listen_port = port;
+                self.reannounce(now, &mut out);
             }
             Event::Reannounce => self.reannounce(now, &mut out),
             Event::AddPeers { peers } => {
@@ -628,7 +643,7 @@ impl MetadataState {
         if reserved.extension_protocol() {
             out.push(Effect::Send {
                 peer: key,
-                message: ext::our_handshake(&self.config, None, addr),
+                message: ext::our_handshake(&self.config, None, addr, false),
             });
         }
         self.peers.insert(key, peer);

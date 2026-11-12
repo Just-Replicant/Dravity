@@ -40,7 +40,13 @@ pub(crate) struct Entry {
     /// File priorities as last set (empty: all normal).
     pub(crate) priorities: Vec<Priority>,
     pub(crate) paused: bool,
+    /// Stopped by the queue, waiting for an active slot.
+    pub(crate) queued: bool,
+    /// Last seen complete (seeding), for the queue.
+    pub(crate) complete: bool,
     pub(crate) added_at: u64,
+    /// Web seed health from the last run or the state directory.
+    pub(crate) web_seeds: Vec<crate::persist::WebSeedStat>,
     /// The running task's queue, if one was started.
     pub(crate) commands: Option<mpsc::Sender<Command>>,
 }
@@ -77,6 +83,7 @@ impl Entry {
         record.priorities.clone_from(&self.priorities);
         record.paused = self.paused;
         record.added_at = self.added_at;
+        record.web_seeds.clone_from(&self.web_seeds);
         record
     }
 }

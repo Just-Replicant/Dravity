@@ -14,19 +14,23 @@ use dravity_wire::{
 
 use crate::ban::HashBans;
 use crate::bitfield::Bitfield;
-use crate::choker::{Candidate, Choker};
+use crate::choker::{Candidate, Choker, tuned_slots};
 use crate::ext::{self, PeerExtensions};
 use crate::hints::{HintBook, Joined};
 use crate::layers::{Answer, LayerSet};
 use crate::picker::{Picker, Priority, Received};
 use crate::pool::{PeerPool, new_duplicate_wins};
 use crate::rate::TokenBucket;
+use crate::smart_ban::{SmartBan, Verdict};
 use crate::types::{
     Alert, AnnounceEvent, Config, DialHints, Effect, Event, PeerInfo, PeerKey, PeerLink, Stats,
     TorrentStatus,
 };
 use crate::web_seed::is_web_seed_addr;
-use crate::window::Window;
+use crate::window::{Bdp, Window};
+
+/// Most tracker URLs kept for `lt_tex` (ours plus learned ones).
+const MAX_TRACKERS: usize = 100;
 
 /// Most peers that may hold a request for the same block (endgame and
 /// stealing): the original requester plus one more.
@@ -121,6 +125,17 @@ struct Peer {
     snub_since: Option<Instant>,
     /// When the peer last held the optimistic unchoke (or connected).
     last_optimistic: Instant,
+    /// Payload bytes sent since we last unchoked the peer (round-robin
+    /// seeding).
+    served: u64,
+    /// When we last choked the peer (or it connected).
+    choked_since: Instant,
+    /// Delivery rate and base round trip, for the request depth.
+    bdp: Bdp,
+    /// The piece revealed to this peer while super-seeding.
+    super_piece: Option<u32>,
+    /// Our tracker list went out (`lt_tex`).
+    tex_sent: bool,
 }
 
 impl Peer {
@@ -168,6 +183,11 @@ impl Peer {
             uploaded: 0,
             snub_since: None,
             last_optimistic: now,
+            served: 0,
+            choked_since: now,
+            bdp: Bdp::default(),
+            super_piece: None,
+            tex_sent: false,
         }
     }
 
@@ -182,11 +202,17 @@ impl Peer {
         !self.am_choking || self.allowed_out.contains(&piece)
     }
 
-    /// Outstanding requests allowed now: the AIMD window, capped by the
-    /// peer's advertised `reqq`.
+    /// Outstanding requests allowed now: the AIMD window, or the peer's
+    /// bandwidth-delay product when that is deeper (a fast, distant peer
+    /// gets a full pipe at once instead of after many round trips), up to
+    /// [`Config::max_requests_per_peer`] and the peer's advertised `reqq`.
     fn request_limit(&self) -> usize {
-        let window = self.window.size().min(self.ext.reqq.unwrap_or(u32::MAX));
-        usize::try_from(window).unwrap_or(usize::MAX)
+        let depth = self
+            .window
+            .size()
+            .max(self.bdp.target().min(self.window.max()))
+            .min(self.ext.reqq.unwrap_or(u32::MAX));
+        usize::try_from(depth).unwrap_or(usize::MAX)
     }
 }
 
@@ -290,10 +316,23 @@ pub struct TorrentState {
     /// known, and those being hashed.
     recheck: VecDeque<u32>,
     rechecking: HashSet<u32>,
+    /// Pieces the driver's prescan found cannot be on disk: the start
+    /// check skips them.
+    absent: Option<Bitfield>,
     /// Needed for the BEP 6 allowed fast set.
     info_hash: Option<InfoHash>,
     choker: Choker,
+    /// Regular upload slots: [`Config::upload_slots`], or the tuner's
+    /// value with [`Config::upload_slots_auto`].
+    upload_slots: usize,
     bans: HashBans,
+    /// Remembered blocks of failed pieces ([`Config::smart_ban`]).
+    smart: SmartBan,
+    /// The v2 files' pieces: `(pieces root, first piece, piece count)`, for
+    /// leaf hash requests about failed pieces.
+    piece_roots: Vec<(Hash, u32, u32)>,
+    /// Leaf hash requests about failed pieces, by piece.
+    leaf_requests: HashMap<u32, (PeerKey, HashRequest)>,
     upload_rate: Option<TokenBucket>,
     /// Block reads for uploads in flight.
     pending_reads: usize,
@@ -303,6 +342,20 @@ pub struct TorrentState {
     uploaded: u64,
     bytes_have: u64,
     pending_writes: usize,
+    /// Tracker URLs shared over `lt_tex` and those learned from peers.
+    trackers: Vec<String>,
+    /// The `upload_only` value our last extension handshakes carried.
+    upload_only_sent: bool,
+    /// Times each piece was revealed while super-seeding.
+    super_revealed: HashMap<u32, u32>,
+    /// Our public address as peers report it (`yourip`), for BEP 40
+    /// priorities.
+    external_ip: Option<IpAddr>,
+    /// Addresses learned over PEX from a peer that supports holepunch
+    /// relaying (BEP 55): who to ask if dialing them fails.
+    holepunch_relays: HashMap<SocketAddr, PeerKey>,
+    /// Addresses a rendezvous was already requested for (once each).
+    holepunch_tried: HashSet<SocketAddr>,
 }
 
 impl TorrentState {
@@ -323,6 +376,7 @@ impl TorrentState {
             .map(|p| u64::from(layout.piece_size(p).unwrap_or(0)))
             .sum();
         Self {
+            upload_slots: config.upload_slots,
             config,
             picker,
             status: TorrentStatus::Idle,
@@ -347,9 +401,13 @@ impl TorrentState {
             padded_last_piece: false,
             recheck: VecDeque::new(),
             rechecking: HashSet::new(),
+            absent: None,
             info_hash: None,
             choker: Choker::default(),
             bans: HashBans::default(),
+            smart: SmartBan::default(),
+            piece_roots: Vec::new(),
+            leaf_requests: HashMap::new(),
             upload_rate: None,
             pending_reads: 0,
             upload_cursor: None,
@@ -357,7 +415,25 @@ impl TorrentState {
             uploaded: 0,
             bytes_have,
             pending_writes: 0,
+            trackers: Vec::new(),
+            upload_only_sent: false,
+            super_revealed: HashMap::new(),
+            external_ip: None,
+            holepunch_relays: HashMap::new(),
+            holepunch_tried: HashSet::new(),
         }
+    }
+
+    /// The torrent's tracker URLs, offered to peers that speak `lt_tex`
+    /// (only those [`dravity_wire::is_exchangeable_tracker`] accepts).
+    #[must_use]
+    pub fn with_trackers(mut self, trackers: impl IntoIterator<Item = String>) -> Self {
+        for url in trackers {
+            if dravity_wire::is_exchangeable_tracker(&url) && !self.trackers.contains(&url) {
+                self.trackers.push(url);
+            }
+        }
+        self
     }
 
     /// Serves `info` (the torrent's bencoded `info` dictionary) to peers that
@@ -491,6 +567,46 @@ impl TorrentState {
         self
     }
 
+    /// IP addresses banned elsewhere in the session: never dialed or
+    /// accepted (see [`Event::BanIp`]).
+    #[must_use]
+    pub fn with_banned_ips(mut self, ips: impl IntoIterator<Item = IpAddr>) -> Self {
+        for ip in ips {
+            self.bans.ban(ip);
+        }
+        self
+    }
+
+    /// Pieces that cannot be on disk (a file is missing or too short, see
+    /// `dravity_storage::absent_pieces`): the start check
+    /// ([`Config::check_existing`]) counts them as missing without hashing.
+    #[must_use]
+    pub fn with_absent_pieces(mut self, pieces: impl IntoIterator<Item = u32>) -> Self {
+        self.set_absent_pieces(pieces);
+        self
+    }
+
+    /// Like [`Self::with_absent_pieces`], on a built state (before
+    /// [`Event::Start`]).
+    pub fn set_absent_pieces(&mut self, pieces: impl IntoIterator<Item = u32>) {
+        let count = self.picker.layout().piece_count();
+        let mut absent = Bitfield::new(count);
+        for piece in pieces.into_iter().filter(|&p| p < count) {
+            absent.set(piece);
+        }
+        self.absent = (absent.count() > 0).then_some(absent);
+    }
+
+    /// The pieces of each v2 file with a piece layer: `(pieces root, first
+    /// piece, piece count)`. With [`Config::smart_ban`], the leaf hashes of
+    /// a failed piece are then asked from BEP 52 peers to find the bad
+    /// block before the piece is downloaded again.
+    #[must_use]
+    pub fn with_piece_roots(mut self, roots: impl IntoIterator<Item = (Hash, u32, u32)>) -> Self {
+        self.piece_roots = roots.into_iter().collect();
+        self
+    }
+
     /// Addresses that must not be dialed (DHT/PEX peers of a private torrent).
     #[must_use]
     pub fn ban_peers(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
@@ -508,6 +624,13 @@ impl TorrentState {
     #[must_use]
     pub const fn have(&self) -> &Bitfield {
         self.picker.have()
+    }
+
+    /// Regular upload slots in use: [`Config::upload_slots`], or the
+    /// tuned value with [`Config::upload_slots_auto`].
+    #[must_use]
+    pub const fn upload_slots(&self) -> usize {
+        self.upload_slots
     }
 
     /// The torrent configuration.
@@ -628,8 +751,19 @@ impl TorrentState {
                 self.pool.dial_done(addr);
                 if retry {
                     self.schedule_retry(now, addr);
+                    self.request_holepunch(now, addr, &mut out);
                 }
                 self.fill_connections(&mut out);
+            }
+            Event::PeerConnectDeferred { addr } => {
+                // Not the peer's fault, and dialing the next address now
+                // would only be deferred too.
+                self.pool.dial_done(addr);
+                let peers = &self.peers;
+                self.pool
+                    .schedule_retry(now + crate::DEFERRED_DIAL_RETRY, addr, |a| {
+                        Self::is_connected(peers, a)
+                    });
             }
             Event::PeerDisconnected { peer } => {
                 if let Some(addr) = self.remove_peer(peer) {
@@ -656,6 +790,14 @@ impl TorrentState {
                 self.fail(format!("storage write failed: {error}"), &mut out);
             }
             Event::PieceHashed { piece, ok } => self.on_hashed(now, piece, ok, &mut out),
+            Event::BlockHashes { piece, hashes } => {
+                self.on_block_hashes(now, piece, &hashes, &mut out);
+            }
+            Event::BanIp { ip } => {
+                if self.bans.ban(ip) {
+                    self.disconnect_ip(crate::ban::canonical_ip(ip), &mut out);
+                }
+            }
             Event::RecheckPieces { pieces } => {
                 let have = self.picker.have();
                 let fresh: Vec<u32> = pieces
@@ -687,6 +829,23 @@ impl TorrentState {
             Event::SetUrgent { pieces } => {
                 self.picker.set_urgent(pieces);
                 self.wanted_changed(now, &mut out);
+            }
+            Event::SetListenPort { port } => {
+                self.config.listen_port = port;
+                let size = self
+                    .info_bytes
+                    .as_ref()
+                    .and_then(|b| u64::try_from(b.len()).ok());
+                let upload_only = self.upload_only_sent;
+                for key in self.sorted_keys() {
+                    if let Some(peer) = self.peers.get_mut(&key)
+                        && peer.extended
+                    {
+                        let hs = ext::our_handshake(&self.config, size, peer.addr, upload_only);
+                        Self::send(peer, key, hs, now, &mut out);
+                    }
+                }
+                self.reannounce(now, &mut out);
             }
             Event::Reannounce => self.reannounce(now, &mut out),
             Event::AnnounceFailed { error } => {
@@ -759,7 +918,8 @@ impl TorrentState {
             return;
         };
         while check.outstanding < self.config.check_concurrency.max(1) && check.next < count {
-            if !self.picker.have().get(check.next) {
+            let skip = self.absent.as_ref().is_some_and(|a| a.get(check.next));
+            if !skip && !self.picker.have().get(check.next) {
                 out.push(Effect::HashPiece { piece: check.next });
                 check.outstanding += 1;
             }
@@ -767,6 +927,7 @@ impl TorrentState {
         }
         if check.outstanding == 0 && check.next >= count {
             self.check = None;
+            self.absent = None;
             self.begin_download(now, out);
         }
     }
@@ -801,6 +962,7 @@ impl TorrentState {
     /// leaves the swarm.
     fn finish(&mut self, now: Instant, out: &mut Vec<Effect>) {
         self.set_status(TorrentStatus::Finished, out);
+        self.refresh_upload_only(now, out);
         out.push(Effect::Alert(Alert::Finished));
         let complete = self.picker.is_complete();
         if !self.config.seed {
@@ -871,6 +1033,7 @@ impl TorrentState {
     /// announces `started` again.
     fn resume_download(&mut self, now: Instant, out: &mut Vec<Effect>) {
         self.set_status(TorrentStatus::Downloading, out);
+        self.refresh_upload_only(now, out);
         if !self.started_announced {
             self.announce(now, AnnounceEvent::Started, out);
         } else if self.next_announce.is_none() {
@@ -1062,6 +1225,15 @@ impl TorrentState {
             self.remove_peer(old);
             out.push(Effect::Disconnect { peer: old });
         }
+        let full = self.peers.len() >= self.config.max_peers;
+        if !refused && full && !Self::is_connected(&self.peers, addr) {
+            // BEP 40: at the cap, a connection both sides rank higher
+            // replaces the lowest-ranked one.
+            if let Some(victim) = self.lower_priority_peer(addr) {
+                self.remove_peer(victim);
+                out.push(Effect::Disconnect { peer: victim });
+            }
+        }
         if refused
             || self.peers.len() >= self.config.max_peers
             || Self::is_connected(&self.peers, addr)
@@ -1077,7 +1249,7 @@ impl TorrentState {
                 .info_bytes
                 .as_ref()
                 .and_then(|b| u64::try_from(b.len()).ok());
-            let hs = ext::our_handshake(&self.config, size, addr);
+            let hs = ext::our_handshake(&self.config, size, addr, self.upload_only_sent);
             Self::send(&mut peer, key, hs, now, out);
         }
         self.peers.insert(key, peer);
@@ -1116,6 +1288,15 @@ impl TorrentState {
     /// without the fast extension when we have nothing). Then the allowed
     /// fast set.
     fn send_bitfield(&mut self, now: Instant, key: PeerKey, out: &mut Vec<Effect>) {
+        if self.super_seeding() {
+            if let Some(peer) = self.peers.get_mut(&key)
+                && peer.fast
+            {
+                Self::send(peer, key, Message::HaveNone, now, out);
+            }
+            self.super_reveal(now, key, out);
+            return;
+        }
         let have = self.picker.have();
         let Some(peer) = self.peers.get_mut(&key) else {
             return;
@@ -1208,6 +1389,7 @@ impl TorrentState {
             self.release_owner(key, *block);
         }
         self.picker.remove_peer_pieces(&peer.has);
+        self.picker.release_owner(key.0);
         if let Some((_, set)) = &mut self.layer_fetch {
             set.release(key);
         }
@@ -1238,9 +1420,84 @@ impl TorrentState {
         self.pump_uploads(out);
     }
 
+    /// The connected peer with the lowest BEP 40 priority, if `addr`
+    /// ranks above it. `None` while our public address is unknown.
+    fn lower_priority_peer(&self, addr: SocketAddr) -> Option<PeerKey> {
+        let ours = SocketAddr::new(self.external_ip?, self.config.listen_port.unwrap_or(0));
+        let rank = |a: SocketAddr| dravity_core::priority::peer_priority(ours, a);
+        let (key, lowest) = self
+            .peers
+            .iter()
+            .map(|(k, p)| (*k, rank(p.reachable.unwrap_or(p.addr))))
+            .min_by_key(|&(k, r)| (r, k))?;
+        (rank(addr) > lowest).then_some(key)
+    }
+
+    /// BEP 16 super-seeding is on and we have every piece.
+    fn super_seeding(&self) -> bool {
+        self.config.super_seed && self.picker.is_complete()
+    }
+
+    /// Reveals one piece to `key` while super-seeding: one it lacks that
+    /// we revealed least often, then the rarest in the swarm, then the
+    /// lowest index.
+    fn super_reveal(&mut self, now: Instant, key: PeerKey, out: &mut Vec<Effect>) {
+        if !self.super_seeding() {
+            return;
+        }
+        let piece_count = self.picker.layout().piece_count();
+        let Some(peer) = self.peers.get(&key) else {
+            return;
+        };
+        if peer.super_piece.is_some() {
+            return;
+        }
+        let pick = (0..piece_count)
+            .filter(|&p| !peer.has.get(p))
+            .min_by_key(|&p| {
+                (
+                    self.super_revealed.get(&p).copied().unwrap_or(0),
+                    self.picker.availability(p),
+                    p,
+                )
+            });
+        let Some(piece) = pick else {
+            return;
+        };
+        *self.super_revealed.entry(piece).or_insert(0) += 1;
+        if let Some(peer) = self.peers.get_mut(&key) {
+            peer.super_piece = Some(piece);
+            Self::send(peer, key, Message::Have { piece }, now, out);
+        }
+    }
+
+    /// Sends a fresh extension handshake when whether we download changed
+    /// (BEP 21 `upload_only`: set once every wanted piece is in).
+    fn refresh_upload_only(&mut self, now: Instant, out: &mut Vec<Effect>) {
+        let upload_only = self.status == TorrentStatus::Finished;
+        if upload_only == self.upload_only_sent {
+            return;
+        }
+        self.upload_only_sent = upload_only;
+        let size = self
+            .info_bytes
+            .as_ref()
+            .and_then(|b| u64::try_from(b.len()).ok());
+        for key in self.sorted_keys() {
+            if let Some(peer) = self.peers.get_mut(&key)
+                && peer.extended
+            {
+                let hs = ext::our_handshake(&self.config, size, peer.addr, upload_only);
+                Self::send(peer, key, hs, now, out);
+            }
+        }
+    }
+
     /// Two seeds have nothing to exchange: drop a peer that has every piece
     /// once we have them too. Returns whether it was dropped.
     fn drop_if_both_seeds(&mut self, key: PeerKey, out: &mut Vec<Effect>) -> bool {
+        // An `upload_only` partial seed is kept: it may want more pieces
+        // after a priority change, and dropping it would cost a redial.
         let both =
             self.picker.is_complete() && self.peers.get(&key).is_some_and(|p| p.has.is_full());
         if both {
@@ -1296,6 +1553,10 @@ impl TorrentState {
                 if peer.has.set(piece) {
                     self.picker.add_peer_piece(piece);
                 }
+                if peer.super_piece == Some(piece) {
+                    peer.super_piece = None;
+                    self.super_reveal(now, key, out);
+                }
                 if self.drop_if_both_seeds(key, out) {
                     return;
                 }
@@ -1311,6 +1572,8 @@ impl TorrentState {
                         self.release_owner(key, block);
                     }
                 }
+                // Its reserved pieces go to peers that can serve them.
+                self.picker.release_owner(key.0);
             }
             Message::Unchoke => peer.peer_choking = false,
             Message::Interested => {
@@ -1361,11 +1624,16 @@ impl TorrentState {
                 Self::send(peer, key, reply, now, out);
             }
             Message::Hashes { request, hashes } => {
+                if self.on_leaf_hashes(key, &request, &hashes, out) {
+                    return;
+                }
                 if !self.on_hashes(now, key, &request, &hashes, out) {
                     return;
                 }
             }
             Message::HashReject(request) => {
+                self.leaf_requests
+                    .retain(|_, (k, r)| !(*k == key && *r == request));
                 let retry_at = now + self.config.request_timeout;
                 if let Some((_, set)) = &mut self.layer_fetch {
                     set.on_reject(key, &request, retry_at);
@@ -1400,6 +1668,18 @@ impl TorrentState {
             ext::HANDSHAKE_ID => {
                 if let Ok(hs) = ExtendedHandshake::decode(payload) {
                     peer.ext.update(&hs);
+                    if let Some(ip) = hs.your_ip.as_deref().and_then(ip_from_bytes) {
+                        self.external_ip = Some(ip);
+                    }
+                    if self.config.tracker_exchange
+                        && !peer.tex_sent
+                        && !self.trackers.is_empty()
+                        && let Some(id) = peer.ext.lt_tex
+                    {
+                        peer.tex_sent = true;
+                        let message = ext::tex_message(id, &self.trackers);
+                        Self::send(peer, key, message, now, out);
+                    }
                     if peer.incoming
                         && let Some(port) = hs.listen_port.filter(|&p| p != 0)
                     {
@@ -1429,10 +1709,55 @@ impl TorrentState {
                 }
                 false
             }
+            ext::OUR_LT_DONTHAVE => {
+                let piece_count = self.picker.layout().piece_count();
+                match dravity_wire::decode_donthave(payload) {
+                    Some(piece) if piece < piece_count => {
+                        if peer.has.clear(piece) {
+                            self.picker.remove_peer_piece(piece);
+                        }
+                    }
+                    _ => self.disconnect(key, out),
+                }
+                false
+            }
+            ext::OUR_LT_TEX if self.config.tracker_exchange => {
+                if let Ok(tex) = dravity_wire::TrackerExchange::decode(payload) {
+                    let room = MAX_TRACKERS.saturating_sub(self.trackers.len());
+                    let urls: Vec<String> = tex
+                        .added
+                        .into_iter()
+                        .filter(|u| !self.trackers.contains(u))
+                        .take(room)
+                        .collect();
+                    if !urls.is_empty() {
+                        self.trackers.extend(urls.iter().cloned());
+                        out.push(Effect::TrackersReceived { urls });
+                    }
+                }
+                false
+            }
+            ext::OUR_UT_HOLEPUNCH if self.config.holepunch => {
+                match dravity_wire::Holepunch::decode(payload) {
+                    Some(msg) => self.on_holepunch(now, key, msg, out),
+                    None => self.disconnect(key, out),
+                }
+                false
+            }
             ext::OUR_UT_PEX if self.config.pex => match ext::pex_added(payload) {
                 Some(added) if !added.is_empty() => {
+                    let relay = self.config.holepunch && peer.ext.ut_holepunch.is_some();
                     for p in &added {
                         self.hints.learn_pex(p.addr, p.flags);
+                        let punchable = p
+                            .flags
+                            .is_some_and(|f| f & dravity_wire::PEX_HOLEPUNCH != 0);
+                        if relay
+                            && punchable
+                            && self.holepunch_relays.len() < ext::MAX_HOLEPUNCH_SOURCES
+                        {
+                            self.holepunch_relays.insert(p.addr, key);
+                        }
                     }
                     self.add_to_pool(added.iter().map(|p| p.addr).collect());
                     true
@@ -1440,6 +1765,100 @@ impl TorrentState {
                 _ => false,
             },
             _ => false,
+        }
+    }
+
+    /// Dialing `addr` failed: if a connected peer told us about it over
+    /// PEX and can relay, ask it for a rendezvous (BEP 55), once.
+    fn request_holepunch(&mut self, now: Instant, addr: SocketAddr, out: &mut Vec<Effect>) {
+        let Some(relay) = self.holepunch_relays.remove(&addr) else {
+            return;
+        };
+        if !self.config.holepunch || !self.holepunch_tried.insert(addr) {
+            return;
+        }
+        if self.holepunch_tried.len() > ext::MAX_HOLEPUNCH_SOURCES {
+            self.holepunch_tried.clear();
+        }
+        if let Some(peer) = self.peers.get_mut(&relay)
+            && let Some(id) = peer.ext.ut_holepunch
+        {
+            let message = ext::holepunch_message(id, dravity_wire::Holepunch::Rendezvous(addr));
+            Self::send(peer, relay, message, now, out);
+        }
+    }
+
+    /// A `ut_holepunch` message from `key`.
+    fn on_holepunch(
+        &mut self,
+        now: Instant,
+        key: PeerKey,
+        msg: dravity_wire::Holepunch,
+        out: &mut Vec<Effect>,
+    ) {
+        use dravity_wire::{Holepunch, HolepunchError};
+        match msg {
+            Holepunch::Rendezvous(target) => {
+                let Some(sender) = self.peers.get(&key) else {
+                    return;
+                };
+                let sender_addr = sender.reachable.unwrap_or(sender.addr);
+                let Some(reply_id) = sender.ext.ut_holepunch else {
+                    return;
+                };
+                let found = self
+                    .peers
+                    .iter()
+                    .find(|(_, p)| p.addr == target || p.reachable == Some(target))
+                    .map(|(&k, p)| (k, p.ext.ut_holepunch, p.reachable.unwrap_or(p.addr)));
+                let outcome = match found {
+                    _ if target == sender_addr => Err(HolepunchError::NoSelf),
+                    Some((k, _, _)) if k == key => Err(HolepunchError::NoSelf),
+                    None => Err(HolepunchError::NotConnected),
+                    Some((_, None, _)) => Err(HolepunchError::NoSupport),
+                    Some((k, Some(id), target_addr)) => Ok((k, id, target_addr)),
+                };
+                match outcome {
+                    Ok((target_key, target_id, target_addr)) => {
+                        if let Some(p) = self.peers.get_mut(&target_key) {
+                            let m =
+                                ext::holepunch_message(target_id, Holepunch::Connect(sender_addr));
+                            Self::send(p, target_key, m, now, out);
+                        }
+                        if let Some(p) = self.peers.get_mut(&key) {
+                            let m =
+                                ext::holepunch_message(reply_id, Holepunch::Connect(target_addr));
+                            Self::send(p, key, m, now, out);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(p) = self.peers.get_mut(&key) {
+                            let m =
+                                ext::holepunch_message(reply_id, Holepunch::Error(target, error));
+                            Self::send(p, key, m, now, out);
+                        }
+                    }
+                }
+            }
+            Holepunch::Connect(addr) => {
+                // Only relays we asked, or peers relaying for others, send
+                // these; either way dial once over uTP if we can use it.
+                let peers = &self.peers;
+                let banned = self.swarm_ban.contains(&addr) || self.bans.is_banned(addr.ip());
+                if banned
+                    || addr.port() == 0
+                    || !self.is_active()
+                    || self.peers.len() + self.pool.connecting() >= self.config.max_peers
+                    || !self.pool.dial_now(addr, |a| Self::is_connected(peers, a))
+                {
+                    return;
+                }
+                let mut hints = self.hints.get(addr);
+                hints.utp = Some(true);
+                out.push(Effect::Connect { addr, hints });
+            }
+            // Nothing to do: the address stays in the retry list.
+            Holepunch::Error(..) => {}
         }
     }
 
@@ -1479,10 +1898,10 @@ impl TorrentState {
         }
         let mut from_ip = None;
         if let Some(peer) = self.peers.get_mut(&key) {
-            let before = peer.inflight.len();
-            peer.inflight.retain(|(b, _)| *b != block);
-            if peer.inflight.len() < before {
+            if let Some(&(_, requested)) = peer.inflight.iter().find(|(b, _)| *b == block) {
+                peer.inflight.retain(|(b, _)| *b != block);
                 peer.window.on_block();
+                peer.bdp.on_block(now, requested, length);
             }
             peer.down_round = peer.down_round.saturating_add(u64::from(length));
             peer.downloaded = peer.downloaded.saturating_add(u64::from(length));
@@ -1502,7 +1921,7 @@ impl TorrentState {
         self.downloaded = self.downloaded.saturating_add(u64::from(length));
         if self.picker.block_received(block) == Received::Accepted {
             if let Some(ip) = from_ip {
-                self.bans.record(piece, ip);
+                self.bans.record(piece, block.offset, ip);
             }
             self.pending_writes += 1;
             out.push(Effect::WriteBlock { block, data });
@@ -1546,6 +1965,13 @@ impl TorrentState {
             return;
         }
         let piece_count = self.picker.layout().piece_count();
+        // Requests outstanding at the other peers, for the torrent budget.
+        let others: usize = self
+            .peers
+            .iter()
+            .filter(|(k, _)| **k != key)
+            .map(|(_, p)| p.inflight.len())
+            .sum();
         let Some(peer) = self.peers.get_mut(&key) else {
             return;
         };
@@ -1569,7 +1995,11 @@ impl TorrentState {
         };
         let has = choked_mask.as_ref().unwrap_or(&peer.has);
         let limit = peer.request_limit();
-        while peer.inflight.len() < limit && self.pending_writes < self.config.max_pending_writes {
+        let budget = self.config.request_budget.max(1);
+        while peer.inflight.len() < limit
+            && others + peer.inflight.len() < budget
+            && self.pending_writes < self.config.max_pending_writes
+        {
             if self
                 .rate
                 .as_ref()
@@ -1579,7 +2009,7 @@ impl TorrentState {
             }
             let block = match self
                 .picker
-                .pick_with_hint(has, peer.suggested.make_contiguous())
+                .pick_for(key.0, has, peer.suggested.make_contiguous())
             {
                 Some(block) => block,
                 None => match duplicate_candidate(
@@ -1635,18 +2065,24 @@ impl TorrentState {
             return;
         }
         if !ok {
-            self.picker.piece_hashed(piece, false);
             out.push(Effect::Alert(Alert::HashFailed { piece }));
-            for ip in self.bans.failed(
-                piece,
-                self.config.hash_fail_ban,
-                now,
-                self.config.hash_fail_quiet,
-            ) {
-                self.ban(ip, out);
+            let senders = self.bans.take(piece);
+            let distinct: HashSet<IpAddr> = senders.values().copied().collect();
+            if self.config.smart_ban && distinct.len() > 1 && self.smart.has_room() {
+                // Keep the piece away from the picker until its blocks are
+                // hashed, so no new block overwrites the evidence.
+                self.smart.failed(piece, senders);
+                out.push(Effect::HashBlocks { piece });
+                self.request_leaves(now, piece, &distinct, out);
+                return;
             }
+            self.picker.piece_hashed(piece, false);
+            self.strike(now, &senders, out);
         } else if self.picker.piece_hashed(piece, true) {
             self.bans.passed(piece);
+            if self.smart.passed(piece) {
+                out.push(Effect::HashBlocks { piece });
+            }
             self.add_have_bytes(piece);
             out.push(Effect::Alert(Alert::PieceCompleted { piece }));
             for key in self.sorted_keys() {
@@ -1662,6 +2098,150 @@ impl TorrentState {
             }
         }
         self.fill_all_requests(now, out);
+    }
+
+    /// Strikes the senders of a failed piece and bans those over the limit.
+    fn strike(&mut self, now: Instant, senders: &HashMap<u32, IpAddr>, out: &mut Vec<Effect>) {
+        for ip in self.bans.strike(
+            senders,
+            self.config.hash_fail_ban,
+            now,
+            self.config.hash_fail_quiet,
+        ) {
+            self.ban(ip, out);
+        }
+    }
+
+    /// The block digests of a piece hashed for [`Config::smart_ban`].
+    fn on_block_hashes(
+        &mut self,
+        now: Instant,
+        piece: u32,
+        hashes: &[Hash],
+        out: &mut Vec<Effect>,
+    ) {
+        match self.smart.on_digests(piece, hashes) {
+            Verdict::Ignored => {}
+            Verdict::Compared { banned } => {
+                for ip in banned {
+                    self.convict(ip, out);
+                }
+            }
+            Verdict::Recorded { banned } => {
+                self.picker.piece_hashed(piece, false);
+                for ip in banned {
+                    self.convict(ip, out);
+                }
+                self.fill_all_requests(now, out);
+            }
+            Verdict::Unhashed { senders } => {
+                self.picker.piece_hashed(piece, false);
+                self.strike(now, &senders, out);
+                self.fill_all_requests(now, out);
+            }
+        }
+    }
+
+    /// The file and position of a v2 `piece`: `(pieces root, index in the
+    /// file's piece layer)`.
+    fn piece_root(&self, piece: u32) -> Option<(Hash, u32)> {
+        self.piece_roots.iter().find_map(|&(root, first, count)| {
+            let index = piece.checked_sub(first)?;
+            (index < count).then_some((root, index))
+        })
+    }
+
+    /// Asks a BEP 52 peer that has `piece` (preferably not one of its
+    /// `senders`) for the piece's leaf hashes.
+    fn request_leaves(
+        &mut self,
+        now: Instant,
+        piece: u32,
+        senders: &HashSet<IpAddr>,
+        out: &mut Vec<Effect>,
+    ) {
+        let Some((root, index)) = self.piece_root(piece) else {
+            return;
+        };
+        let Some((piece_length, layers)) = &self.piece_layers else {
+            return;
+        };
+        if !layers.contains_key(&root) {
+            return;
+        }
+        let Some(per_piece) = merkle::leaves_per_piece(*piece_length) else {
+            return;
+        };
+        let (Ok(length), true) = (u32::try_from(per_piece), per_piece >= 2) else {
+            return;
+        };
+        let Some(start) = index.checked_mul(length) else {
+            return;
+        };
+        let mut candidates: Vec<(bool, PeerKey)> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.v2 && p.has.get(piece))
+            .map(|(k, p)| (senders.contains(&crate::ban::canonical_ip(p.addr.ip())), *k))
+            .collect();
+        candidates.sort_unstable();
+        let Some(&(_, key)) = candidates.first() else {
+            return;
+        };
+        let request = HashRequest {
+            pieces_root: root,
+            base_layer: 0,
+            index: start,
+            length,
+            proof_layers: 0,
+        };
+        self.leaf_requests.insert(piece, (key, request));
+        if let Some(peer) = self.peers.get_mut(&key) {
+            Self::send(peer, key, Message::HashRequest(request), now, out);
+        }
+    }
+
+    /// A `hashes` reply to a leaf request: verified against the piece-layer
+    /// hash before it is used. Returns `true` if it answered one.
+    fn on_leaf_hashes(
+        &mut self,
+        key: PeerKey,
+        request: &HashRequest,
+        hashes: &[u8],
+        out: &mut Vec<Effect>,
+    ) -> bool {
+        let Some(piece) = self
+            .leaf_requests
+            .iter()
+            .find(|(_, (k, r))| *k == key && r == request)
+            .map(|(p, _)| *p)
+        else {
+            return false;
+        };
+        self.leaf_requests.remove(&piece);
+        let (chunks, rest) = hashes.as_chunks::<32>();
+        let leaves: Vec<Hash> = if rest.is_empty() {
+            chunks.to_vec()
+        } else {
+            Vec::new()
+        };
+        let expected = self.piece_root(piece).and_then(|(root, index)| {
+            let (_, layers) = self.piece_layers.as_ref()?;
+            layers
+                .get(&root)?
+                .get(usize::try_from(index).ok()?)
+                .copied()
+        });
+        let width = usize::try_from(request.length).unwrap_or(0);
+        let verified = leaves.len() == width
+            && expected.is_some()
+            && merkle::root_padded(&leaves, width, 0) == expected;
+        if verified {
+            for ip in self.smart.on_leaves(piece, leaves) {
+                self.convict(ip, out);
+            }
+        }
+        true
     }
 
     /// Asks `key` for missing piece-layer blocks (at most
@@ -1748,6 +2328,19 @@ impl TorrentState {
         if !ok && self.picker.mark_missing(piece) {
             let size = self.picker.layout().piece_size(piece).unwrap_or(0);
             self.bytes_have = self.bytes_have.saturating_sub(u64::from(size));
+            // BEP 54: peers stop asking for what we no longer have.
+            let payload = Bytes::copy_from_slice(&dravity_wire::encode_donthave(piece));
+            for key in self.sorted_keys() {
+                if let Some(peer) = self.peers.get_mut(&key)
+                    && let Some(id) = peer.ext.lt_donthave
+                {
+                    let message = Message::Extended {
+                        id,
+                        payload: payload.clone(),
+                    };
+                    Self::send(peer, key, message, now, out);
+                }
+            }
             out.push(Effect::Alert(Alert::HashFailed { piece }));
             self.wanted_changed(now, out);
         }
@@ -1778,6 +2371,7 @@ impl TorrentState {
                     dead.push(key);
                     continue;
                 }
+                peer.bdp.on_tick(now);
                 let timeout = self.config.request_timeout;
                 let mut expired = Vec::new();
                 peer.inflight.retain(|(block, since)| {
@@ -1792,6 +2386,7 @@ impl TorrentState {
                     // that has grown to 128 with reqq 4 becomes 2.
                     let reqq = peer.ext.reqq.unwrap_or(u32::MAX);
                     peer.window.on_timeout(reqq);
+                    peer.bdp.on_loss(now);
                 }
                 if now.saturating_duration_since(peer.last_sent) >= self.config.keepalive_interval {
                     Self::send(peer, key, Message::KeepAlive, now, out);
@@ -1870,9 +2465,11 @@ impl TorrentState {
         let serving = self.is_active();
         let valid = self.is_servable(block) && self.picker.have().get(block.piece);
         let max_queue = self.config.max_upload_queue;
+        let super_seeding = self.super_seeding();
         let Some(peer) = self.peers.get_mut(&key) else {
             return;
         };
+        let valid = valid && (!super_seeding || peer.super_piece == Some(block.piece));
         if peer.upload_queue.contains(&block) || peer.reading.contains(&block) {
             return;
         }
@@ -2066,6 +2663,7 @@ impl TorrentState {
                 };
                 let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
                 peer.up_round = peer.up_round.saturating_add(len);
+                peer.served = peer.served.saturating_add(len);
                 peer.uploaded = peer.uploaded.saturating_add(len);
                 self.uploaded = self.uploaded.saturating_add(len);
                 let message = Message::Piece {
@@ -2113,6 +2711,7 @@ impl TorrentState {
             && peer.am_choking
         {
             peer.am_choking = false;
+            peer.served = 0;
             Self::send(peer, key, Message::Unchoke, now, out);
         }
     }
@@ -2129,6 +2728,7 @@ impl TorrentState {
                 return;
             }
             peer.am_choking = true;
+            peer.choked_since = now;
             Self::send(peer, key, Message::Choke, now, out);
             let allowed = peer.allowed_out.clone();
             let mut dropped: Vec<BlockRef> = Vec::new();
@@ -2170,6 +2770,12 @@ impl TorrentState {
         }
         let seeding = self.status == TorrentStatus::Finished;
         let snub = self.config.snub_timeout;
+        if self.config.upload_slots_auto {
+            let secs = self.config.unchoke_interval.as_secs().max(1);
+            let rates: Vec<u64> = self.peers.values().map(|p| p.up_round / secs).collect();
+            self.upload_slots = tuned_slots(&rates);
+        }
+        let pieces = u64::from(self.picker.layout().piece_count().max(1));
         let candidates: Vec<Candidate> = self
             .sorted_keys()
             .into_iter()
@@ -2182,11 +2788,17 @@ impl TorrentState {
                     snubbed: !seeding && p.is_snubbing(now, snub),
                     unchoked: !p.am_choking,
                     waiting_since: p.last_optimistic,
+                    served: p.served,
+                    choked_since: p.choked_since,
+                    progress: u32::try_from(u64::from(p.has.count()) * 1000 / pieces)
+                        .unwrap_or(1000),
                 })
             })
             .collect();
         let before = self.choker.optimistic();
-        let selected = self.choker.round(now, &self.config, &candidates);
+        let selected =
+            self.choker
+                .round(now, &self.config, self.upload_slots, seeding, &candidates);
         if let Some(key) = self.choker.optimistic().filter(|k| Some(*k) != before)
             && let Some(peer) = self.peers.get_mut(&key)
         {
@@ -2214,7 +2826,7 @@ impl TorrentState {
         if !self.is_active() {
             return;
         }
-        let limit = self.config.upload_slots + usize::from(self.config.optimistic_unchoke);
+        let limit = self.upload_slots + usize::from(self.config.optimistic_unchoke);
         let unchoked = self.peers.values().filter(|p| !p.am_choking).count();
         if unchoked >= limit {
             return;
@@ -2251,6 +2863,18 @@ impl TorrentState {
     fn ban(&mut self, ip: IpAddr, out: &mut Vec<Effect>) {
         let ip = crate::ban::canonical_ip(ip);
         out.push(Effect::Alert(Alert::PeerBanned { ip }));
+        self.disconnect_ip(ip, out);
+    }
+
+    /// Bans `ip`, convicted by smart banning, for the rest of the torrent.
+    fn convict(&mut self, ip: IpAddr, out: &mut Vec<Effect>) {
+        if self.bans.ban(ip) {
+            self.ban(ip, out);
+        }
+    }
+
+    /// Closes every connection of the (canonical) `ip` and forgets it.
+    fn disconnect_ip(&mut self, ip: IpAddr, out: &mut Vec<Effect>) {
         let keys: Vec<PeerKey> = self
             .sorted_keys()
             .into_iter()
@@ -2330,11 +2954,15 @@ fn pex_flags(peer: &Peer, hints: DialHints) -> u8 {
     if peer.link.mse == Some(true) || hints.encryption == Some(true) {
         flags |= dravity_wire::PEX_ENCRYPTION;
     }
-    if peer.has.is_full() {
+    // BEP 11: "seed or partial seed"; BEP 21 `upload_only` is the latter.
+    if peer.has.is_full() || peer.ext.upload_only {
         flags |= dravity_wire::PEX_SEED;
     }
     if peer.link.utp || hints.utp == Some(true) {
         flags |= dravity_wire::PEX_UTP;
+    }
+    if peer.ext.ut_holepunch.is_some() {
+        flags |= dravity_wire::PEX_HOLEPUNCH;
     }
     // Only a connection we opened proves others can open one too.
     if !peer.incoming {
@@ -2457,4 +3085,15 @@ fn metadata_reply(info: Option<&Bytes>, piece: u32) -> MetadataMessage {
         }
         _ => MetadataMessage::Reject { piece },
     }
+}
+
+/// An address from 4 or 16 raw bytes (`yourip`); `None` for other lengths
+/// and for addresses that cannot be public (unspecified, loopback).
+fn ip_from_bytes(bytes: &[u8]) -> Option<IpAddr> {
+    let ip = if let Ok(v4) = <[u8; 4]>::try_from(bytes) {
+        IpAddr::from(v4)
+    } else {
+        IpAddr::from(<[u8; 16]>::try_from(bytes).ok()?)
+    };
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
 }

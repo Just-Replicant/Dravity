@@ -736,11 +736,40 @@ impl Info {
         if u64::try_from(data.len()).ok() != Some(range.end - range.start) {
             return false;
         }
-        if self.version.has_v1() {
-            let digest: [u8; 20] = Sha1::digest(data).into();
-            if self.piece_hash(index) != Some(&digest) {
-                return false;
-            }
+        let sha1: Option<[u8; 20]> = self.version.has_v1().then(|| Sha1::digest(data).into());
+        let leaves = match self.v2_part_len(index) {
+            Some(len) => match data.get(..len) {
+                Some(part) => merkle::leaf_hashes(part),
+                None => return false,
+            },
+            None => Vec::new(),
+        };
+        self.check_digests(index, sha1.as_ref(), &leaves)
+    }
+
+    /// The length of the v2 file's part of piece `index` (the piece minus
+    /// trailing padding), if the piece is in a v2 file.
+    pub(crate) fn v2_part_len(&self, index: u32) -> Option<usize> {
+        if !self.version.has_v2() {
+            return None;
+        }
+        let range = self.layout.piece_range(index)?;
+        let file = self.v2_file(index)?;
+        let end = range.end.min(file.offset + file.length);
+        usize::try_from(end.saturating_sub(range.start)).ok()
+    }
+
+    /// [`Info::check_piece`] from digests: `sha1` of the whole piece (for
+    /// v1 and hybrid torrents) and the SHA-256 `leaves` of the v2 file's
+    /// part of it (see [`Info::v2_part_len`]).
+    pub(crate) fn check_digests(
+        &self,
+        index: u32,
+        sha1: Option<&[u8; 20]>,
+        leaves: &[Hash],
+    ) -> bool {
+        if self.version.has_v1() && (sha1.is_none() || self.piece_hash(index) != sha1) {
+            return false;
         }
         if !self.version.has_v2() {
             return true;
@@ -753,10 +782,7 @@ impl Info {
         if file.layer.is_none() && self.version == MetaVersion::Hybrid {
             return true;
         }
-        let end = range.end.min(file.offset + file.length);
-        let len = usize::try_from(end.saturating_sub(range.start)).unwrap_or(usize::MAX);
-        data.get(..len)
-            .is_some_and(|d| file.check(index, d, self.piece_length()))
+        file.check_leaves(index, leaves, self.piece_length())
     }
 
     /// Suggested name: the file name (single-file) or root directory (multi-file).

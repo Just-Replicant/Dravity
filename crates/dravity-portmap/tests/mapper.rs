@@ -85,6 +85,7 @@ async fn natpmp_maps_reports_and_removes() {
     let (gateway, seen) = fake_natpmp().await;
     let mut c = config();
     c.upnp = false;
+    c.pcp = false;
     c.gateway = Some(gateway);
     let mapper = PortMapper::start(c, mappings());
     let status = wait_for(&mapper, |s| s.method.is_some()).await;
@@ -267,4 +268,149 @@ async fn failure_is_reported_and_retried() {
     assert_eq!(status.method, None);
     assert!(status.mapped.is_empty());
     mapper.stop().await;
+}
+
+/// Answers PCP MAP requests, mapping internal port p to p + 2000 on
+/// 198.51.100.4, and records every request.
+async fn fake_pcp() -> (SocketAddrV4, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let std::net::SocketAddr::V4(addr) = socket.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1100];
+        loop {
+            let (n, from) = socket.recv_from(&mut buf).await.unwrap();
+            let req = buf[..n].to_vec();
+            log.lock().unwrap().push(req.clone());
+            let internal = u16::from_be_bytes([req[40], req[41]]);
+            let mut out = vec![2, 0x81, 0, 0];
+            out.extend_from_slice(&req[4..8]);
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(&[0; 12]);
+            out.extend_from_slice(&req[24..42]);
+            out.extend_from_slice(&(internal + 2000).to_be_bytes());
+            out.extend_from_slice(&Ipv4Addr::new(198, 51, 100, 4).to_ipv6_mapped().octets());
+            socket.send_to(&out, from).await.unwrap();
+        }
+    });
+    (addr, seen)
+}
+
+#[tokio::test]
+async fn pcp_maps_reports_and_deletes_with_the_same_nonce() {
+    let (gateway, seen) = fake_pcp().await;
+    let mut c = config();
+    c.upnp = false;
+    c.gateway = Some(gateway);
+    let mapper = PortMapper::start(c, mappings());
+    let status = wait_for(&mapper, |s| s.method.is_some()).await;
+    assert_eq!(status.method, Some(Method::Pcp));
+    assert_eq!(status.external_ip, Some(Ipv4Addr::new(198, 51, 100, 4)));
+    assert!(status.mapped.iter().all(|m| m.external_port == 8881));
+    mapper.stop().await;
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 4, "two maps, two deletes");
+    assert!(seen.iter().all(|r| r.len() == 60 && r[0] == 2 && r[1] == 1));
+    assert_eq!(seen[0][36], 6, "TCP first");
+    assert_eq!(&seen[0][4..8], &7200u32.to_be_bytes());
+    for (map, delete) in seen[..2].iter().zip(&seen[2..]) {
+        assert_eq!(&delete[4..8], &[0, 0, 0, 0], "lifetime 0 deletes");
+        assert_eq!(&map[24..36], &delete[24..36], "same nonce");
+    }
+    assert_ne!(&seen[0][24..36], &seen[1][24..36], "a nonce per mapping");
+}
+
+#[tokio::test]
+async fn a_nat_pmp_only_gateway_is_used_after_pcp_is_refused() {
+    let (gateway, seen) = fake_natpmp().await;
+    let mut c = config();
+    c.upnp = false;
+    c.gateway = Some(gateway);
+    let mapper = PortMapper::start(c, mappings());
+    let status = wait_for(&mapper, |s| s.method.is_some()).await;
+    assert_eq!(status.method, Some(Method::NatPmp));
+    mapper.stop().await;
+    assert_eq!(seen.lock().unwrap()[0].len(), 60, "PCP was tried first");
+}
+
+/// Answers PCP MAP requests on `[::1]` with the requested port, and records
+/// every request.
+async fn fake_pcp_v6() -> (std::net::SocketAddrV6, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let socket = UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let std::net::SocketAddr::V6(addr) = socket.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1100];
+        loop {
+            let (n, from) = socket.recv_from(&mut buf).await.unwrap();
+            let req = buf[..n].to_vec();
+            log.lock().unwrap().push(req.clone());
+            let mut out = vec![2, 0x81, 0, 0];
+            out.extend_from_slice(&req[4..8]);
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(&[0; 12]);
+            out.extend_from_slice(&req[24..42]);
+            out.extend_from_slice(&req[40..42]);
+            out.extend_from_slice(&req[8..24]);
+            socket.send_to(&out, from).await.unwrap();
+        }
+    });
+    (addr, seen)
+}
+
+#[tokio::test]
+async fn ipv6_pinholes_open_from_our_address_and_close_on_stop() {
+    let (gateway, seen) = fake_pcp_v6().await;
+    let mut c = config();
+    c.pcp = false;
+    c.natpmp = false;
+    c.upnp = false;
+    c.gateway_v6 = Some(gateway);
+    let mapper = PortMapper::start(c, mappings());
+    let status = wait_for(&mapper, |s| s.pinholes.len() == 2).await;
+    assert_eq!(status.pinhole_error, None);
+    assert!(status.mapped.is_empty(), "IPv4 is independent: {status:?}");
+    assert!(status.error.is_some());
+    assert!(status.pinholes.iter().all(|m| m.external_port == 6881));
+    mapper.stop().await;
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 4, "two pinholes, two deletes");
+    for (open, close) in seen[..2].iter().zip(&seen[2..]) {
+        assert_eq!(open[1], 1, "MAP");
+        assert_eq!(
+            &open[8..24],
+            &std::net::Ipv6Addr::LOCALHOST.octets(),
+            "the client address is the one requests come from"
+        );
+        assert_eq!(&open[44..60], &[0; 16], "any external address");
+        assert_eq!(&close[4..8], &[0, 0, 0, 0], "lifetime 0 closes");
+        assert_eq!(&close[24..36], &open[24..36], "same nonce");
+    }
+    assert_eq!(seen[0][36], 6, "TCP first");
+}
+
+#[tokio::test]
+async fn without_ipv6_no_pinhole_is_tried() {
+    let (gateway, seen) = fake_pcp_v6().await;
+    let (v4, _) = fake_natpmp().await;
+    let mut c = config();
+    c.pcp = false;
+    c.upnp = false;
+    c.gateway = Some(v4);
+    c.ipv6 = false;
+    c.gateway_v6 = Some(gateway);
+    let mapper = PortMapper::start(c, mappings());
+    let status = wait_for(&mapper, |s| s.method.is_some()).await;
+    assert!(status.pinholes.is_empty());
+    assert_eq!(status.pinhole_error, None);
+    mapper.stop().await;
+    assert!(seen.lock().unwrap().is_empty());
 }

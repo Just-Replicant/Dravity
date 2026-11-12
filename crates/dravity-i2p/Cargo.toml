@@ -1,0 +1,23 @@
+[package]
+name = "dravity-i2p"
+description = "I2P SAM v3 client for Dravity: naming lookup, outbound and inbound streams"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+fastrand.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "time", "sync", "io-util", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

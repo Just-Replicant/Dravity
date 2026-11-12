@@ -18,6 +18,9 @@ sha1.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(loom)'.dependencies]
+loom.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 

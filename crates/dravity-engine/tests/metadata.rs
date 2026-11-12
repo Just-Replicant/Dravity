@@ -105,6 +105,7 @@ impl Harness {
             metadata_size: size,
             ipv4: None,
             ipv6: None,
+            upload_only: None,
         };
         fx.extend(self.msg(
             peer,
@@ -461,6 +462,7 @@ fn accepted_peers_fetch_metadata_and_are_marked_incoming() {
         metadata_size: Some(40_000),
         ipv4: None,
         ipv6: None,
+        upload_only: None,
     };
     let fx = h.msg(
         7,
@@ -1073,4 +1075,18 @@ fn a_hybrid_rechecks_its_pieces_once_a_layer_arrives() {
     let fx = t.update(now, Event::PieceHashed { piece: 5, ok: true });
     assert!(hashed(&fx).is_empty());
     assert_eq!(t.picker().wanted_left(), 16_384);
+}
+
+#[test]
+fn a_deferred_dial_is_retried_while_fetching_metadata() {
+    let mut h = Harness::new(Config::default());
+    let fx = h.ev(Event::AddPeers {
+        peers: vec![addr(1)],
+    });
+    assert!(fx.iter().any(|e| matches!(e, Effect::Connect { .. })));
+    let fx = h.ev(Event::PeerConnectDeferred { addr: addr(1) });
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Connect { .. })));
+    h.now += dravity_engine::DEFERRED_DIAL_RETRY;
+    let fx = h.ev(Event::Tick);
+    assert!(fx.iter().any(|e| matches!(e, Effect::Connect { .. })));
 }

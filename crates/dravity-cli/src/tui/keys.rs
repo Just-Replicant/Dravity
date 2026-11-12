@@ -4,7 +4,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use dravity_engine::Priority;
 
-use super::view::{Action, Focus, Pane, Prompt, View};
+use super::view::{Action, Direction, Focus, Pane, Prompt, View};
 
 /// Maps a key press to an action.
 pub(crate) fn action(key: KeyEvent, view: &View) -> Action {
@@ -70,6 +70,8 @@ fn torrents(key: KeyEvent) -> Action {
         KeyCode::Char('D') => Action::ConfirmRemove { delete_files: true },
         KeyCode::Char('o') => Action::CycleSort,
         KeyCode::Char('/') => Action::OpenFilter,
+        KeyCode::Char('L') => Action::OpenLimit(Direction::Download),
+        KeyCode::Char('U') => Action::OpenLimit(Direction::Upload),
         KeyCode::Char('?') => Action::Help,
         _ => Action::None,
     }
@@ -120,6 +122,14 @@ mod tests {
             pane,
             ..View::default()
         }
+    }
+
+    #[test]
+    fn capital_l_and_u_open_the_limit_prompts() {
+        use crate::tui::view::Direction;
+        let v = View::default();
+        assert_eq!(action(key('L'), &v), Action::OpenLimit(Direction::Download));
+        assert_eq!(action(key('U'), &v), Action::OpenLimit(Direction::Upload));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::time::Duration;
 use dravity_bencode::Value;
 
 use crate::error::TrackerError;
-use crate::types::{AnnounceRequest, AnnounceResponse, CryptoSupport};
+use crate::types::{AnnounceRequest, AnnounceResponse, CryptoSupport, ScrapeStats};
 
 /// Maximum accepted HTTP response body.
 pub const MAX_RESPONSE_LEN: usize = 2 * 1024 * 1024;
@@ -62,6 +62,94 @@ pub fn announce_url(base: &str, req: &AnnounceRequest) -> String {
         CryptoSupport::Required => url.push_str("&supportcrypto=1&requirecrypto=1"),
     }
     url
+}
+
+/// The scrape URL of an announce URL (BEP 48): the last path segment's
+/// `announce` prefix becomes `scrape`, and one `info_hash` parameter is
+/// added per torrent. `None` when the last segment does not start with
+/// `announce` (the tracker does not support scraping by convention).
+///
+/// ```
+/// use dravity_tracker::http::scrape_url;
+///
+/// let url = scrape_url("http://t.example/x/announce.php?k=1", &[[0xab; 20]]).unwrap();
+/// assert!(url.starts_with("http://t.example/x/scrape.php?k=1&info_hash=%AB%AB"));
+/// assert!(scrape_url("http://t.example/a", &[[0; 20]]).is_none());
+/// ```
+#[must_use]
+pub fn scrape_url(announce: &str, info_hashes: &[[u8; 20]]) -> Option<String> {
+    let (path, query) = match announce.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (announce, None),
+    };
+    let slash = path.rfind('/')?;
+    let (dir, last) = path.split_at(slash + 1);
+    let rest = last.strip_prefix("announce")?;
+    // `scheme://host` alone has its last slash inside `//`.
+    if dir.ends_with("//") {
+        return None;
+    }
+    let mut url = format!("{dir}scrape{rest}");
+    let mut sep = '?';
+    if let Some(q) = query.filter(|q| !q.is_empty()) {
+        url.push('?');
+        url.push_str(q);
+        sep = '&';
+    }
+    for hash in info_hashes {
+        url.push(sep);
+        url.push_str("info_hash=");
+        percent_encode(hash, &mut url);
+        sep = '&';
+    }
+    Some(url)
+}
+
+/// Parses a bencoded HTTP scrape response: the counts per 20-byte info
+/// hash in its `files` dictionary.
+///
+/// # Errors
+/// [`TrackerError::Failure`] for a `failure reason`,
+/// [`TrackerError::Malformed`] for anything that is not a scrape response,
+/// [`TrackerError::TooLarge`] above [`MAX_RESPONSE_LEN`].
+pub fn parse_scrape_response(body: &[u8]) -> Result<Vec<([u8; 20], ScrapeStats)>, TrackerError> {
+    if body.len() > MAX_RESPONSE_LEN {
+        return Err(TrackerError::TooLarge(MAX_RESPONSE_LEN));
+    }
+    let value = Value::decode(body).map_err(|_| TrackerError::Malformed("invalid bencode"))?;
+    if let Some(reason) = value.get(b"failure reason") {
+        let text = reason
+            .as_bytes()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        return Err(TrackerError::Failure(text));
+    }
+    let files = value
+        .get(b"files")
+        .and_then(Value::as_dict)
+        .ok_or(TrackerError::Malformed("scrape response has no `files`"))?;
+    let mut out = Vec::with_capacity(files.len());
+    for (hash, stats) in files {
+        let Ok(hash) = <[u8; 20]>::try_from(hash.as_ref()) else {
+            continue;
+        };
+        let count = |key: &[u8]| {
+            stats
+                .get(key)
+                .and_then(Value::as_int)
+                .and_then(|i| u32::try_from(i).ok())
+                .unwrap_or(0)
+        };
+        out.push((
+            hash,
+            ScrapeStats {
+                seeders: count(b"complete"),
+                leechers: count(b"incomplete"),
+                downloaded: count(b"downloaded"),
+            },
+        ));
+    }
+    Ok(out)
 }
 
 /// Percent-encodes everything except RFC 3986 unreserved characters.
@@ -181,6 +269,53 @@ fn parse_dict_peer(v: &Value<'_>) -> Option<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn scrape_urls_follow_bep_48() {
+        let h = [[0x01; 20]];
+        assert_eq!(
+            scrape_url("http://t/announce", &h).unwrap(),
+            "http://t/scrape?info_hash=%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01%01"
+        );
+        assert!(
+            scrape_url("http://t/x/announce.php", &h)
+                .unwrap()
+                .starts_with("http://t/x/scrape.php?")
+        );
+        assert!(
+            scrape_url("https://t/announce?passkey=p", &h)
+                .unwrap()
+                .starts_with("https://t/scrape?passkey=p&info_hash=")
+        );
+        assert!(scrape_url("http://t/a", &h).is_none());
+        assert!(scrape_url("http://t/announce/x", &h).is_none());
+        assert!(scrape_url("http://announce", &h).is_none());
+    }
+
+    #[test]
+    fn scrape_responses_parse() {
+        let body =
+            b"d5:filesd20:aaaaaaaaaaaaaaaaaaaad8:completei5e10:downloadedi50e10:incompletei3eeee";
+        let parsed = parse_scrape_response(body).unwrap();
+        assert_eq!(
+            parsed,
+            [(
+                [b'a'; 20],
+                ScrapeStats {
+                    seeders: 5,
+                    leechers: 3,
+                    downloaded: 50
+                }
+            )]
+        );
+        assert!(matches!(
+            parse_scrape_response(b"d14:failure reason4:nopee"),
+            Err(TrackerError::Failure(r)) if r == "nope"
+        ));
+        assert!(parse_scrape_response(b"de").is_err());
+        assert!(parse_scrape_response(b"x").is_err());
+    }
+
     use dravity_core::{InfoHash, PeerId};
 
     use super::*;

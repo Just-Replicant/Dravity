@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::BytesMut;
+use dravity_core::admit::{ConnectionLimit, ConnectionSlot};
 use dravity_core::{InfoHash, PeerId};
 use dravity_mse::{MseError, Policy};
 use dravity_utp::UtpSocket;
@@ -263,6 +264,13 @@ pub(crate) struct Acceptor {
     pub(crate) handshake_timeout: Duration,
     pub(crate) encryption: Policy,
     pub(crate) pending: Arc<Semaphore>,
+    /// The session's ban list: banned addresses are closed before the
+    /// handshake.
+    pub(crate) bans: crate::bans::Bans,
+    /// The session-wide connection cap, shared with outgoing dials.
+    pub(crate) connections: ConnectionLimit,
+    /// DSCP mark for accepted TCP connections.
+    pub(crate) dscp: Option<u8>,
 }
 
 /// Starts one accept task per socket; they end when `stop` is cancelled.
@@ -315,6 +323,14 @@ async fn accept_utp(socket: Arc<UtpSocket>, acceptor: Acceptor, stop: Cancellati
 /// Handshakes and routes one accepted connection in its own task, within
 /// the pending-handshake budget.
 fn handle(stream: RawStream, addr: SocketAddr, acceptor: &Acceptor) {
+    if acceptor.bans.contains(addr.ip()) {
+        tracing::debug!(%addr, "banned address; closing");
+        return;
+    }
+    let Some(slot) = acceptor.connections.try_admit() else {
+        tracing::debug!(%addr, "session connection limit reached; closing");
+        return;
+    };
     let Ok(permit) = Arc::clone(&acceptor.pending).try_acquire_owned() else {
         tracing::debug!(%addr, "too many incoming handshakes; closing");
         return;
@@ -323,7 +339,7 @@ fn handle(stream: RawStream, addr: SocketAddr, acceptor: &Acceptor) {
     tokio::spawn(async move {
         let _permit = permit;
         let transport = stream.kind().as_str();
-        if let Err(e) = route(stream, addr, &acceptor).await {
+        if let Err(e) = route(stream, addr, &acceptor, slot).await {
             tracing::debug!(%addr, transport, error = %e, "incoming connection dropped");
         }
     });
@@ -348,8 +364,36 @@ async fn accept_loop(listener: TcpListener, acceptor: Acceptor, stop: Cancellati
         if let Err(e) = stream.set_nodelay(true) {
             tracing::debug!(%addr, error = %e, "set_nodelay failed");
         }
+        crate::qos::mark(&stream, acceptor.dscp, addr);
         handle(RawStream::Tcp(stream), addr, &acceptor);
     }
+}
+
+/// Accepts peers from a [`crate::transport::Network`] listener until
+/// `stop` is cancelled.
+pub(crate) fn start_network(
+    mut listener: Box<dyn crate::transport::TransportListener>,
+    acceptor: &Acceptor,
+    stop: &CancellationToken,
+) {
+    let acceptor = acceptor.clone();
+    let stop = stop.clone();
+    tracing::info!(addr = %listener.local_addr(), "accepting peers over a custom network");
+    tokio::spawn(async move {
+        loop {
+            let accepted = tokio::select! {
+                () = stop.cancelled() => return,
+                accepted = listener.accept() => accepted,
+            };
+            match accepted {
+                Ok((stream, addr)) => handle(RawStream::Boxed(stream), addr, &acceptor),
+                Err(e) => {
+                    tracing::debug!(error = %e, "network accept failed; listener closed");
+                    return;
+                }
+            }
+        }
+    });
 }
 
 /// Handshakes an accepted connection and hands it to its torrent.
@@ -357,6 +401,7 @@ async fn route(
     stream: RawStream,
     addr: SocketAddr,
     acceptor: &Acceptor,
+    slot: ConnectionSlot,
 ) -> Result<(), HandshakeError> {
     let (stream, theirs, leftover, torrent) =
         tokio::time::timeout(acceptor.handshake_timeout, async {
@@ -389,6 +434,7 @@ async fn route(
         addr,
         reserved: theirs.reserved,
         leftover,
+        slot,
     };
     // Never wait on a busy torrent: the peer can connect again later.
     torrent

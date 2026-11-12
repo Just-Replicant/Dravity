@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
+use dravity_core::admit::ConnectionSlot;
 use dravity_core::{InfoHash, PeerId};
 use dravity_engine::{DialHints, PeerKey};
 use dravity_mse::{MseError, Policy};
@@ -21,6 +22,7 @@ use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, FramedParts};
 
 use crate::codec::PeerCodec;
+use crate::rate::RateLimits;
 use crate::stream::{PeerStream, RawStream};
 use crate::torrent::Input;
 
@@ -45,6 +47,14 @@ pub(crate) struct PeerParams {
     pub(crate) encryption: Policy,
     /// What PEX flags or earlier connections say about the peer.
     pub(crate) hints: DialHints,
+    /// The session-wide rate limits.
+    pub(crate) rates: RateLimits,
+    /// Dial through this proxy (TCP only) instead of directly.
+    pub(crate) proxy: Option<Arc<crate::proxy::Proxy>>,
+    /// DSCP mark for the TCP connection.
+    pub(crate) dscp: Option<u8>,
+    /// Dial over this network instead of sockets.
+    pub(crate) network: Option<Arc<dyn crate::transport::Network>>,
 }
 
 /// Why a handshake failed.
@@ -141,11 +151,26 @@ enum Failed {
 
 /// Opens a raw connection over one transport.
 async fn connect(transport: Transport, params: &PeerParams) -> std::io::Result<RawStream> {
+    if let Some(network) = &params.network {
+        return Ok(RawStream::Boxed(network.dial(params.addr).await?));
+    }
+    if let Some(proxy) = &params.proxy {
+        let tcp = crate::proxy::connect(proxy, params.addr)
+            .await
+            .map_err(|e| match e {
+                crate::proxy::ProxyError::Io(io) => io,
+                other => std::io::Error::new(std::io::ErrorKind::ConnectionRefused, other),
+            })?;
+        tcp.set_nodelay(true)?;
+        crate::qos::mark(&tcp, params.dscp, params.addr);
+        return Ok(RawStream::Tcp(tcp));
+    }
     Ok(match (transport, &params.utp) {
         (Transport::Utp, Some(utp)) => RawStream::Utp(utp.connect(params.addr).await?),
         _ => {
             let tcp = TcpStream::connect(params.addr).await?;
             tcp.set_nodelay(true)?;
+            crate::qos::mark(&tcp, params.dscp, params.addr);
             RawStream::Tcp(tcp)
         }
     })
@@ -281,11 +306,16 @@ async fn dial(params: &PeerParams) -> Result<Dialed, HandshakeError> {
 }
 
 /// Connects, handshakes and runs the connection until either side closes.
+///
+/// `slot` is the connection's place under the session-wide cap, held until
+/// the task ends.
 pub(crate) async fn run(
     params: PeerParams,
     events: mpsc::Sender<Input>,
     commands: mpsc::Receiver<PeerCommand>,
+    slot: ConnectionSlot,
 ) {
+    let _slot = slot;
     let (key, addr) = (params.key, params.addr);
     let (stream, reserved, leftover, mse) = match dial(&params).await {
         Ok(Dialed {
@@ -328,20 +358,39 @@ pub(crate) async fn run(
     {
         return;
     }
-    serve(key, addr, stream, leftover, &events, commands).await;
+    serve(
+        key,
+        addr,
+        stream,
+        leftover,
+        &events,
+        commands,
+        &params.rates,
+    )
+    .await;
 }
 
 /// Runs a connection the listener accepted and handshook. The owner
 /// already told the engine about it.
 pub(crate) async fn run_accepted(
-    key: PeerKey,
-    addr: SocketAddr,
+    (key, addr): (PeerKey, SocketAddr),
     stream: PeerStream,
     leftover: BytesMut,
     events: mpsc::Sender<Input>,
     commands: mpsc::Receiver<PeerCommand>,
+    slot: ConnectionSlot,
+    rates: RateLimits,
 ) {
-    serve(key, addr, stream, leftover, &events, commands).await;
+    let _slot = slot;
+    serve(key, addr, stream, leftover, &events, commands, &rates).await;
+}
+
+/// Payload bytes of a piece message (what the rate limits count).
+fn payload(message: &Message) -> usize {
+    match message {
+        Message::Piece { data, .. } => data.len(),
+        _ => 0,
+    }
 }
 
 /// Moves messages between an established connection and the owner until
@@ -353,6 +402,7 @@ async fn serve<S>(
     leftover: BytesMut,
     events: &mpsc::Sender<Input>,
     mut commands: mpsc::Receiver<PeerCommand>,
+    rates: &RateLimits,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -366,8 +416,13 @@ async fn serve<S>(
         tokio::select! {
             message = framed.next() => match message {
                 Some(Ok(message)) => {
+                    let bytes = payload(&message);
                     if events.send(Input::Message { key, message }).await.is_err() {
                         break "session closed".into();
+                    }
+                    // Holding the next read lets flow control slow the peer.
+                    if bytes > 0 {
+                        rates.down.acquire(bytes).await;
                     }
                 }
                 Some(Err(e)) => break e.to_string(),
@@ -376,10 +431,14 @@ async fn serve<S>(
             command = commands.recv() => match command {
                 Some(PeerCommand::Send(message)) => {
                     // Batch everything already queued into one flush.
+                    rates.up.acquire(payload(&message)).await;
                     let mut result = framed.feed(message).await;
                     while result.is_ok() {
                         match commands.try_recv() {
-                            Ok(PeerCommand::Send(m)) => result = framed.feed(m).await,
+                            Ok(PeerCommand::Send(m)) => {
+                                rates.up.acquire(payload(&m)).await;
+                                result = framed.feed(m).await;
+                            }
                             Err(_) => break,
                         }
                     }
@@ -504,8 +563,19 @@ mod tests {
             prefer_utp: false,
             encryption: Policy::Disabled,
             hints: DialHints::default(),
+            rates: RateLimits::new(None, None),
+            proxy: None,
+            dscp: None,
+            network: None,
         };
-        tokio::spawn(run(params, events_tx, cmd_rx));
+        tokio::spawn(run(
+            params,
+            events_tx,
+            cmd_rx,
+            dravity_core::admit::ConnectionLimit::default()
+                .try_admit()
+                .unwrap(),
+        ));
         assert!(matches!(events.recv().await, Some(Input::Connected { .. })));
         let next = tokio::time::timeout(Duration::from_secs(2), events.recv()).await;
         assert!(

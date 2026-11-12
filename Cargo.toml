@@ -29,6 +29,8 @@ dravity-portmap = { path = "crates/dravity-portmap", version = "0.1.0" }
 dravity-http = { path = "crates/dravity-http", version = "0.1.0" }
 dravity-webseed = { path = "crates/dravity-webseed", version = "0.1.0" }
 dravity-mse = { path = "crates/dravity-mse", version = "0.1.0" }
+dravity-lsd = { path = "crates/dravity-lsd", version = "0.1.0" }
+dravity-i2p = { path = "crates/dravity-i2p", version = "0.1.0" }
 
 # External crates
 anyhow = "1"
@@ -36,6 +38,7 @@ anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "tracing"] }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+ed25519-dalek = "3"
 fastrand = "2"
 # OS randomness for MSE keys and padding.
 getrandom = "0.4"
@@ -49,7 +52,7 @@ mainline = { version = "8", default-features = false, features = ["async"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # Directory-relative `openat`/`O_NOFOLLOW` opens (storage path hardening).
 rustix = { version = "1", default-features = false, features = ["std", "fs"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "socks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-platform-verifier = "0.7"
 serde = { version = "1", features = ["derive"] }
@@ -72,6 +75,8 @@ url = "2"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 http-body-util = "0.1"
 proptest = "1"
+# Exhaustive concurrency models (`--cfg loom` builds only).
+loom = "0.7"
 tempfile = "3"
 tower = { version = "0.5", default-features = false, features = ["util"] }
 
@@ -82,6 +87,7 @@ missing_debug_implementations = "warn"
 unreachable_pub = "warn"
 unused_qualifications = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

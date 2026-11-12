@@ -527,3 +527,111 @@ proptest! {
         prop_assert_eq!(covered, m.info().total_length());
     }
 }
+
+/// Feeds every piece of `stream` to a `PieceHasher` in the block order
+/// `order` picks, and returns its verdicts.
+fn hasher_verdicts(m: &Metainfo, stream: &[u8], order: &[usize]) -> Vec<Option<bool>> {
+    use dravity_core::BLOCK_SIZE;
+    use dravity_core::verify::PieceHasher;
+    let info = m.info();
+    (0..info.piece_count())
+        .map(|p| {
+            let r = info.layout().piece_range(p).unwrap();
+            let piece = &stream[r.start as usize..r.end as usize];
+            let mut blocks: Vec<(u32, &[u8])> = piece
+                .chunks(BLOCK_SIZE as usize)
+                .enumerate()
+                .map(|(i, c)| (i as u32 * BLOCK_SIZE, c))
+                .collect();
+            // A deterministic permutation per piece.
+            for (i, &j) in order.iter().enumerate() {
+                let n = blocks.len();
+                if n > 1 {
+                    blocks.swap(i % n, j % n);
+                }
+            }
+            let mut h = PieceHasher::<Vec<u8>>::new(info, p).unwrap();
+            for (offset, data) in blocks {
+                assert!(h.add(offset, data.to_vec()));
+            }
+            assert!(h.is_complete());
+            assert_eq!(h.pending_bytes(), 0, "all early blocks were consumed");
+            h.verify(info)
+        })
+        .collect()
+}
+
+proptest! {
+    #[test]
+    fn hash_on_arrival_agrees_with_check_piece(
+        order in proptest::collection::vec(0usize..64, 0..16),
+        hybrid in any::<bool>(),
+        corrupt in proptest::option::of(0usize..140_000),
+    ) {
+        let (bytes, mut stream) = build("set", sample(), 32_768, hybrid);
+        if let Some(at) = corrupt {
+            let at = at % stream.len();
+            stream[at] ^= 0x55;
+        }
+        let m = Metainfo::from_bytes(&bytes).unwrap();
+        let info = m.info();
+        let expected: Vec<Option<bool>> = (0..info.piece_count())
+            .map(|p| {
+                let r = info.layout().piece_range(p).unwrap();
+                Some(info.check_piece(p, &stream[r.start as usize..r.end as usize]))
+            })
+            .collect();
+        prop_assert_eq!(hasher_verdicts(&m, &stream, &order), expected);
+    }
+}
+
+#[test]
+fn a_hasher_refuses_what_it_cannot_vouch_for() {
+    use dravity_core::verify::PieceHasher;
+    let (bytes, stream) = build("set", sample(), 32_768, true);
+    let m = Metainfo::from_bytes(&bytes).unwrap();
+    let info = m.info();
+    let block = |i: usize| stream[i * 16_384..(i + 1) * 16_384].to_vec();
+    // A block written twice: storage may hold either copy.
+    let mut h = PieceHasher::<Vec<u8>>::new(info, 0).unwrap();
+    assert!(h.add(0, block(0)));
+    assert!(!h.add(0, block(0)));
+    assert!(!h.add(16_384, block(1)), "stays broken");
+    assert_eq!(h.verify(info), None);
+    // Misaligned, short, or out of the piece.
+    let mut h = PieceHasher::<Vec<u8>>::new(info, 0).unwrap();
+    assert!(!h.add(100, block(0)));
+    let mut h = PieceHasher::<Vec<u8>>::new(info, 0).unwrap();
+    assert!(!h.add(0, vec![0; 10]));
+    let mut h = PieceHasher::<Vec<u8>>::new(info, 0).unwrap();
+    assert!(!h.add(32_768, block(2)));
+    // Incomplete: no verdict.
+    let mut h = PieceHasher::<Vec<u8>>::new(info, 0).unwrap();
+    assert!(h.add(16_384, block(1)));
+    assert_eq!(h.pending_bytes(), 16_384, "held until block 0 arrives");
+    assert_eq!(h.verify(info), None);
+    assert!(PieceHasher::<Vec<u8>>::new(info, info.piece_count()).is_none());
+}
+
+#[test]
+fn hash_on_arrival_works_for_v1_torrents() {
+    use dravity_core::verify::PieceHasher;
+    let data = content(40_000, 7);
+    let pieces: Vec<u8> = data
+        .chunks(32_768)
+        .flat_map(|c| Sha1::digest(c).to_vec())
+        .collect();
+    let mut info = b"d6:lengthi40000e4:name1:a12:piece lengthi32768e6:pieces40:".to_vec();
+    info.extend_from_slice(&pieces);
+    info.push(b'e');
+    let m = Metainfo::from_info_bytes(&info, Vec::new()).unwrap();
+    let info = m.info();
+    let mut h = PieceHasher::<&[u8]>::new(info, 1).unwrap();
+    assert!(h.add(0, &data[32_768..]));
+    assert_eq!(h.verify(info), Some(true));
+    let mut bad = data[32_768..].to_vec();
+    bad[0] ^= 1;
+    let mut h = PieceHasher::<Vec<u8>>::new(info, 1).unwrap();
+    assert!(h.add(0, bad));
+    assert_eq!(h.verify(info), Some(false));
+}

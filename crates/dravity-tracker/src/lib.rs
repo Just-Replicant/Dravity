@@ -13,11 +13,17 @@
 #[cfg(feature = "client")]
 mod client;
 mod error;
+#[cfg(feature = "client")]
+pub mod guard;
 pub mod http;
+#[cfg(feature = "client")]
+mod relay;
 mod types;
 pub mod udp;
 
 #[cfg(feature = "client")]
 pub use client::{ClientConfig, TrackerClient, UDP_CONNECTION_TTL};
 pub use error::TrackerError;
-pub use types::{AnnounceEvent, AnnounceRequest, AnnounceResponse, CryptoSupport};
+#[cfg(feature = "client")]
+pub use relay::UdpProxy;
+pub use types::{AnnounceEvent, AnnounceRequest, AnnounceResponse, CryptoSupport, ScrapeStats};

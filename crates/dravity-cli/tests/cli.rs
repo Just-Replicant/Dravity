@@ -364,6 +364,164 @@ fn rejects_unknown_storage_backend() {
 }
 
 #[test]
+fn rejects_unknown_preallocation_and_durability() {
+    for (flag, value, hint) in [
+        ("--preallocate", "huge", "sparse"),
+        ("--durability", "always", "per-piece"),
+        ("--seed-choking", "greedy", "round-robin"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+            .args(["download", "x.torrent", flag, value])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(hint), "{stderr}");
+    }
+}
+
+#[test]
+fn download_preallocated_and_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = content();
+    let (torrent, hash) = write_torrent(dir.path(), &data);
+    let peer = seeder(data.clone(), hash);
+    let out_dir = dir.path().join("out");
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .arg("--output")
+        .arg(&out_dir)
+        .arg("--peer")
+        .arg(peer.to_string())
+        .args(["--encryption", "disabled", "--no-dht", "--no-port-mapping"])
+        .args([
+            "--preallocate",
+            "full",
+            "--durability",
+            "per-piece",
+            "--quiet",
+        ])
+        .args(["--seed-choking", "anti-leech", "--auto-upload-slots"])
+        .args(["--scrape-interval", "30", "--no-lsd"])
+        .args([
+            "--global-download-limit",
+            "4M",
+            "--global-upload-limit",
+            "1M",
+        ])
+        .args(["--max-active-downloads", "1", "--max-active-seeds", "1"])
+        .args(["--super-seed", "--no-tracker-exchange", "--no-holepunch"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(out_dir.join("hello.bin")).unwrap(), data);
+}
+
+#[test]
+fn rejects_a_global_limit_below_the_minimum() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = content();
+    let (torrent, _) = write_torrent(dir.path(), &data);
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .arg("--output")
+        .arg(dir.path().join("out"))
+        .args(["--no-dht", "--no-port-mapping", "--no-lsd", "--quiet"])
+        .args(["--global-upload-limit", "1K"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("upload_rate_limit"), "{stderr}");
+}
+
+#[test]
+fn a_bad_proxy_url_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (torrent, _) = write_torrent(dir.path(), &content());
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .args(["--proxy", "ftp://proxy.example:21"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--proxy"));
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .args(["--peer-dscp", "64"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .arg("--geoip")
+        .arg(dir.path().join("missing.csv"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("GeoIP"));
+}
+
+#[test]
+fn an_ip_filter_blocking_the_seed_stops_the_download() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = content();
+    let (torrent, hash) = write_torrent(dir.path(), &data);
+    let peer = seeder(data, hash);
+    let bad = dir.path().join("bad.dat");
+    std::fs::write(&bad, "nothing here\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .arg("--ip-filter")
+        .arg(&bad)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("IP filter"));
+    let filter = dir.path().join("ipfilter.dat");
+    std::fs::write(
+        &filter,
+        "127.000.000.000 - 127.255.255.255 , 000 , loopback\n",
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("download")
+        .arg(&torrent)
+        .arg("--output")
+        .arg(dir.path().join("out"))
+        .arg("--peer")
+        .arg(peer.to_string())
+        .args(["--no-dht", "--no-port-mapping", "--no-lsd", "--quiet"])
+        .arg("--ip-filter")
+        .arg(&filter)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the download cannot finish"
+    );
+    child.kill().unwrap();
+    let _ = child.wait();
+    assert_ne!(
+        std::fs::read(dir.path().join("out/hello.bin")).ok(),
+        Some(content())
+    );
+}
+
+#[test]
 fn rejects_bad_rate() {
     let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
         .args(["download", "x.torrent", "--download-limit", "fast"])
@@ -659,4 +817,82 @@ fn serve_watches_serves_the_api_and_restores_its_torrents() {
     let (_, body) = http_get(addr, "/api/v1/torrents", "t0ken");
     assert!(body.contains(&hash.to_hex()), "{body}");
     interrupt(&mut child);
+}
+
+#[test]
+fn create_writes_a_torrent_that_info_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("share");
+    std::fs::create_dir_all(src.join("docs")).unwrap();
+    std::fs::write(src.join("a.bin"), content()).unwrap();
+    std::fs::write(src.join("docs/readme.txt"), b"hello").unwrap();
+    let out_file = dir.path().join("share.torrent");
+    let run = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_dravity"))
+            .arg("create")
+            .arg(&src)
+            .arg("--output")
+            .arg(&out_file)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let out = run(&[
+        "--tracker",
+        "http://t1/announce,http://t2/announce",
+        "--tracker",
+        "udp://t3:80",
+        "--web-seed",
+        "http://ws/",
+        "--private",
+        "--source",
+        "X",
+        "--piece-length",
+        "32K",
+        "--no-date",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("v2 hash:"), "{stdout}");
+    let m = Metainfo::from_bytes(&std::fs::read(&out_file).unwrap()).unwrap();
+    assert_eq!(m.info().name(), "share");
+    assert_eq!(m.info().piece_length(), 32 * 1024);
+    assert!(m.info().is_private());
+    assert_eq!(m.announce_list().len(), 2);
+    assert_eq!(m.web_seeds(), ["http://ws/"]);
+    assert!(m.creation_date().is_none());
+    // An existing file is kept unless --force.
+    let again = run(&["--torrent-version", "v1"]);
+    assert!(!again.status.success());
+    let forced = run(&["--torrent-version", "v1", "--force"]);
+    assert!(forced.status.success());
+    let m = Metainfo::from_bytes(&std::fs::read(&out_file).unwrap()).unwrap();
+    assert!(m.info_hash_v2().is_none());
+    assert!(m.creation_date().is_some());
+    // `info` reads it back.
+    let info = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .arg("info")
+        .arg(&out_file)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&info.stdout).contains("share"));
+}
+
+#[test]
+fn every_registered_cli_flag_exists() {
+    use dravity_session::schema::{ENGINE_SETTINGS, SESSION_SETTINGS};
+    let out = Command::new(env!("CARGO_BIN_EXE_dravity"))
+        .args(["download", "--help"])
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&out.stdout);
+    for s in SESSION_SETTINGS.iter().chain(ENGINE_SETTINGS) {
+        for flag in s.cli {
+            assert!(help.contains(flag), "{flag} ({}) is not a CLI flag", s.name);
+        }
+    }
 }

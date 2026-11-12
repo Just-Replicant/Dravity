@@ -83,6 +83,17 @@ pub struct AnnounceRequest {
     pub crypto: CryptoSupport,
 }
 
+/// One torrent's counts from a scrape (BEP 48 / BEP 15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct ScrapeStats {
+    /// Peers with the whole torrent (`complete`).
+    pub seeders: u32,
+    /// Peers still downloading (`incomplete`).
+    pub leechers: u32,
+    /// Completed downloads the tracker has counted (`downloaded`).
+    pub downloaded: u32,
+}
+
 /// A successful announce.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AnnounceResponse {

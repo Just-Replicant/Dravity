@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use dravity_core::{InfoHash, PeerId};
 use dravity_tracker::{
-    AnnounceEvent, AnnounceRequest, ClientConfig, CryptoSupport, TrackerClient, TrackerError, udp,
+    AnnounceEvent, AnnounceRequest, ClientConfig, CryptoSupport, ScrapeStats, TrackerClient,
+    TrackerError, UdpProxy, udp,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
@@ -288,4 +289,397 @@ async fn rejects_bad_urls() {
         c.announce("udp://example.com/announce", &request()).await,
         Err(TrackerError::InvalidUrl(_))
     ));
+}
+
+/// Serves HTTP requests forever: the first `redirects` answer `302` to
+/// `location(n)`, later ones the announce body. Returns the request lines.
+async fn redirecting_tracker(
+    location: fn(SocketAddr, usize) -> String,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut n = 0;
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                let Ok(read) = sock.read(&mut buf).await else {
+                    break;
+                };
+                if read == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..read]);
+            }
+            let line = String::from_utf8_lossy(&req)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let response = if line.contains("/final/announce") {
+                let body = b"d8:intervali60e5:peers0:e";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    String::from_utf8_lossy(body)
+                )
+            } else {
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    location(addr, n)
+                )
+            };
+            n += 1;
+            let _ = sock.write_all(response.as_bytes()).await;
+        }
+    });
+    (addr, task)
+}
+
+#[tokio::test]
+async fn ssrf_local_tracker_needs_announce_path() {
+    let r = client()
+        .announce("http://127.0.0.1:9/admin", &request())
+        .await;
+    assert!(matches!(r, Err(TrackerError::Blocked(_))), "{r:?}");
+}
+
+#[tokio::test]
+async fn ssrf_redirect_within_the_lan_is_followed() {
+    let (addr, task) = redirecting_tracker(|a, _| format!("http://{a}/final/announce")).await;
+    let r = client()
+        .announce(&format!("http://{addr}/announce"), &request())
+        .await
+        .unwrap();
+    assert_eq!(r.interval, Some(Duration::from_secs(60)));
+    task.abort();
+}
+
+#[tokio::test]
+async fn ssrf_redirect_to_other_scheme_or_local_path_is_blocked() {
+    // reqwest never follows a non-HTTP scheme; the redirect is returned.
+    let (addr, task) = redirecting_tracker(|_, _| "file:///etc/passwd".to_owned()).await;
+    let r = client()
+        .announce(&format!("http://{addr}/announce"), &request())
+        .await;
+    assert!(
+        matches!(
+            r,
+            Err(TrackerError::Blocked(_) | TrackerError::HttpStatus(302))
+        ),
+        "{r:?}"
+    );
+    task.abort();
+
+    let (addr, task) = redirecting_tracker(|a, _| format!("http://{a}/admin")).await;
+    let r = client()
+        .announce(&format!("http://{addr}/announce"), &request())
+        .await;
+    assert!(matches!(r, Err(TrackerError::Blocked(_))), "{r:?}");
+    task.abort();
+}
+
+#[tokio::test]
+async fn ssrf_redirect_loop_is_cut_off() {
+    let (addr, task) = redirecting_tracker(|a, n| format!("http://{a}/announce?hop={n}")).await;
+    let r = client()
+        .announce(&format!("http://{addr}/announce"), &request())
+        .await;
+    assert!(matches!(r, Err(TrackerError::Blocked(_))), "{r:?}");
+    task.abort();
+}
+
+#[tokio::test]
+async fn ssrf_checks_can_be_disabled() {
+    let mut c = ClientConfig::default();
+    c.ssrf_mitigation = false;
+    c.http_timeout = Duration::from_secs(2);
+    let r = TrackerClient::new(c)
+        .unwrap()
+        .announce("http://127.0.0.1:9/admin", &request())
+        .await;
+    assert!(!matches!(r, Err(TrackerError::Blocked(_))), "{r:?}");
+}
+
+#[tokio::test]
+async fn http_scrape() {
+    let (url, task) = http_tracker(
+        "200 OK",
+        b"d5:filesd20:\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11\x11d8:completei7e10:downloadedi90e10:incompletei2eeee",
+    )
+    .await;
+    let stats = client().scrape(&url, &[0x11; 20]).await.unwrap();
+    assert_eq!(
+        stats,
+        ScrapeStats {
+            seeders: 7,
+            leechers: 2,
+            downloaded: 90
+        }
+    );
+    let line = task.await.unwrap();
+    assert!(line.starts_with("GET /scrape?info_hash=%11%11"), "{line}");
+    // Missing from the answer, or a URL without `announce`: no scrape.
+    let (url, _t) = http_tracker("200 OK", b"d5:filesdee").await;
+    assert!(matches!(
+        client().scrape(&url, &[0x11; 20]).await,
+        Err(TrackerError::NoScrape)
+    ));
+    assert!(matches!(
+        client()
+            .scrape("http://127.0.0.1:1/tracker", &[0x11; 20])
+            .await,
+        Err(TrackerError::NoScrape)
+    ));
+}
+
+#[tokio::test]
+async fn udp_scrape_reuses_the_connection() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("udp://{}", server.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        let (n, from) = server.recv_from(&mut buf).await.unwrap();
+        assert_eq!(n, 16);
+        let tid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+        server
+            .send_to(&udp::encode_connect_response(tid, 55), from)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let (n, from) = server.recv_from(&mut buf).await.unwrap();
+            assert_eq!(n, 36, "one hash");
+            assert_eq!(u64::from_be_bytes(buf[..8].try_into().unwrap()), 55);
+            assert_eq!(&buf[16..36], &[0x22; 20]);
+            let tid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+            let stats = [ScrapeStats {
+                seeders: 1,
+                leechers: 2,
+                downloaded: 3,
+            }];
+            server
+                .send_to(&udp::encode_scrape_response(tid, &stats), from)
+                .await
+                .unwrap();
+        }
+    });
+    let c = client();
+    for _ in 0..2 {
+        let stats = c.scrape(&url, &[0x22; 20]).await.unwrap();
+        assert_eq!(stats.downloaded, 3);
+    }
+    task.await.unwrap();
+}
+
+/// A SOCKS5 proxy (no auth) that is also the tracker behind it: it checks
+/// the CONNECT names the tracker host (remote DNS), then answers the
+/// tunnelled HTTP announce itself.
+#[tokio::test]
+async fn http_announce_through_socks5_resolves_at_the_proxy() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut greet = [0u8; 2];
+        sock.read_exact(&mut greet).await.unwrap();
+        assert_eq!(greet[0], 5);
+        let mut methods = vec![0u8; usize::from(greet[1])];
+        sock.read_exact(&mut methods).await.unwrap();
+        assert!(methods.contains(&0));
+        sock.write_all(&[5, 0]).await.unwrap();
+        let mut head = [0u8; 4];
+        sock.read_exact(&mut head).await.unwrap();
+        assert_eq!(head[..2], [5, 1], "CONNECT");
+        assert_eq!(head[3], 3, "a domain name, not a locally resolved IP");
+        let mut len = [0u8; 1];
+        sock.read_exact(&mut len).await.unwrap();
+        let mut name = vec![0u8; usize::from(len[0])];
+        sock.read_exact(&mut name).await.unwrap();
+        let mut port = [0u8; 2];
+        sock.read_exact(&mut port).await.unwrap();
+        sock.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        let mut req = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = sock.read(&mut buf).await.unwrap();
+            req.extend_from_slice(&buf[..n]);
+        }
+        let body = b"d8:intervali600e5:peers0:e";
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        sock.write_all(head.as_bytes()).await.unwrap();
+        sock.write_all(body).await.unwrap();
+        (String::from_utf8(name).unwrap(), u16::from_be_bytes(port))
+    });
+    let mut c = ClientConfig::default();
+    c.http_timeout = Duration::from_secs(5);
+    c.http_proxy = Some(format!("socks5h://{proxy}"));
+    let client = TrackerClient::new(c).unwrap();
+    let r = client
+        .announce("http://tracker.invalid:6969/announce", &request())
+        .await
+        .unwrap();
+    assert_eq!(r.interval, Some(Duration::from_secs(600)));
+    assert_eq!(task.await.unwrap(), ("tracker.invalid".to_owned(), 6969));
+}
+
+/// A SOCKS5 proxy with username/password that relays UDP (RFC 1928 §7):
+/// datagrams from the client go to the address in their header, replies
+/// come back wrapped. Returns the proxy address and every relayed target.
+async fn socks5_udp_relay() -> (
+    SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>,
+) {
+    socks5_udp_relay_resolving(None).await
+}
+
+type Names = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// [`socks5_udp_relay`] that sends datagrams addressed by host name
+/// (SOCKS5 address type 3) to `named`, logging the name.
+async fn socks5_udp_relay_resolving(
+    named: Option<(SocketAddr, Names)>,
+) -> (
+    SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let targets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = std::sync::Arc::clone(&targets);
+    tokio::spawn(async move {
+        let (mut control, _) = listener.accept().await.unwrap();
+        let mut greet = [0u8; 4];
+        control.read_exact(&mut greet).await.unwrap();
+        assert_eq!(greet, [5, 2, 0, 2], "offers username/password");
+        control.write_all(&[5, 2]).await.unwrap();
+        let mut auth = [0u8; 9];
+        control.read_exact(&mut auth).await.unwrap();
+        assert_eq!(&auth, b"\x01\x02me\x04pass");
+        control.write_all(&[1, 0]).await.unwrap();
+        let mut req = [0u8; 10];
+        control.read_exact(&mut req).await.unwrap();
+        assert_eq!(req[..4], [5, 3, 0, 1], "UDP ASSOCIATE");
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let outside = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Reply with 0.0.0.0: the client must use the proxy's address.
+        let port = relay.local_addr().unwrap().port().to_be_bytes();
+        control
+            .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, port[0], port[1]])
+            .await
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        loop {
+            let (n, client) = relay.recv_from(&mut buf).await.unwrap();
+            let (target, payload) = if buf[3] == 3 {
+                let len = usize::from(buf[4]);
+                let (to, names) = named.as_ref().unwrap();
+                names
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8(buf[5..5 + len].to_vec()).unwrap());
+                (*to, &buf[5 + len + 2..n])
+            } else {
+                let (target, payload) = dravity_core::socks5::parse_udp_header(&buf[..n]).unwrap();
+                log.lock().unwrap().push(target);
+                (target, payload)
+            };
+            outside.send_to(payload, target).await.unwrap();
+            let mut answer = [0u8; 2048];
+            let (m, from) = outside.recv_from(&mut answer).await.unwrap();
+            let mut wrapped = dravity_core::socks5::udp_header(from);
+            wrapped.extend_from_slice(&answer[..m]);
+            relay.send_to(&wrapped, client).await.unwrap();
+        }
+    });
+    (addr, targets)
+}
+
+#[tokio::test]
+async fn udp_announce_through_a_socks5_relay() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let tracker = server.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        let (_, from) = server.recv_from(&mut buf).await.unwrap();
+        let tid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+        server
+            .send_to(&udp::encode_connect_response(tid, 5), from)
+            .await
+            .unwrap();
+        let (_, from) = server.recv_from(&mut buf).await.unwrap();
+        let tid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+        let peers: Vec<SocketAddr> = vec!["10.9.8.7:51413".parse().unwrap()];
+        server
+            .send_to(&udp::encode_announce_response(tid, 900, 1, 2, &peers), from)
+            .await
+            .unwrap();
+    });
+    let (proxy, targets) = socks5_udp_relay().await;
+    let mut c = ClientConfig::default();
+    c.udp_timeout = Duration::from_millis(500);
+    c.udp_retries = 1;
+    c.udp_proxy = Some(UdpProxy::new(
+        proxy.to_string(),
+        Some(("me".into(), "pass".into())),
+    ));
+    let r = TrackerClient::new(c)
+        .unwrap()
+        .announce(&format!("udp://{tracker}/announce"), &request())
+        .await
+        .unwrap();
+    assert_eq!(
+        r.peers,
+        vec!["10.9.8.7:51413".parse::<SocketAddr>().unwrap()]
+    );
+    // Both the connect and the announce went through the relay.
+    assert_eq!(*targets.lock().unwrap(), vec![tracker, tracker]);
+}
+
+#[tokio::test]
+async fn udp_tracker_names_are_resolved_by_the_proxy() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let tracker = server.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        let (_, from) = server.recv_from(&mut buf).await.unwrap();
+        let tid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+        server
+            .send_to(&udp::encode_connect_response(tid, 9), from)
+            .await
+            .unwrap();
+        let (_, from) = server.recv_from(&mut buf).await.unwrap();
+        let tid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+        server
+            .send_to(&udp::encode_announce_response(tid, 900, 0, 1, &[]), from)
+            .await
+            .unwrap();
+    });
+    let names: Names = std::sync::Arc::default();
+    let (proxy, targets) =
+        socks5_udp_relay_resolving(Some((tracker, std::sync::Arc::clone(&names)))).await;
+    let mut c = ClientConfig::default();
+    c.udp_timeout = Duration::from_millis(500);
+    c.udp_retries = 1;
+    c.udp_proxy = Some(UdpProxy::new(
+        proxy.to_string(),
+        Some(("me".into(), "pass".into())),
+    ));
+    // `.invalid` never resolves locally: only the proxy can reach it.
+    let r = TrackerClient::new(c)
+        .unwrap()
+        .announce("udp://tracker.invalid:6969/announce", &request())
+        .await
+        .unwrap();
+    assert_eq!(r.interval, Some(Duration::from_secs(900)));
+    assert_eq!(*names.lock().unwrap(), vec!["tracker.invalid"; 2]);
+    assert!(targets.lock().unwrap().is_empty(), "no address was sent");
 }

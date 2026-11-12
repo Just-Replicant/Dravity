@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use dravity_core::{BLOCK_SIZE, BlockRef, InfoHash, PieceLayout};
 use dravity_engine::{
-    Alert, AnnounceEvent, Bitfield, Config, DialHints, Effect, Event, PeerKey, PeerLink,
-    TorrentState, TorrentStatus,
+    Alert, AnnounceEvent, Bitfield, Config, DialHints, Effect, Event, PeerKey, PeerLink, Priority,
+    SeedChoking, TorrentState, TorrentStatus,
 };
 use dravity_wire::{BlockRequest, ExtendedHandshake, Message, PexMessage, Reserved};
 
@@ -848,6 +848,13 @@ fn seed_false_leaves_the_swarm_when_done() {
 /// Downloads all of piece 0 from `senders` (alternating), then fails it.
 fn fail_piece_zero(h: &mut Harness, senders: &[u64]) -> Vec<Effect> {
     let blocks = [req(0, 0, BLOCK_SIZE), req(0, BLOCK_SIZE, BLOCK_SIZE)];
+    if senders.len() > 1 {
+        // Piece reservation gives each peer its own piece; with only piece
+        // 0 wanted, the peers share it.
+        h.ev(Event::SetPriorities {
+            priorities: vec![Priority::Normal, Priority::Skip, Priority::Skip],
+        });
+    }
     for p in senders {
         h.msg(*p, Message::HaveAll);
         h.msg(*p, Message::Unchoke);
@@ -1075,6 +1082,27 @@ fn extension_handshake_advertises_port_queue_and_your_ip() {
     assert_eq!(hs.listen_port, Some(51_413));
     assert_eq!(hs.request_queue, Some(250));
     assert_eq!(hs.your_ip, Some(vec![10, 0, 1, 1]));
+}
+
+#[test]
+fn a_new_listen_port_is_sent_in_a_fresh_extension_handshake() {
+    let mut c = config();
+    c.listen_port = Some(51_413);
+    let mut h = Harness::with_have(c, &[]);
+    h.connect(1, Reserved::new().with_extension_protocol(true));
+    h.connect(2, Reserved::new());
+    let fx =
+        h.t.update(h.now, Event::SetListenPort { port: Some(6_000) });
+    assert_eq!(our_handshake(&fx, 1).listen_port, Some(6_000));
+    assert!(
+        sent(&fx, 2)
+            .iter()
+            .all(|m| !matches!(m, Message::Extended { .. })),
+        "a peer without BEP 10 gets no extension message"
+    );
+    // Later connections advertise it too.
+    let fx = h.connect(3, Reserved::new().with_extension_protocol(true));
+    assert_eq!(our_handshake(&fx, 3).listen_port, Some(6_000));
 }
 
 #[test]
@@ -1424,4 +1452,578 @@ fn a_padded_last_piece_serves_whole_blocks_with_zeros() {
         error: "disk".into(),
     });
     assert!(sent(&fx, 1).contains(&Message::Reject(padded)), "{fx:?}");
+}
+
+/// Feeds piece 0's blocks from `senders` (block `i` from `senders[i]`).
+fn send_piece_zero(h: &mut Harness, senders: &[u64], fill: &[u8]) {
+    for (i, r) in [req(0, 0, BLOCK_SIZE), req(0, BLOCK_SIZE, BLOCK_SIZE)]
+        .iter()
+        .enumerate()
+    {
+        h.msg(
+            senders[i],
+            Message::Piece {
+                piece: r.piece,
+                offset: r.offset,
+                data: Bytes::from(vec![fill[i]; r.length as usize]),
+            },
+        );
+    }
+}
+
+fn hash_blocks(fx: &[Effect]) -> Vec<u32> {
+    fx.iter()
+        .filter_map(|e| match e {
+            Effect::HashBlocks { piece } => Some(*piece),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn smart_ban_convicts_only_the_sender_of_the_bad_block() {
+    let mut c = config();
+    c.max_requests_per_peer = 1;
+    c.initial_requests_per_peer = 1;
+    c.endgame = false;
+    let mut h = Harness::with_have(c, &[]);
+    h.connect(1, Reserved::new());
+    h.connect(2, Reserved::new());
+    // Peer 1 sends block 0, peer 2 block 1; the piece fails.
+    let fx = fail_piece_zero(&mut h, &[1, 2]);
+    assert_eq!(
+        hash_blocks(&fx),
+        [0],
+        "the failed piece's blocks are hashed"
+    );
+    assert!(
+        ![1, 2]
+            .iter()
+            .any(|&p| requests(&fx, p).iter().any(|r| r.piece == 0)),
+        "piece 0 is quarantined until its digests are in"
+    );
+    let good = [[1u8; 32], [2u8; 32]];
+    let fx = h.ev(Event::BlockHashes {
+        piece: 0,
+        hashes: vec![good[0], [9u8; 32]],
+    });
+    assert!(
+        !fx.iter()
+            .any(|e| matches!(e, Effect::Alert(Alert::PeerBanned { .. })))
+    );
+    // Downloaded again, all from peer 1, and it passes.
+    send_piece_zero(&mut h, &[1, 1], &[1, 2]);
+    let fx = h.ev(Event::PieceHashed { piece: 0, ok: true });
+    assert_eq!(hash_blocks(&fx), [0], "the verified blocks are hashed");
+    let fx = h.ev(Event::BlockHashes {
+        piece: 0,
+        hashes: good.to_vec(),
+    });
+    assert!(fx.contains(&Effect::Alert(Alert::PeerBanned { ip: addr(2).ip() })));
+    assert!(disconnects(&fx, 2));
+    assert!(!disconnects(&fx, 1));
+    assert_eq!(h.t.stats().banned, 1);
+}
+
+#[test]
+fn smart_ban_falls_back_to_strikes_when_blocks_cannot_be_read() {
+    let mut c = config();
+    c.hash_fail_ban = 1;
+    c.max_requests_per_peer = 1;
+    c.initial_requests_per_peer = 1;
+    c.endgame = false;
+    let mut h = Harness::with_have(c, &[]);
+    h.connect(1, Reserved::new());
+    h.connect(2, Reserved::new());
+    fail_piece_zero(&mut h, &[1, 2]);
+    let fx = h.ev(Event::BlockHashes {
+        piece: 0,
+        hashes: Vec::new(),
+    });
+    assert!(disconnects(&fx, 1) && disconnects(&fx, 2));
+}
+
+#[test]
+fn smart_ban_can_be_disabled() {
+    let mut c = config();
+    c.smart_ban = false;
+    c.max_requests_per_peer = 1;
+    c.initial_requests_per_peer = 1;
+    c.endgame = false;
+    let mut h = Harness::with_have(c, &[]);
+    h.connect(1, Reserved::new());
+    h.connect(2, Reserved::new());
+    let fx = fail_piece_zero(&mut h, &[1, 2]);
+    assert!(hash_blocks(&fx).is_empty());
+}
+
+#[test]
+fn session_bans_close_connections_without_an_alert() {
+    let mut h = Harness::with_have(config(), &[]);
+    h.connect(1, Reserved::new());
+    let fx = h.ev(Event::BanIp { ip: addr(1).ip() });
+    assert!(disconnects(&fx, 1));
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Alert(_))));
+    let fx = h.accept(9, Reserved::new());
+    assert!(!disconnects(&fx, 9), "another address is fine");
+    let mut t = TorrentState::new(layout(), config()).with_banned_ips([addr(3).ip()]);
+    t.update(h.now, Event::Start);
+    let fx = t.update(
+        h.now,
+        Event::PeerAccepted {
+            peer: PeerKey(3),
+            addr: addr(3),
+            reserved: Reserved::new(),
+            link: PeerLink::default(),
+        },
+    );
+    assert!(disconnects(&fx, 3));
+}
+
+#[test]
+fn smart_ban_uses_v2_leaf_hashes_to_convict_at_once() {
+    use dravity_core::merkle;
+    use dravity_wire::HashRequest;
+
+    let piece_length = 2 * BLOCK_SIZE;
+    let len = u64::from(5 * BLOCK_SIZE) + 10;
+    let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let tree = merkle::file_hashes(&data, piece_length).unwrap();
+    let leaves: Vec<merkle::Hash> = data.chunks(16_384).map(merkle::hash_leaf).collect();
+    let mut c = config();
+    c.max_requests_per_peer = 1;
+    c.initial_requests_per_peer = 1;
+    c.endgame = false;
+    let mut h = Harness::with_have(c, &[]);
+    h.t = TorrentState::new(layout(), h.t.config().clone())
+        .with_piece_layers(piece_length, [(tree.root, tree.layer.clone())])
+        .with_piece_roots([(tree.root, 0, 3)]);
+    h.ev(Event::Start);
+    let v2 = fast().with_v2(true);
+    h.connect(1, v2);
+    h.connect(2, v2);
+    h.connect(3, v2);
+    h.msg(3, Message::HaveAll);
+    let fx = fail_piece_zero(&mut h, &[1, 2]);
+    let request = HashRequest {
+        pieces_root: tree.root,
+        base_layer: 0,
+        index: 0,
+        length: 2,
+        proof_layers: 0,
+    };
+    assert_eq!(
+        sent(&fx, 3),
+        [Message::HashRequest(request)],
+        "a peer that sent nothing is asked for the leaves"
+    );
+    // A forged answer is ignored.
+    let fx = h.msg(
+        3,
+        Message::Hashes {
+            request,
+            hashes: Bytes::from(vec![7u8; 64]),
+        },
+    );
+    assert!(!disconnects(&fx, 1) && !disconnects(&fx, 2));
+    // The digests are recorded as suspects.
+    let fx = h.ev(Event::BlockHashes {
+        piece: 0,
+        hashes: vec![leaves[0], [9u8; 32]],
+    });
+    assert!(!disconnects(&fx, 1) && !disconnects(&fx, 2));
+    // The piece fails again with the same split; this time the leaves
+    // arrive intact and convict peer 2 without waiting for a good copy.
+    send_piece_zero(&mut h, &[1, 2], &[0, 0]);
+    let fx = h.ev(Event::PieceHashed {
+        piece: 0,
+        ok: false,
+    });
+    assert_eq!(sent(&fx, 3), [Message::HashRequest(request)]);
+    let fx = h.msg(
+        3,
+        Message::Hashes {
+            request,
+            hashes: leaves[..2].concat().into(),
+        },
+    );
+    assert!(disconnects(&fx, 2), "peer 2 sent the corrupt block");
+    assert!(!disconnects(&fx, 1));
+    assert!(fx.contains(&Effect::Alert(Alert::PeerBanned { ip: addr(2).ip() })));
+}
+
+/// Serves one block of piece 0 to `peer`.
+fn serve_block(h: &mut Harness, peer: u64, offset: u32) {
+    let fx = h.msg(peer, Message::Request(req(0, offset, BLOCK_SIZE)));
+    let out = h.complete_reads(&fx);
+    assert_eq!(pieces_sent(&out, peer).len(), 1);
+}
+
+#[test]
+fn round_robin_seeding_passes_the_slot_after_the_quota() {
+    let mut c = config();
+    c.upload_slots = 1;
+    c.optimistic_unchoke = false;
+    c.seed_choking = SeedChoking::RoundRobin;
+    c.round_robin_quota = u64::from(BLOCK_SIZE);
+    let mut h = Harness::seed(c);
+    h.accept(1, Reserved::new());
+    h.accept(2, Reserved::new());
+    assert_eq!(unchoked(&h.msg(1, Message::Interested), 1), Some(true));
+    h.msg(2, Message::Interested);
+    // Peer 1 used its turn: peer 2 gets the slot although peer 1 was
+    // the fastest upload.
+    serve_block(&mut h, 1, 0);
+    let fx = h.advance(Duration::from_secs(10));
+    assert_eq!(unchoked(&fx, 1), Some(false));
+    assert_eq!(unchoked(&fx, 2), Some(true));
+    // And back again once peer 2 used its own.
+    serve_block(&mut h, 2, 0);
+    let fx = h.advance(Duration::from_secs(10));
+    assert_eq!(unchoked(&fx, 2), Some(false));
+    assert_eq!(unchoked(&fx, 1), Some(true));
+}
+
+#[test]
+fn the_slot_tuner_adds_slots_while_peers_take_data() {
+    let mut c = config();
+    c.upload_slots = 1;
+    c.optimistic_unchoke = false;
+    c.upload_slots_auto = true;
+    let mut h = Harness::seed(c);
+    for p in 1..=3 {
+        h.accept(p, Reserved::new());
+        h.msg(p, Message::Interested);
+    }
+    assert_eq!(h.t.stats().unchoked, 1);
+    // 16 KiB in a 10 s round is 1.6 KiB/s: above the first threshold.
+    serve_block(&mut h, 1, 0);
+    h.advance(Duration::from_secs(10));
+    assert_eq!(h.t.upload_slots(), 2);
+    assert_eq!(h.t.stats().unchoked, 2);
+    // A quiet round shrinks back to one probing slot.
+    h.advance(Duration::from_secs(10));
+    for p in 1..=3 {
+        h.msg(p, Message::KeepAlive);
+    }
+    assert_eq!(h.t.upload_slots(), 1);
+    assert_eq!(h.t.stats().unchoked, 1);
+}
+
+fn ext_msg(id: u8, payload: &'static [u8]) -> Message {
+    Message::Extended {
+        id,
+        payload: Bytes::from_static(payload),
+    }
+}
+
+fn ext_reserved() -> Reserved {
+    Reserved::new()
+        .with_extension_protocol(true)
+        .with_fast(true)
+}
+
+#[test]
+fn a_seed_says_upload_only_and_flags_partial_seeds() {
+    let mut h = Harness::seed(config());
+    let hs = our_handshake(&h.connect(1, ext_reserved()), 1);
+    assert_eq!(hs.upload_only, Some(true));
+    assert!(hs.extension_id("lt_donthave").is_some());
+    // A partial seed (BEP 21) is kept (it may want more later) and shared
+    // with the PEX seed flag.
+    let fx = h.msg(1, ext_msg(0, b"d1:md6:ut_pexi5ee11:upload_onlyi1ee"));
+    assert!(!disconnects(&fx, 1));
+    h.connect(2, ext_reserved());
+    h.msg(2, ext_msg(0, b"d1:md6:ut_pexi5eee"));
+    let fx = h.advance(h.t.config().pex_interval);
+    let pex = sent(&fx, 2)
+        .into_iter()
+        .find_map(|m| match m {
+            Message::Extended { id: 5, payload } => Some(PexMessage::decode(&payload).unwrap()),
+            _ => None,
+        })
+        .expect("pex to peer 2");
+    let entry = pex.added.iter().find(|p| p.addr == addr(1)).unwrap();
+    assert_ne!(entry.flags.unwrap() & dravity_wire::PEX_SEED, 0);
+
+    let mut leecher = Harness::with_have(config(), &[]);
+    let hs = our_handshake(&leecher.connect(1, ext_reserved()), 1);
+    assert_eq!(hs.upload_only, None);
+    let fx = leecher.msg(1, ext_msg(0, b"d1:mde11:upload_onlyi1ee"));
+    assert!(!disconnects(&fx, 1), "a leecher still downloads from it");
+}
+
+#[test]
+fn lt_donthave_takes_a_piece_back() {
+    let mut h = Harness::with_have(config(), &[1, 2]);
+    h.connect(1, ext_reserved());
+    h.msg(1, Message::HaveNone);
+    let fx = h.msg(1, Message::Have { piece: 0 });
+    assert!(sent(&fx, 1).contains(&Message::Interested));
+    // Our id for lt_donthave is the one in our handshake.
+    let fx = h.msg(1, ext_msg(3, &[0, 0, 0, 0]));
+    assert!(sent(&fx, 1).contains(&Message::NotInterested), "{fx:?}");
+    // Out of range or malformed: the peer is dropped.
+    let fx = h.msg(1, ext_msg(3, &[0, 0, 0, 9]));
+    assert!(disconnects(&fx, 1));
+}
+
+#[test]
+fn a_failed_recheck_sends_lt_donthave() {
+    let mut h = Harness::seed(config());
+    h.connect(1, ext_reserved());
+    h.msg(1, ext_msg(0, b"d1:md11:lt_donthavei7eee"));
+    let fx = h.ev(Event::RecheckPieces { pieces: 1..2 });
+    assert!(fx.contains(&Effect::HashPiece { piece: 1 }), "{fx:?}");
+    let fx = h.ev(Event::PieceHashed {
+        piece: 1,
+        ok: false,
+    });
+    assert!(
+        sent(&fx, 1).contains(&Message::Extended {
+            id: 7,
+            payload: Bytes::from_static(&[0, 0, 0, 1]),
+        }),
+        "{fx:?}"
+    );
+}
+
+#[test]
+fn trackers_are_exchanged_with_lt_tex() {
+    let mut bits = Bitfield::new(3);
+    bits.set(0);
+    let t = TorrentState::with_have(layout(), bits, config())
+        .with_info_hash(InfoHash::new([0xaa; 20]))
+        .with_trackers([
+            "udp://ours:1/announce".to_owned(),
+            "file:///etc/passwd".to_owned(),
+        ]);
+    let mut h = Harness {
+        t,
+        now: Instant::now(),
+    };
+    h.ev(Event::Start);
+    let hs = our_handshake(&h.connect(1, ext_reserved()), 1);
+    assert!(hs.extension_id("lt_tex").is_some());
+    let fx = h.msg(1, ext_msg(0, b"d1:md6:lt_texi9eee"));
+    let ours = sent(&fx, 1)
+        .into_iter()
+        .find_map(|m| match m {
+            Message::Extended { id: 9, payload } => {
+                Some(dravity_wire::TrackerExchange::decode(&payload).unwrap())
+            }
+            _ => None,
+        })
+        .expect("our trackers");
+    assert_eq!(ours.added, ["udp://ours:1/announce"]);
+    let fx = h.msg(
+        1,
+        ext_msg(
+            4,
+            b"d5:addedl21:udp://ours:1/announce14:http://new/ann9:ftp://x/aee",
+        ),
+    );
+    assert!(
+        fx.contains(&Effect::TrackersReceived {
+            urls: vec!["http://new/ann".to_owned()],
+        }),
+        "{fx:?}"
+    );
+    // Heard once.
+    let fx = h.msg(1, ext_msg(4, b"d5:addedl14:http://new/annee"));
+    assert!(
+        !fx.iter()
+            .any(|e| matches!(e, Effect::TrackersReceived { .. }))
+    );
+
+    let mut c = config();
+    c.tracker_exchange = false;
+    let mut off = Harness::with_have(c, &[]);
+    let hs = our_handshake(&off.connect(1, ext_reserved()), 1);
+    assert!(hs.extension_id("lt_tex").is_none());
+    let fx = off.msg(1, ext_msg(4, b"d5:addedl14:http://new/annee"));
+    assert!(
+        !fx.iter()
+            .any(|e| matches!(e, Effect::TrackersReceived { .. }))
+    );
+}
+
+#[test]
+fn super_seeding_reveals_one_piece_at_a_time() {
+    let mut c = config();
+    c.super_seed = true;
+    let mut h = Harness::seed(c);
+    let first = h.accept(1, fast());
+    let msgs = sent(&first, 1);
+    assert!(msgs.contains(&Message::HaveNone), "{msgs:?}");
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, Message::HaveAll | Message::Bitfield(_)))
+    );
+    let haves = |fx: &[Effect], p| -> Vec<u32> {
+        sent(fx, p)
+            .into_iter()
+            .filter_map(|m| match m {
+                Message::Have { piece } => Some(piece),
+                _ => None,
+            })
+            .collect()
+    };
+    let one = haves(&first, 1);
+    assert_eq!(one.len(), 1);
+    // The next peer is shown a different piece.
+    let two = haves(&h.accept(2, fast()), 2);
+    assert_eq!(two.len(), 1);
+    assert_ne!(one, two);
+    // A request outside the revealed piece is refused.
+    h.msg(1, Message::Interested);
+    let other = (0..3).find(|p| *p != one[0]).unwrap();
+    let fx = h.msg(1, Message::Request(req(other, 0, BLOCK_SIZE)));
+    assert!(sent(&fx, 1).contains(&Message::Reject(req(other, 0, BLOCK_SIZE))));
+    // Once the peer has its piece, it is shown another.
+    let fx = h.msg(1, Message::Have { piece: one[0] });
+    let next = haves(&fx, 1);
+    assert_eq!(next.len(), 1);
+    assert_ne!(next, one);
+}
+
+#[test]
+fn at_the_cap_a_higher_bep40_priority_replaces_the_lowest() {
+    use dravity_core::priority::peer_priority;
+    let mut c = config();
+    c.max_peers = 1;
+    let mut h = Harness::with_have(c, &[]);
+    h.connect(1, ext_reserved());
+    let ours = SocketAddr::from(([1, 2, 3, 4], 0));
+    let rank = |n: u16| peer_priority(ours, addr(n));
+    // Unknown public address: a newcomer is refused as before.
+    let fx = h.accept(2, fast());
+    assert!(disconnects(&fx, 2) && !disconnects(&fx, 1));
+    // Peer 1 tells us our public address.
+    h.msg(1, ext_msg(0, b"d1:mde6:yourip4:\x01\x02\x03\x04e"));
+    let higher = (2..200).find(|&n| rank(n) > rank(1)).unwrap();
+    let lower = (2..200).find(|&n| rank(n) < rank(1)).unwrap();
+    let fx = h.accept(u64::from(lower), fast());
+    assert!(disconnects(&fx, u64::from(lower)) && !disconnects(&fx, 1));
+    let fx = h.accept(u64::from(higher), fast());
+    assert!(disconnects(&fx, 1), "the lower-ranked peer goes");
+    assert!(!disconnects(&fx, u64::from(higher)));
+}
+
+fn holepunch_sent(fx: &[Effect], peer: u64, id: u8) -> Vec<dravity_wire::Holepunch> {
+    sent(fx, peer)
+        .into_iter()
+        .filter_map(|m| match m {
+            Message::Extended { id: got, payload } if got == id => {
+                dravity_wire::Holepunch::decode(&payload)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn holepunch_msg(msg: dravity_wire::Holepunch) -> Message {
+    // Our id for ut_holepunch.
+    Message::Extended {
+        id: 5,
+        payload: Bytes::from(msg.encode()),
+    }
+}
+
+#[test]
+fn a_relay_pairs_two_peers_for_a_holepunch() {
+    use dravity_wire::{Holepunch, HolepunchError};
+    let mut h = Harness::seed(config());
+    let hs = our_handshake(&h.connect(1, ext_reserved()), 1);
+    assert!(hs.extension_id("ut_holepunch").is_some());
+    h.msg(1, ext_msg(0, b"d1:md12:ut_holepunchi9eee"));
+    h.connect(2, ext_reserved());
+    h.msg(2, ext_msg(0, b"d1:md12:ut_holepunchi9eee"));
+    h.connect(3, ext_reserved());
+    h.msg(3, ext_msg(0, b"d1:mdee"));
+
+    let fx = h.msg(1, holepunch_msg(Holepunch::Rendezvous(addr(2))));
+    assert_eq!(holepunch_sent(&fx, 2, 9), [Holepunch::Connect(addr(1))]);
+    assert_eq!(holepunch_sent(&fx, 1, 9), [Holepunch::Connect(addr(2))]);
+
+    for (target, error) in [
+        (addr(7), HolepunchError::NotConnected),
+        (addr(3), HolepunchError::NoSupport),
+        (addr(1), HolepunchError::NoSelf),
+    ] {
+        let fx = h.msg(1, holepunch_msg(Holepunch::Rendezvous(target)));
+        assert_eq!(
+            holepunch_sent(&fx, 1, 9),
+            [Holepunch::Error(target, error)],
+            "{target}"
+        );
+    }
+    // A malformed message drops the sender.
+    let fx = h.msg(
+        1,
+        Message::Extended {
+            id: 5,
+            payload: Bytes::from_static(&[9]),
+        },
+    );
+    assert!(disconnects(&fx, 1));
+}
+
+#[test]
+fn a_failed_dial_asks_the_pex_source_for_a_rendezvous_once() {
+    use dravity_wire::{Holepunch, PexPeer};
+    let mut h = Harness::with_have(config(), &[]);
+    h.connect(1, ext_reserved());
+    h.msg(1, ext_msg(0, b"d1:md6:ut_pexi8e12:ut_holepunchi9eee"));
+    let target = SocketAddr::from(([10, 9, 9, 9], 7000));
+    let pex = PexMessage {
+        added: vec![PexPeer {
+            addr: target,
+            flags: Some(dravity_wire::PEX_HOLEPUNCH | dravity_wire::PEX_UTP),
+        }],
+        dropped: Vec::new(),
+    };
+    let fx = h.msg(
+        1,
+        Message::Extended {
+            id: 2,
+            payload: Bytes::from(pex.encode()),
+        },
+    );
+    assert!(
+        fx.iter()
+            .any(|e| matches!(e, Effect::Connect { addr, .. } if *addr == target)),
+        "{fx:?}"
+    );
+    let fx = h.ev(Event::PeerConnectFailed {
+        addr: target,
+        retry: true,
+    });
+    assert_eq!(holepunch_sent(&fx, 1, 9), [Holepunch::Rendezvous(target)]);
+    // The relay answers: dial now, over uTP.
+    let fx = h.msg(1, holepunch_msg(Holepunch::Connect(target)));
+    let hints = fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::Connect { addr, hints } if *addr == target => Some(*hints),
+            _ => None,
+        })
+        .expect("a holepunch dial");
+    assert_eq!(hints.utp, Some(true));
+    // That fails too: no second rendezvous for the same address.
+    let fx = h.ev(Event::PeerConnectFailed {
+        addr: target,
+        retry: true,
+    });
+    assert!(holepunch_sent(&fx, 1, 9).is_empty());
+
+    // Disabled: not advertised and messages are ignored.
+    let mut c = config();
+    c.holepunch = false;
+    let mut off = Harness::with_have(c, &[]);
+    let hs = our_handshake(&off.connect(1, ext_reserved()), 1);
+    assert!(hs.extension_id("ut_holepunch").is_none());
+    let fx = off.msg(1, holepunch_msg(Holepunch::Connect(target)));
+    assert!(fx.iter().all(|e| !matches!(e, Effect::Connect { .. })));
 }

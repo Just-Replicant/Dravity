@@ -52,6 +52,9 @@ for incoming peers, the upload rate limit and DHT `announce_peer`.
   no new failure, so a shared NAT is not banned for mistakes spread over
   the download; a ban lasts for the torrent. An IPv4-mapped IPv6 address
   is the same key as its IPv4 address. Bans filter dials, accepts and PEX.
+  (Since the irontide adoption, shared pieces are attributed by block
+  digests first and bans are session-wide; see
+  [`irontide-adoption.md`](irontide-adoption.md#2-smart-ban).)
 - **Listener.** One port for TCP and UDP (uTP), on IPv4 and IPv6
   (`IPV6_V6ONLY`, so both families can use the same port). A port in use
   falls back to a free one; `Session::listen_port` tells which. The accept

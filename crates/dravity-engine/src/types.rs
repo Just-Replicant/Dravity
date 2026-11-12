@@ -53,6 +53,51 @@ pub enum TorrentStatus {
     Stopped,
 }
 
+/// How a seeding torrent ranks peers for its regular upload slots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SeedChoking {
+    /// The peers we uploaded the most to last round: slots go to whoever
+    /// takes data fastest (the default).
+    #[default]
+    FastestUpload,
+    /// Peers take turns: a peer keeps its slot until it received
+    /// [`Config::round_robin_quota`] bytes, then the slot goes to the peer
+    /// that has been choked longest. Spreads a seed evenly.
+    RoundRobin,
+    /// Prefer peers that are just starting or nearly done over peers in
+    /// the middle of the download: new peers get their first pieces fast
+    /// and finishing peers complete (and seed) sooner, while peers that
+    /// only take data mid-download get less.
+    AntiLeech,
+}
+
+impl SeedChoking {
+    /// The mode's name, as [`std::str::FromStr`] reads it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FastestUpload => "fastest-upload",
+            Self::RoundRobin => "round-robin",
+            Self::AntiLeech => "anti-leech",
+        }
+    }
+}
+
+impl std::str::FromStr for SeedChoking {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "fastest-upload" | "fastest" => Ok(Self::FastestUpload),
+            "round-robin" => Ok(Self::RoundRobin),
+            "anti-leech" => Ok(Self::AntiLeech),
+            _ => Err(format!(
+                "unknown seed choking `{s}` (fastest-upload, round-robin, anti-leech)"
+            )),
+        }
+    }
+}
+
 /// Tunables for a torrent. [`Config::default`] gives sensible values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -63,8 +108,14 @@ pub struct Config {
     /// requests). A smaller `reqq` from the peer's extension handshake wins.
     pub max_requests_per_peer: usize,
     /// Request window a new peer starts with; it grows while blocks arrive
-    /// in time and halves when a request times out.
+    /// in time and halves when a request times out. A peer whose measured
+    /// bandwidth-delay product (delivery rate × base round trip) is deeper
+    /// gets that depth at once, still within `max_requests_per_peer`.
     pub initial_requests_per_peer: usize,
+    /// Block requests outstanding across all peers of the torrent. Many
+    /// peers then share a bounded amount of requested-but-undelivered data
+    /// instead of each filling its own window.
+    pub request_budget: usize,
     /// Request a block from a second peer when the first has not delivered
     /// it after this long and the second has nothing else to do (piece
     /// stealing from slow peers).
@@ -77,6 +128,17 @@ pub struct Config {
     pub download_rate_limit: Option<u64>,
     /// Exchange peers with other peers (BEP 11). Disable for private torrents.
     pub pex: bool,
+    /// Exchange tracker URLs with peers (`lt_tex`). Disable for private
+    /// torrents.
+    pub tracker_exchange: bool,
+    /// BEP 55 `ut_holepunch`: relay rendezvous between two connected
+    /// peers, and ask a PEX source to relay one when dialing a peer it
+    /// told us about fails. Disable for private torrents.
+    pub holepunch: bool,
+    /// BEP 16 super-seeding while the torrent is complete: peers see no
+    /// bitfield, only one piece at a time chosen from the least shared,
+    /// and get the next once they announce it. Speeds up initial seeding.
+    pub super_seed: bool,
     /// Minimum time between two PEX messages to the same peer (BEP 11: one
     /// minute).
     pub pex_interval: Duration,
@@ -133,6 +195,17 @@ pub struct Config {
     /// Give one extra slot to a choked peer in turn, so newcomers get data
     /// and better partners are discovered.
     pub optimistic_unchoke: bool,
+    /// How regular slots are ranked while seeding (see [`SeedChoking`]).
+    pub seed_choking: SeedChoking,
+    /// Bytes a peer receives per turn under [`SeedChoking::RoundRobin`]
+    /// before its slot passes on.
+    pub round_robin_quota: u64,
+    /// Tune [`Self::upload_slots`] every round from the measured upload
+    /// rates: one more slot for each peer that takes more than an
+    /// increasing threshold (1 KiB/s, 2 KiB/s, …), so slots grow while
+    /// extra peers still add upload and stop when they would only split
+    /// it. `upload_slots` is the starting value.
+    pub upload_slots_auto: bool,
     /// Time between two choker rounds (BEP 3 suggests ten seconds).
     pub unchoke_interval: Duration,
     /// Time between two changes of the optimistic unchoke.
@@ -170,6 +243,15 @@ pub struct Config {
     /// failure, so a shared NAT is not banned for mistakes spread over the
     /// whole download. Bans themselves are not lifted.
     pub hash_fail_quiet: Duration,
+    /// Smart banning (default `true`): when a piece with several
+    /// contributors fails, find out which block was bad instead of striking
+    /// everyone. The driver hashes the failed piece's blocks
+    /// ([`Effect::HashBlocks`]) and again once the piece passes; the sender
+    /// of a block whose digest differs from the verified one is banned at
+    /// once. For v2 and hybrid torrents the 16 KiB leaf hashes are also
+    /// asked from BEP 52 peers, so the verdict can come before the piece is
+    /// downloaded again. Sole contributors are still handled by strikes.
+    pub smart_ban: bool,
     /// Port we accept connections on, advertised in the extension handshake
     /// (`p`) so peers that we dialed can tell others how to reach us.
     pub listen_port: Option<u16>,
@@ -181,10 +263,14 @@ impl Default for Config {
             max_peers: 50,
             max_requests_per_peer: 128,
             initial_requests_per_peer: 4,
+            request_budget: 1024,
             steal_after: Duration::from_secs(10),
             endgame: true,
             download_rate_limit: None,
             pex: true,
+            tracker_exchange: true,
+            holepunch: true,
+            super_seed: false,
             pex_interval: Duration::from_secs(60),
             dht: false,
             dht_interval: Duration::from_secs(5 * 60),
@@ -205,6 +291,9 @@ impl Default for Config {
             seed: true,
             upload_slots: 4,
             optimistic_unchoke: true,
+            seed_choking: SeedChoking::FastestUpload,
+            round_robin_quota: 4 * 1024 * 1024,
+            upload_slots_auto: false,
             unchoke_interval: Duration::from_secs(10),
             optimistic_unchoke_interval: Duration::from_secs(30),
             snub_timeout: Duration::from_secs(60),
@@ -215,6 +304,7 @@ impl Default for Config {
             allowed_fast: dravity_wire::DEFAULT_ALLOWED_FAST,
             hash_fail_ban: 4,
             hash_fail_quiet: Duration::from_secs(60 * 60),
+            smart_ban: true,
             listen_port: None,
         }
     }
@@ -319,6 +409,13 @@ pub enum Event {
         /// pass `false` so a bad peer is not dialed in a loop.
         retry: bool,
     },
+    /// An [`Effect::Connect`] was not started because the session-wide
+    /// connection cap was reached. The address is not blamed: it is
+    /// dialed again after [`DEFERRED_DIAL_RETRY`](crate::DEFERRED_DIAL_RETRY).
+    PeerConnectDeferred {
+        /// Address that was not dialed.
+        addr: SocketAddr,
+    },
     /// A connected peer went away (EOF, I/O error, protocol error).
     PeerDisconnected {
         /// The peer.
@@ -351,6 +448,21 @@ pub enum Event {
         piece: u32,
         /// Whether the SHA-1 matched.
         ok: bool,
+    },
+    /// Result of an [`Effect::HashBlocks`]: one digest per block, in order.
+    /// Empty when the piece could not be read.
+    BlockHashes {
+        /// Piece index.
+        piece: u32,
+        /// SHA-256 leaf hash of each block.
+        hashes: Vec<Hash>,
+    },
+    /// Ban an address banned elsewhere in the session (another torrent's
+    /// hash-failure or smart ban): its connections are closed and it is
+    /// never dialed or accepted again. No [`Alert::PeerBanned`] is raised.
+    BanIp {
+        /// The address (an IPv4-mapped IPv6 address is its IPv4 address).
+        ip: IpAddr,
     },
     /// The driver installed a piece layer from
     /// [`Effect::PieceLayerReceived`]: hash the verified pieces in `pieces`
@@ -414,6 +526,14 @@ pub enum Event {
     SetUrgent {
         /// Pieces, most urgent first.
         pieces: Vec<u32>,
+    },
+    /// The session now accepts peers on `port`: it is sent in a fresh
+    /// extension handshake (BEP 10 allows repeating it) to connected peers
+    /// that speak the extension protocol, used for new connections, and
+    /// announced again as with [`Event::Reannounce`].
+    SetListenPort {
+        /// The new listen port (`None`: not listening).
+        port: Option<u16>,
     },
     /// The port published to trackers and the DHT changed. When the torrent
     /// is in the swarm, announce again so peers are told the current port.
@@ -483,6 +603,14 @@ pub enum Effect {
         /// Piece index.
         piece: u32,
     },
+    /// Hash every 16 KiB block of a piece as it is on storage with
+    /// [`merkle::hash_leaf`](dravity_core::merkle::hash_leaf) (the last
+    /// block may be shorter), then report [`Event::BlockHashes`]. Used by
+    /// [`Config::smart_ban`].
+    HashBlocks {
+        /// Piece index.
+        piece: u32,
+    },
     /// Announce to the torrent's trackers, then report [`Event::Announced`]
     /// or [`Event::AnnounceFailed`].
     Announce {
@@ -517,6 +645,13 @@ pub enum Effect {
         root: Hash,
         /// One hash per piece of the file.
         layer: Vec<Hash>,
+    },
+    /// A peer shared tracker URLs we did not know (`lt_tex`). Each passed
+    /// [`dravity_wire::is_exchangeable_tracker`]; the driver may add them
+    /// to the torrent's announce list.
+    TrackersReceived {
+        /// New tracker URLs.
+        urls: Vec<String>,
     },
     /// Notify the application.
     Alert(Alert),

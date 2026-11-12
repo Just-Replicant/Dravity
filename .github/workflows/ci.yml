@@ -74,6 +74,20 @@ jobs:
       # `+1.99` overrides rust-toolchain.toml.
       - run: cargo +1.99 test --workspace --locked
 
+  loom:
+    name: loom models
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: --cfg loom
+      LOOM_MAX_PREEMPTIONS: "3"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Only crates without tokio build under `--cfg loom` (tokio's own loom
+      # mode needs its loom dependency).
+      - run: cargo test -p dravity-core --test 'loom_*' --release --locked
+
   docs:
     name: docs
     runs-on: ubuntu-latest

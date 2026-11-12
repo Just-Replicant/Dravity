@@ -19,8 +19,8 @@ use dravity_bencode::{Dict, Value};
 use dravity_core::{InfoHash, Magnet, Metainfo};
 use dravity_engine::{Alert, Priority, TorrentStatus};
 use dravity_session::{
-    AddTorrentOptions, ListenConfig, Session, SessionAlert, SessionConfig, SessionError,
-    WatchConfig,
+    AddTorrentOptions, Durability, ListenConfig, PreallocateMode, Session, SessionAlert,
+    SessionConfig, SessionError, WatchConfig,
 };
 use sha1::{Digest, Sha1};
 use tokio::sync::broadcast;
@@ -412,4 +412,185 @@ async fn the_watch_folder_adds_torrents_and_magnets() {
     .expect("duplicate handled");
     handle.stop().await;
     session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_ban_refuses_the_address_everywhere() {
+    let (len_a, len_b) = (40_000, 30_000);
+    let (encoded, content) = make_torrent(len_a, len_b);
+    let seed = seed(&encoded, &content, len_a).await;
+    let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+    assert!(seed.session.ban_ip(loopback));
+    assert!(!seed.session.ban_ip(loopback), "already banned");
+    // The v4-mapped form is the same address.
+    assert!(!seed.session.ban_ip("::ffff:127.0.0.1".parse().unwrap()));
+    assert_eq!(seed.session.banned_ips(), vec![loopback]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let leecher = Session::new(config()).unwrap();
+    let handle = leecher
+        .add_torrent(
+            metainfo(&encoded),
+            AddTorrentOptions::new(dir.path()).with_peers([seed.addr]),
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let progress = handle.progress().await.unwrap();
+    assert_eq!(progress.stats.bytes_have, 0, "the banned leecher got data");
+
+    assert!(seed.session.unban_ip(loopback));
+    assert!(seed.session.banned_ips().is_empty());
+    leecher.shutdown().await;
+    seed.session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_session_connection_cap_holds_dials_until_raised() {
+    let (len_a, len_b) = (40_000, 30_000);
+    let (encoded, content) = make_torrent(len_a, len_b);
+    let seed = seed(&encoded, &content, len_a).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = config();
+    c.max_connections = Some(0);
+    let leecher = Session::new(c).unwrap();
+    assert_eq!(leecher.max_connections(), Some(0));
+    let mut alerts = leecher.subscribe();
+    let m = metainfo(&encoded);
+    let hash = m.info_hash();
+    let handle = leecher
+        .add_torrent(
+            m,
+            AddTorrentOptions::new(dir.path()).with_peers([seed.addr]),
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(leecher.connection_count(), 0);
+    assert_eq!(handle.progress().await.unwrap().stats.bytes_have, 0);
+    // Raised at runtime: the deferred dial goes out and the download ends.
+    leecher.set_max_connections(Some(4));
+    until_finished(&mut alerts, hash).await;
+    assert!(leecher.connection_count() <= 4);
+    leecher.shutdown().await;
+    seed.session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seeding_reads_go_through_the_shared_cache() {
+    let (len_a, len_b) = (60_000, 50_000);
+    let (encoded, content) = make_torrent(len_a, len_b);
+    let seed = seed(&encoded, &content, len_a).await;
+    for _ in 0..2 {
+        let dir = tempfile::tempdir().unwrap();
+        let leecher = Session::new(config()).unwrap();
+        let mut alerts = leecher.subscribe();
+        let m = metainfo(&encoded);
+        let hash = m.info_hash();
+        leecher
+            .add_torrent(
+                m,
+                AddTorrentOptions::new(dir.path()).with_peers([seed.addr]),
+            )
+            .unwrap();
+        until_finished(&mut alerts, hash).await;
+        leecher.shutdown().await;
+    }
+    let stats = seed.session.read_cache_stats().unwrap();
+    assert!(stats.hits > 0, "{stats:?}");
+    assert!(stats.bytes <= stats.budget);
+    seed.session.shutdown().await;
+
+    let mut c = config();
+    c.read_cache = None;
+    assert!(Session::new(c).unwrap().read_cache_stats().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_download_is_checked_only_where_data_can_be() {
+    let (len_a, len_b) = (100_000, 120_000);
+    let (encoded, content) = make_torrent(len_a, len_b);
+    let dir = tempfile::tempdir().unwrap();
+    // Only a.bin is on disk; b.bin was never created.
+    std::fs::create_dir_all(dir.path().join("payload")).unwrap();
+    std::fs::write(dir.path().join("payload/a.bin"), &content[..len_a]).unwrap();
+    let session = Session::new(config()).unwrap();
+    let mut alerts = session.subscribe();
+    let m = metainfo(&encoded);
+    let hash = m.info_hash();
+    let handle = session
+        .add_torrent(m, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    until(&mut alerts, hash, |a| {
+        *a == Alert::StateChanged(TorrentStatus::Downloading)
+    })
+    .await;
+    let stats = handle.progress().await.unwrap().stats;
+    // The pieces wholly inside a.bin were hashed and found; the rest were
+    // ruled out by the prescan.
+    assert_eq!(stats.pieces_have as usize, len_a / PIECE_LEN);
+    session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preallocated_durable_downloads_complete() {
+    let (len_a, len_b) = (70_000, 90_000);
+    let (encoded, content) = make_torrent(len_a, len_b);
+    let seed = seed(&encoded, &content, len_a).await;
+    for (prealloc, durability) in [
+        (PreallocateMode::Full, Durability::PerPiece),
+        (PreallocateMode::Sparse, Durability::OnComplete),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config();
+        c.preallocate = prealloc;
+        c.durability = durability;
+        let leecher = Session::new(c).unwrap();
+        let mut alerts = leecher.subscribe();
+        let m = metainfo(&encoded);
+        let hash = m.info_hash();
+        leecher
+            .add_torrent(
+                m,
+                AddTorrentOptions::new(dir.path()).with_peers([seed.addr]),
+            )
+            .unwrap();
+        until_finished(&mut alerts, hash).await;
+        leecher.shutdown().await;
+        let a = std::fs::read(dir.path().join("payload/a.bin")).unwrap();
+        let b = std::fs::read(dir.path().join("payload/b.bin")).unwrap();
+        assert_eq!(a, &content[..len_a], "{prealloc:?}");
+        assert_eq!(b, &content[len_a..], "{prealloc:?}");
+    }
+    seed.session.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_select_only_magnet_downloads_just_its_files() {
+    let (len_a, len_b) = (100_000, 120_000);
+    let (encoded, content) = make_torrent(len_a, len_b);
+    let seed = seed(&encoded, &content, len_a).await;
+    let hash = metainfo(&encoded).info_hash();
+    let dir = tempfile::tempdir().unwrap();
+    let leecher = Session::new(config()).unwrap();
+    let mut alerts = leecher.subscribe();
+    let magnet = Magnet::parse(&format!("magnet:?xt=urn:btih:{hash}&so=1")).unwrap();
+    let handle = leecher
+        .add_magnet(
+            &magnet,
+            AddTorrentOptions::new(dir.path()).with_peers([seed.addr]),
+        )
+        .unwrap();
+    until_finished(&mut alerts, hash).await;
+    assert_eq!(
+        std::fs::read(dir.path().join("payload/b.bin")).unwrap(),
+        &content[len_a..]
+    );
+    let files = handle.progress().await.unwrap().files.unwrap();
+    assert_eq!(files[0].priority, Priority::Skip);
+    assert!(files[0].have < PIECE_LEN as u64, "{files:?}");
+    assert_eq!(
+        leecher.list()[0].file_priorities,
+        vec![Priority::Skip, Priority::Normal]
+    );
+    leecher.shutdown().await;
+    seed.session.shutdown().await;
 }

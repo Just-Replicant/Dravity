@@ -126,6 +126,8 @@ struct Partial {
     /// Blocks in [`BlockState::Missing`].
     missing: usize,
     hashing: bool,
+    /// The peer the piece is reserved for (see [`Picker::pick_for`]).
+    owner: Option<u64>,
 }
 
 impl Partial {
@@ -136,6 +138,7 @@ impl Partial {
             written: 0,
             missing: n,
             hashing: false,
+            owner: None,
         }
     }
 
@@ -144,6 +147,12 @@ impl Partial {
         self.written = 0;
         self.missing = self.blocks.len();
         self.hashing = false;
+        self.owner = None;
+    }
+
+    /// Whether a block can be requested from it now.
+    const fn open(&self) -> bool {
+        !self.hashing && self.missing > 0
     }
 
     /// Moves block `idx` from `from` to `to`; returns whether it was in `from`.
@@ -441,6 +450,11 @@ impl Picker {
         }
     }
 
+    /// Records a peer's BEP 54 `lt_donthave` for `piece`.
+    pub fn remove_peer_piece(&mut self, piece: u32) {
+        self.change_availability(piece, false);
+    }
+
     /// Records a peer's `have` message for `piece`.
     pub fn add_peer_piece(&mut self, piece: u32) {
         self.change_availability(piece, true);
@@ -513,6 +527,67 @@ impl Picker {
         if let Some(block) = self.pick_from_partial(pieces) {
             return Some(block);
         }
+        self.pick_new(pieces, hint)
+    }
+
+    /// Like [`Self::pick_with_hint`], with piece reservation: each started
+    /// piece belongs to the peer `owner` that started it, which fills it
+    /// block by block. In order: urgent pieces; a piece `owner` already
+    /// owns; an unowned started piece (its owner left or was choked); a new
+    /// piece, reserved for `owner`; and only then a piece another peer owns
+    /// (so the last pieces still finish fast). Fewer pieces sit half done,
+    /// pieces verify sooner, and a bad piece usually has one sender.
+    pub fn pick_for(&mut self, owner: u64, pieces: &Bitfield, hint: &[u32]) -> Option<BlockRef> {
+        if let Some(block) = self.pick_urgent(pieces) {
+            if let Some(p) = self.partial.get_mut(&block.piece) {
+                p.owner.get_or_insert(owner);
+            }
+            return Some(block);
+        }
+        for want in [Some(owner), None] {
+            let found = self
+                .partial
+                .iter()
+                .find(|&(&i, p)| p.open() && p.owner == want && pieces.get(i) && self.continues(i))
+                .map(|(&i, _)| i);
+            if let Some(index) = found {
+                return self.take_from(index, owner);
+            }
+        }
+        if let Some(block) = self.pick_new(pieces, hint) {
+            if let Some(p) = self.partial.get_mut(&block.piece) {
+                p.owner = Some(owner);
+            }
+            return Some(block);
+        }
+        self.pick_from_partial(pieces)
+    }
+
+    /// Clears every reservation of `owner` (it disconnected or choked us),
+    /// so other peers take over its pieces.
+    pub fn release_owner(&mut self, owner: u64) {
+        for p in self.partial.values_mut() {
+            if p.owner == Some(owner) {
+                p.owner = None;
+            }
+        }
+    }
+
+    /// The peer piece `piece` is reserved for, if it is started.
+    #[must_use]
+    pub fn owner(&self, piece: u32) -> Option<u64> {
+        self.partial.get(&piece).and_then(|p| p.owner)
+    }
+
+    fn take_from(&mut self, index: u32, owner: u64) -> Option<BlockRef> {
+        let partial = self.partial.get_mut(&index)?;
+        partial.owner = Some(owner);
+        let b = partial.take_missing()?;
+        self.layout.block(index, u32::try_from(b).ok()?)
+    }
+
+    /// Starts the best new piece (rarest first, or a hint), if any.
+    fn pick_new(&mut self, pieces: &Bitfield, hint: &[u32]) -> Option<BlockRef> {
         let best = self
             .queue
             .iter()
@@ -903,6 +978,47 @@ mod tests {
         assert!(p.piece_hashed(4, true));
         assert_eq!(p.urgent(), &[3]);
         assert_eq!(p.pick(&all).map(|b| b.piece), Some(0));
+    }
+
+    #[test]
+    fn peers_fill_their_own_pieces() {
+        let mut p = Picker::new(layout(4, 3 * BLOCK_SIZE), Bitfield::new(4));
+        let all = Bitfield::full(4);
+        p.add_peer_pieces(&all);
+        let a = p.pick_for(1, &all, &[]).unwrap();
+        let b = p.pick_for(2, &all, &[]).unwrap();
+        assert_ne!(a.piece, b.piece, "each peer starts its own piece");
+        assert_eq!(p.pick_for(1, &all, &[]).unwrap().piece, a.piece);
+        assert_eq!(p.pick_for(2, &all, &[]).unwrap().piece, b.piece);
+        assert_eq!(p.owner(a.piece), Some(1));
+        // Peer 1 leaves: peer 3 takes over its started piece before
+        // starting a new one.
+        p.release_owner(1);
+        assert_eq!(p.owner(a.piece), None);
+        assert_eq!(p.pick_for(3, &all, &[]).unwrap().piece, a.piece);
+        assert_eq!(p.owner(a.piece), Some(3));
+    }
+
+    #[test]
+    fn reserved_pieces_are_shared_when_nothing_else_is_left() {
+        let mut p = Picker::new(layout(1, 3 * BLOCK_SIZE), Bitfield::new(1));
+        let all = Bitfield::full(1);
+        p.add_peer_pieces(&all);
+        assert_eq!(p.pick_for(1, &all, &[]).unwrap().offset, 0);
+        let helped = p.pick_for(2, &all, &[]).unwrap();
+        assert_eq!((helped.piece, helped.offset), (0, BLOCK_SIZE));
+        assert_eq!(p.owner(0), Some(1), "the owner keeps it");
+        // A failed piece is free again.
+        for offset in [0, BLOCK_SIZE, 2 * BLOCK_SIZE] {
+            let block = p.layout().block(0, offset / BLOCK_SIZE).unwrap();
+            if offset == 2 * BLOCK_SIZE {
+                assert_eq!(p.pick_for(1, &all, &[]), Some(block));
+            }
+            assert_eq!(p.block_received(block), Received::Accepted);
+            p.block_written(block);
+        }
+        p.piece_hashed(0, false);
+        assert_eq!(p.owner(0), None);
     }
 
     #[test]

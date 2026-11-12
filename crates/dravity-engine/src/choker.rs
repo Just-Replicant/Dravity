@@ -5,8 +5,14 @@
 //!
 //! * **downloading** — the peers that sent us the most data in the last
 //!   round (tit-for-tat: reciprocate to those who give);
-//! * **seeding** — the peers we uploaded the most to, so the slots go to
-//!   whoever can take data fastest.
+//! * **seeding** — by [`Config::seed_choking`]: the peers we uploaded the
+//!   most to ([`SeedChoking::FastestUpload`]), peers in turn
+//!   ([`SeedChoking::RoundRobin`]), or peers just starting or nearly done
+//!   first ([`SeedChoking::AntiLeech`]).
+//!
+//! With [`Config::upload_slots_auto`] the number of regular slots is
+//! re-derived every round from the measured upload rates (see
+//! [`tuned_slots`]).
 //!
 //! Peers that snub us (hold our requests and deliver nothing) do not get a
 //! regular slot while we download. They stay eligible for the optimistic
@@ -24,7 +30,33 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use crate::types::{Config, PeerKey};
+use crate::types::{Config, PeerKey, SeedChoking};
+
+/// Most regular slots the slot tuner hands out.
+pub(crate) const AUTO_SLOTS_MAX: usize = 64;
+
+/// Rate step of the slot tuner, in bytes per second.
+const AUTO_SLOTS_STEP: u64 = 1024;
+
+/// Regular upload slots for the next round, from each peer's upload in
+/// bytes per second last round: one slot per peer above a threshold that
+/// starts at 1 KiB/s and rises 1 KiB/s per slot, plus one to probe for
+/// more. Peers that each take a meaningful share keep a slot; a peer that
+/// would only split the same bandwidth thinner does not add one.
+pub(crate) fn tuned_slots(rates: &[u64]) -> usize {
+    let mut sorted = rates.to_vec();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    let mut threshold = AUTO_SLOTS_STEP;
+    let mut slots = 0usize;
+    for rate in sorted {
+        if rate <= threshold {
+            break;
+        }
+        slots += 1;
+        threshold = threshold.saturating_add(AUTO_SLOTS_STEP);
+    }
+    (slots + 1).clamp(1, AUTO_SLOTS_MAX)
+}
 
 /// What the choker needs to know about one peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +72,29 @@ pub(crate) struct Candidate {
     pub(crate) unchoked: bool,
     /// When the peer last had the optimistic slot (or connected).
     pub(crate) waiting_since: Instant,
+    /// Bytes uploaded to the peer since we last unchoked it.
+    pub(crate) served: u64,
+    /// When we last choked the peer (or it connected).
+    pub(crate) choked_since: Instant,
+    /// The peer's progress in thousandths.
+    pub(crate) progress: u32,
+}
+
+impl Candidate {
+    /// Round-robin group: 0 for a peer still in its turn, 1 for a choked
+    /// peer waiting for one, 2 for a peer whose turn is used up.
+    fn turn(&self, quota: u64) -> u8 {
+        match (self.unchoked, self.served < quota) {
+            (true, true) => 0,
+            (false, _) => 1,
+            (true, false) => 2,
+        }
+    }
+
+    /// Anti-leech score: distance from the middle of the download.
+    const fn edge_score(&self) -> u32 {
+        self.progress.abs_diff(500)
+    }
 }
 
 /// Round timing and the current optimistic unchoke.
@@ -64,10 +119,14 @@ impl Choker {
     /// Runs a round and returns the peers to unchoke; everyone else is
     /// choked. The optimistic slot moves when its interval elapsed or its
     /// holder is gone, not interested any more, or now has a regular slot.
+    /// `slots` regular slots are filled; `seeding` selects
+    /// [`Config::seed_choking`] over tit-for-tat.
     pub(crate) fn round(
         &mut self,
         now: Instant,
         config: &Config,
+        slots: usize,
+        seeding: bool,
         candidates: &[Candidate],
     ) -> HashSet<PeerKey> {
         self.next_round = Some(now + config.unchoke_interval);
@@ -75,17 +134,35 @@ impl Choker {
             .iter()
             .filter(|c| c.interested && !c.snubbed)
             .collect();
-        ranked.sort_by(|a, b| {
+        let by_rate = |a: &&Candidate, b: &&Candidate| {
             b.rate
                 .cmp(&a.rate)
                 .then(b.unchoked.cmp(&a.unchoked))
                 .then(a.key.cmp(&b.key))
-        });
-        let mut selected: HashSet<PeerKey> = ranked
-            .iter()
-            .take(config.upload_slots)
-            .map(|c| c.key)
-            .collect();
+        };
+        let mode = if seeding {
+            config.seed_choking
+        } else {
+            SeedChoking::FastestUpload
+        };
+        match mode {
+            SeedChoking::RoundRobin => {
+                let quota = config.round_robin_quota;
+                ranked.sort_by(|a, b| {
+                    a.turn(quota)
+                        .cmp(&b.turn(quota))
+                        .then(a.choked_since.cmp(&b.choked_since))
+                        .then(a.key.cmp(&b.key))
+                });
+            }
+            SeedChoking::AntiLeech => ranked.sort_by(|a, b| {
+                b.edge_score()
+                    .cmp(&a.edge_score())
+                    .then_with(|| by_rate(a, b))
+            }),
+            _ => ranked.sort_by(by_rate),
+        }
+        let mut selected: HashSet<PeerKey> = ranked.iter().take(slots).map(|c| c.key).collect();
         if !config.optimistic_unchoke {
             self.optimistic = None;
             return selected;
@@ -151,6 +228,9 @@ mod tests {
             snubbed: false,
             unchoked: false,
             waiting_since: start + Duration::from_secs(key),
+            served: 0,
+            choked_since: start + Duration::from_secs(key),
+            progress: 0,
         }
     }
 
@@ -167,7 +247,10 @@ mod tests {
         let mut c = config(2);
         c.optimistic_unchoke = false;
         let peers = [cand(1, 10, now), cand(2, 50, now), cand(3, 30, now)];
-        assert_eq!(keys(&choker.round(now, &c, &peers)), [2, 3]);
+        assert_eq!(
+            keys(&choker.round(now, &c, c.upload_slots, false, &peers)),
+            [2, 3]
+        );
         assert!(!choker.due(now + Duration::from_secs(9)));
         assert!(choker.due(now + Duration::from_secs(10)));
     }
@@ -179,7 +262,7 @@ mod tests {
         let mut peers = [cand(1, 100, now), cand(2, 90, now), cand(3, 1, now)];
         peers[0].interested = false;
         peers[1].snubbed = true;
-        let set = choker.round(now, &config(1), &peers);
+        let set = choker.round(now, &config(1), 1, false, &peers);
         // Peer 3 has the regular slot. The snubbed peer still gets the
         // optimistic one; it has waited longer than anyone left over.
         assert_eq!(keys(&set), [2, 3]);
@@ -194,7 +277,10 @@ mod tests {
         c.optimistic_unchoke = false;
         let mut peers = [cand(1, 0, now), cand(2, 0, now)];
         peers[1].unchoked = true;
-        assert_eq!(keys(&choker.round(now, &c, &peers)), [2]);
+        assert_eq!(
+            keys(&choker.round(now, &c, c.upload_slots, false, &peers)),
+            [2]
+        );
     }
 
     #[test]
@@ -203,22 +289,31 @@ mod tests {
         let mut choker = Choker::default();
         let c = config(1);
         let peers = [cand(1, 100, start), cand(2, 0, start), cand(3, 0, start)];
-        let set = choker.round(start, &c, &peers);
+        let set = choker.round(start, &c, c.upload_slots, false, &peers);
         // Peer 1 earns the regular slot; peer 2 has waited longest.
         assert_eq!(keys(&set), [1, 2]);
         assert_eq!(choker.optimistic(), Some(PeerKey(2)));
         // Kept for the optimistic interval…
         let t = start + Duration::from_secs(10);
-        assert_eq!(keys(&choker.round(t, &c, &peers)), [1, 2]);
+        assert_eq!(
+            keys(&choker.round(t, &c, c.upload_slots, false, &peers)),
+            [1, 2]
+        );
         // …then handed on.
         let t = start + Duration::from_secs(30);
         let mut later = peers;
         later[1].waiting_since = t;
-        assert_eq!(keys(&choker.round(t, &c, &later)), [1, 3]);
+        assert_eq!(
+            keys(&choker.round(t, &c, c.upload_slots, false, &later)),
+            [1, 3]
+        );
         // A holder that leaves frees the slot at the next round.
         choker.remove(PeerKey(3));
         let t = t + Duration::from_secs(10);
-        assert_eq!(keys(&choker.round(t, &c, &later[..2])), [1, 2]);
+        assert_eq!(
+            keys(&choker.round(t, &c, c.upload_slots, false, &later[..2])),
+            [1, 2]
+        );
     }
 
     #[test]
@@ -227,8 +322,14 @@ mod tests {
         let mut choker = Choker::default();
         let c = config(0);
         let peers = [cand(1, 0, now)];
-        assert_eq!(keys(&choker.round(now, &c, &peers)), [1]);
+        assert_eq!(
+            keys(&choker.round(now, &c, c.upload_slots, false, &peers)),
+            [1]
+        );
         let later = now + Duration::from_secs(60);
-        assert_eq!(keys(&choker.round(later, &c, &peers)), [1]);
+        assert_eq!(
+            keys(&choker.round(later, &c, c.upload_slots, false, &peers)),
+            [1]
+        );
     }
 }

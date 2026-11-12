@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use dravity_core::InfoHash;
 use dravity_engine::{Alert, Priority, Stats, TorrentStatus};
-use dravity_session::{FileProgress, PeerStatus, TrackerOutcome, TrackerStatus, Transport};
+use dravity_session::{
+    FileProgress, PeerStatus, ScrapeOutcome, ScrapeStats, TrackerOutcome, TrackerStatus, Transport,
+};
 
 use crate::format;
 
@@ -160,6 +162,8 @@ pub(crate) struct PeerRow {
     pub(crate) web: bool,
     /// RC4-encrypted (MSE).
     pub(crate) encrypted: bool,
+    /// Country from the GeoIP database, if one is loaded.
+    pub(crate) country: Option<dravity_session::CountryCode>,
 }
 
 impl From<&PeerStatus> for PeerRow {
@@ -181,6 +185,7 @@ impl From<&PeerStatus> for PeerRow {
             utp: p.transport == Transport::Utp,
             web: p.transport == Transport::Web,
             encrypted: p.encrypted,
+            country: p.country,
         }
     }
 }
@@ -203,6 +208,12 @@ impl PeerRow {
         .iter()
         .map(|&(on, c)| if on { c } else { '.' })
         .collect()
+    }
+
+    /// The country code, or `--` when unknown.
+    pub(crate) fn country(&self) -> String {
+        self.country
+            .map_or_else(|| "--".to_owned(), |c| c.to_string())
     }
 
     /// How much the peer has, as a percentage (`?` before the metadata).
@@ -235,6 +246,8 @@ pub(crate) struct TrackerRow {
     pub(crate) tier: usize,
     pub(crate) url: String,
     pub(crate) state: TrackerState,
+    /// The last successful scrape.
+    pub(crate) scrape: Option<ScrapeStats>,
 }
 
 impl From<&TrackerStatus> for TrackerRow {
@@ -255,10 +268,15 @@ impl From<&TrackerStatus> for TrackerRow {
             Some(TrackerOutcome::Failed { error }) => TrackerState::Failed(error.clone()),
             Some(_) => TrackerState::Failed("unknown outcome".to_owned()),
         };
+        let scrape = match &t.scrape {
+            Some(ScrapeOutcome::Ok(stats)) => Some(*stats),
+            _ => None,
+        };
         Self {
             tier: t.tier,
             url: t.url.clone(),
             state,
+            scrape,
         }
     }
 }
@@ -341,12 +359,21 @@ pub(crate) enum Prompt {
     AddPeer { info_hash: InfoHash, text: String },
     /// Editing [`View::filter`].
     Filter,
+    /// A session-wide rate limit (`500K`, `2M`; empty or `0` lifts it).
+    Limit { direction: Direction, text: String },
     /// Remove a torrent (and maybe its files) once Enter confirms.
     Confirm {
         info_hash: InfoHash,
         name: String,
         delete_files: bool,
     },
+}
+
+/// Which session-wide rate limit a prompt sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Direction {
+    Download,
+    Upload,
 }
 
 /// What a key asks for.
@@ -372,6 +399,8 @@ pub(crate) enum Action {
     },
     CycleSort,
     OpenFilter,
+    /// `L` / `U`: the session-wide download / upload limit prompt.
+    OpenLimit(Direction),
     Help,
     /// Any key while the key list is shown.
     DismissHelp,
@@ -405,6 +434,11 @@ pub(crate) enum Request {
         info_hash: InfoHash,
         name: String,
         delete_files: bool,
+    },
+    /// The limit prompt's line; the prompt stays open until it applies.
+    SetLimit {
+        direction: Direction,
+        text: String,
     },
 }
 
@@ -609,13 +643,24 @@ impl View {
             }
             Action::CycleSort => self.sort = self.sort.next(),
             Action::OpenFilter => self.prompt = Some(Prompt::Filter),
+            Action::OpenLimit(direction) => {
+                self.prompt = Some(Prompt::Limit {
+                    direction,
+                    text: String::new(),
+                });
+                self.message.clear();
+            }
             Action::Input(c) => match &mut self.prompt {
-                Some(Prompt::Add(text) | Prompt::AddPeer { text, .. }) => text.push(c),
+                Some(
+                    Prompt::Add(text) | Prompt::AddPeer { text, .. } | Prompt::Limit { text, .. },
+                ) => text.push(c),
                 Some(Prompt::Filter) => self.filter.push(c),
                 Some(Prompt::Confirm { .. }) | None => {}
             },
             Action::Backspace => match &mut self.prompt {
-                Some(Prompt::Add(text) | Prompt::AddPeer { text, .. }) => {
+                Some(
+                    Prompt::Add(text) | Prompt::AddPeer { text, .. } | Prompt::Limit { text, .. },
+                ) => {
                     text.pop();
                 }
                 Some(Prompt::Filter) => {
@@ -635,6 +680,9 @@ impl View {
                     return Some(Request::AddPeer { info_hash, text });
                 }
                 Prompt::Filter => self.prompt = None,
+                Prompt::Limit { direction, text } => {
+                    return Some(Request::SetLimit { direction, text });
+                }
                 Prompt::Confirm {
                     info_hash,
                     name,
@@ -948,7 +996,17 @@ pub(crate) mod tests {
             utp: true,
             web: false,
             encrypted: true,
+            country: dravity_session::CountryCode::new("se"),
         };
+        assert_eq!(peer.country(), "SE");
+        assert_eq!(
+            PeerRow {
+                country: None,
+                ..peer
+            }
+            .country(),
+            "--"
+        );
         assert_eq!(peer.flags(), "C.I.<U.E");
         assert_eq!(
             PeerRow {

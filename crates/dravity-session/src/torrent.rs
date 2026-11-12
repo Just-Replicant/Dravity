@@ -31,7 +31,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
+use dravity_core::admit::{ConnectionLimit, ConnectionSlot};
 use dravity_core::merkle::Hash;
+use dravity_core::verify::PieceHasher;
 use dravity_core::{BlockRef, Info, InfoHash, InfoHashV2, MetaVersion, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{
@@ -39,23 +41,26 @@ use dravity_engine::{
     PeerLink, Priority, Stats, TorrentState, TorrentStatus,
 };
 use dravity_storage::{
-    FileIo, FileStorage, ResumeData, Storage, load_resume, read_block, read_blocks, save_resume,
-    verify_piece, write_block, write_blocks,
+    CachedStorage, Durability, FileIo, FileStorage, ReadCache, ResumeData, Storage, block_hashes,
+    load_resume, read_block, read_blocks, save_resume, verify_piece, write_block, write_blocks,
 };
 use dravity_tracker::{AnnounceRequest, AnnounceResponse, TrackerClient};
 use dravity_webseed::WebSeedClient;
 use dravity_wire::{Message, Reserved};
 use futures_util::StreamExt;
-use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::catalog::{Catalog, EntrySource};
 use crate::config::SessionConfig;
 use crate::files::{self, FileProgress};
+use crate::hash_pool::HashPool;
 use crate::listen::{self, Registry, UtpSockets};
 use crate::peer::{self, PeerCommand, PeerParams};
 use crate::persist::Persister;
-use crate::status::{self, PeerStatus, TrackerLog, TrackerOutcome, TrackerStatus, Transport};
+use crate::status::{
+    self, PeerStatus, ScrapeOutcome, TrackerLog, TrackerOutcome, TrackerStatus, Transport,
+};
 use crate::stream::PeerStream;
 use crate::web_seed::{self, WebSeedParams};
 use crate::{EncryptionPolicy, SessionAlert};
@@ -107,6 +112,12 @@ pub(crate) enum Input {
         event: Event,
         outcomes: Vec<(String, TrackerOutcome)>,
     },
+    /// A scrape finished; `reply` waits for the tracker list if a handle
+    /// asked for it.
+    Scraped {
+        outcomes: Vec<(String, ScrapeOutcome)>,
+        reply: Option<oneshot::Sender<Vec<TrackerStatus>>>,
+    },
 }
 
 /// A connection the listener accepted and handshook for this torrent.
@@ -118,6 +129,8 @@ pub(crate) struct Accepted {
     pub(crate) reserved: Reserved,
     /// Bytes that arrived after the handshake.
     pub(crate) leftover: BytesMut,
+    /// The connection's slot under the session-wide cap.
+    pub(crate) slot: ConnectionSlot,
 }
 
 /// A torrent's content, once its metadata is known.
@@ -138,6 +151,14 @@ pub struct TorrentProgress {
     pub files: Option<Vec<FileProgress>>,
 }
 
+/// Where the session accepts peers after a rebind.
+#[derive(Debug, Clone)]
+pub(crate) struct Relisten {
+    pub(crate) port: Option<u16>,
+    pub(crate) utp: UtpSockets,
+    pub(crate) port_map: Option<tokio::sync::watch::Receiver<dravity_portmap::Status>>,
+}
+
 /// Commands from [`TorrentHandle`](crate::TorrentHandle), streams and the
 /// listener.
 #[derive(Debug)]
@@ -147,6 +168,8 @@ pub(crate) enum Command {
     AddPeers(Vec<SocketAddr>),
     Peers(oneshot::Sender<Vec<PeerStatus>>),
     Trackers(oneshot::Sender<Vec<TrackerStatus>>),
+    /// Scrape every tracker now, then reply with the tracker list.
+    Scrape(oneshot::Sender<Vec<TrackerStatus>>),
     Incoming(Accepted),
     /// One priority per file (already validated against the metadata, or
     /// kept until it arrives).
@@ -157,6 +180,8 @@ pub(crate) enum Command {
         piece: u32,
         reply: oneshot::Sender<()>,
     },
+    /// The session moved its listener ([`crate::Session::set_listen_port`]).
+    Relisten(Relisten),
     /// A stream's urgent window, replacing its previous one.
     Stream {
         id: u64,
@@ -164,6 +189,10 @@ pub(crate) enum Command {
     },
     CloseStream(u64),
     Stop(oneshot::Sender<()>),
+    /// An address was banned elsewhere in the session.
+    BanIp(IpAddr),
+    /// The IP filter changed: close connections it now blocks.
+    Refilter,
 }
 
 /// Shared, immutable inputs of a torrent task.
@@ -187,8 +216,22 @@ pub(crate) struct TorrentContext {
     pub(crate) utp: UtpSockets,
     /// The session's torrents, updated when a magnet's metadata arrives.
     pub(crate) catalog: Catalog,
+    /// The session-wide ban list.
+    pub(crate) bans: crate::bans::Bans,
+    /// The session's read cache, for storages the session creates.
+    pub(crate) read_cache: Option<Arc<ReadCache>>,
+    /// The session-wide hashing pool.
+    pub(crate) hash_pool: HashPool,
+    /// The session-wide rate limits.
+    pub(crate) rates: crate::rate::RateLimits,
+    /// The session-wide connection cap: every dial takes a slot first.
+    pub(crate) connections: ConnectionLimit,
     /// Session state writer, with a state directory.
     pub(crate) persist: Option<Persister>,
+    /// Web seed health from the previous run, applied when the web seeds
+    /// load (the catalog is locked while a task is created, so it is
+    /// passed in rather than read back).
+    pub(crate) web_seed_stats: Vec<crate::persist::WebSeedStat>,
     /// Router port mapping status, when mapping runs.
     pub(crate) port_map: Option<tokio::sync::watch::Receiver<dravity_portmap::Status>>,
     /// Registers the second swarm id of a hybrid magnet once its metadata
@@ -203,8 +246,22 @@ impl TorrentContext {
         let mut config = self.config.engine.clone();
         config.dht = self.dht.is_some() && !private;
         config.pex = config.pex && !private;
+        config.tracker_exchange = config.tracker_exchange && !private;
+        config.holepunch = config.holepunch && !private;
         config.listen_port = self.listen_port;
         config
+    }
+
+    /// Every tracker URL of the torrent, tier by tier (shared over
+    /// `lt_tex`).
+    fn tracker_urls(&self) -> Vec<String> {
+        self.trackers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .flatten()
+            .cloned()
+            .collect()
     }
 
     /// Port reported to trackers and the DHT: the router's public TCP port
@@ -293,6 +350,9 @@ pub(crate) struct MagnetStart {
     pub(crate) info_hash_v2: Option<InfoHashV2>,
     /// Web seeds from the link (`ws`), added to the torrent's.
     pub(crate) web_seeds: Vec<String>,
+    /// BEP 53 `so`: the files the link selects (empty: all). Used only
+    /// when no file priorities were given.
+    pub(crate) select_only: Vec<std::ops::RangeInclusive<usize>>,
 }
 
 /// The engine state machine currently driving the torrent.
@@ -352,16 +412,20 @@ pub(crate) struct TorrentTask {
     web_peers: HashSet<PeerKey>,
     /// The last announce outcome per tracker URL.
     tracker_log: TrackerLog,
+    /// When the next scheduled scrape is due.
+    next_scrape: Option<Instant>,
     next_key: u64,
     events_tx: mpsc::Sender<Input>,
     events_rx: mpsc::Receiver<Input>,
     commands: mpsc::Receiver<Command>,
     /// Events produced synchronously during dispatch, handled next.
     local: VecDeque<Event>,
-    hash_slots: Arc<Semaphore>,
     /// Block writes and upload reads waiting to go to storage together
     /// (see [`MAX_IO_BATCH`]).
     pending_writes: Vec<(BlockRef, Bytes)>,
+    /// Hash-on-arrival state, fed by the block writes
+    /// ([`SessionConfig::hash_on_arrival`]).
+    hashers: Option<Arc<Mutex<Hashers>>>,
     pending_reads: Vec<(PeerKey, BlockRef)>,
     /// Announce and DHT tasks. Aborted on stop; they must not delay it.
     background: JoinSet<()>,
@@ -403,6 +467,9 @@ impl TorrentTask {
                 // Served to magnet-link peers over BEP 9.
                 let info = Bytes::copy_from_slice(metainfo.info_bytes());
                 let state = TorrentState::new(*metainfo.info().layout(), config)
+                    .with_banned_ips(ctx.bans.snapshot())
+                    .with_trackers(ctx.tracker_urls())
+                    .with_piece_roots(piece_roots(&metainfo))
                     .with_info_hash(ctx.info_hash)
                     .with_info_bytes(info)
                     .with_piece_layers(metainfo.info().piece_length(), owned_layers(&metainfo))
@@ -431,7 +498,10 @@ impl TorrentTask {
             }
         };
         let (events_tx, events_rx) = mpsc::channel(ctx.config.event_queue.max(1));
-        let hash_slots = Arc::new(Semaphore::new(ctx.config.hash_workers.max(1)));
+        let hashers = ctx
+            .config
+            .hash_on_arrival
+            .then(|| Arc::new(Mutex::new(Hashers::default())));
         let mut task = Self {
             ctx,
             phase,
@@ -444,13 +514,14 @@ impl TorrentTask {
             web_seeds: Vec::new(),
             web_peers: HashSet::new(),
             tracker_log: TrackerLog::default(),
+            next_scrape: None,
             next_key: 0,
             events_tx,
             events_rx,
             commands,
             local: VecDeque::new(),
-            hash_slots,
             pending_writes: Vec::new(),
+            hashers,
             pending_reads: Vec::new(),
             background: JoinSet::new(),
             disk: JoinSet::new(),
@@ -471,20 +542,58 @@ impl TorrentTask {
             return;
         }
         let now = Instant::now();
+        let saved = &self.ctx.web_seed_stats;
+        let unix = crate::persist::unix_now();
         self.web_seeds = content
             .metainfo
             .web_seeds()
             .iter()
             .zip(0u32..)
-            .map(|(url, index)| WebSeed {
-                url: url.clone(),
-                addr: dravity_engine::web_seed_addr(index),
-                key: None,
-                retry_at: now,
-                failures: 0,
-                stopped: false,
+            .map(|(url, index)| {
+                let stat = saved.iter().find(|s| &s.url == url);
+                let wait = stat.map_or(0, |s| s.retry_at.saturating_sub(unix));
+                WebSeed {
+                    url: url.clone(),
+                    addr: dravity_engine::web_seed_addr(index),
+                    key: None,
+                    retry_at: now + std::time::Duration::from_secs(wait),
+                    failures: stat.map_or(0, |s| s.failures),
+                    stopped: stat.is_some_and(|s| s.stopped),
+                }
             })
             .collect();
+    }
+
+    /// Stores web seed health in the catalog and the state directory.
+    fn save_web_seed_stats(&self) {
+        let now = Instant::now();
+        let unix = crate::persist::unix_now();
+        let stats: Vec<crate::persist::WebSeedStat> = self
+            .web_seeds
+            .iter()
+            .map(|s| {
+                let mut stat = crate::persist::WebSeedStat::new(s.url.clone());
+                stat.failures = s.failures;
+                stat.stopped = s.stopped;
+                stat.retry_at = unix + s.retry_at.saturating_duration_since(now).as_secs();
+                stat
+            })
+            .collect();
+        let record = {
+            let mut catalog = self
+                .ctx
+                .catalog
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(entry) = catalog.get_mut(&self.ctx.info_hash) else {
+                return;
+            };
+            entry.web_seeds = stats;
+            entry.record(self.ctx.info_hash)
+        };
+        if let Some(persist) = &self.ctx.persist {
+            persist.save_record(&record);
+        }
     }
 
     /// Starts web seeds that are due while the torrent downloads, and
@@ -550,11 +659,13 @@ impl TorrentTask {
         // A ban or a URL that can never work must not come back on the
         // back-off timer: the engine would only disconnect it again.
         if seed.stopped {
+            self.save_web_seed_stats();
             return;
         }
         seed.failures = seed.failures.saturating_add(1);
         let factor = 1u32 << seed.failures.saturating_sub(1).min(5);
         seed.retry_at = Instant::now() + base.saturating_mul(factor);
+        self.save_web_seed_stats();
     }
 
     /// Stops the web seed reported at `ip` (a synthetic `100::/64` address).
@@ -566,6 +677,7 @@ impl TorrentTask {
         if let Some(seed) = self.web_seeds.iter_mut().find(|s| s.addr.ip() == ip) {
             seed.stopped = true;
             tracing::debug!(url = %seed.url, %ip, "web seed stopped after a hash failure");
+            self.save_web_seed_stats();
         }
     }
 
@@ -578,6 +690,13 @@ impl TorrentTask {
     /// event for those that do.
     fn command(&mut self, command: Command) -> Option<Event> {
         match command {
+            Command::Relisten(update) => {
+                self.ctx.listen_port = update.port;
+                self.ctx.utp = update.utp;
+                self.ctx.port_map = update.port_map;
+                self.announce_dht_port();
+                Some(Event::SetListenPort { port: update.port })
+            }
             Command::Stats(reply) => {
                 let _ = reply.send(self.phase.stats());
                 None
@@ -598,6 +717,22 @@ impl TorrentTask {
                 None
             }
             Command::AddPeers(peers) => Some(Event::AddPeers { peers }),
+            Command::BanIp(ip) => Some(Event::BanIp { ip }),
+            Command::Refilter => {
+                let peers = match &self.phase {
+                    Phase::Metadata(state) => state.peers(),
+                    Phase::Download(state) => state.peers(),
+                };
+                let filter = self.ctx.bans.filter();
+                for p in peers.iter().filter(|p| filter.is_blocked(p.addr.ip())) {
+                    tracing::debug!(addr = %p.addr, "blocked by the IP filter; closing");
+                    self.peers.remove(&p.key);
+                    self.web_seed_gone(p.key);
+                    self.local
+                        .push_back(Event::PeerDisconnected { peer: p.key });
+                }
+                None
+            }
             Command::Peers(reply) => {
                 let peers = match &self.phase {
                     Phase::Metadata(state) => state.peers(),
@@ -609,7 +744,8 @@ impl TorrentTask {
                 let utp = &self.utp_peers;
                 let web = &self.web_peers;
                 let encrypted = &self.encrypted_peers;
-                let _ = reply.send(status::peers(peers, |p| {
+                let geoip = self.ctx.config.geoip.as_deref();
+                let _ = reply.send(status::peers(peers, geoip, |p| {
                     let transport = if web.contains(&p.key) {
                         Transport::Web
                     } else if utp.contains(&p.key) {
@@ -622,13 +758,11 @@ impl TorrentTask {
                 None
             }
             Command::Trackers(reply) => {
-                let tiers = self
-                    .ctx
-                    .trackers
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone();
-                let _ = reply.send(self.tracker_log.list(&tiers));
+                let _ = reply.send(self.tracker_list());
+                None
+            }
+            Command::Scrape(reply) => {
+                self.scrape(Some(reply));
                 None
             }
             Command::Incoming(accepted) => Some(self.accept(accepted)),
@@ -715,10 +849,12 @@ impl TorrentTask {
     /// Runs until the torrent stops, then flushes storage, writes resume
     /// data and acknowledges a pending stop command.
     pub(crate) async fn run(mut self) {
-        if let Some(content) = self.content.clone()
-            && let Some(state) = self.resumed_state(&content, None).await
-        {
-            self.phase = Phase::Download(Box::new(state));
+        if let Some(content) = self.content.clone() {
+            if let Some(state) = self.resumed_state(&content, None).await {
+                self.phase = Phase::Download(Box::new(state));
+            } else if let Phase::Download(state) = &mut self.phase {
+                state.set_absent_pieces(prescan(&content).await);
+            }
         }
         let mut tick = tokio::time::interval(self.ctx.config.tick_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -762,6 +898,7 @@ impl TorrentTask {
                 },
                 _ = tick.tick() => {
                     self.maintain_web_seeds();
+                    self.scheduled_scrape();
                     Event::Tick
                 }
                 // Reap finished background work so the set does not grow.
@@ -857,6 +994,9 @@ impl TorrentTask {
         let mut config = self.ctx.engine_config(content.metainfo.info().is_private());
         config.check_existing = false;
         let state = TorrentState::with_have(*content.metainfo.info().layout(), have, config)
+            .with_banned_ips(self.ctx.bans.snapshot())
+            .with_trackers(self.ctx.tracker_urls())
+            .with_piece_roots(piece_roots(&content.metainfo))
             .with_info_hash(self.ctx.info_hash)
             .with_priorities(&self.piece_priorities(content));
         let info = info
@@ -947,8 +1087,10 @@ impl TorrentTask {
                 if matches!(message, Message::Piece { .. })
                     && self.web_peers.contains(&key)
                     && let Some(seed) = self.web_seeds.iter_mut().find(|s| s.key == Some(key))
+                    && seed.failures > 0
                 {
                     seed.failures = 0;
+                    self.save_web_seed_stats();
                 }
                 Event::Message { peer: key, message }
             }
@@ -956,6 +1098,13 @@ impl TorrentTask {
             Input::Announced { event, outcomes } => {
                 self.tracker_log.record(Instant::now(), outcomes);
                 event
+            }
+            Input::Scraped { outcomes, reply } => {
+                self.tracker_log.record_scrapes(Instant::now(), outcomes);
+                if let Some(reply) = reply {
+                    let _ = reply.send(self.tracker_list());
+                }
+                return None;
             }
         })
     }
@@ -983,6 +1132,25 @@ impl TorrentTask {
         tracing::warn!(%message, "torrent failed");
         self.alert(Alert::Error { message });
         self.local.push_back(Event::Stop);
+    }
+
+    /// Trackers a peer shared (`lt_tex`): added as one new last tier, so
+    /// the torrent's own trackers keep priority. The tracker client's SSRF
+    /// guard still applies when they are announced to.
+    fn add_exchanged_trackers(&mut self, urls: Vec<String>) {
+        let mut tiers = self
+            .ctx
+            .trackers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let fresh: Vec<String> = urls
+            .into_iter()
+            .filter(|u| !tiers.iter().flatten().any(|t| t == u))
+            .collect();
+        if !fresh.is_empty() {
+            tracing::debug!(?fresh, "trackers learned from peers");
+            tiers.push(fresh);
+        }
     }
 
     /// Switches a magnet link from the metadata phase to downloading.
@@ -1019,9 +1187,19 @@ impl TorrentTask {
         }
         let metainfo = Arc::new(metainfo);
         let storage: Arc<dyn Storage> = match FileStorage::new(&dir, metainfo.info()) {
-            Ok(storage) => Arc::new(storage.with_io(Arc::clone(&self.ctx.file_io))),
+            Ok(storage) => cached(
+                Arc::new(
+                    storage
+                        .with_io(Arc::clone(&self.ctx.file_io))
+                        .with_preallocate(self.ctx.config.preallocate),
+                ),
+                self.ctx.read_cache.as_ref(),
+            ),
             Err(e) => return self.fail(format!("setting up storage: {e}")),
         };
+        if self.file_priorities.is_empty() {
+            self.file_priorities = files::selected(metainfo.info(), &start.select_only);
+        }
         self.file_priorities = files::normalize(metainfo.info(), &self.file_priorities)
             .unwrap_or_else(|| {
                 tracing::warn!("file priorities do not match the metadata; using normal");
@@ -1037,12 +1215,16 @@ impl TorrentTask {
                 *info_meta.layout(),
                 self.ctx.engine_config(info_meta.is_private()),
             )
+            .with_banned_ips(self.ctx.bans.snapshot())
+            .with_trackers(self.ctx.tracker_urls())
+            .with_piece_roots(piece_roots(&content.metainfo))
             .with_info_hash(self.ctx.info_hash)
             .with_info_bytes(info)
             .with_piece_layers(info_meta.piece_length(), owned_layers(&content.metainfo))
             .with_padded_last_piece(padded_last_piece(info_meta))
             .with_missing_piece_layers(info_meta.piece_length(), missing_layers(&content.metainfo))
-            .with_priorities(&self.piece_priorities(&content)),
+            .with_priorities(&self.piece_priorities(&content))
+            .with_absent_pieces(prescan(&content).await),
         };
         self.content = Some(content);
         self.load_web_seeds();
@@ -1189,6 +1371,7 @@ impl TorrentTask {
             }
             Effect::WriteBlock { block, data } => self.write(block, data),
             Effect::HashPiece { piece } => self.hash(piece),
+            Effect::HashBlocks { piece } => self.hash_blocks(piece),
             Effect::ReadBlock { peer, block } => self.read(peer, block),
             Effect::Announce {
                 event,
@@ -1219,9 +1402,16 @@ impl TorrentTask {
                 self.metadata = Some((info, piece_layers));
             }
             Effect::PieceLayerReceived { root, layer } => self.install_piece_layer(root, layer),
+            Effect::TrackersReceived { urls } => self.add_exchanged_trackers(urls),
             Effect::Alert(alert) => {
                 if let Alert::PeerBanned { ip } = &alert {
                     self.stop_web_seed(*ip);
+                    self.share_ban(*ip);
+                }
+                if matches!(alert, Alert::Finished)
+                    && self.ctx.config.durability == Durability::OnComplete
+                {
+                    self.sync_all();
                 }
                 self.alert(alert);
             }
@@ -1362,6 +1552,7 @@ impl TorrentTask {
             addr,
             reserved,
             leftover,
+            slot,
         } = accepted;
         let (key, rx) = self.new_peer();
         if stream.kind() == Transport::Utp {
@@ -1376,12 +1567,13 @@ impl TorrentTask {
             mse: stream.uses_mse().then_some(true),
         };
         tokio::spawn(peer::run_accepted(
-            key,
-            addr,
+            (key, addr),
             stream,
             leftover,
             self.events_tx.clone(),
             rx,
+            slot,
+            self.ctx.rates.clone(),
         ));
         Event::PeerAccepted {
             peer: key,
@@ -1402,6 +1594,17 @@ impl TorrentTask {
                 .push_back(Event::PeerConnectFailed { addr, retry: false });
             return;
         }
+        if self.ctx.bans.filter().is_blocked(addr.ip()) {
+            tracing::trace!(%addr, "blocked by the IP filter; not dialing");
+            self.local
+                .push_back(Event::PeerConnectFailed { addr, retry: false });
+            return;
+        }
+        let Some(slot) = self.ctx.connections.try_admit() else {
+            tracing::trace!(%addr, "session connection limit reached; dial deferred");
+            self.local.push_back(Event::PeerConnectDeferred { addr });
+            return;
+        };
         let (key, rx) = self.new_peer();
         let params = PeerParams {
             key,
@@ -1414,10 +1617,14 @@ impl TorrentTask {
             prefer_utp: self.ctx.config.prefer_utp,
             encryption: self.ctx.config.encryption,
             hints,
+            rates: self.ctx.rates.clone(),
+            proxy: self.ctx.config.proxy.clone().map(Arc::new),
+            dscp: self.ctx.config.peer_dscp,
+            network: self.ctx.config.network.clone(),
         };
         // Peer tasks are not in `background`: dropping their command sender
         // ends them, and they must not delay shutdown.
-        tokio::spawn(peer::run(params, self.events_tx.clone(), rx));
+        tokio::spawn(peer::run(params, self.events_tx.clone(), rx, slot));
     }
 
     fn write(&mut self, block: BlockRef, data: Bytes) {
@@ -1449,14 +1656,21 @@ impl TorrentTask {
         if !self.pending_writes.is_empty() {
             let writes = std::mem::take(&mut self.pending_writes);
             let content = content.clone();
+            let hashers = self.hashers.clone();
             let tx = self.events_tx.clone();
             self.disk.spawn(async move {
-                let events = tokio::task::spawn_blocking(move || write_batch(&content, writes))
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(error = %e, "block writes panicked");
-                        Vec::new()
-                    });
+                let events = tokio::task::spawn_blocking(move || {
+                    let events = write_batch(&content, writes.clone());
+                    if let Some(hashers) = hashers {
+                        feed_hashers(&hashers, &content, &writes, &events);
+                    }
+                    events
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "block writes panicked");
+                    Vec::new()
+                });
                 for event in events {
                     let _ = tx.send(Input::Engine(event)).await;
                 }
@@ -1484,35 +1698,184 @@ impl TorrentTask {
             tracing::warn!(piece, "hash request before metadata");
             return;
         };
-        let slots = Arc::clone(&self.hash_slots);
+        let arrived = self
+            .hashers
+            .as_ref()
+            .and_then(|h| h.lock().unwrap_or_else(PoisonError::into_inner).take(piece));
+        let pool = self.ctx.hash_pool.clone();
         let tx = self.events_tx.clone();
+        let sync = self.ctx.config.durability == Durability::PerPiece;
         self.disk.spawn(async move {
-            let Ok(_permit) = slots.acquire_owned().await else {
-                return;
-            };
-            let result = tokio::task::spawn_blocking(move || {
-                verify_piece(content.storage.as_ref(), content.metainfo.info(), piece)
-            })
-            .await;
+            let result = pool
+                .run(move || {
+                    let info = content.metainfo.info();
+                    // Blocks hashed as they were written: no read-back.
+                    let ok = match arrived.and_then(|h| h.verify(info)) {
+                        Some(ok) => ok,
+                        None => verify_piece(content.storage.as_ref(), info, piece)?,
+                    };
+                    // Durable before the engine counts it.
+                    if ok
+                        && sync
+                        && let Some(range) = info.layout().piece_range(piece)
+                    {
+                        content
+                            .storage
+                            .sync_range(range.start, range.end - range.start)?;
+                    }
+                    Ok::<bool, dravity_storage::StorageError>(ok)
+                })
+                .await;
             // A mismatch or a short file is "we don't have it". Any other I/O
             // error would otherwise reset the piece and download it forever.
             let event = match result {
-                Ok(Ok(ok)) => Event::PieceHashed { piece, ok },
-                Ok(Err(e)) if e.is_missing_data() => Event::PieceHashed { piece, ok: false },
-                Ok(Err(e)) => {
+                Some(Ok(ok)) => Event::PieceHashed { piece, ok },
+                Some(Err(e)) if e.is_missing_data() => Event::PieceHashed { piece, ok: false },
+                Some(Err(e)) => {
                     tracing::warn!(piece, error = %e, "piece hash failed");
                     Event::StorageFailed {
                         error: format!("hashing piece {piece}: {e}"),
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(piece, error = %e, "piece hash task failed");
-                    Event::StorageFailed {
-                        error: format!("hashing piece {piece}: {e}"),
-                    }
-                }
+                None => Event::StorageFailed {
+                    error: format!("hashing piece {piece}: the hash job failed"),
+                },
             };
             let _ = tx.send(Input::Engine(event)).await;
+        });
+    }
+
+    /// Forces everything written so far to disk
+    /// ([`Durability::OnComplete`]).
+    fn sync_all(&mut self) {
+        let Some(content) = self.content.clone() else {
+            return;
+        };
+        let tx = self.events_tx.clone();
+        self.disk.spawn(async move {
+            let storage = Arc::clone(&content.storage);
+            let result = tokio::task::spawn_blocking(move || storage.flush()).await;
+            let error = match result {
+                Ok(Ok(())) => return,
+                Ok(Err(e)) => e.to_string(),
+                Err(e) => e.to_string(),
+            };
+            tracing::warn!(%error, "syncing the finished download failed");
+            let _ = tx
+                .send(Input::Engine(Event::StorageFailed {
+                    error: format!("syncing the finished download: {error}"),
+                }))
+                .await;
+        });
+    }
+
+    /// Hashes each block of `piece` for smart banning and reports
+    /// [`Event::BlockHashes`] (empty if the piece cannot be read).
+    fn hash_blocks(&mut self, piece: u32) {
+        let Some(content) = self.content.clone() else {
+            self.local.push_back(Event::BlockHashes {
+                piece,
+                hashes: Vec::new(),
+            });
+            return;
+        };
+        let pool = self.ctx.hash_pool.clone();
+        let tx = self.events_tx.clone();
+        self.disk.spawn(async move {
+            let hashes = pool
+                .run(move || block_hashes(content.storage.as_ref(), content.metainfo.info(), piece))
+                .await
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            let _ = tx
+                .send(Input::Engine(Event::BlockHashes { piece, hashes }))
+                .await;
+        });
+    }
+
+    /// Adds `ip` to the session's ban list and tells the other running
+    /// torrents.
+    fn share_ban(&self, ip: IpAddr) {
+        if !self.ctx.bans.insert(ip) {
+            return;
+        }
+        let catalog = self
+            .ctx
+            .catalog
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (hash, entry) in catalog.iter() {
+            if *hash == self.ctx.info_hash {
+                continue;
+            }
+            if let Some(tx) = &entry.commands {
+                // Best effort: a full queue still has the ban list on restart
+                // and the listener refuses the address.
+                let _ = tx.try_send(Command::BanIp(ip));
+            }
+        }
+    }
+
+    /// Every tracker with its last announce and scrape.
+    fn tracker_list(&self) -> Vec<TrackerStatus> {
+        let tiers = self
+            .ctx
+            .trackers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        self.tracker_log.list(&tiers)
+    }
+
+    /// Scrapes when [`SessionConfig::scrape_interval`] says one is due.
+    fn scheduled_scrape(&mut self) {
+        let Some(every) = self.ctx.config.scrape_interval else {
+            return;
+        };
+        let now = Instant::now();
+        if self.next_scrape.is_some_and(|at| now < at) {
+            return;
+        }
+        self.next_scrape = Some(now + every);
+        self.scrape(None);
+    }
+
+    /// Scrapes every tracker in the background; the results come back as
+    /// [`Input::Scraped`].
+    fn scrape(&mut self, reply: Option<oneshot::Sender<Vec<TrackerStatus>>>) {
+        let urls: Vec<String> = self
+            .ctx
+            .trackers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
+        let client = self.ctx.tracker.clone();
+        let hash = *self.ctx.info_hash.as_bytes();
+        let tx = self.events_tx.clone();
+        self.background.spawn(async move {
+            let mut set = JoinSet::new();
+            for url in urls {
+                let client = client.clone();
+                set.spawn(async move {
+                    let outcome = match client.scrape(&url, &hash).await {
+                        Ok(stats) => ScrapeOutcome::Ok(stats),
+                        Err(e) => ScrapeOutcome::Failed {
+                            error: e.to_string(),
+                        },
+                    };
+                    (url, outcome)
+                });
+            }
+            let mut outcomes = Vec::new();
+            while let Some(joined) = set.join_next().await {
+                if let Ok(outcome) = joined {
+                    outcomes.push(outcome);
+                }
+            }
+            let _ = tx.send(Input::Scraped { outcomes, reply }).await;
         });
     }
 
@@ -1839,6 +2202,93 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     text
 }
 
+/// The pieces a stat of every file shows cannot be on disk, so the start
+/// check need not hash them (empty when the storage has no stamps).
+async fn prescan(content: &Content) -> Vec<u32> {
+    let storage = Arc::clone(&content.storage);
+    let metainfo = Arc::clone(&content.metainfo);
+    let absent = tokio::task::spawn_blocking(move || match storage.stamps() {
+        Ok(Some(stamps)) => dravity_storage::absent_pieces(metainfo.info(), &stamps),
+        _ => Vec::new(),
+    })
+    .await
+    .unwrap_or_default();
+    if !absent.is_empty() {
+        tracing::debug!(
+            pieces = absent.len(),
+            "prescan: skipping pieces that cannot be on disk"
+        );
+    }
+    absent
+}
+
+/// Wraps `storage` in the session's read cache, if there is one.
+pub(crate) fn cached(
+    storage: Arc<dyn Storage>,
+    cache: Option<&Arc<ReadCache>>,
+) -> Arc<dyn Storage> {
+    match cache {
+        Some(cache) => Arc::new(CachedStorage::new(storage, Arc::clone(cache))),
+        None => storage,
+    }
+}
+
+/// Bytes of early blocks one torrent's hashers may hold while they wait to
+/// be fed in order. A piece that would go over falls back to read-back.
+const MAX_HASH_PENDING: usize = 32 * 1024 * 1024;
+
+/// Hash-on-arrival state of one torrent: a [`PieceHasher`] per piece being
+/// written.
+#[derive(Debug, Default)]
+struct Hashers {
+    pieces: HashMap<u32, PieceHasher<Bytes>>,
+    /// Sum of the hashers' pending bytes.
+    pending: usize,
+}
+
+impl Hashers {
+    /// Takes the hasher of `piece` (its blocks are all written).
+    fn take(&mut self, piece: u32) -> Option<PieceHasher<Bytes>> {
+        let h = self.pieces.remove(&piece)?;
+        self.pending = self.pending.saturating_sub(h.pending_bytes());
+        Some(h)
+    }
+}
+
+/// Feeds the blocks of `writes` that were written (per `events`) to their
+/// pieces' hashers.
+fn feed_hashers(
+    hashers: &Mutex<Hashers>,
+    content: &Content,
+    writes: &[(BlockRef, Bytes)],
+    events: &[Event],
+) {
+    let info = content.metainfo.info();
+    let mut hashers = hashers.lock().unwrap_or_else(PoisonError::into_inner);
+    for (block, data) in writes {
+        if !events.contains(&Event::BlockWritten { block: *block }) {
+            continue;
+        }
+        let Hashers { pieces, pending } = &mut *hashers;
+        let Some(h) = (match pieces.entry(block.piece) {
+            std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                PieceHasher::new(info, block.piece).map(|h| e.insert(h))
+            }
+        }) else {
+            continue;
+        };
+        let before = h.pending_bytes();
+        let usable = h.add(block.offset, data.clone());
+        *pending = (*pending + h.pending_bytes()).saturating_sub(before);
+        if usable && *pending > MAX_HASH_PENDING {
+            // Too many early blocks: this piece is read back instead.
+            *pending = pending.saturating_sub(h.pending_bytes());
+            pieces.remove(&block.piece);
+        }
+    }
+}
+
 /// Most block writes (or upload reads) sent to storage as one batch.
 const MAX_IO_BATCH: usize = 64;
 
@@ -1918,6 +2368,19 @@ fn padded_last_piece(info: &Info) -> bool {
 }
 
 /// The piece layers of `metainfo`, owned, for serving BEP 52 hash requests.
+/// Each v2 file's pieces: `(pieces root, first piece, piece count)`, for
+/// smart banning's leaf hash requests.
+fn piece_roots(metainfo: &Metainfo) -> Vec<(Hash, u32, u32)> {
+    let info = metainfo.info();
+    let mut out = Vec::new();
+    for (root, _) in info.piece_layers() {
+        for range in info.pieces_with_root(&root) {
+            out.push((root, range.start, range.end.saturating_sub(range.start)));
+        }
+    }
+    out
+}
+
 fn owned_layers(metainfo: &Metainfo) -> PieceLayers {
     metainfo
         .info()

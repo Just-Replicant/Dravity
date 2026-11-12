@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use dravity_engine::PeerInfo;
+use dravity_tracker::ScrapeStats;
 
 /// The transport under a peer connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -41,6 +42,9 @@ pub struct PeerStatus {
     pub transport: Transport,
     /// Whether the connection is RC4-encrypted (MSE).
     pub encrypted: bool,
+    /// The peer's country, from [`crate::SessionConfig::geoip`] (never
+    /// for web seeds).
+    pub country: Option<crate::CountryCode>,
 }
 
 /// The last answer one tracker gave.
@@ -65,6 +69,19 @@ pub enum TrackerOutcome {
     },
 }
 
+/// The last scrape of one tracker (BEP 48 / BEP 15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScrapeOutcome {
+    /// The tracker's counts for the torrent.
+    Ok(ScrapeStats),
+    /// The scrape failed (or the tracker does not support scraping).
+    Failed {
+        /// Cause.
+        error: String,
+    },
+}
+
 /// One tracker of a torrent and the outcome of its last announce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -78,12 +95,18 @@ pub struct TrackerStatus {
     pub last: Option<TrackerOutcome>,
     /// When `last` was recorded.
     pub updated: Option<Instant>,
+    /// The last scrape; `None` until the tracker was scraped
+    /// ([`crate::TorrentHandle::scrape`], [`crate::SessionConfig::scrape_interval`]).
+    pub scrape: Option<ScrapeOutcome>,
+    /// When `scrape` was recorded.
+    pub scraped: Option<Instant>,
 }
 
 /// The last outcome per tracker URL, kept by the torrent's owner task.
 #[derive(Debug, Default)]
 pub(crate) struct TrackerLog {
     last: HashMap<String, (Instant, TrackerOutcome)>,
+    scrapes: HashMap<String, (Instant, ScrapeOutcome)>,
 }
 
 impl TrackerLog {
@@ -98,6 +121,17 @@ impl TrackerLog {
         }
     }
 
+    /// Records scrape outcomes that arrived at `now`.
+    pub(crate) fn record_scrapes(
+        &mut self,
+        now: Instant,
+        outcomes: impl IntoIterator<Item = (String, ScrapeOutcome)>,
+    ) {
+        for (url, outcome) in outcomes {
+            self.scrapes.insert(url, (now, outcome));
+        }
+    }
+
     /// Every tracker of `tiers`, in announce order, with its last outcome.
     pub(crate) fn list(&self, tiers: &[Vec<String>]) -> Vec<TrackerStatus> {
         tiers
@@ -106,11 +140,14 @@ impl TrackerLog {
             .flat_map(|(tier, urls)| {
                 urls.iter().map(move |url| {
                     let last = self.last.get(url);
+                    let scrape = self.scrapes.get(url);
                     TrackerStatus {
                         url: url.clone(),
                         tier,
                         last: last.map(|(_, outcome)| outcome.clone()),
                         updated: last.map(|&(at, _)| at),
+                        scrape: scrape.map(|(_, outcome)| outcome.clone()),
+                        scraped: scrape.map(|&(at, _)| at),
                     }
                 })
             })
@@ -122,15 +159,20 @@ impl TrackerLog {
 /// connection: its transport and whether it is encrypted.
 pub(crate) fn peers(
     infos: Vec<PeerInfo>,
+    geoip: Option<&crate::GeoIp>,
     connection: impl Fn(&PeerInfo) -> (Transport, bool),
 ) -> Vec<PeerStatus> {
     infos
         .into_iter()
         .map(|info| {
             let (transport, encrypted) = connection(&info);
+            let country = geoip
+                .filter(|_| transport != Transport::Web)
+                .and_then(|db| db.lookup(info.addr.ip()));
             PeerStatus {
                 transport,
                 encrypted,
+                country,
                 info,
             }
         })

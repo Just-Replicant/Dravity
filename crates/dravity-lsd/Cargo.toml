@@ -1,0 +1,26 @@
+[package]
+name = "dravity-lsd"
+description = "Local Service Discovery (BEP 14) for Dravity: a sans-IO codec plus a Tokio service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[dependencies]
+dravity-core.workspace = true
+fastrand.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "time", "sync", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

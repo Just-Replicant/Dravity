@@ -1,160 +1,72 @@
 # Phase 2 — Magnets and swarm: notes and decisions
 
-Scope from the roadmap (plan §8): BEP 9/10 metadata; DHT via
-`dravity-dht`/`mainline`; PEX; endgame; piece stealing; fastresume; AIMD
-window + rate limits. Also picks up the items Phase 1 deferred to Phase 2:
-UDP tracker connection-id caching and BEP 12 tier ordering.
+Scope (plan §8): BEP 9/10 metadata, DHT via `mainline`, PEX, endgame,
+piece stealing, fastresume, an AIMD window, and rate limits. Also the
+UDP connection-id cache and BEP 12 tiers deferred from Phase 1.
 
-## Crates
-
-| Crate | I/O? | Phase 2 additions |
-|---|---|---|
-| `dravity-core` | no | `compact` peer codec (BEP 23/7 compact v4/v6), `Metainfo::from_info_bytes` for metadata fetched from peers |
-| `dravity-bencode` | no | `Value::decode_prefix` (a value followed by raw bytes, as in `ut_metadata` data messages) |
-| `dravity-wire` | no | `MetadataMessage` (BEP 9 `ut_metadata`), `PexMessage` (BEP 11 `ut_pex`) |
-| `dravity-engine` | no | `MetadataState` (magnet metadata fetch + handover), extension handshake, metadata serving, PEX, AIMD window, endgame, block stealing, download rate limit, DHT scheduling |
-| `dravity-storage` | blocking | `resume`: `ResumeData`, `FileStamp`, `Storage::stamps`, atomic `save_resume` / `load_resume` |
-| `dravity-tracker` | async | UDP connection-id cache |
-| `dravity-dht` (new) | async (own thread) | `Dht` (`get_peers`, `announce`) and a loopback `Testnet`, wrapping `mainline` |
-| `dravity-session` | async | `Session::add_magnet`, DHT lookups, fastresume load/save, BEP 12 tiers |
-| `dravity-cli` | via session | magnet links, `--no-dht`, `--download-limit`, `--resume-dir`, `--no-resume` |
+Phase 3 added listening, seeding, the upload limit, and DHT
+`announce_peer`. This phase did not announce or set the BEP 5 reserved bit.
 
 ## Decisions
 
-- **Magnets run two state machines.** A magnet starts as a sans-IO
-  `MetadataState`: it announces (with `left` set to one metadata piece so
-  trackers return peers), dials peers, exchanges BEP 10 handshakes and asks
-  for 16 KiB metadata pieces (two in flight per peer). The assembled `info`
-  dictionary is hashed against the info-hash; a mismatch disconnects every
-  peer that contributed, bans those addresses, and starts over. A `reject`
-  or a timeout moves that piece to another peer (the peer that failed it is
-  skipped until `request_timeout` elapses). The first in-range
-  `metadata_size` is kept only while it makes progress: if every request
-  for it has failed and another peer advertises a different size, that size
-  is abandoned. Sizes above `max_metadata_size` (8 MiB) are refused.
-  `Stop` is still handled after the metadata is verified, so a storage
-  failure during handover can finish the task.
-  `into_handover()` then returns the open connections with the messages to
-  replay (extension handshake, availability, `unchoke`), the known
-  addresses, and whether `started` was announced. The session builds the
-  storage and a `TorrentState` and replays all of that as ordinary events,
-  so no connection is dropped and no second `started` is sent.
-- **`TorrentState` accepts peers while checking** (needed for the handover)
-  but sends no bitfield or interest until the check is done.
-- **Metadata serving.** A `TorrentState` built `with_info_bytes` advertises
-  `metadata_size` and answers `ut_metadata` requests; otherwise it rejects
-  them.
-- **PEX (BEP 11).** Peers from `ut_pex` are added to the pool (capped at
-  200 per message on decode); every `pex_interval` (60 s) each peer gets
-  the added/dropped diff since its last message (at most 50 entries each).
-  Private torrents (BEP 27) disable PEX and DHT. A magnet does not know
-  that until the info-dict arrives; peers and addresses learned from DHT or
-  PEX during the fetch are then dropped, and a late lookup is ignored.
-- **AIMD request window.** Each peer starts at `initial_requests_per_peer`
-  (4). Blocks that arrive in time grow it — doubling in slow start, then +1
-  per window — up to `max_requests_per_peer` (128) or the peer's `reqq`,
-  whichever is smaller. A request timeout halves that effective limit (not
-  the uncapped window) and cancels requests that no longer fit. A `piece`
+- A magnet starts as `MetadataState`. It announces with `left` set to one
+  metadata piece, dials peers, and fetches 16 KiB metadata pieces (two in
+  flight per peer). The assembled `info` is hashed against the info-hash;
+  a mismatch disconnects every peer that contributed, bans those
+  addresses, and starts over. A `reject` or a timeout moves that piece;
+  the peer is skipped until `request_timeout`. The first in-range
+  `metadata_size` is kept only while it makes progress, and is abandoned
+  when every request for it has failed and another peer advertises a
+  different size. Sizes above `max_metadata_size` (8 MiB) are refused.
+  `into_handover()` returns the open connections and the messages to
+  replay, so the session builds `TorrentState` without dropping peers or
+  sending a second `started`.
+- `TorrentState` accepts peers during the initial check and sends no
+  bitfield or interest until the check finishes.
+- `with_info_bytes` advertises `metadata_size` and answers `ut_metadata`.
+  Without those bytes, requests are rejected.
+- PEX adds at most 200 peers per message. Every `pex_interval` (60 s) a
+  peer gets the added and dropped diff since its last message, at most
+  50 each. Private torrents disable PEX and DHT. A magnet learns
+  `private` only with the info-dict; addresses learned from DHT or PEX
+  during the fetch are then dropped.
+- Each peer starts at `initial_requests_per_peer` (4) and grows to
+  `max_requests_per_peer` (128) or the peer's `reqq`, whichever is
+  smaller: doubling in slow start, then +1 per window. A timeout halves
+  the effective limit and cancels requests that no longer fit. A `piece`
   is accepted only from a peer that was asked for that block.
-- **Endgame and stealing share one mechanism.** A block may have at most two
-  owners. Once every missing block is requested (endgame) an idle peer
-  duplicates outstanding requests; before that, an idle peer may "steal" a
-  block whose holder has not delivered after `steal_after` (10 s). When a
-  copy arrives the other owners get `cancel`. A block goes back to the
-  picker only when no owner is left.
-- **Rate limit.** `download_rate_limit` is a token bucket (one second of
-  burst, at least one block) that paces *requests*, so the engine stays
-  clock-free and nothing is buffered beyond what was asked for. Upload
-  limits come with seeding in Phase 3.
-- **DHT through `mainline`.** `dravity-dht` wraps `mainline` 8 (MIT,
-  MSRV 1.85), which runs the node on its own thread; its types stay out of
-  the public API. The engine emits `Effect::DhtLookup` on start and every
-  `dht_interval` (5 min); the session runs a lookup bounded by
-  `dht_lookup_timeout` (30 s) and returns `Event::DhtPeers`, including
-  peers found before the deadline. A timeout, or an empty result when the
-  routing table has no live neighbors (`Dht::has_nodes`, a local snapshot —
-  not `Dht::bootstrapped`, which sends `find_node`), is retried after
-  `dht_retry` (15 s) instead of `dht_interval`. The session's
-  DHT is on by default (`SessionConfig::dht`) and off in tests unless they
-  bring a loopback `Testnet`. `mainline` brings a second
-  `sha1`/`digest` generation; cargo-deny reports the duplicates as
-  warnings (`multiple-versions = "warn"`).
-- **No DHT `announce_peer` yet.** We do not accept incoming connections
-  until Phase 3, so announcing ourselves would only send peers to a closed
-  port. `Dht::announce` exists (and is tested) for when we listen. For the
-  same reason we do not set the BEP 5 DHT reserved bit, and `port` messages
-  are ignored (`mainline` has no API to add a node by address).
-- **Fastresume.** On stop, after the final flush, the session saves
+- A block has at most two owners. In endgame an idle peer duplicates
+  outstanding requests. Before that, an idle peer may steal a block held
+  for `steal_after` (10 s). When one copy arrives the other owners get
+  `cancel`. The block returns to the picker only when no owner is left.
+- `download_rate_limit` is a token bucket (one second of burst, at least
+  one block) that paces requests.
+- `dravity-dht` wraps `mainline` on its own thread. The engine emits
+  `Effect::DhtLookup` on start and every `dht_interval` (5 min). A lookup
+  is bounded by `dht_lookup_timeout` (30 s). A timeout, or an empty result
+  when `Dht::has_nodes` is false, retries after `dht_retry` (15 s). DHT is
+  on by default and off in tests unless they bring a loopback `Testnet`.
+- On stop, after the final flush, the session saves
   `<resume_dir>/<info-hash>.resume`: the verified-piece bitfield and a
-  length + mtime (ns) stamp per file. On the next start the data is trusted —
-  `check_existing` is skipped — only if the info-hash, piece count and every
-  stamp still match; anything else (a touched, truncated, created or deleted
-  file) falls back to the full check. Saving is atomic (synced temporary file
-  + rename). Before that, in-flight disk writes are drained and every file
-  is synced, including ones already evicted from the descriptor cache.
-  Resume is off by default in the library
-  (`SessionConfig::resume_dir = None`); the CLI uses `<output>/.dravity`.
-- **BEP 12 tiers.** Tiers are shuffled once, announced concurrently, and the
-  trackers within a tier are tried one after another until one answers; that
-  tracker moves to the front of its tier. Asking every tier at once trades
-  some tracker load for faster peer discovery (libtorrent's
-  `announce_to_all_tiers`). Magnet `tr` entries each form their own tier.
-- **UDP connection ids** are cached per tracker address for 60 s (BEP 15)
-  and shared between `TrackerClient` clones, together with the UDP socket
-  that performed `connect` (the id is only valid from that source port).
-  Announces to one tracker take turns on that socket: responses are not
-  demultiplexed, and a second `connect` would replace the id. A failure
-  with a cached id (an error response, or no answer to a single attempt)
-  drops that id — not a newer id for the same address — and retries once
-  with a fresh `connect` on the same socket. An I/O error drops the socket
-  and the announce is tried once more from a new port.
-- **We advertise BEP 10** in the handshake reserved bits so peers send their
-  extension handshakes.
+  length plus mtime stamp per file. The next start skips `check_existing`
+  only when the info-hash, piece count, and every stamp match. Saving is
+  atomic. In-flight writes are drained and every file is synced first,
+  including files already evicted from the descriptor cache. The library
+  leaves `resume_dir` unset; the CLI uses `<output>/.dravity`.
+- BEP 12: tiers are shuffled once and announced concurrently. Trackers in
+  a tier are tried in order until one answers, and that tracker moves to
+  the front. Each magnet `tr` entry is its own tier.
+- UDP connection ids are cached per tracker address for 60 s and shared
+  by `TrackerClient` clones, with the UDP socket that performed
+  `connect`. Announces to one tracker take turns on that socket. A
+  failure with a cached id drops that id and retries once with a fresh
+  `connect`. An I/O error drops the socket and retries once from a new port.
+- The handshake advertises BEP 10.
 
-## Phase 1 deferrals handled here
+## Left for later
 
-| Item | Where |
-|---|---|
-| Magnets, BEP 9/10 metadata, DHT, PEX | `dravity-engine` (`MetadataState`, `ext`), `dravity-wire`, `dravity-dht`, `dravity-session` |
-| Endgame, piece stealing, AIMD request window, rate limits | `dravity-engine` (`state`, `window`, `rate`) |
-| Fastresume | `dravity-storage::resume`, `dravity-session` |
-| UDP tracker connection-id caching; BEP 12 tier ordering | `dravity-tracker`, `dravity-session` |
-| Random tie-breaking among equally rare pieces | Not done: endgame and stealing already cover the slow-tail problem; ties still go to the lowest index |
-
-## Tests
-
-- Wire: unit tests and proptest roundtrips for `ut_metadata` and `ut_pex`;
-  fuzz targets `wire_metadata`, `wire_pex`.
-- Engine: scripted sequences for the extension handshake and metadata
-  serving, PEX (including private torrents), window growth and `reqq`,
-  endgame duplicates and cancels, stealing from slow peers, rate pacing, DHT
-  scheduling, peers handed over while checking; `MetadataState` fetch,
-  verification and handover, bad metadata, rejects, timeouts, oversize; the
-  proptest now includes extended messages and checks no peer gets the same
-  block twice.
-- Storage: resume roundtrip, bitfield validation, stamp invalidation, atomic
-  save; fuzz target `storage_resume`.
-- Tracker: a counting UDP tracker shows ids are reused, shared by clones
-  (including overlapping announces) and refreshed after the tracker forgets
-  them.
-- DHT: announce + lookup on a loopback testnet; an isolated node.
-- Session (loopback): magnet via a tracker, magnet via a DHT testnet, peers
-  learned only through PEX, fastresume (skip, then invalidation), tier
-  fallback; existing Phase 1 swarm tests.
-- CLI: download with `--no-dht --download-limit`, resume file written,
-  `info` for magnets, bad rate rejected.
-
-Not covered: real public swarms. The sandbox this was built in drops
-BitTorrent UDP traffic (DHT routers and UDP trackers never answer), so the
-DHT and magnet paths were verified on loopback only.
-
-## Deferred
-
-| Item | Phase |
-|---|---|
-| Listening for incoming peers, seeding, choking, upload rate limit, DHT `announce_peer` | 3 |
-| BEP 5 `port` message → DHT node | 3 (needs an add-node API or another DHT backend) |
-| IPv6 DHT (BEP 32) | 3, with IPv6 |
-| v2-only magnets (`btmh` without `btih`) | 5, with BEP 52 |
-| Custom storage backends for magnets (size unknown up front) | 4 (storage factory) |
-| Resume data written periodically during a download (now: on stop only) | 4, with session persistence |
+Phase 3: incoming peers, seeding, choking, the upload limit, DHT
+`announce_peer`. IPv6 DHT and BEP 5 `port` waited on a DHT backend that
+could do them. v2-only magnets waited on BEP 52. Periodic resume writes
+and a storage factory for magnets waited on Phase 4. Piece ties still
+use the lowest index.

@@ -140,10 +140,15 @@ impl Drop for AbortOnDrop {
     }
 }
 
-fn random_bytes<const N: usize>() -> [u8; N] {
+/// Fills `N` bytes from the operating system's cryptographic generator.
+///
+/// Used for announce-token secrets (and for node-id entropy). A failure is
+/// reported to the caller: a token secret must not fall back to a
+/// non-cryptographic PRNG.
+fn random_bytes<const N: usize>() -> io::Result<[u8; N]> {
     let mut out = [0u8; N];
-    out.fill_with(|| fastrand::u8(..));
-    out
+    getrandom::fill(&mut out).map_err(io::Error::other)?;
+    Ok(out)
 }
 
 type Answered = Vec<(Node, Option<Vec<u8>>, Ext)>;
@@ -171,11 +176,7 @@ impl NativeDht {
     /// If the socket cannot be bound.
     pub async fn bind_with(addr: SocketAddr, config: NativeConfig) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
-        Ok(Self::start(
-            Transport::Direct(socket),
-            random_bytes(),
-            config,
-        ))
+        Self::start(Transport::Direct(socket), random_bytes()?, config)
     }
 
     /// Like [`Self::bind`] with a chosen node id (for tests).
@@ -184,14 +185,14 @@ impl NativeDht {
     /// If the socket cannot be bound.
     pub async fn with_id(addr: SocketAddr, id: [u8; 20], timeout: Duration) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
-        Ok(Self::start(
+        Self::start(
             Transport::Direct(socket),
             id,
             NativeConfig {
                 timeout,
                 ..NativeConfig::default()
             },
-        ))
+        )
     }
 
     /// Starts a node whose datagrams go through `proxy`. Returns only
@@ -202,11 +203,7 @@ impl NativeDht {
     /// If the proxy cannot be reached or refuses the association.
     pub async fn bind_relayed(proxy: &Socks5Proxy, config: NativeConfig) -> io::Result<Self> {
         let relay = UdpAssociate::open(proxy).await?;
-        Ok(Self::start(
-            Transport::Relayed(relay),
-            random_bytes(),
-            config,
-        ))
+        Self::start(Transport::Relayed(relay), random_bytes()?, config)
     }
 
     /// A node on an already bound socket, without awaiting (must be
@@ -216,20 +213,20 @@ impl NativeDht {
     /// If the socket cannot be registered with the runtime.
     pub fn from_std(socket: std::net::UdpSocket, config: NativeConfig) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
-        Ok(Self::start(
+        Self::start(
             Transport::Direct(UdpSocket::from_std(socket)?),
-            random_bytes(),
+            random_bytes()?,
             config,
-        ))
+        )
     }
 
-    fn start(socket: Transport, id: [u8; 20], config: NativeConfig) -> Self {
+    fn start(socket: Transport, id: [u8; 20], config: NativeConfig) -> io::Result<Self> {
         let shared = Arc::new(Shared {
             socket,
             state: Mutex::new(State {
                 id,
                 table: RoutingTable::new(id),
-                tokens: Tokens::new(random_bytes()),
+                tokens: Tokens::new(random_bytes()?),
                 rotated: Instant::now(),
                 store: PeerStore::new(10_000, 200),
                 items: ItemStore::new(10_000),
@@ -240,10 +237,10 @@ impl NativeDht {
             config,
         });
         let task = tokio::spawn(receive(Arc::downgrade(&shared)));
-        Self {
+        Ok(Self {
             shared,
             _task: Arc::new(AbortOnDrop(task)),
-        }
+        })
     }
 
     /// Our node id (it changes once, if BEP 42 asks for a matching one).
@@ -602,7 +599,11 @@ impl Shared {
         if is_secure(&state.id, ip) {
             return;
         }
-        let id = secure_node_id(ip, random_bytes());
+        let Ok(entropy) = random_bytes() else {
+            tracing::warn!("cannot generate a BEP 42 node id: OS randomness unavailable");
+            return;
+        };
+        let id = secure_node_id(ip, entropy);
         let known = state.table.closest(&state.id, usize::MAX);
         let mut table = RoutingTable::new(id);
         let now = Instant::now().into_std();
@@ -699,8 +700,19 @@ impl Shared {
         let now = Instant::now();
         let mut state = self.lock();
         if now.saturating_duration_since(state.rotated) >= TOKEN_ROTATION {
-            state.tokens.rotate(random_bytes());
-            state.rotated = now;
+            match random_bytes() {
+                Ok(secret) => {
+                    state.tokens.rotate(secret);
+                    state.rotated = now;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "cannot rotate the DHT token secret; keeping the current one"
+                    );
+                    // Leave `rotated` alone so the next query retries.
+                }
+            }
         }
         let id = state.id;
         let response = |nodes, values, token| Body::Response {
@@ -844,5 +856,19 @@ async fn receive(shared: std::sync::Weak<Shared>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorization_secrets_come_from_the_os() {
+        let a = random_bytes::<16>().unwrap();
+        let b = random_bytes::<16>().unwrap();
+        assert_ne!(a, [0u8; 16], "OS randomness must not be all zeros");
+        assert_ne!(a, b, "two secrets from the OS must differ");
     }
 }

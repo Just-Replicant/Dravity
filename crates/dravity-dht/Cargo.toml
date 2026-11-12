@@ -16,6 +16,7 @@ dravity-bencode.workspace = true
 dravity-core.workspace = true
 ed25519-dalek.workspace = true
 fastrand.workspace = true
+getrandom.workspace = true
 futures-util.workspace = true
 mainline.workspace = true
 sha1.workspace = true

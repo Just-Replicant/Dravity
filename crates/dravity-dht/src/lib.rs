@@ -24,9 +24,12 @@ pub mod demux;
 pub mod items;
 pub mod krpc;
 pub mod native;
+pub mod relay;
 pub mod routing;
 pub mod secure_id;
 pub mod store;
+
+pub use relay::{Contact, Socks5Proxy};
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -71,6 +74,12 @@ pub struct DhtConfig {
     /// live network). Needs a Tokio runtime when the node starts;
     /// `server_mode` does not apply (the native node always answers).
     pub native: bool,
+    /// Send the native node's datagrams through this SOCKS5 UDP relay.
+    /// The node is not started (and sends or accepts nothing) until the
+    /// association is up; bootstrap host names go to the proxy as domain
+    /// addresses and are never resolved locally. Ignored when [`Self::native`]
+    /// is `false` (`mainline` has no proxy support).
+    pub socks5: Option<Socks5Proxy>,
 }
 
 impl Default for DhtConfig {
@@ -82,6 +91,7 @@ impl Default for DhtConfig {
             server_mode: false,
             max_peers: DEFAULT_MAX_PEERS,
             native: false,
+            socks5: None,
         }
     }
 }
@@ -110,10 +120,64 @@ pub struct Dht {
 enum Backend {
     Mainline(AsyncDht),
     Native {
-        node: native::NativeDht,
-        /// `host:port` entries, resolved at each (re)bootstrap.
+        node: NativeSlot,
+        /// `host:port` entries, resolved at each (re)bootstrap unless
+        /// the node is proxied (then they are sent as domain addresses).
         bootstrap: std::sync::Arc<Vec<String>>,
+        /// Through a SOCKS5 relay: never resolve names locally.
+        proxied: bool,
     },
+}
+
+/// The native node, or a delayed start that is waiting for a SOCKS5
+/// association (during which nothing is sent or accepted).
+#[derive(Debug, Clone)]
+enum NativeSlot {
+    Ready(native::NativeDht),
+    Starting(tokio::sync::watch::Receiver<std::sync::Arc<NativePhase>>),
+}
+
+#[derive(Debug, Clone)]
+enum NativePhase {
+    Pending,
+    Up(native::NativeDht),
+    Failed(std::sync::Arc<str>),
+}
+
+impl NativeSlot {
+    /// The node if it is already running (a local read; does not wait).
+    fn ready(&self) -> Option<native::NativeDht> {
+        match self {
+            Self::Ready(node) => Some(node.clone()),
+            Self::Starting(rx) => match rx.borrow().as_ref() {
+                NativePhase::Up(node) => Some(node.clone()),
+                NativePhase::Pending | NativePhase::Failed(_) => None,
+            },
+        }
+    }
+
+    /// Waits until the SOCKS5 association succeeds or fails.
+    async fn wait(&self) -> Option<native::NativeDht> {
+        match self {
+            Self::Ready(node) => Some(node.clone()),
+            Self::Starting(rx) => {
+                let mut rx = rx.clone();
+                loop {
+                    let phase = std::sync::Arc::clone(&rx.borrow());
+                    match phase.as_ref() {
+                        NativePhase::Up(node) => return Some(node.clone()),
+                        NativePhase::Failed(reason) => {
+                            tracing::debug!(%reason, "native DHT SOCKS5 associate failed");
+                            return None;
+                        }
+                        NativePhase::Pending => {
+                            rx.changed().await.ok()?;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The public routers a native node joins through by default.
@@ -173,30 +237,61 @@ impl Dht {
     fn new_native(config: &DhtConfig) -> Result<Self, DhtError> {
         let runtime = tokio::runtime::Handle::try_current().map_err(std::io::Error::other)?;
         let _entered = runtime.enter();
-        let socket = std::net::UdpSocket::bind((
-            config.bind_address.unwrap_or(Ipv4Addr::UNSPECIFIED),
-            config.port.unwrap_or(0),
-        ))?;
-        let node = native::NativeDht::from_std(
-            socket,
-            native::NativeConfig {
-                timeout: NATIVE_QUERY_TIMEOUT,
-                ..native::NativeConfig::default()
-            },
-        )?;
         let bootstrap = std::sync::Arc::new(
             config
                 .bootstrap
                 .clone()
                 .unwrap_or_else(|| DEFAULT_BOOTSTRAP.iter().map(|s| (*s).to_owned()).collect()),
         );
+        let native_config = native::NativeConfig {
+            timeout: NATIVE_QUERY_TIMEOUT,
+            ..native::NativeConfig::default()
+        };
+        if let Some(proxy) = config.socks5.clone() {
+            let (tx, rx) = tokio::sync::watch::channel(std::sync::Arc::new(NativePhase::Pending));
+            let entries = std::sync::Arc::clone(&bootstrap);
+            tokio::spawn(async move {
+                match native::NativeDht::bind_relayed(&proxy, native_config).await {
+                    Ok(node) => {
+                        let joining = node.clone();
+                        let _ = tx.send(std::sync::Arc::new(NativePhase::Up(node)));
+                        joining
+                            .bootstrap_contacts(&Contact::parse_all(&entries))
+                            .await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "native DHT SOCKS5 associate failed");
+                        let _ = tx.send(std::sync::Arc::new(NativePhase::Failed(
+                            error.to_string().into(),
+                        )));
+                    }
+                }
+            });
+            return Ok(Self {
+                inner: Backend::Native {
+                    node: NativeSlot::Starting(rx),
+                    bootstrap,
+                    proxied: true,
+                },
+                max_peers: config.max_peers.max(1),
+            });
+        }
+        let socket = std::net::UdpSocket::bind((
+            config.bind_address.unwrap_or(Ipv4Addr::UNSPECIFIED),
+            config.port.unwrap_or(0),
+        ))?;
+        let node = native::NativeDht::from_std(socket, native_config)?;
         let joining = node.clone();
         let entries = std::sync::Arc::clone(&bootstrap);
         tokio::spawn(async move {
             joining.bootstrap(&resolve(&entries).await).await;
         });
         Ok(Self {
-            inner: Backend::Native { node, bootstrap },
+            inner: Backend::Native {
+                node: NativeSlot::Ready(node),
+                bootstrap,
+                proxied: false,
+            },
             max_peers: config.max_peers.max(1),
         })
     }
@@ -206,8 +301,9 @@ impl Dht {
         match &self.inner {
             Backend::Mainline(dht) => SocketAddr::V4(dht.info().await.local_addr()),
             Backend::Native { node, .. } => node
-                .local_addr()
-                .unwrap_or_else(|_| SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))),
+                .ready()
+                .and_then(|n| n.local_addr().ok())
+                .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))),
         }
     }
 
@@ -219,8 +315,21 @@ impl Dht {
     pub async fn bootstrapped(&self) -> bool {
         match &self.inner {
             Backend::Mainline(dht) => dht.bootstrapped().await,
-            Backend::Native { node, bootstrap } => {
-                node.bootstrap(&resolve(bootstrap).await).await > 0
+            Backend::Native {
+                node,
+                bootstrap,
+                proxied,
+            } => {
+                let Some(node) = node.wait().await else {
+                    return false;
+                };
+                if *proxied {
+                    node.bootstrap_contacts(&Contact::parse_all(bootstrap))
+                        .await
+                        > 0
+                } else {
+                    node.bootstrap(&resolve(bootstrap).await).await > 0
+                }
             }
         }
     }
@@ -239,7 +348,10 @@ impl Dht {
     pub async fn to_bootstrap(&self) -> Vec<String> {
         match &self.inner {
             Backend::Mainline(dht) => dht.to_bootstrap().await,
-            Backend::Native { node, .. } => node.nodes().iter().map(ToString::to_string).collect(),
+            Backend::Native { node, .. } => node
+                .ready()
+                .map(|n| n.nodes().iter().map(ToString::to_string).collect())
+                .unwrap_or_default(),
         }
     }
 
@@ -265,15 +377,32 @@ impl Dht {
                         .collect()
                 })
                 .left_stream(),
-            Backend::Native { node, bootstrap } => futures_util::stream::once(async move {
-                if node.table_len() == 0 {
-                    node.bootstrap(&resolve(bootstrap).await).await;
-                }
-                let mut peers = node.get_peers(*info_hash.as_bytes()).await.peers;
-                peers.retain(usable);
-                peers
-            })
-            .right_stream(),
+            Backend::Native {
+                node,
+                bootstrap,
+                proxied,
+            } => {
+                let node = node.clone();
+                let bootstrap = std::sync::Arc::clone(bootstrap);
+                let proxied = *proxied;
+                futures_util::stream::once(async move {
+                    let Some(node) = node.wait().await else {
+                        return Vec::new();
+                    };
+                    if node.table_len() == 0 {
+                        if proxied {
+                            node.bootstrap_contacts(&Contact::parse_all(&bootstrap))
+                                .await;
+                        } else {
+                            node.bootstrap(&resolve(&bootstrap).await).await;
+                        }
+                    }
+                    let mut peers = node.get_peers(*info_hash.as_bytes()).await.peers;
+                    peers.retain(usable);
+                    peers
+                })
+                .right_stream()
+            }
         }
     }
 
@@ -314,6 +443,9 @@ impl Dht {
                 .map(drop)
                 .map_err(|e| DhtError::Announce(e.to_string())),
             Backend::Native { node, .. } => {
+                let Some(node) = node.wait().await else {
+                    return Err(DhtError::Announce("SOCKS5 relay is not up".to_owned()));
+                };
                 match node.announce(*info_hash.as_bytes(), port).await.1 {
                     0 => Err(DhtError::Announce("no node accepted".to_owned())),
                     _ => Ok(()),

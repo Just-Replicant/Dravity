@@ -7,6 +7,11 @@
 //!
 //! The session uses it with [`crate::DhtConfig::native`]; `mainline`
 //! stays the default until it has been validated on the live network.
+//!
+//! With a [`crate::Socks5Proxy`], [`NativeDht::bind_relayed`] starts
+//! the node only after a SOCKS5 UDP ASSOCIATE succeeds, so nothing is
+//! sent or accepted until the relay is up. Bootstrap host names go to
+//! the proxy as domain addresses and are never resolved locally.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -25,6 +30,7 @@ use tokio::time::Instant;
 use crate::bloom::Bloom;
 use crate::items::{self, Item, ItemStore, Mutable};
 use crate::krpc::{Body, Ext, Message, Node, Query};
+use crate::relay::{Contact, Socks5Proxy, Transport, UdpAssociate};
 use crate::routing::{K, RoutingTable, distance};
 use crate::secure_id::{is_secure, secure_node_id};
 use crate::store::{PeerStore, TOKEN_ROTATION, Tokens};
@@ -65,6 +71,17 @@ impl Default for NativeConfig {
     }
 }
 
+impl NativeConfig {
+    /// The defaults, with this query timeout.
+    #[must_use]
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            ..Self::default()
+        }
+    }
+}
+
 /// What a `get_peers` lookup found.
 #[derive(Debug, Clone, Default)]
 pub struct Lookup {
@@ -100,7 +117,7 @@ type Pending = Mutex<HashMap<[u8; 2], oneshot::Sender<(SocketAddr, Message)>>>;
 
 #[derive(Debug)]
 struct Shared {
-    socket: UdpSocket,
+    socket: Transport,
     state: Mutex<State>,
     pending: Pending,
     next_tid: AtomicU16,
@@ -154,7 +171,11 @@ impl NativeDht {
     /// If the socket cannot be bound.
     pub async fn bind_with(addr: SocketAddr, config: NativeConfig) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
-        Ok(Self::start(socket, random_bytes(), config))
+        Ok(Self::start(
+            Transport::Direct(socket),
+            random_bytes(),
+            config,
+        ))
     }
 
     /// Like [`Self::bind`] with a chosen node id (for tests).
@@ -164,12 +185,27 @@ impl NativeDht {
     pub async fn with_id(addr: SocketAddr, id: [u8; 20], timeout: Duration) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
         Ok(Self::start(
-            socket,
+            Transport::Direct(socket),
             id,
             NativeConfig {
                 timeout,
                 ..NativeConfig::default()
             },
+        ))
+    }
+
+    /// Starts a node whose datagrams go through `proxy`. Returns only
+    /// after the SOCKS5 UDP ASSOCIATE has succeeded; until then (and if
+    /// it fails) no UDP socket exists, so nothing is sent or accepted.
+    ///
+    /// # Errors
+    /// If the proxy cannot be reached or refuses the association.
+    pub async fn bind_relayed(proxy: &Socks5Proxy, config: NativeConfig) -> io::Result<Self> {
+        let relay = UdpAssociate::open(proxy).await?;
+        Ok(Self::start(
+            Transport::Relayed(relay),
+            random_bytes(),
+            config,
         ))
     }
 
@@ -181,13 +217,13 @@ impl NativeDht {
     pub fn from_std(socket: std::net::UdpSocket, config: NativeConfig) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
         Ok(Self::start(
-            UdpSocket::from_std(socket)?,
+            Transport::Direct(UdpSocket::from_std(socket)?),
             random_bytes(),
             config,
         ))
     }
 
-    fn start(socket: UdpSocket, id: [u8; 20], config: NativeConfig) -> Self {
+    fn start(socket: Transport, id: [u8; 20], config: NativeConfig) -> Self {
         let shared = Arc::new(Shared {
             socket,
             state: Mutex::new(State {
@@ -252,10 +288,17 @@ impl NativeDht {
     /// our id, takes a BEP 42 id if the answers show ours does not match
     /// our address, then looks our id up. Returns the routing table size.
     pub async fn bootstrap(&self, nodes: &[SocketAddr]) -> usize {
+        let contacts: Vec<Contact> = nodes.iter().copied().map(Contact::Addr).collect();
+        self.bootstrap_contacts(&contacts).await
+    }
+
+    /// [`Self::bootstrap`] for addresses or, through a SOCKS5 relay,
+    /// host names the proxy resolves (never the local resolver).
+    pub async fn bootstrap_contacts(&self, nodes: &[Contact]) -> usize {
         let own = self.id();
-        join_all(nodes.iter().map(|addr| {
+        join_all(nodes.iter().cloned().map(|dest| {
             self.shared
-                .query(*addr, None, Query::FindNode { target: own }, Ext::default())
+                .query(dest, None, Query::FindNode { target: own }, Ext::default())
         }))
         .await;
         self.shared.adopt_secure_id();
@@ -324,10 +367,12 @@ impl NativeDht {
         ext: &Ext,
     ) -> usize {
         join_all(closest.iter().filter_map(|(node, token)| {
-            Some(
-                self.shared
-                    .query(node.addr, Some(node.id), query(token.clone()?), ext.clone()),
-            )
+            Some(self.shared.query(
+                Contact::Addr(node.addr),
+                Some(node.id),
+                query(token.clone()?),
+                ext.clone(),
+            ))
         }))
         .await
         .into_iter()
@@ -480,11 +525,14 @@ impl NativeDht {
             if batch.is_empty() {
                 break;
             }
-            let replies = join_all(
-                batch
-                    .iter()
-                    .map(|n| shared.query(n.addr, Some(n.id), query.clone(), ext.clone())),
-            )
+            let replies = join_all(batch.iter().map(|n| {
+                shared.query(
+                    Contact::Addr(n.addr),
+                    Some(n.id),
+                    query.clone(),
+                    ext.clone(),
+                )
+            }))
             .await;
             for (node, reply) in batch.into_iter().zip(replies) {
                 queried.insert(node.id);
@@ -572,7 +620,7 @@ impl Shared {
     /// the node in the table; a timeout counts against `id` if known.
     async fn query(
         &self,
-        addr: SocketAddr,
+        dest: Contact,
         id: Option<[u8; 20]>,
         query: Query,
         mut ext: Ext,
@@ -592,7 +640,7 @@ impl Shared {
             },
             ext,
         };
-        let sent = self.socket.send_to(&message.encode(), addr).await.is_ok();
+        let sent = self.socket.send_to(&message.encode(), &dest).await.is_ok();
         let reply = if sent {
             tokio::time::timeout(self.config.timeout, rx)
                 .await
@@ -765,7 +813,10 @@ async fn receive(shared: std::sync::Weak<Shared>) {
                     body,
                     ext,
                 };
-                let _ = node.socket.send_to(&reply.encode(), from).await;
+                let _ = node
+                    .socket
+                    .send_to(&reply.encode(), &Contact::Addr(from))
+                    .await;
             }
             Body::Response { .. } | Body::Error { .. } => {
                 let Ok(tid) = <[u8; 2]>::try_from(message.transaction.as_slice()) else {

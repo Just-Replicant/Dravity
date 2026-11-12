@@ -299,6 +299,60 @@ async fn fake_pcp() -> (SocketAddrV4, Arc<Mutex<Vec<Vec<u8>>>>) {
     (addr, seen)
 }
 
+type TimedRequests = Arc<Mutex<Vec<(tokio::time::Instant, Vec<u8>)>>>;
+
+async fn wait_for_requests(seen: &TimedRequests, count: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if seen.lock().unwrap().len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("PCP requests");
+}
+
+/// Grants TCP two seconds and UDP eight seconds so renewal must use the
+/// shortest response lifetime, not the configured request lifetime.
+async fn fake_timed_pcp_v4() -> (SocketAddrV4, TimedRequests) {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let std::net::SocketAddr::V4(addr) = socket.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1100];
+        loop {
+            let (n, from) = socket.recv_from(&mut buf).await.unwrap();
+            let req = buf[..n].to_vec();
+            log.lock()
+                .unwrap()
+                .push((tokio::time::Instant::now(), req.clone()));
+            let requested = u32::from_be_bytes(req[4..8].try_into().unwrap());
+            let granted: u32 = if requested == 0 {
+                0
+            } else if req[36] == 6 {
+                2
+            } else {
+                8
+            };
+            let internal = u16::from_be_bytes([req[40], req[41]]);
+            let mut out = vec![2, 0x81, 0, 0];
+            out.extend_from_slice(&granted.to_be_bytes());
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(&[0; 12]);
+            out.extend_from_slice(&req[24..42]);
+            out.extend_from_slice(&(internal + 2000).to_be_bytes());
+            out.extend_from_slice(&Ipv4Addr::new(198, 51, 100, 4).to_ipv6_mapped().octets());
+            socket.send_to(&out, from).await.unwrap();
+        }
+    });
+    (addr, seen)
+}
+
 #[tokio::test]
 async fn pcp_maps_reports_and_deletes_with_the_same_nonce() {
     let (gateway, seen) = fake_pcp().await;
@@ -321,6 +375,44 @@ async fn pcp_maps_reports_and_deletes_with_the_same_nonce() {
         assert_eq!(&map[24..36], &delete[24..36], "same nonce");
     }
     assert_ne!(&seen[0][24..36], &seen[1][24..36], "a nonce per mapping");
+}
+
+#[tokio::test]
+async fn pcp_renews_with_retained_identity_at_the_minimum_granted_lifetime() {
+    let (gateway, seen) = fake_timed_pcp_v4().await;
+    let mut c = config();
+    c.ipv6 = false;
+    c.natpmp = false;
+    c.upnp = false;
+    c.gateway = Some(gateway);
+    c.lifetime = Duration::from_secs(20);
+    let mapper = PortMapper::start(c, mappings());
+    let status = wait_for(&mapper, |s| s.mapped.len() == 2).await;
+    assert!(status.mapped.iter().all(|m| m.external_port == 8881));
+
+    wait_for_requests(&seen, 4).await;
+    mapper.stop().await;
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 6, "two maps, two renewals, two deletes");
+    let elapsed = seen[2].0.duration_since(seen[0].0);
+    assert!(
+        (Duration::from_millis(700)..Duration::from_secs(4)).contains(&elapsed),
+        "renewed after {elapsed:?}, expected half the two-second grant"
+    );
+    let assigned_ip = Ipv4Addr::new(198, 51, 100, 4).to_ipv6_mapped().octets();
+    for index in 0..2 {
+        let open = &seen[index].1;
+        let renew = &seen[index + 2].1;
+        let delete = &seen[index + 4].1;
+        assert_eq!(&renew[24..42], &open[24..42], "retained MAP identity");
+        assert_eq!(&delete[24..42], &open[24..42], "retained delete identity");
+        assert_eq!(&renew[42..44], &8881u16.to_be_bytes());
+        assert_eq!(&delete[42..44], &8881u16.to_be_bytes());
+        assert_eq!(&renew[44..60], &assigned_ip);
+        assert_eq!(&delete[44..60], &assigned_ip);
+        assert_eq!(&renew[4..8], &20u32.to_be_bytes());
+        assert_eq!(&delete[4..8], &[0; 4]);
+    }
 }
 
 #[tokio::test]
@@ -366,6 +458,50 @@ async fn fake_pcp_v6() -> (std::net::SocketAddrV6, Arc<Mutex<Vec<Vec<u8>>>>) {
     (addr, seen)
 }
 
+async fn fake_timed_pcp_v6() -> (std::net::SocketAddrV6, TimedRequests) {
+    let socket = UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let std::net::SocketAddr::V6(addr) = socket.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1100];
+        loop {
+            let (n, from) = socket.recv_from(&mut buf).await.unwrap();
+            let req = buf[..n].to_vec();
+            log.lock()
+                .unwrap()
+                .push((tokio::time::Instant::now(), req.clone()));
+            let requested = u32::from_be_bytes(req[4..8].try_into().unwrap());
+            let granted: u32 = if requested == 0 {
+                0
+            } else if req[36] == 6 {
+                2
+            } else {
+                8
+            };
+            let internal = u16::from_be_bytes([req[40], req[41]]);
+            let mut out = vec![2, 0x81, 0, 0];
+            out.extend_from_slice(&granted.to_be_bytes());
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(&[0; 12]);
+            out.extend_from_slice(&req[24..42]);
+            out.extend_from_slice(&(internal + 3000).to_be_bytes());
+            out.extend_from_slice(
+                &"2001:db8::5"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+            );
+            socket.send_to(&out, from).await.unwrap();
+        }
+    });
+    (addr, seen)
+}
+
 #[tokio::test]
 async fn ipv6_pinholes_open_from_our_address_and_close_on_stop() {
     let (gateway, seen) = fake_pcp_v6().await;
@@ -395,6 +531,48 @@ async fn ipv6_pinholes_open_from_our_address_and_close_on_stop() {
         assert_eq!(&close[24..36], &open[24..36], "same nonce");
     }
     assert_eq!(seen[0][36], 6, "TCP first");
+}
+
+#[tokio::test]
+async fn ipv6_pinholes_renew_and_close_with_the_retained_identity() {
+    let (gateway, seen) = fake_timed_pcp_v6().await;
+    let mut c = config();
+    c.pcp = false;
+    c.natpmp = false;
+    c.upnp = false;
+    c.gateway_v6 = Some(gateway);
+    c.lifetime = Duration::from_secs(20);
+    c.retry = Duration::from_secs(10);
+    let mapper = PortMapper::start(c, mappings());
+    let status = wait_for(&mapper, |s| s.pinholes.len() == 2).await;
+    assert!(status.pinholes.iter().all(|m| m.external_port == 9881));
+
+    wait_for_requests(&seen, 4).await;
+    mapper.stop().await;
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 6, "two opens, two renewals, two closes");
+    let elapsed = seen[2].0.duration_since(seen[0].0);
+    assert!(
+        (Duration::from_millis(700)..Duration::from_secs(4)).contains(&elapsed),
+        "renewed after {elapsed:?}, expected half the two-second grant"
+    );
+    let assigned_ip = "2001:db8::5"
+        .parse::<std::net::Ipv6Addr>()
+        .unwrap()
+        .octets();
+    for index in 0..2 {
+        let open = &seen[index].1;
+        let renew = &seen[index + 2].1;
+        let close = &seen[index + 4].1;
+        assert_eq!(&renew[24..42], &open[24..42], "retained MAP identity");
+        assert_eq!(&close[24..42], &open[24..42], "retained close identity");
+        assert_eq!(&renew[42..44], &9881u16.to_be_bytes());
+        assert_eq!(&close[42..44], &9881u16.to_be_bytes());
+        assert_eq!(&renew[44..60], &assigned_ip);
+        assert_eq!(&close[44..60], &assigned_ip);
+        assert_eq!(&renew[4..8], &20u32.to_be_bytes());
+        assert_eq!(&close[4..8], &[0; 4]);
+    }
 }
 
 #[tokio::test]

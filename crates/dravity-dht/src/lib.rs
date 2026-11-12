@@ -1,11 +1,11 @@
 //! Mainline DHT (BEP 5) peer discovery for the Dravity BitTorrent engine.
 //!
-//! A thin wrapper around the [`mainline`] crate, which runs the DHT node
-//! (routing table, KRPC, token handling) on its own thread. This crate
-//! exposes only what a BitTorrent client needs — "who has this info-hash?"
-//! and "I have this info-hash" — in Dravity's own types, so the rest of the
-//! workspace never depends on `mainline` directly and the backend can be
-//! replaced later.
+//! Peer discovery through the BitTorrent DHT (BEP 5).
+//!
+//! The default backend is the [`mainline`] crate. [`native::NativeDht`] is
+//! Dravity's own node (KRPC, BEP 32/33/42/43/44/51, optional SOCKS5 UDP
+//! relay), selected with [`DhtConfig::native`]. The session talks to either
+//! backend through [`Dht`].
 //!
 //! The async methods are runtime-agnostic; the session wraps them in its own
 //! timeouts.
@@ -27,6 +27,7 @@ pub mod native;
 pub mod relay;
 pub mod routing;
 pub mod secure_id;
+pub mod shared;
 pub mod store;
 
 pub use relay::{Contact, Socks5Proxy};

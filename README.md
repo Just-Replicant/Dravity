@@ -39,7 +39,7 @@ for the full architecture, comparison with existing clients, and roadmap.
 | [`dravity-dht`](crates/dravity-dht) | ✅ IronTide | DHT (BEP 5): `mainline` by default, or Dravity's own `NativeDht` (`DhtConfig::native`, `--native-dht`) with BEP 32/33/42/43/44/51, optional IPv6 dual-stack and SOCKS5 UDP relay. Public-network validation is documented in [`docs/native-dht-validation.md`](docs/native-dht-validation.md). |
 | [`dravity-session`](crates/dravity-session) | ✅ IronTide | The only I/O driver: per-torrent owner task on Tokio, peer tasks, TCP/uTP listener (IPv4 + IPv6, live rebind), disk/hash offload, uploads, magnets, DHT, port mapping, fastresume, BEP 12 tiers, alerts; file priorities, streaming `FileStream`, pause/resume/remove, persisted state + restore, watch folder; live settings (rate limits, queue, connection cap); IP filter, GeoIP, DSCP, SOCKS/HTTP proxies; peer and tracker reads; v2/hybrid torrents, web seeds, MSE/PE; pluggable `Network` transport; settings registry |
 | [`dravity-http`](crates/dravity-http) | ✅ Phase 4 | axum JSON API over the session: torrents, files, priorities, streaming with `Range`, server-sent alerts, Prometheus `/metrics`, bearer token. A non-loopback bind without a token is refused unless `--allow-insecure-http` / `HttpConfig::allow_insecure_unauthenticated` is set. |
-| [`dravity-cli`](crates/dravity-cli) | ✅ Phase 6 | `dravity download` / `info` / `create` / `serve` for files and magnet links, seeding, file selection, a full ratatui `--tui` client (add, remove, peers, trackers, alerts); renders alerts, never drives I/O |
+| [`dravity-cli`](crates/dravity-cli) | ✅ Phase 6 | `dravity download` / `info` / `create` / `serve` for files and magnet links, seeding, file selection, a full ratatui `--tui` client (add with options, remove, peers, trackers, live session actions, alerts); renders alerts, never drives I/O |
 | [`dravity-utp`](crates/dravity-utp) | ✅ Phase 6 | uTP (BEP 29): packet codec, sans-IO connection with LEDBAT congestion control, Tokio socket and streams |
 | [`dravity-lsd`](crates/dravity-lsd) | ✅ irontide | Local Service Discovery (BEP 14): sans-IO `BT-SEARCH` codec and a multicast service; the session skips private torrents |
 | [`dravity-portmap`](crates/dravity-portmap) | ✅ IronTide | Router port mapping: PCP (RFC 6887, including IPv6 pinholes) first, then NAT-PMP (RFC 6886) and UPnP IGD. PCP mappings keep their nonce and assigned address and renew at half the lifetime the router granted. |
@@ -250,8 +250,15 @@ Fastresume data goes to `<output>/.dravity` (`--resume-dir DIR` to move it,
 ```sh
 # only files 0 and 2-4 (indices from `dravity info`), file 3 first
 cargo run --release -p dravity-cli -- download example.torrent --files 0,2-4 --file-priority 3=high
-# full-screen terminal UI: a adds a magnet or .torrent, d/D remove, enter shows
-# files/peers/trackers (1/2/3), space pauses, s/l/n/h set file priorities, ? lists keys
+# full-screen terminal UI: a adds a magnet or .torrent (tab for pause, extra
+# peers, a download directory and file priorities), d/D remove, enter shows
+# files/peers/trackers (1/2/3), space pauses, s/l/n/h set file priorities,
+# t streams a file (HTTP Range URL when the API is up), s on trackers scrapes
+# now, Q/C/P set queue caps, the connection cap and the listen port, b/B/i
+# ban, unban and load an IP filter, L/U rate limits, ? lists keys.
+# A queued torrent is shown as "queued", not "stopped". The header shows
+# current limits, queue caps, the peer id, open connections, hash jobs,
+# read-cache stats, and port-mapping protocol and external address.
 cargo run --release -p dravity-cli -- download example.torrent --tui
 cargo run --release -p dravity-cli -- serve --download-dir downloads --tui
 # a daemon: saved session, watch folder, HTTP API on 127.0.0.1:9091
@@ -259,7 +266,7 @@ DRAVITY_TOKEN=change-me cargo run --release -p dravity-cli -- serve \
     --download-dir downloads --watch torrents
 curl -H 'Authorization: Bearer change-me' localhost:9091/api/v1/torrents
 # 4 MiB/s down for all torrents together, at most 2 downloading at once
-# (the rest queue); the same settings change live over the API or with L/U in the TUI
+# (the rest queue); the same settings change live over the API or with L/U/Q/C in the TUI
 cargo run --release -p dravity-cli -- serve --download-dir downloads \
     --global-download-limit 4M --max-active-downloads 2
 curl -X PATCH -H 'Authorization: Bearer change-me' -H 'Content-Type: application/json' \

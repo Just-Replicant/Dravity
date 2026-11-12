@@ -6,6 +6,41 @@ the roadmap phases until the first release.
 
 ## [Unreleased]
 
+### TUI: live session actions and session numbers
+
+The `--tui` client can now drive the session APIs that were already there,
+and it shows the numbers the screen used to drop.
+
+- **Queued vs stopped:** the torrent table reads `TorrentSummary::queued`
+  and draws a distinct `queued` state (a user pause still wins).
+- **Live actions:** `Q` sets `max_active_downloads` and `max_active_seeds`,
+  `C` the session `max_connections`, `P` moves the listen port
+  (`Session::set_listen_port`; `0` picks a free port). `b` bans an IP,
+  `B` shows the ban list (`u` unbans the selection, `U` types an address),
+  `i` loads or replaces the IP filter (empty clears it). `s` on the
+  trackers pane forces a scrape (`TorrentHandle::scrape`); the UI notes
+  that periodic scrape counts need `--scrape-interval`. `t` on a file
+  calls `open_file` and, when `dravity serve --tui` is running, shows the
+  HTTP Range URL (`/api/v1/torrents/{hash}/files/{index}/content`).
+- **Add options:** the add prompt is a form (tab between fields): start
+  paused, extra peers, a download directory other than the session's, and
+  for a `.torrent`, file selection and priorities (enter inspects, enter
+  again adds).
+- **Header and selected torrent:** current rate limits and queue caps,
+  peer id, open connection count, hash jobs in flight, read-cache stats,
+  port-mapping protocol, UDP port and external address (not only the
+  mapped TCP port), session ban and filter counts. The selected pane
+  shows piece counts, peers still connecting, known-but-not-connected
+  peers, unchoked and interested peers, pending disk reads and writes,
+  and the torrent's banned-peer count.
+- **Trackers and alerts:** last announce and scrape times, scrape
+  failures, and alert lines for a completed piece and a failed upload
+  read (`Alert::PieceCompleted`, `Alert::UploadFailed`).
+- In-TUI `?` help and the README list the new keys. Input parsing
+  (IPs, ports, caps, peer lists, filter paths) and state mapping
+  including `queued` are tested, plus a loopback session test of the
+  actions.
+
 ### Audit remediation
 
 Fixes and follow-ups from a review of the IronTide adoption work. All

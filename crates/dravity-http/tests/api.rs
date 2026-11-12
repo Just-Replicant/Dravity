@@ -21,7 +21,7 @@ use axum::http::{Method, Request, StatusCode, header};
 use dravity_bencode::{Dict, Value};
 use dravity_core::{InfoHash, Metainfo};
 use dravity_engine::Alert;
-use dravity_http::HttpConfig;
+use dravity_http::{HttpConfig, HttpError};
 use dravity_session::{AddTorrentOptions, ListenConfig, Session, SessionAlert, SessionConfig};
 use http_body_util::BodyExt;
 use serde_json::{Value as Json, json};
@@ -212,6 +212,42 @@ async fn requests_need_the_token_when_one_is_set() {
     assert_eq!(body["torrents"], 0);
     assert_eq!(body["peer_id"].as_str().unwrap().len(), 40);
     assert!(body["listen_port"].as_u64().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_loopback_startup_requires_auth_or_override() {
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let session = Session::new(config()).unwrap();
+    let result = dravity_http::serve(
+        listener,
+        session.clone(),
+        HttpConfig::new("unused"),
+        std::future::pending(),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(HttpError::UnauthenticatedNonLoopback(found)) if found == addr
+    ));
+    assert!(
+        HttpConfig::new("unused")
+            .with_token("token")
+            .validate_listener(addr)
+            .is_ok()
+    );
+    assert!(
+        HttpConfig::new("unused")
+            .allow_insecure_unauthenticated()
+            .validate_listener(addr)
+            .is_ok()
+    );
+    assert!(
+        HttpConfig::new("unused")
+            .validate_listener("127.0.0.1:9091".parse().unwrap())
+            .is_ok()
+    );
+    session.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

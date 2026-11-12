@@ -95,6 +95,9 @@ enum Command {
         /// Bearer token the HTTP API requires.
         #[arg(long, env = "DRAVITY_TOKEN", hide_env_values = true)]
         token: Option<String>,
+        /// Allow a non-loopback HTTP API without a bearer token.
+        #[arg(long, conflicts_with = "no_http")]
+        allow_insecure_http: bool,
         /// Stop uploading once a torrent is complete.
         #[arg(long)]
         no_seed: bool,
@@ -594,6 +597,7 @@ fn run(cli: Cli) -> Result<()> {
             http,
             no_http,
             token,
+            allow_insecure_http,
             no_seed,
             tui,
             network,
@@ -609,6 +613,7 @@ fn run(cli: Cli) -> Result<()> {
                 watch,
                 http: (!no_http).then_some(http),
                 token,
+                allow_insecure_http,
                 tui,
             };
             let runtime = tokio::runtime::Runtime::new().context("starting the Tokio runtime")?;

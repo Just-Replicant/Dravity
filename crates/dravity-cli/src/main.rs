@@ -303,6 +303,15 @@ struct NetworkArgs {
     /// accepts RC4-encrypted connections; `disabled` never encrypts.
     #[arg(long, value_enum, default_value_t = Encryption::Enabled, value_name = "POLICY")]
     encryption: Encryption,
+    /// Largest torrent piece length accepted, in bytes (default: 32 MiB).
+    #[arg(long, value_name = "BYTES", default_value_t = dravity_session::DEFAULT_MAX_PIECE_LENGTH)]
+    max_piece_length: u32,
+    /// Allow HTTP and UDP trackers on private, loopback or link-local
+    /// addresses (or hosts that resolve to them). Off by default, so an
+    /// untrusted torrent cannot probe the local network. Allowed HTTP
+    /// origins still need a path segment beginning with `announce`.
+    #[arg(long)]
+    allow_private_trackers: bool,
 }
 
 /// `--encryption` values.
@@ -420,6 +429,8 @@ impl NetworkArgs {
         }
         config.storage_backend = self.storage_backend.into();
         config.encryption = self.encryption.into();
+        config.max_piece_length = self.max_piece_length;
+        config.tracker.allow_private_trackers = self.allow_private_trackers;
         Ok(config)
     }
 }

@@ -40,6 +40,7 @@ pub struct MetainfoLimits {
 }
 
 impl MetainfoLimits {
+    /// Limits that accept piece lengths up to `max_piece_length` bytes.
     #[must_use]
     pub const fn new(max_piece_length: u32) -> Self {
         Self { max_piece_length }

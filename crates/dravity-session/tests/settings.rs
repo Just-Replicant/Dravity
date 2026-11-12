@@ -13,11 +13,11 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use dravity_core::create::{CreateOptions, CreateVersion, InputFile, TorrentCreator};
-use dravity_core::{InfoHash, Metainfo};
+use dravity_core::{InfoHash, Metainfo, MetainfoLimits};
 use dravity_engine::Alert;
 use dravity_session::{
-    AddTorrentOptions, ListenConfig, Session, SessionAlert, SessionConfig, SettingsError,
-    SettingsUpdate,
+    AddTorrentOptions, DEFAULT_MAX_PIECE_LENGTH, ListenConfig, Session, SessionAlert,
+    SessionConfig, SessionError, SettingsError, SettingsUpdate,
 };
 use tokio::sync::broadcast;
 
@@ -41,6 +41,8 @@ fn torrent(name: &str, data: &[u8]) -> Metainfo {
 
 fn config() -> SessionConfig {
     let mut c = SessionConfig::default();
+    // Loopback HTTP/UDP trackers in these hermetic tests are private origins.
+    c.tracker.allow_private_trackers = true;
     c.dht = None;
     c.port_mapping = None;
     c.listen = Some(ListenConfig::loopback(0));
@@ -291,4 +293,145 @@ async fn a_moved_listen_port_survives_a_restart() {
     let s = Session::new(c).unwrap();
     let report = s.restore().await.unwrap();
     assert_eq!(report.failed.len(), 1, "port 0 is refused: {report:?}");
+}
+
+#[tokio::test]
+async fn a_live_rebind_fails_when_the_requested_port_is_taken() {
+    let session = Session::new(config()).unwrap();
+    let old = session.listen_port().unwrap();
+    // Occupant without SO_REUSEADDR, so the session cannot share the port.
+    let occupant = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = occupant.local_addr().unwrap().port();
+    let err = session.set_listen_port(taken).await.unwrap_err();
+    assert!(
+        matches!(err, SessionError::Listen(ref e) if e.kind() == std::io::ErrorKind::AddrInUse),
+        "{err:?}"
+    );
+    assert_eq!(
+        session.listen_port(),
+        Some(old),
+        "a failed rebind must leave the old listener in place"
+    );
+    assert_eq!(session.set_listen_port(old).await.unwrap(), old);
+    drop(occupant);
+}
+
+#[test]
+fn concurrent_settings_updates_keep_every_field() {
+    let state = tempfile::tempdir().unwrap();
+    let mut c = config();
+    c.state_dir = Some(state.path().to_path_buf());
+    let session = Session::new(c).unwrap();
+    let first = session.clone();
+    let second = session.clone();
+    let a = std::thread::spawn(move || {
+        let mut update = SettingsUpdate::default();
+        update.download_rate_limit = Some(Some(32 * 1024));
+        first.apply_settings(update).unwrap()
+    });
+    let b = std::thread::spawn(move || {
+        let mut update = SettingsUpdate::default();
+        update.upload_rate_limit = Some(Some(64 * 1024));
+        second.apply_settings(update).unwrap()
+    });
+    a.join().expect("download-limit thread");
+    b.join().expect("upload-limit thread");
+    let live = session.settings();
+    assert_eq!(live.download_rate_limit, Some(32 * 1024));
+    assert_eq!(live.upload_rate_limit, Some(64 * 1024));
+}
+
+#[tokio::test]
+async fn a_torrent_with_an_oversized_piece_length_is_refused() {
+    let large = DEFAULT_MAX_PIECE_LENGTH.saturating_mul(2);
+    let data = content(16, 1);
+    let mut options = CreateOptions::new(CreateVersion::V1);
+    options.piece_length = Some(large);
+    let mut creator = TorrentCreator::new(
+        "big-piece.bin",
+        vec![InputFile::new(["big-piece.bin"], data.len() as u64)],
+        true,
+        options,
+    )
+    .unwrap();
+    creator.update(&data).unwrap();
+    let encoded = creator.finish().unwrap();
+    let metainfo = Metainfo::from_bytes_with_limits(&encoded, MetainfoLimits::new(large)).unwrap();
+    assert_eq!(metainfo.info().piece_length(), large);
+
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(config()).unwrap();
+    let err = session
+        .add_torrent(metainfo.clone(), AddTorrentOptions::new(dir.path()))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SessionError::PieceLengthTooLarge {
+                actual,
+                maximum,
+            } if actual == large && maximum == DEFAULT_MAX_PIECE_LENGTH
+        ),
+        "{err:?}"
+    );
+
+    let mut raised = config();
+    raised.max_piece_length = large;
+    let session = Session::new(raised).unwrap();
+    session
+        .add_torrent(metainfo, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+}
+
+/// Default sessions refuse private-network tracker origins (SSRF).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_default_session_blocks_private_tracker_origins() {
+    let data = content(16, 9);
+    let mut opts = CreateOptions::new(CreateVersion::V1);
+    opts.trackers = vec![vec!["http://10.0.0.5/announce".into()]];
+    let mut creator = TorrentCreator::new(
+        "blocked.bin",
+        vec![InputFile::new(["blocked.bin"], data.len() as u64)],
+        true,
+        opts,
+    )
+    .unwrap();
+    creator.update(&data).unwrap();
+    let metainfo = Metainfo::from_bytes(&creator.finish().unwrap()).unwrap();
+
+    let mut cfg = SessionConfig::default();
+    cfg.dht = None;
+    cfg.port_mapping = None;
+    cfg.listen = None;
+    assert!(
+        !cfg.tracker.allow_private_trackers,
+        "the production default must stay closed"
+    );
+    let session = Session::new(cfg).unwrap();
+    let mut alerts = session.subscribe();
+    let dir = tempfile::tempdir().unwrap();
+    let hash = metainfo.info_hash();
+    session
+        .add_torrent(metainfo, AddTorrentOptions::new(dir.path()))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match alerts.recv().await {
+                Ok(a) if a.info_hash == hash => {
+                    if let Alert::TrackerError { message } = a.alert {
+                        assert!(
+                            message.contains("non-public tracker origin is not allowed"),
+                            "{message}"
+                        );
+                        return;
+                    }
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+    })
+    .await
+    .expect("the announce must be blocked");
+    session.shutdown().await;
 }

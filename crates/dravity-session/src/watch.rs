@@ -15,7 +15,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use dravity_core::{Magnet, Metainfo};
+use dravity_core::{Magnet, Metainfo, MetainfoLimits};
 use tokio::task::JoinHandle;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
@@ -165,9 +165,12 @@ async fn add_file(session: &Session, config: &WatchConfig, path: PathBuf) {
         };
     let options = AddTorrentOptions::new(&config.download_dir).paused(config.paused);
     let result = match kind {
-        Kind::Torrent => Metainfo::from_bytes(&bytes)
-            .map_err(|e| Some(e.to_string()))
-            .and_then(|m| session.add_torrent(m, options).map_err(added_error)),
+        Kind::Torrent => Metainfo::from_bytes_with_limits(
+            &bytes,
+            MetainfoLimits::new(session.config().max_piece_length),
+        )
+        .map_err(|e| Some(e.to_string()))
+        .and_then(|m| session.add_torrent(m, options).map_err(added_error)),
         Kind::Magnet => std::str::from_utf8(&bytes)
             .map_err(|e| Some(e.to_string()))
             .and_then(|text| {

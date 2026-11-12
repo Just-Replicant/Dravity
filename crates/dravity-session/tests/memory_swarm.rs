@@ -27,6 +27,8 @@ fn torrent() -> Metainfo {
 
 fn config(net: &MemoryNetwork, host: u8) -> SessionConfig {
     let mut c = SessionConfig::default();
+    // Loopback HTTP/UDP trackers in these hermetic tests are private origins.
+    c.tracker.allow_private_trackers = true;
     c.dht = None;
     c.port_mapping = None;
     c.lsd = None;

@@ -62,4 +62,12 @@ pub enum SessionError {
     /// unknown until the metadata arrives.
     #[error("custom storage is not supported for magnet links")]
     StorageForMagnet,
+    /// The torrent's piece length exceeds [`crate::SessionConfig::max_piece_length`].
+    #[error("piece length {actual} exceeds the session maximum of {maximum}")]
+    PieceLengthTooLarge {
+        /// Piece length in the torrent, in bytes.
+        actual: u32,
+        /// Configured session ceiling, in bytes.
+        maximum: u32,
+    },
 }

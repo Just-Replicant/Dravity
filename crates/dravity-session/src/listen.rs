@@ -100,14 +100,36 @@ pub(crate) struct Bound {
     pub(crate) port: u16,
 }
 
-/// Binds the sockets of `config`.
-///
-/// IPv4 is bound first; IPv6 then uses the same port. A taken port falls
-/// back to a free one.
+/// How [`bind_with`] treats a requested port that is already taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindMode {
+    /// The first occupied requested port falls back to an ephemeral one.
+    /// Used when the session starts, so a default like 6881 still works.
+    Fallback,
+    /// The exact requested port must be bound on every configured address
+    /// family. Port 0 still means "any free port". Used for a live rebind,
+    /// which must leave the old listener alone on failure.
+    Strict,
+}
+
+/// Binds the sockets of `config`, falling back to a free port if the
+/// requested one is taken. See [`bind_with`].
 ///
 /// # Errors
 /// The bind error if no socket could be bound.
 pub(crate) fn bind(config: &ListenConfig) -> io::Result<Bound> {
+    bind_with(config, BindMode::Fallback)
+}
+
+/// Binds the sockets of `config` under `mode`.
+///
+/// IPv4 is bound first; IPv6 then uses the same port.
+///
+/// # Errors
+/// The bind error if no socket could be bound, or, in
+/// [`BindMode::Strict`], if any configured address could not use the
+/// requested port.
+pub(crate) fn bind_with(config: &ListenConfig, mode: BindMode) -> io::Result<Bound> {
     let mut sockets = Vec::new();
     let mut port = config.port;
     let mut first_error = None;
@@ -120,9 +142,14 @@ pub(crate) fn bind(config: &ListenConfig) -> io::Result<Bound> {
         addr.set_port(port);
         let bound = match bind_one(addr) {
             Err(e) if e.kind() == io::ErrorKind::AddrInUse && sockets.is_empty() && port != 0 => {
-                tracing::warn!(port, "listen port in use, using a free port");
-                addr.set_port(0);
-                bind_one(addr)
+                match mode {
+                    BindMode::Fallback => {
+                        tracing::warn!(port, "listen port in use, using a free port");
+                        addr.set_port(0);
+                        bind_one(addr)
+                    }
+                    BindMode::Strict => Err(e),
+                }
             }
             other => other,
         };
@@ -133,6 +160,9 @@ pub(crate) fn bind(config: &ListenConfig) -> io::Result<Bound> {
             }
             Err(e) => {
                 tracing::warn!(%addr, error = %e, "cannot listen");
+                if mode == BindMode::Strict {
+                    return Err(e);
+                }
                 first_error.get_or_insert(e);
             }
         }
@@ -140,6 +170,17 @@ pub(crate) fn bind(config: &ListenConfig) -> io::Result<Bound> {
     if sockets.is_empty() {
         return Err(first_error
             .unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address to bind")));
+    }
+    if mode == BindMode::Strict {
+        let wanted = config.ipv4.is_some() as usize + config.ipv6.is_some() as usize;
+        if sockets.len() != wanted {
+            return Err(first_error.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "could not bind every configured address family",
+                )
+            }));
+        }
     }
     let mut udp = Vec::new();
     if config.utp.is_some() {
@@ -593,5 +634,26 @@ mod tests {
             })
             .is_err()
         );
+
+        let taken = first.port;
+        let err = bind_with(
+            &ListenConfig {
+                ipv6: None,
+                ..ListenConfig::loopback(taken)
+            },
+            BindMode::Strict,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        // The original sockets are still bound: a strict failure must not
+        // have touched them (they were never passed in).
+        assert_eq!(
+            first.sockets.first().unwrap().local_addr().unwrap().port(),
+            taken
+        );
+        // An explicit ephemeral request is still allowed in strict mode.
+        let ephemeral = bind_with(&ListenConfig::loopback(0), BindMode::Strict).unwrap();
+        assert_ne!(ephemeral.port, 0);
+        assert_ne!(ephemeral.port, taken);
     }
 }

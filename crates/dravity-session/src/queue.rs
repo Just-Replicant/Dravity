@@ -106,12 +106,19 @@ async fn step(session: &Session) {
             })
         })
         .collect();
-    let mut seen = Vec::with_capacity(running.len());
-    for (hash, handle) in running {
-        if let Ok(Ok(stats)) = tokio::time::timeout(Duration::from_secs(1), handle.stats()).await {
-            seen.push((hash, stats.status == TorrentStatus::Finished));
-        }
-    }
+    // Ask every running torrent at once. A sequential query would allow
+    // one unresponsive task to consume a full second per torrent.
+    let seen: Vec<(InfoHash, bool)> =
+        futures_util::future::join_all(running.into_iter().map(|(hash, handle)| async move {
+            match tokio::time::timeout(Duration::from_secs(1), handle.stats()).await {
+                Ok(Ok(stats)) => Some((hash, stats.status == TorrentStatus::Finished)),
+                _ => None,
+            }
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
     let mut stop = Vec::new();
     {
         let mut catalog = session.inner.catalog();

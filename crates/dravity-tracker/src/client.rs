@@ -1,6 +1,6 @@
 //! Async announce over HTTP(S) and UDP.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -34,11 +34,19 @@ pub struct ClientConfig {
     /// never downgrade and never move from a non-local tracker to a
     /// non-public address (literal or resolved).
     pub ssrf_mitigation: bool,
+    /// Permit private, loopback and link-local tracker origins. Off by
+    /// default; allowed HTTP origins still need an announce-shaped path.
+    pub allow_private_trackers: bool,
+    /// Exact URL origins permitted to reach non-public addresses.
+    pub private_tracker_origins: Vec<String>,
     /// Send HTTP(S) announces and scrapes through this proxy:
     /// `http://`, `socks5://`, `socks5h://`, `socks4://` or `socks4a://`
     /// (`[user:pass@]host:port`; the `h`/`a` forms resolve names at the
     /// proxy). UDP trackers are not proxied.
     pub http_proxy: Option<String>,
+    /// Trust proxy-side tracker DNS. Off by default because the guarded
+    /// local resolver cannot inspect addresses selected by the proxy.
+    pub allow_proxy_dns: bool,
     /// Send UDP tracker requests through this SOCKS5 proxy's UDP relay
     /// (UDP ASSOCIATE). Tracker host names are resolved by the proxy.
     pub udp_proxy: Option<UdpProxy>,
@@ -52,7 +60,10 @@ impl Default for ClientConfig {
             udp_retries: 2,
             user_agent: concat!("Dravity/", env!("CARGO_PKG_VERSION")).to_owned(),
             ssrf_mitigation: true,
+            allow_private_trackers: false,
+            private_tracker_origins: Vec::new(),
             http_proxy: None,
+            allow_proxy_dns: false,
             udp_proxy: None,
         }
     }
@@ -95,7 +106,6 @@ pub struct TrackerClient {
     http: reqwest::Client,
     config: ClientConfig,
     endpoints: Arc<Mutex<HashMap<Target, UdpEndpoint>>>,
-    trusted: Arc<TrustedHosts>,
 }
 
 /// A request that needs a UDP connection id.
@@ -112,41 +122,11 @@ enum UdpAnswer {
     Scrape(Vec<ScrapeStats>),
 }
 
-/// Most host names remembered as announce origins; the set is cleared when
-/// it grows past this (names are re-added on their next announce).
-const MAX_TRUSTED_HOSTS: usize = 1024;
-
-/// Host names that appeared in an announce URL itself (not in a redirect).
-///
-/// Only these may resolve to non-public addresses: a LAN tracker named by
-/// the torrent works, but a public tracker cannot redirect to a name that
-/// resolves into the LAN (and DNS rebinding cannot swap the address after
-/// a check, because the filter runs in the resolver the connection uses).
-#[derive(Debug, Default)]
-struct TrustedHosts(Mutex<HashSet<String>>);
-
-impl TrustedHosts {
-    fn insert(&self, host: &str) {
-        let mut set = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if set.len() >= MAX_TRUSTED_HOSTS {
-            set.clear();
-        }
-        set.insert(host.to_ascii_lowercase());
-    }
-
-    fn contains(&self, host: &str) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(&host.to_ascii_lowercase())
-    }
-}
-
 /// The system resolver, keeping only public addresses for names that are
-/// not announce origins.
+/// not the explicitly permitted origin of this request.
 #[derive(Debug)]
 struct GuardedResolver {
-    trusted: Arc<TrustedHosts>,
+    private_origin_host: Option<String>,
 }
 
 /// A redirect target whose every address is non-public.
@@ -157,7 +137,10 @@ struct NotPublic(String);
 impl Resolve for GuardedResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_owned();
-        let trusted = self.trusted.contains(&host);
+        let trusted = self
+            .private_origin_host
+            .as_ref()
+            .is_some_and(|allowed| allowed.eq_ignore_ascii_case(&host));
         Box::pin(async move {
             let found: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
                 .await?
@@ -179,7 +162,7 @@ fn redirect(attempt: Attempt<'_>) -> reqwest::redirect::Action {
         return attempt.follow();
     };
     let hops = previous.len().saturating_sub(1);
-    match guard::check_redirect(origin, from, attempt.url(), hops) {
+    match guard::check_redirect(origin, from, attempt.url(), hops, false) {
         Ok(()) => attempt.follow(),
         Err(blocked) => attempt.error(blocked),
     }
@@ -210,7 +193,6 @@ impl TrackerClient {
             .with_platform_verifier()?
             .with_no_client_auth();
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let trusted = Arc::new(TrustedHosts::default());
         let mut builder = reqwest::Client::builder()
             .tls_backend_preconfigured(tls)
             .timeout(config.http_timeout)
@@ -219,7 +201,7 @@ impl TrackerClient {
             builder = builder
                 .redirect(Policy::custom(redirect))
                 .dns_resolver(Arc::new(GuardedResolver {
-                    trusted: Arc::clone(&trusted),
+                    private_origin_host: None,
                 }));
         } else {
             builder = builder.redirect(Policy::limited(guard::MAX_REDIRECTS));
@@ -232,8 +214,59 @@ impl TrackerClient {
             http,
             config,
             endpoints: Arc::default(),
-            trusted,
         })
+    }
+
+    fn private_origin_allowed(&self, url: &Url) -> bool {
+        self.config.allow_private_trackers
+            || self
+                .config
+                .private_tracker_origins
+                .iter()
+                .filter_map(|origin| Url::parse(origin).ok())
+                .any(|origin| guard::same_origin(&origin, url))
+    }
+
+    fn scoped_http(&self, origin: &Url) -> Result<reqwest::Client, TrackerError> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .with_platform_verifier()?
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let policy_origin = origin.clone();
+        let policy = Policy::custom(move |attempt| {
+            let previous = attempt.previous();
+            let Some(from) = previous.last() else {
+                return attempt.follow();
+            };
+            match guard::check_redirect(
+                &policy_origin,
+                from,
+                attempt.url(),
+                previous.len().saturating_sub(1),
+                true,
+            ) {
+                Ok(()) => attempt.follow(),
+                Err(blocked) => attempt.error(blocked),
+            }
+        });
+        let host = match origin.host() {
+            Some(url::Host::Domain(name)) => Some(name.to_owned()),
+            _ => None,
+        };
+        let mut builder = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls)
+            .timeout(self.config.http_timeout)
+            .user_agent(self.config.user_agent.clone())
+            .redirect(policy)
+            .dns_resolver(Arc::new(GuardedResolver {
+                private_origin_host: host,
+            }));
+        if let Some(url) = &self.config.http_proxy {
+            builder = builder.proxy(reqwest::Proxy::all(url.as_str())?);
+        }
+        Ok(builder.build()?)
     }
 
     /// The client configuration.
@@ -317,15 +350,25 @@ impl TrackerClient {
     /// guard judges `base`: a scrape URL differs from its announce URL only
     /// in `announce` becoming `scrape`, on the same host.
     async fn get(&self, base: &str, url: &str) -> Result<Vec<u8>, TrackerError> {
+        let mut scoped = None;
         if self.config.ssrf_mitigation {
             let parsed = Url::parse(base).map_err(|_| TrackerError::InvalidUrl(base.to_owned()))?;
-            guard::check_announce(&parsed)?;
-            if let Some(url::Host::Domain(name)) = parsed.host() {
-                self.trusted.insert(name);
+            let private_allowed = self.private_origin_allowed(&parsed);
+            guard::check_announce(&parsed, private_allowed)?;
+            if self.config.http_proxy.is_some()
+                && !self.config.allow_proxy_dns
+                && !private_allowed
+                && matches!(parsed.host(), Some(url::Host::Domain(_)))
+            {
+                return Err(guard::Blocked::ProxyResolution(parsed.to_string()).into());
+            }
+            if private_allowed {
+                scoped = Some(self.scoped_http(&parsed)?);
             }
         }
+        let client = scoped.as_ref().unwrap_or(&self.http);
         let mut response =
-            self.http.get(url).send().await.map_err(|e| {
+            client.get(url).send().await.map_err(|e| {
                 blocked_reason(&e).map_or(TrackerError::Http(e), TrackerError::Blocked)
             })?;
         if !response.status().is_success() {
@@ -342,6 +385,10 @@ impl TrackerClient {
     }
 
     async fn udp_request(&self, url: &Url, req: UdpRequest<'_>) -> Result<UdpAnswer, TrackerError> {
+        let private_allowed = self.private_origin_allowed(url);
+        if self.config.ssrf_mitigation && guard::is_non_public(url) && !private_allowed {
+            return Err(guard::Blocked::PrivateOrigin(url.to_string()).into());
+        }
         let host = url
             .host_str()
             .ok_or_else(|| TrackerError::InvalidUrl(url.to_string()))?;
@@ -352,16 +399,26 @@ impl TrackerClient {
         let addr = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             Target::Addr(SocketAddr::new(ip, port))
         } else if self.config.udp_proxy.is_some() {
+            if self.config.ssrf_mitigation && !private_allowed && !self.config.allow_proxy_dns {
+                return Err(guard::Blocked::ProxyResolution(url.to_string()).into());
+            }
             // The proxy resolves the name (SOCKS5 domain address type), so
             // it never reaches the local resolver.
             Target::Name(host.into(), port)
         } else {
-            Target::Addr(
-                tokio::net::lookup_host((host, port))
-                    .await?
-                    .next()
-                    .ok_or_else(|| TrackerError::Resolve(host.to_owned()))?,
-            )
+            let address = tokio::net::lookup_host((host, port))
+                .await?
+                .find(|address| {
+                    !self.config.ssrf_mitigation || private_allowed || is_public(address.ip())
+                })
+                .ok_or_else(|| {
+                    if self.config.ssrf_mitigation && !private_allowed {
+                        TrackerError::Blocked(guard::Blocked::PrivateOrigin(url.to_string()))
+                    } else {
+                        TrackerError::Resolve(host.to_owned())
+                    }
+                })?;
+            Target::Addr(address)
         };
         let addr = &addr;
         match self.udp_request_at(addr, req).await {

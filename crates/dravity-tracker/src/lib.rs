@@ -9,6 +9,11 @@
 //! Both codecs are sans-IO and fuzzed; only `TrackerClient` touches the
 //! network. Responses are untrusted input: sizes are bounded and malformed
 //! data is an error, never a panic.
+//!
+//! Private, loopback and link-local tracker origins are denied by default.
+//! Proxy-side DNS cannot be inspected by the local filtering resolver, so
+//! hostname trackers through a proxy also require the explicit
+//! `ClientConfig::allow_proxy_dns` acknowledgement.
 
 #[cfg(feature = "client")]
 mod client;

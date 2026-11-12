@@ -29,6 +29,29 @@ use crate::merkle::{self, Hash};
 use crate::path::{PathError, SafePath, validate_component};
 use crate::v2::{self, MetaVersion, TreeFile, V2File};
 
+/// Default maximum accepted torrent piece length: 32 MiB.
+pub const DEFAULT_MAX_PIECE_LENGTH: u32 = 32 * 1024 * 1024;
+
+/// Resource limits used while validating metainfo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetainfoLimits {
+    /// Largest accepted nominal piece length.
+    pub max_piece_length: u32,
+}
+
+impl MetainfoLimits {
+    #[must_use]
+    pub const fn new(max_piece_length: u32) -> Self {
+        Self { max_piece_length }
+    }
+}
+
+impl Default for MetainfoLimits {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_PIECE_LENGTH)
+    }
+}
+
 /// Errors produced while parsing metainfo.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -68,6 +91,14 @@ pub enum MetainfoError {
     /// `piece length` is zero or does not fit in 32 bits.
     #[error("invalid piece length {0}")]
     InvalidPieceLength(u64),
+    /// The piece length exceeds the configured resource ceiling.
+    #[error("piece length {actual} exceeds maximum {maximum}")]
+    PieceLengthTooLarge {
+        /// Value in the torrent.
+        actual: u64,
+        /// Configured ceiling.
+        maximum: u32,
+    },
     /// The number of piece hashes does not match the content length.
     #[error("expected {expected} piece hashes, found {actual}")]
     PieceCountMismatch {
@@ -168,12 +199,23 @@ impl Metainfo {
     /// # Errors
     /// Returns a [`MetainfoError`] describing the first problem found.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MetainfoError> {
+        Self::from_bytes_with_limits(bytes, MetainfoLimits::default())
+    }
+
+    /// Parses a `.torrent` with caller-selected resource limits.
+    ///
+    /// # Errors
+    /// Returns a [`MetainfoError`] describing the first validation failure.
+    pub fn from_bytes_with_limits(
+        bytes: &[u8],
+        limits: MetainfoLimits,
+    ) -> Result<Self, MetainfoError> {
         let raw: RawTorrent<'_> = dravity_bencode::from_bytes(bytes)?;
         let info_bytes = raw.info.as_bytes();
         if info_bytes.first() != Some(&b'd') {
             return Err(MetainfoError::InfoNotDict);
         }
-        let mut info = Info::from_raw(raw.info.deserialize()?)?;
+        let mut info = Info::from_raw(raw.info.deserialize()?, limits)?;
         let layers = raw.piece_layers.as_ref().and_then(Value::as_dict);
         for root in info.missing_piece_layers() {
             let hex = crate::encoding::hex_encode(&root);
@@ -225,11 +267,23 @@ impl Metainfo {
     /// The same validation errors as [`Metainfo::from_bytes`] for `info`;
     /// trailing bytes after the dictionary are rejected.
     pub fn from_info_bytes(info: &[u8], trackers: Vec<Vec<String>>) -> Result<Self, MetainfoError> {
+        Self::from_info_bytes_with_limits(info, trackers, MetainfoLimits::default())
+    }
+
+    /// Builds metainfo from an `info` dictionary with caller-selected limits.
+    ///
+    /// # Errors
+    /// Returns a [`MetainfoError`] describing the first validation failure.
+    pub fn from_info_bytes_with_limits(
+        info: &[u8],
+        trackers: Vec<Vec<String>>,
+        limits: MetainfoLimits,
+    ) -> Result<Self, MetainfoError> {
         if info.first() != Some(&b'd') {
             return Err(MetainfoError::InfoNotDict);
         }
         let raw: RawInfo<'_> = dravity_bencode::from_bytes(info)?;
-        let parsed = Info::from_raw(raw)?;
+        let parsed = Info::from_raw(raw, limits)?;
         let announce_list: Vec<Vec<String>> = trackers
             .into_iter()
             .map(|tier| {
@@ -421,11 +475,17 @@ pub struct Info {
 }
 
 impl Info {
-    fn from_raw(raw: RawInfo<'_>) -> Result<Self, MetainfoError> {
+    fn from_raw(raw: RawInfo<'_>, limits: MetainfoLimits) -> Result<Self, MetainfoError> {
         let piece_length = u32::try_from(raw.piece_length)
             .ok()
             .filter(|&l| l > 0)
             .ok_or(MetainfoError::InvalidPieceLength(raw.piece_length))?;
+        if piece_length > limits.max_piece_length {
+            return Err(MetainfoError::PieceLengthTooLarge {
+                actual: raw.piece_length,
+                maximum: limits.max_piece_length,
+            });
+        }
 
         let name = raw
             .name_utf8

@@ -42,7 +42,7 @@ tracing.workspace = true
 proptest.workspace = true
 sha1.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true

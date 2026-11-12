@@ -61,7 +61,9 @@ pub struct PortMapConfig {
     pub gateway_v6: Option<SocketAddrV6>,
     /// UPnP device description URL; `None` discovers it with SSDP.
     pub upnp_location: Option<String>,
-    /// Requested mapping lifetime; mappings are renewed at half of it.
+    /// Requested mapping lifetime. PCP mappings are renewed at half the
+    /// shortest lifetime granted by the server; other methods use half of
+    /// this value.
     pub lifetime: Duration,
     /// Mapping description shown in the router's UI (UPnP).
     pub description: String,
@@ -225,20 +227,23 @@ impl Drop for PortMapper {
 /// Mappings made by one method, for renewing and removing.
 #[derive(Debug)]
 enum Active {
-    /// The server and the request each mapping was made with (renewals
-    /// and the delete reuse its nonce).
-    Pcp(SocketAddrV4, Vec<pcp::MapRequest>),
+    /// The requests retain the server-assigned identity for renewals and
+    /// deletion.
+    Pcp(PcpMappings),
     NatPmp(SocketAddrV4),
     Upnp(upnp::Service),
 }
 
-/// IPv6 pinholes made with PCP: the server, the socket address requests
-/// leave from, and each request (renewals and deletes reuse its nonce).
+/// Active PCP MAP operations. The request fields are updated from every
+/// response because the nonce, protocol, internal port, assigned external
+/// port, and assigned external address identify a mapping on renewal and
+/// deletion (RFC 6887 §11.2).
 #[derive(Debug)]
-struct Pinholes {
+struct PcpMappings {
     server: SocketAddr,
     from: SocketAddr,
     requests: Vec<pcp::MapRequest>,
+    granted_lifetime: Duration,
 }
 
 async fn run(
@@ -247,50 +252,112 @@ async fn run(
     status: watch::Sender<Status>,
     stop: CancellationToken,
 ) {
+    let mut active = None;
+    let mut retired_pcp = Vec::new();
+    let mut pinholes = None;
+    let now = tokio::time::Instant::now();
+    let mut ipv4_due = now;
+    let mut pinhole_due = now;
+
     loop {
-        let (pinholes, pinhole_status) = if config.ipv6 {
-            match map_pinholes(&config, &mappings).await {
-                Ok((pinholes, mapped)) => (Some(pinholes), (mapped, None)),
+        let now = tokio::time::Instant::now();
+        if config.ipv6 && now >= pinhole_due {
+            let result = if let Some(pinholes) = &mut pinholes {
+                renew_pinholes(pinholes).await
+            } else {
+                map_pinholes(&config, &mappings).await
+            };
+            match result {
+                Ok((renewed, mapped)) => {
+                    pinhole_due =
+                        tokio::time::Instant::now() + pcp_renewal_delay(renewed.granted_lifetime);
+                    pinholes = Some(renewed);
+                    status.send_modify(|s| {
+                        s.pinholes = mapped;
+                        s.pinhole_error = None;
+                    });
+                }
                 Err(e) => {
                     tracing::debug!(error = %e, "IPv6 pinholes failed");
-                    (None, (Vec::new(), Some(e.to_string())))
+                    pinhole_due = tokio::time::Instant::now() + retry_delay(config.retry);
+                    status.send_modify(|s| {
+                        s.pinholes.clear();
+                        s.pinhole_error = Some(e.to_string());
+                    });
                 }
             }
-        } else {
-            (None, (Vec::new(), None))
-        };
-        let (active, mut wait) = match map_all(&config, &mappings).await {
-            Ok((active, mut next)) => {
-                (next.pinholes, next.pinhole_error) = pinhole_status;
-                status.send_replace(next);
-                // Renew at half the lifetime (RFC 6886 §3.3).
-                (Some(active), config.lifetime / 2)
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "port mapping failed");
-                status.send_modify(|s| {
-                    s.method = None;
-                    s.mapped.clear();
-                    s.error = Some(e.to_string());
-                    (s.pinholes, s.pinhole_error) = pinhole_status;
-                });
-                (None, config.retry)
-            }
-        };
-        if pinholes.is_some() {
-            // Pinholes must be renewed in time even while IPv4 retries.
-            wait = wait.min(config.lifetime / 2);
         }
+
+        if now >= ipv4_due {
+            let renewed = match &mut active {
+                Some(Active::Pcp(pcp)) => Some(renew_pcp(pcp).await),
+                _ => None,
+            };
+            match renewed {
+                Some(Ok(next)) => {
+                    let delay = match &active {
+                        Some(Active::Pcp(pcp)) => pcp_renewal_delay(pcp.granted_lifetime),
+                        _ => unreachable!(),
+                    };
+                    ipv4_due = tokio::time::Instant::now() + delay;
+                    set_ipv4_status(&status, next);
+                }
+                Some(Err(renew_error)) => {
+                    tracing::debug!(
+                        error = %renew_error,
+                        "PCP renewal failed; trying mapping fallbacks"
+                    );
+                    match map_all(&config, &mappings).await {
+                        Ok((replacement, next)) => {
+                            let delay = active_renewal_delay(&replacement, &config);
+                            if let Some(Active::Pcp(old)) = active.replace(replacement) {
+                                // Keep the old identity so stop can still delete it.
+                                retired_pcp.push(old);
+                            }
+                            ipv4_due = tokio::time::Instant::now() + delay;
+                            set_ipv4_status(&status, next);
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "port mapping failed");
+                            ipv4_due = tokio::time::Instant::now() + retry_delay(config.retry);
+                            set_ipv4_error(&status, &e);
+                        }
+                    }
+                }
+                None => match map_all(&config, &mappings).await {
+                    Ok((next_active, next)) => {
+                        let delay = active_renewal_delay(&next_active, &config);
+                        active = Some(next_active);
+                        ipv4_due = tokio::time::Instant::now() + delay;
+                        set_ipv4_status(&status, next);
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "port mapping failed");
+                        ipv4_due = tokio::time::Instant::now() + retry_delay(config.retry);
+                        set_ipv4_error(&status, &e);
+                    }
+                },
+            }
+        }
+
+        let wake = if config.ipv6 {
+            ipv4_due.min(pinhole_due)
+        } else {
+            ipv4_due
+        };
         let stopped = tokio::select! {
             () = stop.cancelled() => true,
-            () = tokio::time::sleep(wait.max(Duration::from_secs(1))) => false,
+            () = tokio::time::sleep_until(wake) => false,
         };
         if stopped {
-            if let Some(active) = active {
-                unmap_all(&config, &mappings, &active).await;
+            if let Some(active) = &active {
+                unmap_all(&config, &mappings, active).await;
             }
-            if let Some(pinholes) = pinholes {
-                close_pinholes(&pinholes).await;
+            for pcp in &retired_pcp {
+                delete_pcp(pcp).await;
+            }
+            if let Some(pinholes) = &pinholes {
+                delete_pcp(pinholes).await;
             }
             status.send_modify(|s| {
                 s.mapped.clear();
@@ -299,6 +366,43 @@ async fn run(
             return;
         }
     }
+}
+
+fn retry_delay(delay: Duration) -> Duration {
+    delay.max(Duration::from_secs(1))
+}
+
+fn pcp_renewal_delay(granted: Duration) -> Duration {
+    if granted.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        (granted / 2).max(Duration::from_millis(100))
+    }
+}
+
+fn active_renewal_delay(active: &Active, config: &PortMapConfig) -> Duration {
+    match active {
+        Active::Pcp(pcp) => pcp_renewal_delay(pcp.granted_lifetime),
+        Active::NatPmp(_) | Active::Upnp(_) => retry_delay(config.lifetime / 2),
+    }
+}
+
+fn set_ipv4_status(status: &watch::Sender<Status>, next: Status) {
+    status.send_modify(|s| {
+        s.method = next.method;
+        s.external_ip = next.external_ip;
+        s.mapped = next.mapped;
+        s.error = None;
+    });
+}
+
+fn set_ipv4_error(status: &watch::Sender<Status>, error: &PortMapError) {
+    status.send_modify(|s| {
+        s.method = None;
+        s.external_ip = None;
+        s.mapped.clear();
+        s.error = Some(error.to_string());
+    });
 }
 
 async fn map_all(
@@ -360,22 +464,8 @@ async fn natpmp_exchange(
     Err(io::Error::from(io::ErrorKind::TimedOut).into())
 }
 
-/// One PCP exchange with retransmissions (RFC 6887 §8.1.1, cut short like
-/// NAT-PMP's).
-async fn pcp_exchange(
-    server: SocketAddrV4,
-    request: &pcp::MapRequest,
-) -> Result<pcp::MapResponse, PortMapError> {
-    pcp_exchange_from(
-        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-        SocketAddr::V4(server),
-        request,
-    )
-    .await
-}
-
-/// [`pcp_exchange`] from a chosen local address (a pinhole request must
-/// come from the address it opens, RFC 6887 §8.3).
+/// One PCP exchange with retransmissions from a chosen local address (a
+/// pinhole request must come from the address it opens, RFC 6887 §8.3).
 async fn pcp_exchange_from(
     from: SocketAddr,
     server: SocketAddr,
@@ -425,13 +515,9 @@ async fn map_pcp(
     let server = natpmp_server(config)?;
     let client = upnp::local_addr_towards(SocketAddr::V4(server))?;
     let lifetime = u32::try_from(config.lifetime.as_secs()).unwrap_or(u32::MAX);
-    let mut status = Status {
-        method: Some(Method::Pcp),
-        ..Status::default()
-    };
     let mut requests = Vec::new();
     for mapping in mappings {
-        let request = pcp::MapRequest {
+        requests.push(pcp::MapRequest {
             nonce: nonce(),
             protocol: mapping.protocol,
             internal_port: mapping.port,
@@ -439,21 +525,27 @@ async fn map_pcp(
             external_ip: pcp::any_external(client),
             client_ip: client,
             lifetime,
-        };
-        let response = pcp_exchange(server, &request).await?;
-        if let IpAddr::V4(ip) = response.external_ip
-            && !ip.is_unspecified()
-        {
-            status.external_ip = Some(ip);
-        }
-        status.mapped.push(Mapped {
-            mapping: *mapping,
-            external_port: response.external_port,
         });
-        requests.push(request);
     }
+    let mut pcp = PcpMappings {
+        server: SocketAddr::V4(server),
+        from: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        requests,
+        granted_lifetime: config.lifetime,
+    };
+    let status = renew_pcp(&mut pcp).await?;
     tracing::info!(?status, "ports mapped with PCP");
-    Ok((Active::Pcp(server, requests), status))
+    Ok((Active::Pcp(pcp), status))
+}
+
+async fn renew_pcp(pcp: &mut PcpMappings) -> Result<Status, PortMapError> {
+    let (mapped, external_ip) = renew_pcp_requests(pcp).await?;
+    Ok(Status {
+        method: Some(Method::Pcp),
+        external_ip,
+        mapped,
+        ..Status::default()
+    })
 }
 
 /// The PCP server for pinholes.
@@ -507,15 +599,14 @@ fn pinhole_client(server: SocketAddrV6) -> Result<Ipv6Addr, PortMapError> {
 async fn map_pinholes(
     config: &PortMapConfig,
     mappings: &[Mapping],
-) -> Result<(Pinholes, Vec<Mapped>), PortMapError> {
+) -> Result<(PcpMappings, Vec<Mapped>), PortMapError> {
     let server = pinhole_server(config)?;
     let client = pinhole_client(server)?;
     let from = SocketAddr::from((client, 0));
     let lifetime = u32::try_from(config.lifetime.as_secs()).unwrap_or(u32::MAX);
-    let mut mapped = Vec::new();
     let mut requests = Vec::new();
     for mapping in mappings {
-        let request = pcp::MapRequest {
+        requests.push(pcp::MapRequest {
             nonce: nonce(),
             protocol: mapping.protocol,
             internal_port: mapping.port,
@@ -523,34 +614,76 @@ async fn map_pinholes(
             external_ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
             client_ip: IpAddr::V6(client),
             lifetime,
-        };
-        let response = pcp_exchange_from(from, SocketAddr::V6(server), &request).await?;
-        mapped.push(Mapped {
-            mapping: *mapping,
-            external_port: response.external_port,
         });
-        requests.push(request);
     }
+    let mut pinholes = PcpMappings {
+        server: SocketAddr::V6(server),
+        from,
+        requests,
+        granted_lifetime: config.lifetime,
+    };
+    let (mapped, _) = renew_pcp_requests(&mut pinholes).await?;
     tracing::info!(%client, ?mapped, "IPv6 pinholes open with PCP");
+    Ok((pinholes, mapped))
+}
+
+async fn renew_pinholes(
+    pinholes: &mut PcpMappings,
+) -> Result<(PcpMappings, Vec<Mapped>), PortMapError> {
+    let (mapped, _) = renew_pcp_requests(pinholes).await?;
     Ok((
-        Pinholes {
-            server: SocketAddr::V6(server),
-            from,
-            requests,
+        PcpMappings {
+            server: pinholes.server,
+            from: pinholes.from,
+            requests: pinholes.requests.clone(),
+            granted_lifetime: pinholes.granted_lifetime,
         },
         mapped,
     ))
 }
 
-async fn close_pinholes(pinholes: &Pinholes) {
-    for request in &pinholes.requests {
+async fn renew_pcp_requests(
+    pcp: &mut PcpMappings,
+) -> Result<(Vec<Mapped>, Option<Ipv4Addr>), PortMapError> {
+    let mut mapped = Vec::with_capacity(pcp.requests.len());
+    let mut external_ip = None;
+    let mut minimum_lifetime = None;
+    for request in &mut pcp.requests {
+        let response = pcp_exchange_from(pcp.from, pcp.server, request).await?;
+        mapped.push(Mapped {
+            mapping: Mapping {
+                protocol: request.protocol,
+                port: request.internal_port,
+            },
+            external_port: response.external_port,
+        });
+        if let IpAddr::V4(ip) = response.external_ip
+            && !ip.is_unspecified()
+        {
+            external_ip = Some(ip);
+        }
+        request.external_port = response.external_port;
+        request.external_ip = response.external_ip;
+        minimum_lifetime = Some(
+            minimum_lifetime.map_or(response.lifetime, |current: Duration| {
+                current.min(response.lifetime)
+            }),
+        );
+    }
+    if let Some(minimum_lifetime) = minimum_lifetime {
+        pcp.granted_lifetime = minimum_lifetime;
+    }
+    Ok((mapped, external_ip))
+}
+
+async fn delete_pcp(pcp: &PcpMappings) {
+    for request in &pcp.requests {
         let delete = pcp::MapRequest {
             lifetime: 0,
-            external_port: 0,
             ..*request
         };
-        if let Err(e) = pcp_exchange_from(pinholes.from, pinholes.server, &delete).await {
-            tracing::debug!(port = request.internal_port, error = %e, "closing pinhole failed");
+        if let Err(e) = pcp_exchange_from(pcp.from, pcp.server, &delete).await {
+            tracing::debug!(port = request.internal_port, error = %e, "deleting PCP mapping failed");
         }
     }
 }
@@ -694,20 +827,7 @@ async fn map_upnp(
 async fn unmap_all(config: &PortMapConfig, mappings: &[Mapping], active: &Active) {
     for mapping in mappings {
         let result = match active {
-            Active::Pcp(server, requests) => {
-                let Some(request) = requests
-                    .iter()
-                    .find(|r| r.protocol == mapping.protocol && r.internal_port == mapping.port)
-                else {
-                    continue;
-                };
-                let delete = pcp::MapRequest {
-                    lifetime: 0,
-                    external_port: 0,
-                    ..*request
-                };
-                pcp_exchange(*server, &delete).await.map(drop)
-            }
+            Active::Pcp(_) => continue,
             Active::NatPmp(server) => {
                 let request = natpmp::Request::Map {
                     protocol: mapping.protocol,
@@ -725,6 +845,9 @@ async fn unmap_all(config: &PortMapConfig, mappings: &[Mapping], active: &Active
         if let Err(e) = result {
             tracing::debug!(?mapping, error = %e, "removing port mapping failed");
         }
+    }
+    if let Active::Pcp(pcp) = active {
+        delete_pcp(pcp).await;
     }
 }
 

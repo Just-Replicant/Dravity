@@ -75,6 +75,8 @@ pub struct HttpConfig {
     /// Bearer token every request must carry (`Authorization: Bearer …`);
     /// `None` disables authentication.
     pub token: Option<String>,
+    /// Explicitly permit an unauthenticated non-loopback listener.
+    pub allow_insecure_unauthenticated: bool,
     /// Where torrents added without a `download_dir` go.
     pub download_dir: PathBuf,
     /// Largest request body (a `.torrent` upload), in bytes.
@@ -86,6 +88,10 @@ impl std::fmt::Debug for HttpConfig {
         f.debug_struct("HttpConfig")
             .field("bind", &self.bind)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "allow_insecure_unauthenticated",
+                &self.allow_insecure_unauthenticated,
+            )
             .field("download_dir", &self.download_dir)
             .field("max_body", &self.max_body)
             .finish()
@@ -98,6 +104,7 @@ impl HttpConfig {
         Self {
             bind: SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_PORT)),
             token: None,
+            allow_insecure_unauthenticated: false,
             download_dir: download_dir.into(),
             max_body: 16 * 1024 * 1024,
         }
@@ -115,6 +122,26 @@ impl HttpConfig {
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
         self
+    }
+
+    /// Explicitly permits network-reachable operation without authentication.
+    #[must_use]
+    pub const fn allow_insecure_unauthenticated(mut self) -> Self {
+        self.allow_insecure_unauthenticated = true;
+        self
+    }
+
+    /// Validates the address actually bound by a listener.
+    ///
+    /// # Errors
+    /// [`HttpError::UnauthenticatedNonLoopback`] when authentication is
+    /// required by the safe default.
+    pub fn validate_listener(&self, addr: SocketAddr) -> Result<(), HttpError> {
+        if self.token.is_none() && !addr.ip().is_loopback() && !self.allow_insecure_unauthenticated
+        {
+            return Err(HttpError::UnauthenticatedNonLoopback(addr));
+        }
+        Ok(())
     }
 }
 
@@ -185,6 +212,9 @@ fn build(session: Session, config: HttpConfig, closing: watch::Receiver<bool>) -
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum HttpError {
+    /// A non-loopback listener was configured without authentication.
+    #[error("refusing unauthenticated HTTP API on non-loopback address {0}")]
+    UnauthenticatedNonLoopback(SocketAddr),
     /// Accepting connections failed.
     #[error("HTTP server failed: {0}")]
     Io(#[from] std::io::Error),
@@ -202,9 +232,7 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), HttpError> {
     if let Ok(addr) = listener.local_addr() {
-        if config.token.is_none() && !addr.ip().is_loopback() {
-            tracing::warn!(%addr, "HTTP API reachable from the network without a token");
-        }
+        config.validate_listener(addr)?;
         tracing::info!(%addr, "HTTP API listening");
     }
     let (closing_tx, closing) = watch::channel(false);

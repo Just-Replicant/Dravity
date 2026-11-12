@@ -22,6 +22,8 @@ pub(crate) struct Options {
     pub(crate) http: Option<SocketAddr>,
     /// HTTP API bearer token.
     pub(crate) token: Option<String>,
+    /// Permit an unauthenticated non-loopback HTTP API.
+    pub(crate) allow_insecure_http: bool,
     /// Full-screen UI instead of log lines.
     pub(crate) tui: bool,
 }
@@ -60,9 +62,15 @@ pub(crate) async fn run(config: SessionConfig, options: Options) -> Result<()> {
                 .await
                 .with_context(|| format!("binding the HTTP API to {addr}"))?;
             let bound = listener.local_addr().unwrap_or(addr);
-            let _ = writeln!(err, "HTTP API on http://{bound}/api/v1/");
             let mut config = HttpConfig::new(&options.download_dir).with_bind(bound);
             config.token.clone_from(&options.token);
+            if options.allow_insecure_http {
+                config = config.allow_insecure_unauthenticated();
+            }
+            config
+                .validate_listener(bound)
+                .context("validating the HTTP API security policy")?;
+            let _ = writeln!(err, "HTTP API on http://{bound}/api/v1/");
             Some(tokio::spawn(dravity_http::serve(
                 listener,
                 session.clone(),

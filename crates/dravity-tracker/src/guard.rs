@@ -3,10 +3,8 @@
 //! An announce URL comes from a `.torrent` or a magnet's `tr=` and is
 //! attacker-controlled. The rules follow libtorrent's `ssrf_mitigation`:
 //!
-//! * A tracker on `localhost` or a loopback address must use a path ending
-//!   in `/announce`, so a torrent cannot make the client `GET` arbitrary
-//!   local services (an admin page, a local API) with a tracker query
-//!   string appended.
+//! * Non-public trackers are denied unless explicitly allowed, and allowed
+//!   private origins must use a final path segment beginning with `announce`.
 //! * A redirect may only go to `http` or `https`, never from `https` down
 //!   to `http`, and at most [`MAX_REDIRECTS`] times.
 //! * A redirect from a tracker that is not itself local must not land on a
@@ -31,9 +29,12 @@ pub const MAX_REDIRECTS: usize = 5;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Blocked {
-    /// A loopback tracker whose path does not end in `/announce`.
-    #[error("local tracker URL must end in /announce: {0}")]
-    LocalPath(String),
+    /// A non-public tracker origin was not explicitly allowed.
+    #[error("non-public tracker origin is not allowed: {0}")]
+    PrivateOrigin(String),
+    /// An allowed private tracker does not have an announce-shaped path.
+    #[error("non-public tracker path must end in an announce segment: {0}")]
+    PrivatePath(String),
     /// A redirect to a scheme other than `http` or `https`.
     #[error("redirect to unsupported scheme: {0}")]
     Scheme(String),
@@ -43,6 +44,9 @@ pub enum Blocked {
     /// A redirect from a non-local tracker to a non-public address.
     #[error("redirect from a public tracker to a non-public address: {0}")]
     PrivateTarget(String),
+    /// A proxy would resolve a name outside the guarded resolver.
+    #[error("tracker proxy resolution cannot be verified safely: {0}")]
+    ProxyResolution(String),
     /// More than [`MAX_REDIRECTS`] redirects.
     #[error("too many tracker redirects")]
     TooManyRedirects,
@@ -89,14 +93,39 @@ pub fn is_non_public(url: &Url) -> bool {
     literal(url).is_some_and(|ip| !is_public(ip))
 }
 
+/// Whether two URLs have the same scheme, host and effective port.
+#[must_use]
+pub fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str().map(str::to_ascii_lowercase)
+            == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn has_announce_path(url: &Url) -> bool {
+    url.path_segments()
+        .and_then(Iterator::last)
+        .is_some_and(|segment| segment.starts_with("announce"))
+}
+
 /// Checks an announce URL before the first request.
 ///
 /// # Errors
 /// [`Blocked::LocalPath`] for a loopback tracker whose path does not end in
 /// `/announce`.
-pub fn check_announce(url: &Url) -> Result<(), Blocked> {
-    if is_loopback(url) && !url.path().ends_with("/announce") {
-        return Err(Blocked::LocalPath(url.to_string()));
+pub fn check_announce(url: &Url, allow_private: bool) -> Result<(), Blocked> {
+    // This guard prevents HTTP request forgery. UDP tracker packets have a
+    // fixed BEP 15 binary shape and no path or headers that can be turned
+    // into requests to an HTTP service; LAN UDP trackers therefore remain
+    // usable without weakening the HTTP policy.
+    if !matches!(url.scheme(), "http" | "https") {
+        return Ok(());
+    }
+    if is_non_public(url) && !allow_private {
+        return Err(Blocked::PrivateOrigin(url.to_string()));
+    }
+    if allow_private && !has_announce_path(url) {
+        return Err(Blocked::PrivatePath(url.to_string()));
     }
     Ok(())
 }
@@ -107,7 +136,13 @@ pub fn check_announce(url: &Url) -> Result<(), Blocked> {
 ///
 /// # Errors
 /// The [`Blocked`] reason.
-pub fn check_redirect(origin: &Url, from: &Url, to: &Url, hops: usize) -> Result<(), Blocked> {
+pub fn check_redirect(
+    origin: &Url,
+    from: &Url,
+    to: &Url,
+    hops: usize,
+    origin_allows_private: bool,
+) -> Result<(), Blocked> {
     if hops >= MAX_REDIRECTS {
         return Err(Blocked::TooManyRedirects);
     }
@@ -116,10 +151,14 @@ pub fn check_redirect(origin: &Url, from: &Url, to: &Url, hops: usize) -> Result
         (_, "http" | "https") => return Err(Blocked::Downgrade(to.to_string())),
         _ => return Err(Blocked::Scheme(to.to_string())),
     }
-    if !is_non_public(origin) && is_non_public(to) {
+    let same_origin = same_origin(origin, to);
+    if origin_allows_private && !same_origin {
         return Err(Blocked::PrivateTarget(to.to_string()));
     }
-    check_announce(to)
+    if is_non_public(to) && !(origin_allows_private && same_origin) {
+        return Err(Blocked::PrivateTarget(to.to_string()));
+    }
+    check_announce(to, origin_allows_private && same_origin)
 }
 
 #[cfg(test)]
@@ -135,21 +174,20 @@ mod tests {
     fn local_trackers_need_an_announce_path() {
         for ok in [
             "http://127.0.0.1:6969/announce",
-            "http://localhost/x/announce",
-            "http://[::1]:80/announce",
-            "http://10.0.0.5/admin",
-            "https://tracker.example/anything",
+            "http://localhost/x/announce.php",
+            "http://[::1]:80/announce.cgi",
         ] {
-            assert_eq!(check_announce(&u(ok)), Ok(()), "{ok}");
+            assert_eq!(check_announce(&u(ok), true), Ok(()), "{ok}");
         }
         for bad in [
             "http://127.0.0.1:8080/admin?x=1",
             "http://LOCALHOST./api",
             "http://foo.localhost/",
             "http://[::ffff:127.0.0.1]/",
+            "http://10.0.0.5/admin",
         ] {
             assert!(
-                matches!(check_announce(&u(bad)), Err(Blocked::LocalPath(_))),
+                matches!(check_announce(&u(bad), true), Err(Blocked::PrivatePath(_))),
                 "{bad}"
             );
         }
@@ -159,7 +197,7 @@ mod tests {
     fn redirects_from_public_trackers_stay_public() {
         let origin = u("http://tracker.example/announce");
         let ok = u("https://other.example/announce");
-        assert_eq!(check_redirect(&origin, &origin, &ok, 0), Ok(()));
+        assert_eq!(check_redirect(&origin, &origin, &ok, 0, false), Ok(()));
         for bad in [
             "http://192.168.1.1/announce",
             "http://169.254.169.254/latest/meta-data",
@@ -168,7 +206,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    check_redirect(&origin, &origin, &u(bad), 0),
+                    check_redirect(&origin, &origin, &u(bad), 0, false),
                     Err(Blocked::PrivateTarget(_))
                 ),
                 "{bad}"
@@ -177,25 +215,30 @@ mod tests {
     }
 
     #[test]
-    fn lan_trackers_may_redirect_within_the_lan() {
+    fn private_redirect_trust_is_exact_origin_scoped() {
         let origin = u("http://10.0.0.2/announce");
+        let same = u("http://10.0.0.2/announce.php");
+        assert_eq!(check_redirect(&origin, &origin, &same, 1, true), Ok(()));
         let to = u("http://10.0.0.3/announce");
-        assert_eq!(check_redirect(&origin, &origin, &to, 1), Ok(()));
+        assert!(matches!(
+            check_redirect(&origin, &origin, &to, 1, true),
+            Err(Blocked::PrivateTarget(_))
+        ));
     }
 
     #[test]
     fn scheme_downgrade_and_hop_limit() {
         let https = u("https://t.example/announce");
         assert!(matches!(
-            check_redirect(&https, &https, &u("http://t.example/announce"), 0),
+            check_redirect(&https, &https, &u("http://t.example/announce"), 0, false),
             Err(Blocked::Downgrade(_))
         ));
         assert!(matches!(
-            check_redirect(&https, &https, &u("ftp://t.example/announce"), 0),
+            check_redirect(&https, &https, &u("ftp://t.example/announce"), 0, false),
             Err(Blocked::Scheme(_))
         ));
         assert_eq!(
-            check_redirect(&https, &https, &https, MAX_REDIRECTS),
+            check_redirect(&https, &https, &https, MAX_REDIRECTS, false),
             Err(Blocked::TooManyRedirects)
         );
     }

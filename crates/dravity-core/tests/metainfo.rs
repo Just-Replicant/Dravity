@@ -12,7 +12,9 @@ use std::path::PathBuf;
 
 use dravity_bencode::{Dict, Value};
 use dravity_core::layout::FileSlice;
-use dravity_core::{InfoHash, Metainfo, MetainfoError, PathError};
+use dravity_core::{
+    DEFAULT_MAX_PIECE_LENGTH, InfoHash, Metainfo, MetainfoError, MetainfoLimits, PathError,
+};
 use proptest::prelude::*;
 
 fn b(s: &str) -> Value<'static> {
@@ -464,6 +466,37 @@ fn zero_length_torrent_has_no_pieces() {
     assert_eq!(m.info().files()[0].length(), 0);
     let public = parse(with(single_info("a.txt", 1, 1), "private", Some(int(0)))).unwrap();
     assert!(!public.info().is_private());
+}
+
+#[test]
+fn piece_length_ceiling_applies_to_v1_v2_and_hybrid() {
+    let large = u64::from(DEFAULT_MAX_PIECE_LENGTH) * 2;
+    let leaf = dict(vec![("", dict(vec![("length", int(0))]))]);
+    let tree = dict(vec![("x", leaf)]);
+    let v1 = single_info("x", 0, large);
+    let v2 = dict(vec![
+        ("file tree", tree.clone()),
+        ("meta version", int(2)),
+        ("name", b("x")),
+        ("piece length", int(large as i64)),
+    ]);
+    let hybrid = with(
+        with(v1.clone(), "meta version", Some(int(2))),
+        "file tree",
+        Some(tree),
+    );
+    for info in [v1.clone(), v2, hybrid] {
+        assert_eq!(
+            parse(info).unwrap_err(),
+            MetainfoError::PieceLengthTooLarge {
+                actual: large,
+                maximum: DEFAULT_MAX_PIECE_LENGTH
+            }
+        );
+    }
+    assert!(
+        Metainfo::from_bytes_with_limits(&torrent(v1), MetainfoLimits::new(large as u32)).is_ok()
+    );
 }
 
 #[test]

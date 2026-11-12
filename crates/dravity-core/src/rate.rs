@@ -16,8 +16,10 @@ use loom::sync::{Arc, Mutex};
 #[cfg(not(loom))]
 use std::sync::{Arc, Mutex};
 
-/// Longest a single take asks the caller to wait, so lowering a limit
-/// sharply does not stall a connection for minutes.
+/// Legacy wait interval retained for source compatibility.
+///
+/// [`TokenBucket::take`] returns the complete wait now; callers must not
+/// use this value to truncate it, because doing so lets deep debt escape.
 pub const MAX_WAIT: Duration = Duration::from_secs(2);
 
 /// One direction's token bucket.
@@ -48,31 +50,70 @@ impl TokenBucket {
         self.rate
     }
 
-    /// Changes the limit from `now`; any saved-up burst is dropped, debt
-    /// is kept.
-    pub fn set_rate(&mut self, rate: Option<u64>, now: Instant) {
-        self.rate = rate.filter(|&r| r > 0);
-        self.tokens = self.tokens.min(0.0);
-        self.last = now;
+    #[allow(clippy::cast_precision_loss)] // rates use floating-point token arithmetic
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = self.last.max(now);
+        if let Some(rate) = self.rate {
+            let rate = rate as f64;
+            self.tokens = (self.tokens + elapsed * rate).min(rate);
+        }
     }
 
-    /// Takes `bytes` tokens at `now` and returns how long to wait (at most
-    /// [`MAX_WAIT`]). At most one second of rate is saved up as burst.
-    #[allow(clippy::cast_precision_loss)] // byte counts far below 2^52
-    pub fn take(&mut self, bytes: usize, now: Instant) -> Duration {
+    #[allow(clippy::cast_precision_loss)] // rates use floating-point token arithmetic
+    fn debt_wait(&self) -> Duration {
         let Some(rate) = self.rate else {
             return Duration::ZERO;
         };
-        let rate = rate as f64;
-        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
-        self.last = self.last.max(now);
-        self.tokens = (self.tokens + elapsed * rate).min(rate);
-        self.tokens -= bytes as f64;
         if self.tokens >= 0.0 {
-            Duration::ZERO
-        } else {
-            Duration::from_secs_f64(-self.tokens / rate).min(MAX_WAIT)
+            return Duration::ZERO;
         }
+        let seconds = -self.tokens / rate as f64;
+        if seconds >= Duration::MAX.as_secs_f64() {
+            Duration::MAX
+        } else {
+            Duration::from_secs_f64(seconds)
+        }
+    }
+
+    /// Changes the limit from `now`.
+    ///
+    /// Debt is first repaid at the old rate through `now`, then repriced
+    /// at the new rate. Saved-up burst credit is dropped when the rate
+    /// changes. Disabling the limit clears debt, and setting the same rate
+    /// leaves accumulated credit intact.
+    pub fn set_rate(&mut self, rate: Option<u64>, now: Instant) {
+        let rate = rate.filter(|&r| r > 0);
+        self.refill(now);
+        if rate == self.rate {
+            return;
+        }
+        self.tokens = if rate.is_none() {
+            0.0
+        } else {
+            self.tokens.min(0.0)
+        };
+        self.rate = rate;
+    }
+
+    /// Takes `bytes` tokens at `now` and returns the complete time needed
+    /// to repay the resulting debt. At most one second of rate is saved up
+    /// as burst.
+    #[allow(clippy::cast_precision_loss)] // byte counts far below 2^52
+    pub fn take(&mut self, bytes: usize, now: Instant) -> Duration {
+        if self.rate.is_none() {
+            return Duration::ZERO;
+        }
+        self.refill(now);
+        self.tokens -= bytes as f64;
+        self.debt_wait()
+    }
+
+    /// Returns the time needed to repay existing debt at `now`, without
+    /// taking more tokens.
+    pub fn wait(&mut self, now: Instant) -> Duration {
+        self.refill(now);
+        self.debt_wait()
     }
 
     /// Available tokens (negative: debt), as of the last take.
@@ -108,6 +149,11 @@ impl SharedBucket {
         self.with(|b| b.take(bytes, now))
     }
 
+    /// See [`TokenBucket::wait`].
+    pub fn wait(&self, now: Instant) -> Duration {
+        self.with(|b| b.wait(now))
+    }
+
     /// See [`TokenBucket::set_rate`].
     pub fn set_rate(&self, rate: Option<u64>, now: Instant) {
         self.with(|b| b.set_rate(rate, now));
@@ -135,11 +181,16 @@ mod tests {
         let t = Instant::now();
         let mut b = TokenBucket::new(Some(1000), t);
         assert_eq!(b.take(500, t), Duration::from_millis(500));
+        assert_eq!(b.wait(t), Duration::from_millis(500));
         assert_eq!(b.take(500, t + Duration::from_millis(1500)), Duration::ZERO);
         let later = t + Duration::from_secs(100);
         assert_eq!(b.take(1000, later), Duration::ZERO);
         assert_eq!(b.take(1000, later), Duration::from_secs(1));
-        assert_eq!(b.take(1 << 30, later), MAX_WAIT);
+        assert_eq!(
+            b.take(4000, later),
+            Duration::from_secs(5),
+            "deep debt must not be truncated"
+        );
         // A clock that goes backwards (callers race to the lock) adds no
         // tokens and does not rewind the bucket.
         let before = b.tokens();
@@ -154,8 +205,20 @@ mod tests {
         assert_eq!(shared.rate(), None);
         assert_eq!(shared.take(1 << 30, t), Duration::ZERO);
         shared.set_rate(Some(10), t);
-        assert!(!shared.take(100, t).is_zero());
-        shared.set_rate(None, t);
+        assert_eq!(shared.take(100, t), Duration::from_secs(10));
+        shared.set_rate(Some(20), t + Duration::from_secs(2));
+        assert_eq!(
+            shared.wait(t + Duration::from_secs(2)),
+            Duration::from_secs(4),
+            "elapsed time uses the old rate and remaining debt the new rate"
+        );
+        shared.set_rate(None, t + Duration::from_secs(2));
         assert_eq!(shared.take(1 << 20, t), Duration::ZERO);
+        shared.set_rate(Some(10), t + Duration::from_secs(2));
+        assert_eq!(
+            shared.wait(t + Duration::from_secs(2)),
+            Duration::ZERO,
+            "disabling a limit must not leave dormant debt"
+        );
     }
 }

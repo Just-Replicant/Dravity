@@ -32,6 +32,11 @@ fn concurrent_takes_conserve_tokens_and_queue() {
             [Duration::from_millis(500), Duration::from_millis(1000)]
         );
         assert!((bucket.tokens() + 1000.0).abs() < 1e-9);
+        assert_eq!(bucket.wait(now), Duration::from_millis(1000));
+        assert!(
+            (bucket.tokens() + 1000.0).abs() < 1e-9,
+            "observing debt must not charge it again"
+        );
     });
 }
 

@@ -10,8 +10,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(test)]
-use dravity_core::rate::MAX_WAIT;
 use dravity_core::rate::SharedBucket;
 use tokio::time::Instant;
 
@@ -94,8 +92,7 @@ mod tests {
         let later = t + Duration::from_secs(100);
         assert_eq!(l.take(1000, later), Duration::ZERO);
         assert!(near(l.take(1000, later), Duration::from_secs(1)));
-        // Huge debts are capped per call.
-        assert_eq!(l.take(1 << 30, later), MAX_WAIT);
+        assert_eq!(l.take(4000, later), Duration::from_secs(5));
     }
 
     #[test]

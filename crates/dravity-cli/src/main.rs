@@ -254,8 +254,8 @@ struct NetworkArgs {
     /// Dial peers through a proxy: `socks5://[user:pass@]host:port`,
     /// `socks4://host:port` or `http://[user:pass@]host:port` (it also
     /// carries HTTP trackers and web seeds, SOCKS with remote DNS; SOCKS5
-    /// also relays UDP trackers). The DHT and LSD are not proxied; add
-    /// `--no-dht --no-lsd` for that.
+    /// also relays UDP trackers and, with `--native-dht`, the native DHT).
+    /// LSD is not proxied; add `--no-lsd` for that.
     #[arg(long, value_name = "URL")]
     proxy: Option<String>,
     /// Show peer countries from this "IP to country" CSV database

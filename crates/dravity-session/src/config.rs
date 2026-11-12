@@ -133,7 +133,9 @@ pub struct SessionConfig {
     /// Dial peers through this proxy (TCP only: uTP is skipped while a
     /// proxy is set). HTTP(S) tracker and web seed requests go through it
     /// too (SOCKS with remote DNS, `socks5h`/`socks4a`), and a SOCKS5
-    /// proxy relays UDP tracker requests (UDP ASSOCIATE). The DHT, LSD
+    /// proxy relays UDP tracker requests (UDP ASSOCIATE). When the native
+    /// DHT is on, a SOCKS5 proxy also carries its datagrams
+    /// (`DhtConfig::socks5` is set automatically unless already set). LSD
     /// (LAN multicast only) and incoming connections are not proxied.
     /// `None` (the default) connects directly.
     pub proxy: Option<crate::proxy::Proxy>,

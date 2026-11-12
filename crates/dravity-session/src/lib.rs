@@ -420,7 +420,25 @@ impl Session {
             .as_ref()
             .map(|l| l.local_addr().port())
             .or_else(|| listener.as_ref().map(|bound| bound.port));
-        let dht = config.dht.as_ref().map(Dht::new).transpose()?;
+        let dht = {
+            let mut dht_cfg = config.dht.clone();
+            if let Some(dht_cfg) = dht_cfg.as_mut()
+                && dht_cfg.native
+                && dht_cfg.socks5.is_none()
+                && let Some(socks) = config
+                    .proxy
+                    .as_ref()
+                    .filter(|p| p.kind == proxy::ProxyKind::Socks5)
+            {
+                // A SOCKS5 session proxy carries the native DHT; nothing is
+                // sent until the UDP ASSOCIATE is up (see dravity_dht).
+                dht_cfg.socks5 = Some(dravity_dht::Socks5Proxy::new(
+                    socks.server.clone(),
+                    socks.auth.clone(),
+                ));
+            }
+            dht_cfg.as_ref().map(Dht::new).transpose()?
+        };
         let (alerts, _) = broadcast::channel(config.alert_buffer.max(1));
         let stop = CancellationToken::new();
         let connections = ConnectionLimit::new(config.max_connections);

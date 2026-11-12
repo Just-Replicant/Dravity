@@ -33,6 +33,7 @@ fn client() -> TrackerClient {
     c.http_timeout = Duration::from_secs(5);
     c.udp_timeout = Duration::from_millis(200);
     c.udp_retries = 1;
+    c.allow_private_trackers = true;
     TrackerClient::new(c).unwrap()
 }
 
@@ -349,6 +350,42 @@ async fn ssrf_local_tracker_needs_announce_path() {
 }
 
 #[tokio::test]
+async fn ssrf_private_literals_are_blocked_by_default() {
+    let c = TrackerClient::new(ClientConfig::default()).unwrap();
+    for url in [
+        "http://127.0.0.1:9/announce",
+        "http://10.0.0.1:9/announce",
+        "http://169.254.169.254/announce",
+        "http://[::1]:9/announce",
+        "http://[fd00::1]:9/announce",
+    ] {
+        let result = c.announce(url, &request()).await;
+        assert!(
+            matches!(result, Err(TrackerError::Blocked(_))),
+            "{url}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ssrf_private_allowlist_is_exact_origin_scoped() {
+    let (url, task) = http_tracker("200 OK", b"d8:intervali60e5:peers0:e").await;
+    let mut config = ClientConfig::default();
+    config
+        .private_tracker_origins
+        .push(url.trim_end_matches("/announce").to_owned());
+    let client = TrackerClient::new(config).unwrap();
+    client.announce(&url, &request()).await.unwrap();
+    task.await.unwrap();
+    assert!(matches!(
+        client
+            .announce("http://127.0.0.1:9/admin", &request())
+            .await,
+        Err(TrackerError::Blocked(_))
+    ));
+}
+
+#[tokio::test]
 async fn ssrf_redirect_within_the_lan_is_followed() {
     let (addr, task) = redirecting_tracker(|a, _| format!("http://{a}/final/announce")).await;
     let r = client()
@@ -403,6 +440,20 @@ async fn ssrf_checks_can_be_disabled() {
         .announce("http://127.0.0.1:9/admin", &request())
         .await;
     assert!(!matches!(r, Err(TrackerError::Blocked(_))), "{r:?}");
+}
+
+#[tokio::test]
+async fn proxy_dns_is_blocked_without_explicit_acknowledgement() {
+    let mut config = ClientConfig::default();
+    config.http_proxy = Some("socks5h://127.0.0.1:9".to_owned());
+    let result = TrackerClient::new(config)
+        .unwrap()
+        .announce("http://tracker.example/announce", &request())
+        .await;
+    assert!(
+        matches!(result, Err(TrackerError::Blocked(_))),
+        "{result:?}"
+    );
 }
 
 #[tokio::test]
@@ -522,6 +573,7 @@ async fn http_announce_through_socks5_resolves_at_the_proxy() {
     let mut c = ClientConfig::default();
     c.http_timeout = Duration::from_secs(5);
     c.http_proxy = Some(format!("socks5h://{proxy}"));
+    c.allow_proxy_dns = true;
     let client = TrackerClient::new(c).unwrap();
     let r = client
         .announce("http://tracker.invalid:6969/announce", &request())
@@ -627,6 +679,7 @@ async fn udp_announce_through_a_socks5_relay() {
     let mut c = ClientConfig::default();
     c.udp_timeout = Duration::from_millis(500);
     c.udp_retries = 1;
+    c.allow_proxy_dns = true;
     c.udp_proxy = Some(UdpProxy::new(
         proxy.to_string(),
         Some(("me".into(), "pass".into())),
@@ -669,6 +722,7 @@ async fn udp_tracker_names_are_resolved_by_the_proxy() {
     let mut c = ClientConfig::default();
     c.udp_timeout = Duration::from_millis(500);
     c.udp_retries = 1;
+    c.allow_proxy_dns = true;
     c.udp_proxy = Some(UdpProxy::new(
         proxy.to_string(),
         Some(("me".into(), "pass".into())),

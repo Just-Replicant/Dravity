@@ -6,6 +6,48 @@ the roadmap phases until the first release.
 
 ## [Unreleased]
 
+### Audit remediation
+
+Fixes and follow-ups from a review of the IronTide adoption work. All
+of this lives on a local branch; it is not pushed.
+
+- **Rate limiting:** the token bucket returns the complete wait (no
+  two-second cap); session admissions are FIFO and a live rate change
+  reprices debt without double-charging.
+- **PCP:** mappings keep their nonce and assigned identity and renew at
+  half the lifetime the router granted.
+- **Live listen port:** a requested port that is taken fails the rebind
+  and leaves the old listener in place (strict bind). Initial listen
+  still falls back to a free port.
+- **Tracker SSRF:** private origins need an explicit opt-in or
+  allowlist (`--allow-private-trackers`); trust is request-scoped;
+  proxy DNS is refused unless allowed.
+- **Ban and IP-filter propagation:** a generation watch on `BanList`
+  is applied by every torrent task, so a full command queue cannot
+  drop `BanIp` or `Refilter`.
+- **Piece length:** a configurable 32 MiB ceiling
+  (`SessionConfig::max_piece_length`, `--max-piece-length`) is applied
+  before torrent state is allocated.
+- **HTTP API:** a non-loopback bind without a token is refused unless
+  `HttpConfig::allow_insecure_unauthenticated` / `--allow-insecure-http`
+  is set.
+- **Settings:** `apply_settings` and `set_listen_port` are serialized
+  so concurrent updates cannot write a stale snapshot.
+- **Native DHT:** announce-token secrets and node-id entropy use OS
+  cryptographic randomness; offline public-network validation tests
+  and `docs/native-dht-validation.md` cover what can be checked
+  without the internet. The default stays `mainline`.
+- **Queue and cache:** torrent-queue status queries run in parallel;
+  concurrent read-cache misses of the same span share one inner read.
+- **CI:** GitHub Actions are pinned to commit SHAs.
+- **Shared UDP:** `dravity_dht::shared::SharedUdp` demultiplexes DHT,
+  uTP and tracker datagrams on one socket. The session is not yet
+  wired to it.
+- **Library consumption:** all crates stay `publish = false`; the
+  `dravity` facade is the intended public API. See the README.
+- **Docs:** BEP coverage, `--dht-ipv6` in the generated configuration
+  reference, and a README that describes the IronTide work.
+
 ### irontide adoption
 
 Ideas adopted from a review of the irontide engine, reimplemented for

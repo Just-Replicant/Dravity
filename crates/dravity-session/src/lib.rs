@@ -117,6 +117,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub use codec::{CodecError, PeerCodec};
 pub use config::{DEFAULT_MAX_CONNECTIONS, DEFAULT_READ_CACHE, SessionConfig, StorageBackend};
+pub use dravity_core::DEFAULT_MAX_PIECE_LENGTH;
 pub use dravity_lsd::LsdConfig;
 pub use dravity_mse::Policy as EncryptionPolicy;
 pub use dravity_portmap::{
@@ -139,7 +140,7 @@ pub use torrent::TorrentProgress;
 pub use watch::{WatchConfig, WatchHandle};
 
 use crate::catalog::{Catalog, Entry, EntrySource};
-use crate::listen::{Acceptor, Bound, Registry, Route, UtpSockets};
+use crate::listen::{Acceptor, BindMode, Bound, Registry, Route, UtpSockets};
 use crate::persist::{Persister, TorrentRecord};
 use crate::torrent::{
     Aliases, Command, MagnetStart, Source, TorrentContext, TorrentTask, prepare_tiers,
@@ -252,6 +253,25 @@ pub struct RestoreReport {
     pub failed: Vec<(PathBuf, String)>,
 }
 
+/// Outcome of the synchronous half of a live listen-port change.
+enum ListenPrepare {
+    /// The session is on this port; nothing else to do.
+    Done(u16),
+    /// The listener was swapped; the caller finishes mapper and torrent work.
+    Moved(ListenMove),
+}
+
+/// The synchronous half of a live listen-port change, finished under
+/// [`Inner::settings_lock`]. The caller then stops the old mapper and
+/// tells running torrents, without holding the lock across `.await`.
+struct ListenMove {
+    new_port: u16,
+    utp: UtpSockets,
+    token: CancellationToken,
+    old_mapper: Option<PortMapper>,
+    routes: Vec<mpsc::Sender<Command>>,
+}
+
 #[derive(Debug)]
 struct Inner {
     config: Arc<SessionConfig>,
@@ -295,6 +315,10 @@ struct Inner {
     port_mapper: Mutex<Option<PortMapper>>,
     /// The live settings ([`Session::apply_settings`]).
     live: Mutex<LiveSettings>,
+    /// Held around live-settings persistence and listen-port changes so
+    /// concurrent updates cannot write a stale snapshot or fight over the
+    /// listener.
+    settings_lock: Mutex<()>,
     /// Session-wide rate limits, shared by every peer connection.
     rates: rate::RateLimits,
     /// The queue task, started with the first torrent.
@@ -487,6 +511,7 @@ impl Session {
                 listen_stop: Mutex::new(stop.child_token()),
                 port_mapper: Mutex::new(None),
                 live: Mutex::new(live),
+                settings_lock: Mutex::new(()),
                 rates,
                 queue_started: OnceLock::new(),
                 _stop: stop.clone().drop_guard(),
@@ -524,18 +549,48 @@ impl Session {
     ///
     /// The new TCP (and uTP) sockets are bound before the old ones are
     /// retired, so a port that cannot be bound leaves everything as it
-    /// was. Connections already open stay open. Router port mapping and
-    /// LSD restart on the new port, and every running torrent re-announces
-    /// it to its trackers and the DHT, and sends connected peers a fresh
-    /// extension handshake with the new `p`. With a
-    /// [`SessionConfig::state_dir`] the port is saved and
-    /// [`Session::restore`] moves the listener back to it.
+    /// was. A requested port that is already taken is an error: the
+    /// listener is not moved to a different port. Connections already
+    /// open stay open. Router port mapping and LSD restart on the new
+    /// port, and every running torrent re-announces it to its trackers
+    /// and the DHT, and sends connected peers a fresh extension handshake
+    /// with the new `p`. With a [`SessionConfig::state_dir`] the port is
+    /// saved and [`Session::restore`] moves the listener back to it.
+    /// Concurrent calls, and concurrent [`Session::apply_settings`], are
+    /// serialized so a later write cannot replace an earlier one with a
+    /// stale snapshot.
     ///
     /// # Errors
     /// [`SessionError::Listen`] if the session does not listen on sockets
     /// ([`SessionConfig::listen`] unset, or a custom
     /// [`SessionConfig::network`]) or the port cannot be bound.
     pub async fn set_listen_port(&self, port: u16) -> Result<u16, SessionError> {
+        let prepared = match self.prepare_listen_port(port)? {
+            ListenPrepare::Done(port) => return Ok(port),
+            ListenPrepare::Moved(prepared) => prepared,
+        };
+        if let Some(mapper) = prepared.old_mapper {
+            // Removing the old mappings is a courtesy; never hang on a router.
+            let _ = tokio::time::timeout(Duration::from_secs(5), mapper.stop()).await;
+        }
+        let port_map = self.start_side_services(prepared.new_port, &prepared.token);
+        for tx in prepared.routes {
+            let _ = tx
+                .send(Command::Relisten(torrent::Relisten {
+                    port: Some(prepared.new_port),
+                    utp: prepared.utp.clone(),
+                    port_map: port_map.clone(),
+                }))
+                .await;
+        }
+        tracing::info!(port = prepared.new_port, "listener moved");
+        Ok(prepared.new_port)
+    }
+
+    /// Binds, persists and swaps the listener under [`Inner::settings_lock`].
+    /// [`ListenPrepare::Done`] is the port now in force when no asynchronous
+    /// follow-up is needed (already on `port`, or not yet accepting).
+    fn prepare_listen_port(&self, port: u16) -> Result<ListenPrepare, SessionError> {
         let config = &self.inner.config;
         let listen = config
             .listen
@@ -547,19 +602,21 @@ impl Session {
                     "the session does not listen on sockets",
                 ))
             })?;
+        let _serial = self
+            .inner
+            .settings_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if port != 0 && self.listen_port() == Some(port) {
-            return Ok(port);
+            return Ok(ListenPrepare::Done(port));
         }
         let mut wanted = listen.clone();
         wanted.port = port;
-        let bound = listen::bind(&wanted).map_err(SessionError::Listen)?;
+        // A live rebind must use the exact requested port (or an ephemeral
+        // one when the caller passed 0). Falling back to port 0 would
+        // silently move the listener and break the rollback guarantee.
+        let bound = listen::bind_with(&wanted, BindMode::Strict).map_err(SessionError::Listen)?;
         let new_port = bound.port;
-        if let Some(dir) = &config.state_dir {
-            let path = dir.join(settings::LISTEN_FILE);
-            if let Err(e) = persist::write_atomic(&path, &settings::encode_listen_port(new_port)) {
-                tracing::warn!(path = %path.display(), error = %e, "cannot save the listen port");
-            }
-        }
         let acceptor = {
             let mut pending = self
                 .inner
@@ -582,7 +639,8 @@ impl Session {
                         .listen_port
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner) = Some(new_port);
-                    return Ok(new_port);
+                    self.persist_listen_port(new_port);
+                    return Ok(ListenPrepare::Done(new_port));
                 }
             }
         };
@@ -607,17 +665,13 @@ impl Session {
             .listen_port
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(new_port);
+        self.persist_listen_port(new_port);
         let old_mapper = self
             .inner
             .port_mapper
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(mapper) = old_mapper {
-            // Removing the old mappings is a courtesy; never hang on a router.
-            let _ = tokio::time::timeout(Duration::from_secs(5), mapper.stop()).await;
-        }
-        let port_map = self.start_side_services(new_port, &token);
         let mut routes: Vec<mpsc::Sender<Command>> = Vec::new();
         for route in self
             .inner
@@ -630,17 +684,23 @@ impl Session {
                 routes.push(route.tx.clone());
             }
         }
-        for tx in routes {
-            let _ = tx
-                .send(Command::Relisten(torrent::Relisten {
-                    port: Some(new_port),
-                    utp: utp.clone(),
-                    port_map: port_map.clone(),
-                }))
-                .await;
+        Ok(ListenPrepare::Moved(ListenMove {
+            new_port,
+            utp,
+            token,
+            old_mapper,
+            routes,
+        }))
+    }
+
+    fn persist_listen_port(&self, port: u16) {
+        let Some(dir) = &self.inner.config.state_dir else {
+            return;
+        };
+        let path = dir.join(settings::LISTEN_FILE);
+        if let Err(e) = persist::write_atomic(&path, &settings::encode_listen_port(port)) {
+            tracing::warn!(path = %path.display(), error = %e, "cannot save the listen port");
         }
-        tracing::info!(port = new_port, "listener moved");
-        Ok(new_port)
     }
 
     /// Starts router port mapping and LSD for `port`, LSD under `stop`;
@@ -792,6 +852,7 @@ impl Session {
         metainfo: Metainfo,
         options: AddTorrentOptions,
     ) -> Result<TorrentHandle, SessionError> {
+        self.admit_piece_length(&metainfo)?;
         let metainfo = Arc::new(metainfo);
         let priorities = &options.file_priorities;
         if !priorities.is_empty() && priorities.len() != metainfo.info().files().len() {
@@ -843,6 +904,17 @@ impl Session {
 
     /// Registers `entry`, starts it unless paused, and (when `save`)
     /// persists it.
+    /// Refuses a torrent whose piece length is above the session ceiling,
+    /// before storage or engine state is allocated.
+    fn admit_piece_length(&self, metainfo: &Metainfo) -> Result<(), SessionError> {
+        let maximum = self.inner.config.max_piece_length;
+        let actual = metainfo.info().piece_length();
+        if actual > maximum {
+            return Err(SessionError::PieceLengthTooLarge { actual, maximum });
+        }
+        Ok(())
+    }
+
     fn add_entry(
         &self,
         info_hash: InfoHash,
@@ -1035,6 +1107,8 @@ impl Session {
         if !self.inner.bans.insert(ip) {
             return false;
         }
+        // Optimistic notify; the ban-list watch is the reliable path if a
+        // command queue is full.
         for entry in self.inner.catalog().values() {
             if let Some(tx) = &entry.commands {
                 let _ = tx.try_send(Command::BanIp(ip));
@@ -1099,6 +1173,11 @@ impl Session {
     /// # Errors
     /// [`SettingsError::Invalid`] for the first invalid field.
     pub fn apply_settings(&self, update: SettingsUpdate) -> Result<LiveSettings, SettingsError> {
+        let _serial = self
+            .inner
+            .settings_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut live = self
             .inner
             .live
@@ -1131,6 +1210,8 @@ impl Session {
     /// now. An empty filter blocks nothing.
     pub fn set_ip_filter(&self, filter: IpFilter) {
         self.inner.bans.set_filter(Arc::new(filter));
+        // Optimistic notify; the ban-list watch is the reliable path if a
+        // command queue is full.
         for entry in self.inner.catalog().values() {
             if let Some(tx) = &entry.commands {
                 let _ = tx.try_send(Command::Refilter);
@@ -1396,7 +1477,8 @@ impl Session {
             .state_dir
             .clone()
             .ok_or(SessionError::NoStateDir)?;
-        let loaded = tokio::task::spawn_blocking(move || load_state_dir(&dir))
+        let max_piece_length = self.inner.config.max_piece_length;
+        let loaded = tokio::task::spawn_blocking(move || load_state_dir(&dir, max_piece_length))
             .await
             .map_err(std::io::Error::other)?
             .map_err(SessionError::Io)?;
@@ -1561,7 +1643,7 @@ struct Loaded {
 }
 
 /// Reads every `<info-hash>.state` (and its `.torrent`) in `dir`.
-fn load_state_dir(dir: &Path) -> std::io::Result<Loaded> {
+fn load_state_dir(dir: &Path, max_piece_length: u32) -> std::io::Result<Loaded> {
     let mut loaded = Loaded {
         torrents: Vec::new(),
         failed: Vec::new(),
@@ -1596,7 +1678,10 @@ fn load_state_dir(dir: &Path) -> std::io::Result<Loaded> {
         }
         let torrent_path = path.with_extension("torrent");
         let metainfo = match persist::read_bounded(&torrent_path, persist::MAX_TORRENT_FILE) {
-            Ok(bytes) => match Metainfo::from_bytes(&bytes) {
+            Ok(bytes) => match Metainfo::from_bytes_with_limits(
+                &bytes,
+                dravity_core::MetainfoLimits::new(max_piece_length),
+            ) {
                 // A v2-only magnet whose metadata turned out hybrid stays
                 // under the truncated v2 hash it was added with.
                 Ok(m) if m.swarm_hashes().contains(&record.info_hash) => Some(m),

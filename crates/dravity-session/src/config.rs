@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use dravity_core::DEFAULT_MAX_PIECE_LENGTH;
 use dravity_dht::DhtConfig;
 use dravity_mse::Policy;
 use dravity_portmap::PortMapConfig;
@@ -196,6 +197,12 @@ pub struct SessionConfig {
     /// connections; [`Disabled`](Policy::Disabled) never encrypts. MSE is
     /// obfuscation against traffic shaping, not authenticated security.
     pub encryption: Policy,
+    /// Largest torrent piece length accepted, in bytes, before the session
+    /// allocates torrent state. The default is
+    /// [`DEFAULT_MAX_PIECE_LENGTH`] (32 MiB), matching libtorrent's
+    /// IronTide-era ceiling. Metainfo parsed with a higher
+    /// [`dravity_core::MetainfoLimits`] cap is still refused here.
+    pub max_piece_length: u32,
 }
 
 impl Default for SessionConfig {
@@ -240,6 +247,7 @@ impl Default for SessionConfig {
             web_seed_retry: Duration::from_secs(30),
             storage_backend: StorageBackend::Blocking,
             encryption: Policy::Enabled,
+            max_piece_length: DEFAULT_MAX_PIECE_LENGTH,
         }
     }
 }

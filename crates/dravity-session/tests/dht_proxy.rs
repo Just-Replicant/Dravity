@@ -151,6 +151,8 @@ fn decode<'a>(
 
 fn session_config(proxy: SocketAddr, bootstrap: String) -> SessionConfig {
     let mut c = SessionConfig::default();
+    // Loopback HTTP/UDP trackers in these hermetic tests are private origins.
+    c.tracker.allow_private_trackers = true;
     c.tick_interval = Duration::from_millis(50);
     c.stop_announce_timeout = Duration::from_secs(1);
     c.listen = Some(ListenConfig::loopback(0));

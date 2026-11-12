@@ -719,18 +719,7 @@ impl TorrentTask {
             Command::AddPeers(peers) => Some(Event::AddPeers { peers }),
             Command::BanIp(ip) => Some(Event::BanIp { ip }),
             Command::Refilter => {
-                let peers = match &self.phase {
-                    Phase::Metadata(state) => state.peers(),
-                    Phase::Download(state) => state.peers(),
-                };
-                let filter = self.ctx.bans.filter();
-                for p in peers.iter().filter(|p| filter.is_blocked(p.addr.ip())) {
-                    tracing::debug!(addr = %p.addr, "blocked by the IP filter; closing");
-                    self.peers.remove(&p.key);
-                    self.web_seed_gone(p.key);
-                    self.local
-                        .push_back(Event::PeerDisconnected { peer: p.key });
-                }
+                self.refilter();
                 None
             }
             Command::Peers(reply) => {
@@ -863,6 +852,10 @@ impl TorrentTask {
         if let Some(rx) = &mut self.ctx.port_map {
             rx.borrow_and_update();
         }
+        let mut ban_changes = self.ctx.bans.subscribe();
+        // The engine already starts with the current snapshot; only later
+        // generations need to be applied here.
+        ban_changes.borrow_and_update();
         let mut announced_port = self.ctx.announce_port();
         let mut stop_ack: Option<oneshot::Sender<()>> = None;
         self.handle(Event::Start).await;
@@ -912,6 +905,13 @@ impl TorrentTask {
                     announced_port = port;
                     self.announce_dht_port();
                     Event::Reannounce
+                }
+                result = ban_changes.changed() => {
+                    if result.is_err() {
+                        continue;
+                    }
+                    self.apply_session_controls();
+                    continue;
                 }
             };
             self.handle(event).await;
@@ -1168,7 +1168,11 @@ impl TorrentTask {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        let mut metainfo = match Metainfo::from_info_bytes(&info, tiers) {
+        let mut metainfo = match Metainfo::from_info_bytes_with_limits(
+            &info,
+            tiers,
+            dravity_core::MetainfoLimits::new(self.ctx.config.max_piece_length),
+        ) {
             Ok(metainfo) => metainfo.with_web_seeds(start.web_seeds),
             Err(e) => return self.fail(format!("invalid metadata: {e}")),
         };
@@ -1793,8 +1797,35 @@ impl TorrentTask {
         });
     }
 
-    /// Adds `ip` to the session's ban list and tells the other running
-    /// torrents.
+    /// Closes connections the current session ban list and IP filter
+    /// refuse. Driven by the ban-list watch, so a full command queue
+    /// cannot drop the update.
+    fn apply_session_controls(&mut self) {
+        for ip in self.ctx.bans.snapshot() {
+            self.local.push_back(Event::BanIp { ip });
+        }
+        self.refilter();
+    }
+
+    /// Closes open connections the IP filter now blocks.
+    fn refilter(&mut self) {
+        let peers = match &self.phase {
+            Phase::Metadata(state) => state.peers(),
+            Phase::Download(state) => state.peers(),
+        };
+        let filter = self.ctx.bans.filter();
+        for p in peers.iter().filter(|p| filter.is_blocked(p.addr.ip())) {
+            tracing::debug!(addr = %p.addr, "blocked by the IP filter; closing");
+            self.peers.remove(&p.key);
+            self.web_seed_gone(p.key);
+            self.local
+                .push_back(Event::PeerDisconnected { peer: p.key });
+        }
+    }
+
+    /// Adds `ip` to the session's ban list. Other running torrents close
+    /// their connections through the ban-list watch; a command is also
+    /// sent as a fast path.
     fn share_ban(&self, ip: IpAddr) {
         if !self.ctx.bans.insert(ip) {
             return;
@@ -1809,8 +1840,6 @@ impl TorrentTask {
                 continue;
             }
             if let Some(tx) = &entry.commands {
-                // Best effort: a full queue still has the ban list on restart
-                // and the listener refuses the address.
                 let _ = tx.try_send(Command::BanIp(ip));
             }
         }
@@ -2596,7 +2625,9 @@ mod tests {
         drop(dead_listener);
         let dead_url = dead.clone();
         let tiers = Arc::new(Mutex::new(vec![vec![dead.clone(), good.clone()]]));
-        let client = TrackerClient::new(ClientConfig::default()).unwrap();
+        let mut tracker = ClientConfig::default();
+        tracker.allow_private_trackers = true;
+        let client = TrackerClient::new(tracker).unwrap();
         let req = AnnounceRequest {
             info_hash: InfoHash::new([9; 20]),
             peer_id: PeerId::new(*b"-TS0001-testtesttest"),

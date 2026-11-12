@@ -301,3 +301,104 @@ async fn a_bep42_id_is_taken_once_nodes_report_our_address() {
         Some(us.local_addr().unwrap())
     );
 }
+
+/// A token issued to one loopback IP cannot be spent from another.
+#[tokio::test]
+async fn a_token_is_bound_to_the_querier_ip() {
+    let node = NativeDht::bind("127.0.0.1:0".parse().unwrap(), TIMEOUT)
+        .await
+        .unwrap();
+    let to = node.local_addr().unwrap();
+    let holder = UdpSocket::bind("127.0.0.2:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let Body::Response {
+        token: Some(token), ..
+    } = exchange(
+        &holder,
+        to,
+        Query::GetPeers {
+            info_hash: [0x42; 20],
+        },
+    )
+    .await
+    else {
+        panic!("get_peers gives a token");
+    };
+    let thief = UdpSocket::bind("127.0.0.3:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let steal = Query::AnnouncePeer {
+        info_hash: [0x42; 20],
+        port: 6881,
+        token: token.clone(),
+        implied_port: false,
+    };
+    let Body::Error { code, .. } = exchange(&thief, to, steal).await else {
+        panic!("a borrowed token must be refused");
+    };
+    assert_eq!(code, 203);
+    // The original holder can still use it.
+    let ok = Query::AnnouncePeer {
+        info_hash: [0x42; 20],
+        port: 6881,
+        token,
+        implied_port: false,
+    };
+    assert!(matches!(
+        exchange(&holder, to, ok).await,
+        Body::Response { .. }
+    ));
+}
+
+/// Unparsable and hostile datagrams must not take the node down, and a
+/// later well-formed ping must still be answered. This is the offline
+/// stand-in for public-network junk traffic.
+#[tokio::test]
+async fn garbage_and_truncated_queries_leave_the_node_answering() {
+    let node = NativeDht::bind("127.0.0.1:0".parse().unwrap(), TIMEOUT)
+        .await
+        .unwrap();
+    let to = node.local_addr().unwrap();
+    let us = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    for payload in [
+        Vec::new(),
+        b"d".to_vec(),
+        b"not bencode".to_vec(),
+        b"d1:x1:ye".to_vec(),
+        vec![0xff; 2048],
+        b"d1:y1:q1:q4:pinge".to_vec(), // missing id and transaction
+    ] {
+        us.send_to(&payload, to).await.unwrap();
+    }
+    assert!(matches!(
+        exchange(&us, to, Query::Ping).await,
+        Body::Response { .. }
+    ));
+}
+
+/// A bootstrap list with unresponsive addresses still joins through the
+/// live ones, as a public bootstrap will when some routers are down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_skips_unresponsive_routers() {
+    let seed = NativeDht::bind("127.0.0.1:0".parse().unwrap(), TIMEOUT)
+        .await
+        .unwrap();
+    let seed_addr = seed.local_addr().unwrap();
+    // Bound but never read: datagrams vanish, the address is unresponsive.
+    let dead = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    let node = NativeDht::bind("127.0.0.1:0".parse().unwrap(), TIMEOUT)
+        .await
+        .unwrap();
+    let known = node.bootstrap(&[dead_addr, seed_addr]).await;
+    assert!(
+        known >= 1,
+        "the live router must still be learned; known={known}"
+    );
+    assert!(node.nodes().contains(&seed_addr));
+}

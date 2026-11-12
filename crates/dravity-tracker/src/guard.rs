@@ -3,17 +3,17 @@
 //! An announce URL comes from a `.torrent` or a magnet's `tr=` and is
 //! attacker-controlled. The rules follow libtorrent's `ssrf_mitigation`:
 //!
-//! * Non-public trackers are denied unless explicitly allowed, and allowed
-//!   private origins must use a final path segment beginning with `announce`.
+//! * Non-public trackers are denied unless explicitly allowed (a client
+//!   opt-in or an origin allowlist), and allowed private origins must use
+//!   a final path segment beginning with `announce`.
 //! * A redirect may only go to `http` or `https`, never from `https` down
 //!   to `http`, and at most [`MAX_REDIRECTS`] times.
-//! * A redirect from a tracker that is not itself local must not land on a
-//!   non-public address: neither a literal (`http://10.0.0.1/…`,
-//!   `http://localhost/…`) nor a host name that resolves to one (enforced by
-//!   the client's resolver, which this module cannot see).
-//!
-//! LAN trackers named directly by the torrent keep working: only the
-//! *redirect* from a public tracker into the LAN is refused.
+//! * A redirect from a tracker that is not itself an allowed private
+//!   origin must not land on a non-public address: neither a literal
+//!   (`http://10.0.0.1/…`, `http://localhost/…`) nor a host name that
+//!   resolves to one (enforced by the client's request-scoped resolver).
+//!   Private-origin trust is scoped to that request's announce URL, never
+//!   to the client as a whole.
 //!
 //! These are pure functions over [`Url`]s; the client applies them.
 
@@ -111,21 +111,26 @@ fn has_announce_path(url: &Url) -> bool {
 /// Checks an announce URL before the first request.
 ///
 /// # Errors
-/// [`Blocked::LocalPath`] for a loopback tracker whose path does not end in
-/// `/announce`.
+/// [`Blocked::PrivateOrigin`] for a non-public tracker that was not
+/// allowed, or [`Blocked::PrivatePath`] for an allowed private tracker
+/// whose path does not end in an `announce` segment.
 pub fn check_announce(url: &Url, allow_private: bool) -> Result<(), Blocked> {
     // This guard prevents HTTP request forgery. UDP tracker packets have a
     // fixed BEP 15 binary shape and no path or headers that can be turned
     // into requests to an HTTP service; LAN UDP trackers therefore remain
-    // usable without weakening the HTTP policy.
+    // usable without weakening the HTTP policy, except that a literal
+    // non-public UDP host still requires the same opt-in as HTTP (enforced
+    // by the client, not this function).
     if !matches!(url.scheme(), "http" | "https") {
         return Ok(());
     }
-    if is_non_public(url) && !allow_private {
-        return Err(Blocked::PrivateOrigin(url.to_string()));
-    }
-    if allow_private && !has_announce_path(url) {
-        return Err(Blocked::PrivatePath(url.to_string()));
+    if is_non_public(url) {
+        if !allow_private {
+            return Err(Blocked::PrivateOrigin(url.to_string()));
+        }
+        if !has_announce_path(url) {
+            return Err(Blocked::PrivatePath(url.to_string()));
+        }
     }
     Ok(())
 }
@@ -212,6 +217,17 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_global_private_opt_in_does_not_restrict_public_paths() {
+        let public = u("http://tracker.example/peers");
+        assert_eq!(check_announce(&public, true), Ok(()));
+        assert_eq!(check_announce(&public, false), Ok(()));
+        assert!(matches!(
+            check_announce(&u("http://10.0.0.5/admin"), false),
+            Err(Blocked::PrivateOrigin(_))
+        ));
     }
 
     #[test]

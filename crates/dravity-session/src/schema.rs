@@ -42,7 +42,7 @@ prefer_utp: Restart, ["--prefer-utp"], "Dial peers over uTP first and fall back 
 port_mapping: Restart, ["--no-port-mapping"], "Ask the router (PCP, NAT-PMP, then UPnP IGD) to forward the listening port, TCP and (with uTP) UDP, so peers behind no NAT of their own can reach us, and open matching IPv6 firewall pinholes with PCP.";
 announce_port: Restart, ["--port"], "Port reported to trackers when the session does not listen (for example behind a proxy that forwards to us).";
 engine: Restart, [], "Per-torrent engine tunables.";
-tracker: Restart, [], "Tracker client settings.";
+tracker: Restart, ["--allow-private-trackers"], "Tracker client settings, including `--allow-private-trackers` to opt in to private, loopback or link-local HTTP and UDP tracker origins (allowed HTTP paths must still end in an announce segment).";
 num_want: Restart, [], "Peers requested per announce.";
 connect_timeout: Restart, [], "Timeout for TCP connect plus handshake.";
 tick_interval: Restart, [], "Engine timer period.";
@@ -67,14 +67,15 @@ lsd: Restart, ["--no-lsd"], "Local Service Discovery (BEP 14): find peers of the
 scrape_interval: Restart, ["--scrape-interval"], "Scrape every tracker this often (BEP 48 / BEP 15) and show the counts in `crate::TrackerStatus::scrape`.";
 stop_announce_timeout: Restart, [], "Time allowed for the `stopped` announce when a torrent stops.";
 alert_buffer: Restart, [], "Broadcast buffer for alerts; slow subscribers miss older alerts.";
-dht: Restart, ["--no-dht", "--native-dht"], "Run a DHT node (BEP 5) for peer discovery; `None` disables the DHT.";
+dht: Restart, ["--no-dht", "--native-dht", "--dht-ipv6"], "Run a DHT node (BEP 5) for peer discovery; `None` disables the DHT. `--dht-ipv6` starts a second native node on an IPv6 socket (BEP 32) and implies `--native-dht`.";
 dht_lookup_timeout: Restart, [], "Time allowed for one DHT lookup.";
 resume_dir: Restart, [], "Directory for fastresume files (`<info-hash>.resume`).";
 state_dir: Restart, [], "Directory for session state (`crate::persist`): the torrents of the session, their directories, file priorities and paused flags, so `crate::Session::restore` can bring them back after a restart.";
 web_seed: Restart, ["--no-web-seeds", "--web-seeds-allow-private"], "HTTP settings for web seeds (BEP 19: a torrent's `url-list`, a magnet link's `ws`).";
 web_seed_retry: Restart, [], "Wait this long before trying a web seed again after it failed; doubles with every failure in a row, up to 32 times as long.";
 storage_backend: Restart, ["--storage-backend"], "How file data is read and written for torrents whose storage the session creates (not for `AddTorrentOptions::with_storage`).";
-encryption: Restart, ["--encryption"], "Message Stream Encryption (MSE/PE) for peer connections over TCP and uTP.";}
+encryption: Restart, ["--encryption"], "Message Stream Encryption (MSE/PE) for peer connections over TCP and uTP.";
+max_piece_length: Restart, ["--max-piece-length"], "Largest torrent piece length accepted, in bytes, before torrent state is allocated (default: 32 MiB).";}
 
 /// The configuration reference (`docs/configuration.md`), generated from
 /// the registries.

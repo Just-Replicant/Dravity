@@ -13,11 +13,16 @@
 //! Writes go straight through and drop the chunks they overlap. A read
 //! that raced a write does not insert what it read, so the cache never
 //! serves bytes older than the last write.
+//!
+//! Concurrent misses of the same aligned span are coalesced: one inner
+//! read fills the cache and every waiter, so a popular piece asked for by
+//! many peers at once is still read from disk once.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use bytes::Bytes;
 
@@ -100,6 +105,105 @@ impl Segments {
     }
 }
 
+/// `(storage id, span start, span end)` identifying a miss to coalesce.
+type SpanKey = (u64, u64, u64);
+
+/// One in-flight miss that later arrivals can wait on.
+struct Inflight {
+    result: Mutex<Option<Result<Bytes, StoredError>>>,
+    cv: Condvar,
+}
+
+/// A [`StorageError`] that can be cloned for every waiter.
+#[derive(Debug, Clone)]
+struct StoredError {
+    kind: StoredKind,
+}
+
+#[derive(Debug, Clone)]
+enum StoredKind {
+    OutOfBounds {
+        offset: u64,
+        len: usize,
+    },
+    InvalidBlock(dravity_core::BlockRef),
+    Symlink(std::path::PathBuf),
+    UnsafePath(std::path::PathBuf),
+    Io {
+        path: std::path::PathBuf,
+        kind: io::ErrorKind,
+        message: String,
+    },
+}
+
+impl StoredError {
+    fn from_storage(error: &StorageError) -> Self {
+        let kind = match error {
+            StorageError::OutOfBounds { offset, len } => StoredKind::OutOfBounds {
+                offset: *offset,
+                len: *len,
+            },
+            StorageError::InvalidBlock(block) => StoredKind::InvalidBlock(*block),
+            StorageError::Symlink(path) => StoredKind::Symlink(path.clone()),
+            StorageError::UnsafePath(path) => StoredKind::UnsafePath(path.clone()),
+            StorageError::Io { path, source } => StoredKind::Io {
+                path: path.clone(),
+                kind: source.kind(),
+                message: source.to_string(),
+            },
+        };
+        Self { kind }
+    }
+
+    fn into_storage(self) -> StorageError {
+        match self.kind {
+            StoredKind::OutOfBounds { offset, len } => StorageError::OutOfBounds { offset, len },
+            StoredKind::InvalidBlock(block) => StorageError::InvalidBlock(block),
+            StoredKind::Symlink(path) => StorageError::Symlink(path),
+            StoredKind::UnsafePath(path) => StorageError::UnsafePath(path),
+            StoredKind::Io {
+                path,
+                kind,
+                message,
+            } => StorageError::io(path, io::Error::new(kind, message)),
+        }
+    }
+}
+
+/// Leader of a coalesced miss. If it is dropped without finishing, waiters
+/// are unblocked with an error instead of hanging.
+struct SpanLead<'a> {
+    cache: &'a ReadCache,
+    key: SpanKey,
+    done: bool,
+}
+
+impl Drop for SpanLead<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.cache.complete_span(
+                self.key,
+                Err(StoredError::from_storage(&StorageError::io(
+                    "cache",
+                    io::Error::new(io::ErrorKind::Interrupted, "cache miss leader dropped"),
+                ))),
+            );
+        }
+    }
+}
+
+impl SpanLead<'_> {
+    fn finish(mut self, result: Result<Bytes, StorageError>) -> Result<Bytes, StorageError> {
+        self.done = true;
+        let stored = match &result {
+            Ok(data) => Ok(data.clone()),
+            Err(error) => Err(StoredError::from_storage(error)),
+        };
+        self.cache.complete_span(self.key, stored);
+        result
+    }
+}
+
 /// A shared, byte-budgeted chunk cache. See the [module docs](self).
 pub struct ReadCache {
     budget: usize,
@@ -107,6 +211,8 @@ pub struct ReadCache {
     next_id: AtomicU64,
     hits: AtomicU64,
     misses: AtomicU64,
+    /// Concurrent misses of the same aligned span share one inner read.
+    inflight: Mutex<HashMap<SpanKey, Arc<Inflight>>>,
 }
 
 impl ReadCache {
@@ -119,6 +225,7 @@ impl ReadCache {
             next_id: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            inflight: Mutex::new(HashMap::new()),
         })
     }
 
@@ -195,6 +302,61 @@ impl ReadCache {
             for chunk in chunks {
                 s.remove((id, chunk));
             }
+        }
+    }
+
+    /// Starts a miss for `key`, or joins one already in flight.
+    fn begin_span(&self, key: SpanKey) -> Result<SpanLead<'_>, Arc<Inflight>> {
+        let mut pending = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(existing) = pending.get(&key) {
+            return Err(Arc::clone(existing));
+        }
+        pending.insert(
+            key,
+            Arc::new(Inflight {
+                result: Mutex::new(None),
+                cv: Condvar::new(),
+            }),
+        );
+        Ok(SpanLead {
+            cache: self,
+            key,
+            done: false,
+        })
+    }
+
+    fn complete_span(&self, key: SpanKey, result: Result<Bytes, StoredError>) {
+        let Some(inflight) = self
+            .inflight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key)
+        else {
+            return;
+        };
+        *inflight
+            .result
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(result);
+        inflight.cv.notify_all();
+    }
+
+    fn wait_span(inflight: &Inflight) -> Result<Bytes, StorageError> {
+        let mut result = inflight
+            .result
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if let Some(ready) = result.as_ref() {
+                return match ready {
+                    Ok(data) => Ok(data.clone()),
+                    Err(error) => Err(error.clone().into_storage()),
+                };
+            }
+            result = inflight
+                .cv
+                .wait(result)
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 
@@ -352,17 +514,31 @@ impl Storage for CachedStorage {
             copy_out(&chunks, start, offset, buf);
             return Ok(());
         }
-        let n = (end - start).div_ceil(CACHE_CHUNK);
-        self.cache.misses.fetch_add(n, Ordering::Relaxed);
-        let epoch = self.epoch.load(Ordering::Acquire);
-        let span_len = usize::try_from(end - start).map_err(|_| StorageError::OutOfBounds {
-            offset,
-            len: buf.len(),
-        })?;
-        let data = Bytes::from(self.inner.read_vec(start, span_len)?);
-        copy_out(std::slice::from_ref(&data), start, offset, buf);
-        self.fill(start, &data, epoch);
-        Ok(())
+        let key = (self.id, start, end);
+        match self.cache.begin_span(key) {
+            Err(inflight) => {
+                let data = ReadCache::wait_span(&inflight)?;
+                copy_out(std::slice::from_ref(&data), start, offset, buf);
+                Ok(())
+            }
+            Ok(lead) => {
+                let n = (end - start).div_ceil(CACHE_CHUNK);
+                self.cache.misses.fetch_add(n, Ordering::Relaxed);
+                let epoch = self.epoch.load(Ordering::Acquire);
+                let span_len =
+                    usize::try_from(end - start).map_err(|_| StorageError::OutOfBounds {
+                        offset,
+                        len: buf.len(),
+                    })?;
+                let result = self.inner.read_vec(start, span_len).map(Bytes::from);
+                if let Ok(data) = &result {
+                    copy_out(std::slice::from_ref(data), start, offset, buf);
+                    self.fill(start, data, epoch);
+                }
+                lead.finish(result)?;
+                Ok(())
+            }
+        }
     }
 
     fn read_many(&self, reads: &[(u64, usize)]) -> Result<Vec<Bytes>, StorageError> {
@@ -386,19 +562,59 @@ impl Storage for CachedStorage {
             }
         }
         if !spans.is_empty() {
-            let chunks: u64 = spans
-                .iter()
-                .map(|&(_, l)| (l as u64).div_ceil(CACHE_CHUNK))
-                .sum();
-            self.cache.misses.fetch_add(chunks, Ordering::Relaxed);
-            let epoch = self.epoch.load(Ordering::Acquire);
-            let read = self.inner.read_many(&spans)?;
-            for ((slot, offset, len, start), data) in misses.into_iter().zip(read) {
+            // Coalesce spans already being read; only unique leaders hit disk.
+            let mut leaders: Vec<SpanLead<'_>> = Vec::new();
+            let mut leader_spans = Vec::new();
+            let mut leader_misses = Vec::new();
+            let mut joined = Vec::new();
+            for ((slot, offset, len, start), (span_start, span_len)) in
+                misses.into_iter().zip(spans)
+            {
+                let end = span_start.saturating_add(span_len as u64);
+                match self.cache.begin_span((self.id, span_start, end)) {
+                    Err(inflight) => joined.push((slot, offset, len, start, inflight)),
+                    Ok(lead) => {
+                        leaders.push(lead);
+                        leader_spans.push((span_start, span_len));
+                        leader_misses.push((slot, offset, len, start));
+                    }
+                }
+            }
+            for (slot, offset, len, start, inflight) in joined {
+                let data = ReadCache::wait_span(&inflight)?;
                 let mut buf = vec![0; len];
                 copy_out(std::slice::from_ref(&data), start, offset, &mut buf);
-                self.fill(start, &data, epoch);
                 if let Some(o) = out.get_mut(slot) {
                     *o = Some(Bytes::from(buf));
+                }
+            }
+            if !leader_spans.is_empty() {
+                let chunks: u64 = leader_spans
+                    .iter()
+                    .map(|&(_, l)| (l as u64).div_ceil(CACHE_CHUNK))
+                    .sum();
+                self.cache.misses.fetch_add(chunks, Ordering::Relaxed);
+                let epoch = self.epoch.load(Ordering::Acquire);
+                let read = match self.inner.read_many(&leader_spans) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        for lead in leaders {
+                            let _ =
+                                lead.finish(Err(StoredError::from_storage(&error).into_storage()));
+                        }
+                        return Err(error);
+                    }
+                };
+                for ((lead, (slot, offset, len, start)), data) in
+                    leaders.into_iter().zip(leader_misses).zip(read)
+                {
+                    let mut buf = vec![0; len];
+                    copy_out(std::slice::from_ref(&data), start, offset, &mut buf);
+                    self.fill(start, &data, epoch);
+                    let _ = lead.finish(Ok(data));
+                    if let Some(o) = out.get_mut(slot) {
+                        *o = Some(Bytes::from(buf));
+                    }
                 }
             }
         }
@@ -534,5 +750,78 @@ mod tests {
         assert_eq!(cache.stats().bytes, CACHE_CHUNK);
         drop(b);
         assert_eq!(cache.stats().bytes, 0);
+    }
+
+    /// Memory storage that holds a gate so concurrent misses overlap, and
+    /// counts how many times it is read.
+    #[derive(Debug)]
+    struct Gated {
+        inner: MemoryStorage,
+        gate: Mutex<()>,
+        reads: AtomicU64,
+    }
+
+    impl Storage for Gated {
+        fn len(&self) -> u64 {
+            self.inner.len()
+        }
+        fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), StorageError> {
+            self.inner.write_at(offset, data)
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+            let _hold = self.gate.lock().unwrap();
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.read_at(offset, buf)
+        }
+        fn flush(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn concurrent_misses_share_one_inner_read() {
+        let data: Vec<u8> = (0..32_768)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let gated = Arc::new(Gated {
+            inner: MemoryStorage::new(32_768),
+            gate: Mutex::new(()),
+            reads: AtomicU64::new(0),
+        });
+        gated.write_at(0, &data).unwrap();
+        let cached = CachedStorage::new(gated.clone(), ReadCache::new(1 << 20));
+        let started = AtomicU64::new(0);
+        // Hold the inner read until every thread has entered `read_vec`.
+        let hold = gated.gate.lock().unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let started = &started;
+                let cached = &cached;
+                let data = &data;
+                scope.spawn(move || {
+                    started.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(cached.read_vec(0, 16_384).unwrap(), &data[..16_384]);
+                });
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while started.load(Ordering::Relaxed) < 8 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "workers did not start"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // Let the leader reach the inner gate and the others join it.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(hold);
+        });
+        assert_eq!(
+            gated.reads.load(Ordering::Relaxed),
+            1,
+            "overlapping misses must share the inner read"
+        );
+        // A later read is a hit.
+        assert_eq!(cached.read_vec(0, 16_384).unwrap(), &data[..16_384]);
+        assert_eq!(gated.reads.load(Ordering::Relaxed), 1);
     }
 }

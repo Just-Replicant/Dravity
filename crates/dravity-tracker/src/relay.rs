@@ -41,6 +41,22 @@ impl fmt::Debug for UdpProxy {
     }
 }
 
+/// A UDP tracker: an address, or (through a proxy) a host name the proxy
+/// resolves.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Target {
+    Addr(SocketAddr),
+    Name(std::sync::Arc<str>, u16),
+}
+
+impl Target {
+    /// Whether peers come back in the IPv6 compact form (BEP 15): an IPv6
+    /// tracker; a name the proxy resolves is taken as IPv4.
+    pub(crate) const fn is_ipv6(&self) -> bool {
+        matches!(self, Self::Addr(SocketAddr::V6(_)))
+    }
+}
+
 /// Where announces to one tracker go.
 #[derive(Debug)]
 pub(crate) struct UdpLink {
@@ -50,8 +66,9 @@ pub(crate) struct UdpLink {
 
 #[derive(Debug)]
 struct Relayed {
-    /// The tracker, which every reply must come from.
-    target: SocketAddr,
+    /// The tracker, which every reply must come from (any source for a
+    /// name: the relay reports the address it resolved).
+    target: Option<SocketAddr>,
     header: Vec<u8>,
     /// Closing this ends the association.
     _control: TcpStream,
@@ -70,8 +87,15 @@ fn refused(what: &str) -> io::Error {
 }
 
 impl UdpLink {
-    /// A socket connected straight to `target`.
-    pub(crate) async fn direct(target: SocketAddr) -> io::Result<Self> {
+    /// A socket connected straight to `target` (a name is resolved here).
+    pub(crate) async fn direct(target: &Target) -> io::Result<Self> {
+        let target = match target {
+            Target::Addr(addr) => *addr,
+            Target::Name(host, port) => tokio::net::lookup_host((&**host, *port))
+                .await?
+                .next()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?,
+        };
         let socket = UdpSocket::bind(unspecified(target)).await?;
         socket.connect(target).await?;
         Ok(Self {
@@ -81,7 +105,16 @@ impl UdpLink {
     }
 
     /// A UDP association with `proxy` for datagrams to `target`.
-    pub(crate) async fn relayed(proxy: &UdpProxy, target: SocketAddr) -> io::Result<Self> {
+    pub(crate) async fn relayed(proxy: &UdpProxy, target: &Target) -> io::Result<Self> {
+        let (header, family, expected) = match target {
+            Target::Addr(addr) => (socks5::udp_header(*addr), *addr, Some(*addr)),
+            Target::Name(host, port) => (
+                socks5::udp_header_domain(host, *port)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?,
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+                None,
+            ),
+        };
         let mut control = TcpStream::connect(proxy.server.as_str()).await?;
         control
             .write_all(&socks5::greeting(proxy.auth.is_some()))
@@ -105,7 +138,7 @@ impl UdpLink {
         // We do not know our relay-facing address in advance: 0.0.0.0:0
         // lets the proxy accept our datagrams from wherever they come.
         control
-            .write_all(&socks5::request(socks5::UDP_ASSOCIATE, unspecified(target)))
+            .write_all(&socks5::request(socks5::UDP_ASSOCIATE, unspecified(family)))
             .await?;
         let mut head = [0u8; 5];
         control.read_exact(&mut head).await?;
@@ -130,8 +163,8 @@ impl UdpLink {
         Ok(Self {
             socket,
             relayed: Some(Relayed {
-                target,
-                header: socks5::udp_header(target),
+                target: expected,
+                header,
                 _control: control,
             }),
         })
@@ -162,7 +195,10 @@ impl UdpLink {
             else {
                 continue;
             };
-            if !same_host(from, relayed.target) {
+            if relayed
+                .target
+                .is_some_and(|target| !same_host(from, target))
+            {
                 continue;
             }
             let len = payload.len().min(buf.len());

@@ -538,6 +538,19 @@ async fn socks5_udp_relay() -> (
     SocketAddr,
     std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>,
 ) {
+    socks5_udp_relay_resolving(None).await
+}
+
+type Names = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// [`socks5_udp_relay`] that sends datagrams addressed by host name
+/// (SOCKS5 address type 3) to `named`, logging the name.
+async fn socks5_udp_relay_resolving(
+    named: Option<(SocketAddr, Names)>,
+) -> (
+    SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let targets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -566,8 +579,19 @@ async fn socks5_udp_relay() -> (
         let mut buf = [0u8; 2048];
         loop {
             let (n, client) = relay.recv_from(&mut buf).await.unwrap();
-            let (target, payload) = dravity_core::socks5::parse_udp_header(&buf[..n]).unwrap();
-            log.lock().unwrap().push(target);
+            let (target, payload) = if buf[3] == 3 {
+                let len = usize::from(buf[4]);
+                let (to, names) = named.as_ref().unwrap();
+                names
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8(buf[5..5 + len].to_vec()).unwrap());
+                (*to, &buf[5 + len + 2..n])
+            } else {
+                let (target, payload) = dravity_core::socks5::parse_udp_header(&buf[..n]).unwrap();
+                log.lock().unwrap().push(target);
+                (target, payload)
+            };
             outside.send_to(payload, target).await.unwrap();
             let mut answer = [0u8; 2048];
             let (m, from) = outside.recv_from(&mut answer).await.unwrap();
@@ -618,4 +642,44 @@ async fn udp_announce_through_a_socks5_relay() {
     );
     // Both the connect and the announce went through the relay.
     assert_eq!(*targets.lock().unwrap(), vec![tracker, tracker]);
+}
+
+#[tokio::test]
+async fn udp_tracker_names_are_resolved_by_the_proxy() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let tracker = server.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        let (_, from) = server.recv_from(&mut buf).await.unwrap();
+        let tid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+        server
+            .send_to(&udp::encode_connect_response(tid, 9), from)
+            .await
+            .unwrap();
+        let (_, from) = server.recv_from(&mut buf).await.unwrap();
+        let tid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+        server
+            .send_to(&udp::encode_announce_response(tid, 900, 0, 1, &[]), from)
+            .await
+            .unwrap();
+    });
+    let names: Names = std::sync::Arc::default();
+    let (proxy, targets) =
+        socks5_udp_relay_resolving(Some((tracker, std::sync::Arc::clone(&names)))).await;
+    let mut c = ClientConfig::default();
+    c.udp_timeout = Duration::from_millis(500);
+    c.udp_retries = 1;
+    c.udp_proxy = Some(UdpProxy::new(
+        proxy.to_string(),
+        Some(("me".into(), "pass".into())),
+    ));
+    // `.invalid` never resolves locally: only the proxy can reach it.
+    let r = TrackerClient::new(c)
+        .unwrap()
+        .announce("udp://tracker.invalid:6969/announce", &request())
+        .await
+        .unwrap();
+    assert_eq!(r.interval, Some(Duration::from_secs(900)));
+    assert_eq!(*names.lock().unwrap(), vec!["tracker.invalid"; 2]);
+    assert!(targets.lock().unwrap().is_empty(), "no address was sent");
 }

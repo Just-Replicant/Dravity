@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::relay::{UdpLink, UdpProxy};
+use crate::relay::{Target, UdpLink, UdpProxy};
 use dravity_core::net::is_public;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::redirect::{Attempt, Policy};
@@ -40,7 +40,7 @@ pub struct ClientConfig {
     /// proxy). UDP trackers are not proxied.
     pub http_proxy: Option<String>,
     /// Send UDP tracker requests through this SOCKS5 proxy's UDP relay
-    /// (UDP ASSOCIATE). The tracker's host name is resolved locally first.
+    /// (UDP ASSOCIATE). Tracker host names are resolved by the proxy.
     pub udp_proxy: Option<UdpProxy>,
 }
 
@@ -94,7 +94,7 @@ struct UdpEndpoint {
 pub struct TrackerClient {
     http: reqwest::Client,
     config: ClientConfig,
-    endpoints: Arc<Mutex<HashMap<SocketAddr, UdpEndpoint>>>,
+    endpoints: Arc<Mutex<HashMap<Target, UdpEndpoint>>>,
     trusted: Arc<TrustedHosts>,
 }
 
@@ -349,10 +349,21 @@ impl TrackerClient {
             .port()
             .ok_or_else(|| TrackerError::InvalidUrl(url.to_string()))?;
         let host = host.trim_start_matches('[').trim_end_matches(']');
-        let addr = tokio::net::lookup_host((host, port))
-            .await?
-            .next()
-            .ok_or_else(|| TrackerError::Resolve(host.to_owned()))?;
+        let addr = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            Target::Addr(SocketAddr::new(ip, port))
+        } else if self.config.udp_proxy.is_some() {
+            // The proxy resolves the name (SOCKS5 domain address type), so
+            // it never reaches the local resolver.
+            Target::Name(host.into(), port)
+        } else {
+            Target::Addr(
+                tokio::net::lookup_host((host, port))
+                    .await?
+                    .next()
+                    .ok_or_else(|| TrackerError::Resolve(host.to_owned()))?,
+            )
+        };
+        let addr = &addr;
         match self.udp_request_at(addr, req).await {
             // The socket may be dead (a refused datagram sticks to a connected
             // UDP socket). Drop it and try once more from a new port.
@@ -368,7 +379,7 @@ impl TrackerClient {
     /// needed. The endpoint's gate is held for the whole exchange.
     async fn udp_request_at(
         &self,
-        addr: SocketAddr,
+        addr: &Target,
         req: UdpRequest<'_>,
     ) -> Result<UdpAnswer, TrackerError> {
         let (socket, gate) = self.udp_socket(addr).await?;
@@ -413,7 +424,7 @@ impl TrackerClient {
     /// first one stored is kept, and the connection id always belongs to it.
     async fn udp_socket(
         &self,
-        addr: SocketAddr,
+        addr: &Target,
     ) -> Result<(Arc<UdpLink>, Arc<AsyncMutex<()>>), TrackerError> {
         if let Some((socket, gate)) = self.endpoint_handle(addr) {
             return Ok((socket, gate));
@@ -423,13 +434,13 @@ impl TrackerClient {
             None => UdpLink::direct(addr).await?,
         });
         let mut endpoints = self.lock_endpoints();
-        if let Some(existing) = endpoints.get(&addr) {
+        if let Some(existing) = endpoints.get(addr) {
             return Ok((Arc::clone(&existing.socket), Arc::clone(&existing.gate)));
         }
         let gate = Arc::new(AsyncMutex::new(()));
         self.evict_expired(&mut endpoints);
         endpoints.insert(
-            addr,
+            addr.clone(),
             UdpEndpoint {
                 socket: Arc::clone(&socket),
                 id: None,
@@ -440,26 +451,26 @@ impl TrackerClient {
         Ok((socket, gate))
     }
 
-    fn endpoint_handle(&self, addr: SocketAddr) -> Option<(Arc<UdpLink>, Arc<AsyncMutex<()>>)> {
+    fn endpoint_handle(&self, addr: &Target) -> Option<(Arc<UdpLink>, Arc<AsyncMutex<()>>)> {
         self.lock_endpoints()
-            .get(&addr)
+            .get(addr)
             .map(|endpoint| (Arc::clone(&endpoint.socket), Arc::clone(&endpoint.gate)))
     }
 
     /// Forgets `addr` after an I/O error so the next attempt binds a new socket.
-    fn fail_socket(&self, addr: SocketAddr, err: TrackerError) -> TrackerError {
+    fn fail_socket(&self, addr: &Target, err: TrackerError) -> TrackerError {
         self.drop_endpoint(addr);
         err
     }
 
-    fn drop_endpoint(&self, addr: SocketAddr) {
-        self.lock_endpoints().remove(&addr);
+    fn drop_endpoint(&self, addr: &Target) {
+        self.lock_endpoints().remove(addr);
     }
 
     async fn udp_request_with(
         &self,
         socket: &UdpLink,
-        addr: SocketAddr,
+        addr: &Target,
         connection_id: u64,
         req: UdpRequest<'_>,
         retries: u32,
@@ -484,15 +495,15 @@ impl TrackerClient {
         }
     }
 
-    fn lock_endpoints(&self) -> std::sync::MutexGuard<'_, HashMap<SocketAddr, UdpEndpoint>> {
+    fn lock_endpoints(&self) -> std::sync::MutexGuard<'_, HashMap<Target, UdpEndpoint>> {
         self.endpoints
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn cached_connection(&self, addr: SocketAddr) -> Option<u64> {
+    fn cached_connection(&self, addr: &Target) -> Option<u64> {
         let mut endpoints = self.lock_endpoints();
-        let endpoint = endpoints.get_mut(&addr)?;
+        let endpoint = endpoints.get_mut(addr)?;
         match endpoint.id {
             Some(id) if endpoint.at.elapsed() < UDP_CONNECTION_TTL => Some(id),
             Some(_) => {
@@ -503,7 +514,7 @@ impl TrackerClient {
         }
     }
 
-    fn evict_expired(&self, endpoints: &mut HashMap<SocketAddr, UdpEndpoint>) {
+    fn evict_expired(&self, endpoints: &mut HashMap<Target, UdpEndpoint>) {
         endpoints.retain(|_, endpoint| {
             endpoint.id.is_none() || endpoint.at.elapsed() < UDP_CONNECTION_TTL
         });
@@ -511,7 +522,7 @@ impl TrackerClient {
             let Some(oldest) = endpoints
                 .iter()
                 .min_by_key(|(_, endpoint)| endpoint.at)
-                .map(|(addr, _)| *addr)
+                .map(|(addr, _)| addr.clone())
             else {
                 break;
             };
@@ -521,27 +532,27 @@ impl TrackerClient {
 
     fn remember_connection(
         &self,
-        addr: SocketAddr,
+        addr: &Target,
         id: u64,
         socket: &Arc<UdpLink>,
         gate: &Arc<AsyncMutex<()>>,
     ) {
         let mut endpoints = self.lock_endpoints();
         endpoints.retain(|kept, endpoint| {
-            *kept == addr || endpoint.id.is_none() || endpoint.at.elapsed() < UDP_CONNECTION_TTL
+            kept == addr || endpoint.id.is_none() || endpoint.at.elapsed() < UDP_CONNECTION_TTL
         });
         while endpoints.len() >= MAX_CACHED_CONNECTIONS {
             let Some(oldest) = endpoints
                 .iter()
-                .filter(|(candidate, _)| **candidate != addr)
+                .filter(|(candidate, _)| *candidate != addr)
                 .min_by_key(|(_, endpoint)| endpoint.at)
-                .map(|(candidate, _)| *candidate)
+                .map(|(candidate, _)| candidate.clone())
             else {
                 break;
             };
             endpoints.remove(&oldest);
         }
-        match endpoints.get_mut(&addr) {
+        match endpoints.get_mut(addr) {
             // The id was issued to this source port. A replacement socket
             // must not inherit it.
             Some(endpoint) if Arc::ptr_eq(&endpoint.socket, socket) => {
@@ -551,7 +562,7 @@ impl TrackerClient {
             Some(_) => {}
             None => {
                 endpoints.insert(
-                    addr,
+                    addr.clone(),
                     UdpEndpoint {
                         socket: Arc::clone(socket),
                         id: Some(id),
@@ -565,9 +576,9 @@ impl TrackerClient {
 
     /// Drops `id` if it is still the one stored. A newer id from another
     /// clone is left in place.
-    fn forget_connection(&self, addr: SocketAddr, id: u64) {
+    fn forget_connection(&self, addr: &Target, id: u64) {
         let mut endpoints = self.lock_endpoints();
-        if let Some(endpoint) = endpoints.get_mut(&addr)
+        if let Some(endpoint) = endpoints.get_mut(addr)
             && endpoint.id == Some(id)
         {
             endpoint.id = None;

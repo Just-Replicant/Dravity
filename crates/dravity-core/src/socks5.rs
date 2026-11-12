@@ -114,6 +114,22 @@ pub fn udp_header(target: SocketAddr) -> Vec<u8> {
     out
 }
 
+/// The UDP relay header for a target named by host name (address type 3),
+/// so the proxy resolves it; `None` for a name over 255 bytes.
+///
+/// ```
+/// let h = dravity_core::socks5::udp_header_domain("t.example", 6969).unwrap();
+/// assert_eq!(h, b"\0\0\0\x03\x09t.example\x1b\x39");
+/// ```
+#[must_use]
+pub fn udp_header_domain(host: &str, port: u16) -> Option<Vec<u8>> {
+    let len = u8::try_from(host.len()).ok()?;
+    let mut out = vec![0, 0, 0, 3, len];
+    out.extend_from_slice(host.as_bytes());
+    out.extend_from_slice(&port.to_be_bytes());
+    Some(out)
+}
+
 /// Splits a datagram received from a UDP relay into its source address
 /// and payload. Fragmented and domain-addressed datagrams are refused
 /// (`None`).

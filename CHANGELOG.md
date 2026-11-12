@@ -1,567 +1,220 @@
 # Changelog
 
-All notable changes to this project are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
-the roadmap phases until the first release.
+Notable changes. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Versions follow the roadmap until the first release.
 
 ## [Unreleased]
 
-### TUI: live session actions and session numbers
+### TUI
 
-The `--tui` client can now drive the session APIs that were already there,
-and it shows the numbers the screen used to drop.
-
-- **Queued vs stopped:** the torrent table reads `TorrentSummary::queued`
-  and draws a distinct `queued` state (a user pause still wins).
-- **Live actions:** `Q` sets `max_active_downloads` and `max_active_seeds`,
-  `C` the session `max_connections`, `P` moves the listen port
-  (`Session::set_listen_port`; `0` picks a free port). `b` bans an IP,
-  `B` shows the ban list (`u` unbans the selection, `U` types an address),
-  `i` loads or replaces the IP filter (empty clears it). `s` on the
-  trackers pane forces a scrape (`TorrentHandle::scrape`); the UI notes
-  that periodic scrape counts need `--scrape-interval`. `t` on a file
-  calls `open_file` and, when `dravity serve --tui` is running, shows the
-  HTTP Range URL (`/api/v1/torrents/{hash}/files/{index}/content`).
-- **Add options:** the add prompt is a form (tab between fields): start
-  paused, extra peers, a download directory other than the session's, and
-  for a `.torrent`, file selection and priorities (enter inspects, enter
-  again adds).
-- **Header and selected torrent:** current rate limits and queue caps,
-  peer id, open connection count, hash jobs in flight, read-cache stats,
-  port-mapping protocol, UDP port and external address (not only the
-  mapped TCP port), session ban and filter counts. The selected pane
-  shows piece counts, peers still connecting, known-but-not-connected
-  peers, unchoked and interested peers, pending disk reads and writes,
-  and the torrent's banned-peer count.
-- **Trackers and alerts:** last announce and scrape times, scrape
-  failures, and alert lines for a completed piece and a failed upload
-  read (`Alert::PieceCompleted`, `Alert::UploadFailed`).
-- In-TUI `?` help and the README list the new keys. Input parsing
-  (IPs, ports, caps, peer lists, filter paths) and state mapping
-  including `queued` are tested, plus a loopback session test of the
-  actions.
+- Queued torrents draw as `queued`. A user pause still wins.
+- `Q` sets queue caps, `C` the connection cap, `P` the listen port
+  (`0` picks a free port). `b` / `B` / `U` ban and unban. `i` loads an
+  IP filter. `s` on trackers scrapes now. `t` on a file opens it and,
+  under `serve --tui`, shows the HTTP Range URL.
+- Add is a form: start paused, extra peers, a download directory, and
+  file selection.
+- The header shows limits, queue caps, peer id, connections, hash jobs,
+  read-cache stats, and port mapping. The selected torrent shows piece
+  and peer counts. Trackers show announce and scrape times.
+  `Alert::PieceCompleted` and `Alert::UploadFailed` appear in the log.
 
 ### Audit remediation
 
-Fixes and follow-ups from a review of the IronTide adoption work. All
-of this lives on a local branch; it is not pushed.
-
-- **Rate limiting:** the token bucket returns the complete wait (no
-  two-second cap); session admissions are FIFO and a live rate change
-  reprices debt without double-charging.
-- **PCP:** mappings keep their nonce and assigned identity and renew at
-  half the lifetime the router granted.
-- **Live listen port:** a requested port that is taken fails the rebind
-  and leaves the old listener in place (strict bind). Initial listen
-  still falls back to a free port.
-- **Tracker SSRF:** private origins need an explicit opt-in or
-  allowlist (`--allow-private-trackers`); trust is request-scoped;
-  proxy DNS is refused unless allowed.
-- **Ban and IP-filter propagation:** a generation watch on `BanList`
-  is applied by every torrent task, so a full command queue cannot
-  drop `BanIp` or `Refilter`.
-- **Piece length:** a configurable 32 MiB ceiling
-  (`SessionConfig::max_piece_length`, `--max-piece-length`) is applied
-  before torrent state is allocated.
-- **HTTP API:** a non-loopback bind without a token is refused unless
-  `HttpConfig::allow_insecure_unauthenticated` / `--allow-insecure-http`
-  is set.
-- **Settings:** `apply_settings` and `set_listen_port` are serialized
-  so concurrent updates cannot write a stale snapshot.
-- **Native DHT:** announce-token secrets and node-id entropy use OS
-  cryptographic randomness; offline public-network validation tests
-  and `docs/native-dht-validation.md` cover what can be checked
-  without the internet. The default stays `mainline`.
-- **Queue and cache:** torrent-queue status queries run in parallel;
-  concurrent read-cache misses of the same span share one inner read.
-- **CI:** GitHub Actions are pinned to commit SHAs.
-- **Shared UDP:** `dravity_dht::shared::SharedUdp` demultiplexes DHT,
-  uTP and tracker datagrams on one socket. The session is not yet
-  wired to it.
-- **Library consumption:** all crates stay `publish = false`; the
-  `dravity` facade is the intended public API. See the README.
-- **Docs:** BEP coverage, `--dht-ipv6` in the generated configuration
-  reference, and a README that describes the IronTide work.
+- The token bucket returns the full wait. Admissions are FIFO. A live
+  rate change reprices debt without charging the bytes again.
+- PCP renewals keep the nonce and assigned address and use half the
+  granted lifetime.
+- A live rebind of a taken port fails and leaves the old listener.
+- Private tracker origins need `--allow-private-trackers`. Trust is
+  request-scoped. Proxy DNS is refused unless allowed.
+- Ban and IP-filter updates use a generation watch, so a full command
+  queue cannot drop them.
+- Piece length is capped at 32 MiB (`--max-piece-length`) before state
+  is allocated.
+- A non-loopback HTTP bind without a token is refused unless
+  `--allow-insecure-http` is set.
+- `apply_settings` and `set_listen_port` are serialized.
+- Native DHT token secrets come from the OS CSPRNG. The default node
+  stays `mainline`. See [`docs/native-dht-validation.md`](docs/native-dht-validation.md).
+- Queue status queries run in parallel. Concurrent read-cache misses of
+  one span share one disk read.
+- GitHub Actions are pinned to commit SHAs.
+- `SharedUdp` can demultiplex DHT, uTP, and tracker datagrams. The
+  session does not use it yet.
+- Crates stay `publish = false`. The `dravity` facade is the public API.
 
 ### irontide adoption
 
-Ideas adopted from a review of the irontide engine, reimplemented for
-Dravity's sans-IO design. Status per item: [`docs/irontide-adoption.md`](docs/irontide-adoption.md).
+Reimplemented for the sans-IO design. Per-item notes:
+[`docs/irontide-adoption.md`](docs/irontide-adoption.md).
 
-- **Security (item 1):** tracker HTTP announces are SSRF-guarded
-  (`dravity_tracker::guard`, `ClientConfig::ssrf_mitigation`, default on):
-  a `localhost`/loopback tracker must use an `/announce` path; redirects
-  stay on `http(s)`, never downgrade `https`, are capped at 5, and a
-  redirect from a non-local tracker may not reach a non-public address,
-  literal or resolved (a resolver drops non-public addresses for every
-  host that is not itself an announce origin). New
-  `TrackerError::Blocked`. The address classifier moved to
-  `dravity_core::net::is_public` (`dravity_webseed::is_public` re-exports it).
-- **Smart ban (item 2):** a failed piece with blocks from more than one
-  address is quarantined while its blocks are hashed
-  (`Effect::HashBlocks` → `Event::BlockHashes`, SHA-256 per 16 KiB block
-  via `dravity_storage::block_hashes`); once a copy verifies, only the
-  senders of the blocks that differ are banned. On v2/hybrid torrents
-  the piece's leaf hashes are requested from a BEP 52 peer that did not
-  send it (verified against the piece layer) and convict at once.
-  `Config::smart_ban` (default on); strikes remain the fallback when the
-  blocks cannot be read or the tracking table (256 pieces) is full. Bans
-  are session-wide: a torrent's ban is shared with every other torrent
-  and the listener (`Session::ban_ip`, `unban_ip`, `banned_ips`,
-  `Event::BanIp`, `TorrentState::with_banned_ips`).
-- **Session connection cap (item 3):** `SessionConfig::max_connections`
-  (default 500, `--max-connections`, 0 for none) caps open peer
-  connections across all torrents, TCP and uTP, dialed and accepted. One
-  lock-free counter (`dravity_core::admit::{ConnectionLimit,
-  ConnectionSlot, admit_permitted}`) hands out RAII slots: the listener
-  closes connections over the cap before the handshake, and a dial over
-  the cap is reported as the new `Event::PeerConnectDeferred` (no blame;
-  dialed again after `DEFERRED_DIAL_RETRY`, 5 s). Changeable at runtime
-  (`Session::set_max_connections`, `max_connections`, `connection_count`).
-  A loom model (`dravity-core/tests/loom_admit.rs`, CI job `loom`) checks
-  the counter under every interleaving.
-- **Session-wide hash pool (item 4):** `SessionConfig::hash_workers` now
-  bounds piece hashing across the whole session instead of per torrent.
-  Checks, rechecks and smart-ban digests of every torrent share one FIFO
-  pool, so N torrents rechecking at once no longer run N × cores
-  blocking jobs. A panicking job reports a storage error and frees its
-  slot. `Session::hash_jobs_running` shows the pool's load.
-- **Sans-IO purity tripwires (item 5):** `tests/sans_io_purity.rs` in
-  `dravity-utp` (`conn`, `packet`), `dravity-mse` (`handshake`,
-  `crypto`), `dravity-webseed` (`plan`, `addr`), `dravity-tracker`
-  (`http`, `udp`, `guard`, `types`) and `dravity-portmap` (`natpmp`), and
-  for every file of `dravity-core`, `-engine`, `-wire` and `-bencode`,
-  fail the build when a sans-IO module mentions tokio, `.await`, sockets,
-  `std::fs`, threads or the clock (comments and unit tests excepted).
-- **Hash on arrival (item 6):** downloaded pieces are verified from their
-  blocks as they are written: `dravity_core::verify::PieceHasher` feeds
-  SHA-1 in order (holding early blocks) and hashes each block's SHA-256
-  leaf at once, then checks with the same rules as `Info::check_piece`
-  (now built on a shared digest check). The session feeds it on the write
-  threads and answers `Effect::HashPiece` without reading the piece back
-  (`SessionConfig::hash_on_arrival`, default on). Rechecks, duplicate
-  blocks and pieces whose early blocks exceed 32 MiB per torrent still
-  read back. Hybrids no longer hash a piece twice from disk.
-- **Read cache (item 7):** `dravity_storage::{CachedStorage, ReadCache,
-  CacheStats}`, a `Storage` middleware with a segmented-LRU cache of
-  16 KiB chunks under one byte budget shared by all torrents (scan
-  resistant: a chunk is protected on its second hit). Writes go through
-  and invalidate; a read that raced a write is not cached. The session
-  wraps the storages it creates (`SessionConfig::read_cache`, default
-  64 MiB, `--read-cache`, `Session::read_cache_stats`).
-- **Verify-before-download prescan (item 8):** before the start check,
-  one `stat` per file (`Storage::stamps`) finds pieces that touch a
-  missing or short file (`dravity_storage::absent_pieces`); the engine
-  skips hashing them (`TorrentState::with_absent_pieces` /
-  `set_absent_pieces`). A new or partial download is checked in O(files)
-  plus the pieces that may be present.
-- **BDP request depth and torrent budget (item 9):** each peer's request
-  depth is the larger of its AIMD window and its bandwidth-delay product
-  (EWMA delivery rate × minimum recent request round trip, +25 % and two
-  blocks), still capped by `max_requests_per_peer` and `reqq`; a request
-  timeout hands control back to AIMD for 10 s. New
-  `Config::request_budget` (1024 blocks) bounds outstanding requests
-  across all peers of a torrent. Rate and RTT are measured from the
-  engine's own events, so it stays sans-IO.
-- **Piece reservation (item 10):** `Picker::pick_for(owner, ..)` reserves
-  each started piece for the peer that started it. Peers continue their
-  own pieces, take over unowned ones (owner left or choked us), start new
-  ones, and only then help with another peer's piece, so fewer pieces
-  sit half done and a bad piece usually has a single sender (which helps
-  smart banning). `Picker::release_owner`, `Picker::owner`.
-- **Preallocation and durability (item 11):** `PreallocateMode`
-  (`none`/`sparse`/`full`) sizes or reserves each file when
-  `FileStorage` creates it (`FileStorage::with_preallocate`; `full` uses
-  `fallocate` and falls back to sparse). `Durability`
-  (`never`/`per-piece`/`on-complete`) controls when data is synced:
-  `per-piece` syncs a verified piece's files before the engine counts it.
-  New `Storage::sync_range` (default: `flush`). `SessionConfig::preallocate`,
-  `SessionConfig::durability`, and the CLI flags `--preallocate` and `--durability`.
-- **Seed choking modes and slot tuner (item 12):** `Config::seed_choking`
-  (`SeedChoking::FastestUpload`, the default, `RoundRobin` with
-  `Config::round_robin_quota`, or `AntiLeech`) ranks regular slots while
-  seeding. `Config::upload_slots_auto` re-derives the slot count every
-  round from measured upload rates. `TorrentState::upload_slots`. The
-  CLI flags are `--seed-choking` and `--auto-upload-slots`.
-- **Torrent creation (item 13):** `dravity_core::create::TorrentCreator`
-  is a sans-IO creator for v1, v2 and hybrid torrents. It handles BEP 47
-  padding (always for hybrids, optional for v1), automatic piece length
-  (`auto_piece_length`), trackers in tiers, web seeds, `private`,
-  `source`, comments and dates. `dravity_storage::create_torrent` walks a
-  file or directory. The new `dravity create` command writes the
-  `.torrent` and prints its info hashes.
-- **Tracker scrape (item 14):** `TrackerClient::scrape` covers HTTP (BEP 48:
-  `announce` becomes `scrape`, `http::scrape_url` and
-  `http::parse_scrape_response`) and UDP (BEP 15 action 2:
-  `udp::scrape_request` and `udp::parse_scrape_response`, reusing the
-  cached connection id). The new type is `ScrapeStats`. In the session,
-  `TorrentHandle::scrape()` and `SessionConfig::scrape_interval` (off by
-  default) fill `TrackerStatus::scrape` / `scraped`. The TUI tracker pane
-  shows scraped counts, and the CLI flag is `--scrape-interval MINUTES`.
-- **Local Service Discovery (item 15):** the new `dravity-lsd` crate has a
-  sans-IO BEP 14 codec (`codec::encode` / `codec::parse`) and an `Lsd`
-  service on `239.192.152.143:6771` and `[ff15::efc0:988f]:6771`, with
-  a per-source rate limit and a cookie that drops our own announces.
-  `SessionConfig::lsd` (off by default in the library) announces running
-  public torrents and adds discovered peers. Private torrents and
-  magnets without metadata are never announced. The CLI enables LSD when
-  it listens; `--no-lsd` turns it off.
-- **Live settings, session-wide rate limits and queueing** (irontide item 16): `Session::settings`/`apply_settings` change the session-wide download/upload limits (token buckets enforced at the socket in every peer task), the connection cap and the active-download/active-seed queue limits at runtime, all fields or none (`SettingsUpdate`, `SettingsError`, `MIN_RATE_LIMIT` = 16 KiB/s). New torrents beyond the active limits wait `queued` (`TorrentSummary::queued`, HTTP state `queued`) and start oldest first as slots free up. `GET`/`PATCH /api/v1/settings`, CLI `--global-download-limit`, `--global-upload-limit`, `--max-active-downloads`, `--max-active-seeds`, TUI keys `L`/`U`. The per-torrent engine limits are unchanged. With a state directory, applied live settings are saved (`settings.bencode`, `LiveSettings::encode`/`decode`) and `Session::restore` (so `dravity serve`) brings them back before the torrents. `Session::set_listen_port` moves the listener while running: new sockets are bound before the old ones close, and port mapping, LSD and every torrent's announces follow. Connected peers get a fresh extension handshake with the new port (`Event::SetListenPort`), and the port is saved (`listen.bencode`) and restored by `Session::restore`.
-- **BEP 53 select-only magnets** (irontide item 17): `Magnet::select_only` parses `so=0,2,4-6` (repeatable, at most `MAX_SELECT_RANGES` ranges, malformed lists are `MagnetError::InvalidSelection`), `Magnet::selects_file` checks an index and `to_uri` writes it back. When the metadata of such a magnet arrives, files outside the selection get `Priority::Skip`; explicit `with_file_priorities` still wins.
-- **Small wire extensions** (irontide item 18): BEP 21 `upload_only` (sent in a fresh extension handshake when a torrent finishes or resumes downloading; received, it marks the peer as a partial seed in PEX), BEP 54 `lt_donthave` (received: the piece leaves the peer's availability; sent when a recheck loses a piece), BEP 16 super-seeding (`Config::super_seed`, CLI `--super-seed`) and `lt_tex` tracker exchange (`Config::tracker_exchange`, `TorrentState::with_trackers`, `Effect::TrackersReceived`; learned trackers become a new last tier; off for private torrents; CLI `--no-tracker-exchange`). Wire: `ExtendedHandshake::upload_only`, `TrackerExchange`, `encode_donthave`/`decode_donthave`, `is_exchangeable_tracker`.
-- **BEP 40 canonical peer priority** (irontide item 19): `dravity_core::priority::{peer_priority, crc32c}` computes the swarm-wide connection rank (checked against the BEP's own vectors). The engine learns our public address from peers' `yourip` and, when a torrent is at `max_peers`, lets a connection that ranks higher replace the lowest-ranked one instead of refusing it.
-- **IP filter** (irontide item 20): `IpFilter` reads eMule `ipfilter.dat` (levels up to 127 block), PeerGuardian P2P text and plain addresses, ranges and CIDR blocks (IPv4 and IPv6) into merged sorted intervals. `SessionConfig::ip_filter`, `Session::set_ip_filter` (closes open connections it now blocks) and `Session::ip_filter`; filtered addresses are refused by the listener before the handshake and never dialed. CLI `--ip-filter FILE`.
-- **PCP port mapping** (irontide item 21): `dravity_portmap::pcp` encodes RFC 6887 MAP requests and decodes responses (sans-IO, IPv4-mapped and IPv6 addresses); the mapper now tries PCP first, falls back to NAT-PMP when the gateway answers as a NAT-PMP-only server, then UPnP. `PortMapConfig::pcp`, `Method::Pcp` (HTTP `"pcp"`). Follow-up: IPv6 firewall pinholes over PCP to the IPv6 default router (`PortMapConfig::ipv6`, `gateway_v6`, `Status::pinholes`, shown in `GET /api/v1/session`), renewed and closed like the IPv4 mappings.
-- **Native DHT building blocks** (irontide item 22, partial): `dravity_dht::krpc` (sans-IO BEP 5 messages with BEP 32 `nodes6`), `dravity_dht::secure_id` (BEP 42 node ids and checks, verified against the BEP's vectors) and `dravity_dht::demux::classify` (tells DHT, uTP and UDP tracker datagrams apart for a shared socket). The running DHT is still `mainline` on its own socket. Stage 2: a sans-IO routing table (`dravity_dht::routing`) and token/peer store (`dravity_dht::store`). Stage 3: `dravity_dht::native::NativeDht`, a working node (answers all four queries, iterative lookups, announce with tokens) tested in a 24-node loopback swarm; the session still uses `mainline` until a live-network check. Stage 4: `DhtConfig::native` / `--native-dht` runs it behind the session's `Dht` API (opt-in). Stage 5: BEP 33 scrapes (bloom filters), BEP 42 id enforcement and adoption, BEP 43 read-only mode, BEP 44 immutable and mutable items (ed25519) and BEP 51 `sample_infohashes` in the native node. Stage 6: BEP 32 IPv6 dual-stack — a second native node on an `IPV6_V6ONLY` socket (`DhtConfig::ipv6`, `bind_address_v6`, `port_v6`, CLI `--dht-ipv6`, which implies `--native-dht`); the facade bootstraps, announces and looks up on both and merges peers; each node keeps only its own address family. Switching and live-validation steps are in `docs/irontide-adoption.md`.
-- **Proxies** (irontide item 23, partial): `SessionConfig::proxy` / `--proxy URL` dials peers through SOCKS4, SOCKS5 (with username/password) or HTTP `CONNECT` (with Basic auth). An HTTP proxy also carries HTTP(S) tracker and web seed requests (`ClientConfig::http_proxy`, `WebSeedConfig::http_proxy`). A SOCKS proxy now carries them as well (reqwest `socks` feature; `Proxy::http_url` gives `socks5h://`/`socks4a://` so host names are resolved at the proxy). A SOCKS5 proxy also relays UDP tracker requests (UDP ASSOCIATE, `ClientConfig::udp_proxy` / `UdpProxy`; the SOCKS5 bytes live in `dravity_core::socks5`). UDP tracker host names are resolved by the proxy (SOCKS5 domain address type). The native DHT can run through the same SOCKS5 UDP relay (`DhtConfig::socks5`, `NativeDht::bind_relayed`): the node is not started and sends or accepts nothing until the association is up, and bootstrap host names go to the proxy as domain addresses (never resolved locally). When a session has both a SOCKS5 proxy and the native DHT, the session sets `DhtConfig::socks5` automatically so the native node goes through the same relay (nothing is sent until the association is up). The `mainline` DHT is not proxied; LSD stays LAN-only. An I2P SAM v3 client (`dravity-i2p`) does naming lookup, outbound `STREAM CONNECT` and inbound `STREAM ACCEPT` against a SAM bridge (tested with a fake server); it is not yet wired into the session for peers.
-- **Peer extras** (irontide item 24): `SessionConfig::geoip` / `--geoip FILE` loads an IP-to-country CSV (db-ip lite or IP2Location LITE layout) and fills `PeerStatus::country`, shown in a new TUI `CC` column. `SessionConfig::peer_dscp` / `--peer-dscp N` marks peer TCP connections (`IP_TOS` / `IPV6_TCLASS`, both directions). Web seed failure counts, back-off and bans are now saved in the `.state` record (`web-seeds`, `TorrentRecord::web_seeds`, `WebSeedStat`), so they survive a restart.
-- **BEP 55 holepunch** (irontide item 25): `dravity_wire::Holepunch` codec; the engine advertises `ut_holepunch` (`Config::holepunch`, default on, off for private torrents, `--no-holepunch`), relays rendezvous between two connected peers (with the BEP's error codes), asks the PEX source of an address for a rendezvous when dialing it fails, dials over uTP when told to connect, and sets the PEX `0x08` flag for peers that support it.
-- **BEP 52 conformance vectors** (irontide item 26): `dravity-core/tests/bep52_conformance.rs` checks pieces roots and piece layers for 39 file sizes around leaf and piece edges at 16, 32 and 64 KiB pieces, the padding hashes, created v2 torrents and the v2 info hash. The expected values come from an independent Python reference (`tests/data/bep52_vectors.py`).
-- **More loom models** (irontide item 27): the session's token bucket moved to `dravity_core::rate` (`TokenBucket`, `SharedBucket`, clock passed in), built on loom's mutex under `--cfg loom`. `tests/loom_rate.rs` checks concurrent takes and a rate change racing a take, and `tests/loom_admit.rs` gains a model of `set_max` racing `try_admit`. A clock that runs backwards between racing callers no longer rewinds the bucket.
-- **Pluggable peer transport** (irontide item 28): `dravity_session::transport` defines `Network` (`dial`, `listen`), `TransportListener` and `BoxedStream`. `SessionConfig::network` routes every peer dial and accept through it, and `MemoryNetwork` runs whole swarms in process over `tokio::io::duplex` pipes, with fault injection (`set_unreachable`, listeners that go away).
-- **Settings registry** (irontide item 29): `dravity_engine::schema::ENGINE_SETTINGS` and `dravity_session::schema::SESSION_SETTINGS` list every config field with its class (live or restart), CLI flags and summary. Each is locked to its struct at compile time. `docs/configuration.md` is generated from them (`schema::configuration_markdown`), and tests fail when the doc, the live settings, the HTTP settings API or the CLI flags drift from the registry.
-- **`dravity` facade crate** (irontide item 30): one dependency for library users, with `Client`/`ClientBuilder` (listen, DHT, LSD, port mapping, limits, state dir, encryption, proxy, custom network, plus a `config` escape hatch), a single `Error`/`Result`, a `prelude`, and the full `session`, `core` and `storage` APIs re-exported as modules.
-- **BEP coverage** (irontide item 31): `docs/bep-coverage.md` lists 27 implemented BEPs (Full or Partial, with crate and notes), 13 BEPs not supported with the reason, and the non-BEP protocols. `crates/dravity/tests/bep_coverage.rs` fails when code cites a BEP that has no row.
+- HTTP tracker SSRF guard, on by default.
+- Session-wide smart ban, with strikes as the fallback.
+- One connection cap (default 500) for every torrent.
+- One hash pool for the session.
+- Sans-IO modules fail CI if they touch tokio, sockets, files, or the clock.
+- Pieces hash as their blocks are written.
+- Shared read cache (default 64 MiB). No shared write pool.
+- Files shorter than the torrent skip hashing the missing tail.
+- Request depth follows the bandwidth-delay product, plus a torrent budget.
+- A started piece stays with the peer that started it.
+- Sparse or full preallocation, and sync per piece, on finish, or never.
+- Seed choking: fastest, round-robin, or anti-leech, with an optional slot tuner.
+- `dravity create` writes v1, v2, and hybrid torrents.
+- HTTP and UDP tracker scrape.
+- Local service discovery (BEP 14). Off in the library. On in the CLI.
+- Live session rate limits, queue, and listen port, saved with the session.
+- Magnet `so=` selects files.
+- `upload_only`, `lt_donthave`, super-seeding, and tracker exchange.
+- BEP 40 decides who is dropped at the peer cap.
+- IP filter (eMule, P2P, CIDR).
+- PCP first, including IPv6 pinholes, then NAT-PMP, then UPnP.
+- Native DHT (BEP 5/32/33/42/43/44/51), opt-in with `--native-dht`.
+- SOCKS4/5 and HTTP CONNECT for peers, trackers, web seeds, and native DHT.
+  I2P SAM exists and is not used for peers.
+- GeoIP country, DSCP on peer TCP, web-seed back-off saved across restarts.
+- BEP 55 holepunch.
+- BEP 52 vectors from an independent reference.
+- Loom models for the rate bucket and the connection cap.
+- Pluggable `Network`, with an in-memory swarm.
+- Settings registry. It generates [`docs/configuration.md`](docs/configuration.md).
+- `dravity` facade: `ClientBuilder` and one `Error`.
+- BEP table with a drift test.
 
-### Phase 6 — v2/hybrid torrents, web seeds, io_uring and encryption
+### Phase 6 — v2, web seeds, io_uring, encryption
 
-See [`docs/phase-6.md`](docs/phase-6.md) for design notes.
+Design: [`docs/phase-6.md`](docs/phase-6.md).
 
 #### Added
 
-- BEP 52: `dravity_core::merkle` (SHA-256 trees over 16 KiB leaves, piece
-  layers, padded subtrees); v2-only and hybrid `.torrent` parsing
-  (`file tree`, `piece layers`) with `MetaVersion`, `Metainfo::info_hash_v2`,
-  `swarm_hashes`, `set_piece_layer`, `Info::version`, `check_piece`,
-  `pieces_root`, `piece_layers`, `missing_piece_layers`, and
-  `InfoHashV2::from_info_bytes`. New `MetainfoError` variants
-  `MissingFileTree`, `InvalidFileTree`, `HybridMismatch`,
-  `MissingPieceLayer`, `InvalidPieceLayer`.
-- `Magnet::swarm_hash`; `MetadataState::new_v2` and `with_info_hash_v2`
-  check magnet metadata with SHA-256 (both hashes for hybrid links).
-- The session downloads and seeds v2 and hybrid torrents and `btmh`
-  magnet links. A hybrid torrent accepts peers, and looks up and
-  announces on the DHT, under both swarm ids. Saved torrents keep their
-  piece layers and web seeds.
-- Web seeds (BEP 19): `Metainfo::web_seeds` / `with_web_seeds` (`url-list`,
-  magnet `ws`), the new `dravity-webseed` crate (sans-IO range planning,
-  HTTP(S) client), and web seeds as virtual peers in the session
-  (`SessionConfig::web_seed`, `web_seed_retry`, `Transport::Web`,
-  re-exported `WebSeedConfig`, `SessionError::WebSeed`).
-- CLI: `info` prints the metainfo version, v2 hash and web seeds;
-  `--no-web-seeds`; the TUI peer flags mark web seeds with `W`.
-- BEP 52 hash requests: `Message::HashRequest`, `Hashes` and `HashReject`
-  (`dravity_wire::HashRequest`), `Reserved::v2` / `with_v2`;
-  `merkle::layer_proof`, `verify_proof`, `layer_requests`, `HashProof`,
-  `LayerRequest`, `MAX_HASH_REQUEST`; `Info::piece_layer`. v2-only
-  magnets with files larger than one piece fetch and verify their piece
-  layers from peers (`Effect::MetadataReceived` now carries them);
-  torrents answer hash requests from their piece layers
-  (`TorrentState::with_piece_layers`). Dravity sets the v2 reserved bit.
-- Hybrid torrents announce their second id to the tracker that answered
-  and merge its peers; a hybrid added from a magnet accepts peers on its
-  second id as soon as the metadata arrives.
-- Optional io_uring file I/O: `dravity_storage::FileIo`, `BlockingIo`,
-  `FileStorage::with_io`, and with the `uring` feature (Linux) `UringIo`
-  (`tokio-uring` on a dedicated thread). `SessionConfig::storage_backend`
-  (`StorageBackend::{Blocking, IoUring}`) with a logged fallback to
-  blocking I/O, `Session::storage_backend`; CLI `--storage-backend` and
-  `uring` features on `dravity-session` and `dravity-cli`.
-  `FileIo::sync_data`, so io_uring also flushes through the ring.
-- Message Stream Encryption: the new `dravity-mse` crate (sans-IO
-  `Initiator` / `Responder`, async `initiate` / `respond`, `MseStream`,
-  `Policy`); `SessionConfig::encryption` (`EncryptionPolicy`, default
-  `Enabled`) for TCP and uTP, incoming and outgoing;
-  `PeerStatus::encrypted`; CLI `--encryption` and the `E` peer flag.
-- `dravity_tracker::CryptoSupport` and `AnnounceRequest::crypto`: HTTP
-  announces send `supportcrypto=1` (and `requirecrypto=1` under
-  `EncryptionPolicy::Required`).
-- Fuzz targets `webseed_plan` and `mse_handshake`; `metainfo_parse` checks
-  v2 hashes and `check_piece`.
-- Hybrid magnets fetch their piece layers with BEP 52 hash requests (from
-  peers with the v2 reserved bit) before downloading, so every piece is
-  checked with SHA-1 and Merkle and the layers are saved and served;
-  `Config::piece_layer_timeout` bounds the wait, then files without a
-  layer verify with SHA-1 only.
-- PEX flags (BEP 11) describe each peer: `0x01` once it completed MSE,
-  `0x02` seed, `0x04` uTP, `0x10` only for peers we dialed. Received flags
-  and our own connections steer dialing (`dravity_engine::DialHints`,
-  `PeerLink`, `TorrentState::with_dial_hints`, `Handover::hints`):
-  `Required` skips peers known not to encrypt, `Enabled` tries plain first
-  for them, and uTP-flagged peers are dialed over uTP first.
-- `Storage::write_bytes` and `read_vec` (owned buffers),
-  `dravity_storage::OpenFile`, and a `file_io` Criterion bench comparing
-  the storage backends.
-- A hybrid that started on SHA-1 alone keeps fetching its missing piece
-  layers from BEP 52 peers while it downloads or seeds
-  (`TorrentState::with_missing_piece_layers`, `Effect::PieceLayerReceived`);
-  a completed layer is served, saved, and the file's pieces are checked
-  again (`Event::RecheckPieces`); refuted pieces are downloaded again.
-  `Info::pieces_with_root`.
-- `Alert::PieceLayersStalled` (`Config::piece_layer_stall_alert`, 2 min):
-  a v2-only magnet whose piece layers nobody sends says so, repeatedly,
-  in the CLI, TUI and HTTP event stream (`piece_layers_stalled`).
-- Web seed network safety: `WebSeedConfig::allow_private_addresses` (CLI
-  `--web-seeds-allow-private`, off by default), `dravity_webseed::is_public`,
-  `WebSeedError::ForbiddenAddress`, `ContentRange` and `FileLength`.
-- Batched block I/O: `Storage::write_many` / `read_many`,
-  `OpenFile::write_batch` / `read_batch`, `write_blocks` / `read_blocks`;
-  io_uring merges adjacent blocks into one `writev` / `readv` and submits
-  a batch in one ring round trip (about 5× faster block writes and reads
-  than one call per block in the bench). The session hands storage the
-  blocks queued since its last turn as one batch.
-- `dravity_engine::web_seed_addr` / `is_web_seed_addr`.
-- `TorrentState::with_padded_last_piece`.
-- The `dravity-interop` crate: opt-in tests (`DRAVITY_INTEROP=1`,
-  `#[ignore]`d) against `qbittorrent-nox` and `transmission-daemon` for
-  v1, hybrid and v2 torrents both ways, MSE disabled, enabled and
-  required, over TCP and uTP. Results are in `docs/phase-6.md`.
+- v2 and hybrid torrents, `btmh` magnets, piece layers, and hash requests.
+- A hybrid joins both swarms (listener, DHT, trackers).
+- HTTP(S) web seeds as virtual peers, with back-off and `--no-web-seeds`.
+- Optional io_uring storage (`--storage-backend io-uring`), with blocking fallback.
+- MSE/PE (`--encryption disabled|enabled|required`). HTTP announces send
+  `supportcrypto` / `requirecrypto`.
+- PEX flags steer encryption and TCP versus uTP.
+- Opt-in interop tests against qBittorrent and Transmission.
 
 #### Changed
 
-- **Breaking:** `SessionError::MagnetWithoutV1Hash` is now
-  `MagnetWithoutInfoHash` (raised only when a magnet has neither a `btih`
-  nor a `btmh` topic).
-- **Breaking:** `MetainfoError::UnsupportedV2Only` is removed: v2-only
-  torrents load.
-- Storage verifies pieces through `Info::check_piece` (SHA-1, Merkle or
-  both) and no longer depends on `sha1` directly.
-- A v2-only torrent's session key (`info_hash()`) is its v2 hash
-  truncated to 20 bytes, as in the handshake, trackers and the DHT.
-- Outgoing peer connections try MSE first by default and fall back to a
-  plain handshake; set `SessionConfig::encryption` to
-  `EncryptionPolicy::Disabled` (CLI `--encryption disabled`) for the old
-  behaviour.
-- **Breaking:** `AnnounceRequest` has a new `crypto` field.
-- **Breaking:** a v2-only magnet with files larger than one piece no longer
-  stops with a missing piece layers error; it fetches the layers.
-- The io_uring backend keeps each file open on the ring (no `dup` per
-  operation) and moves owned buffers through it (no copy per block):
-  about 15 % faster writes and piece checks and 25 % faster reads in the
-  bench. **Breaking:** `FileIo` is now `name` + `adopt`, returning an
-  `OpenFile`; `write_block` takes `Bytes`.
-- **Breaking:** `PexPeer::flags` is `Option<u8>`; `Event::PeerConnected`
-  and `PeerAccepted` have a `link` field, `Effect::Connect` a `hints`
-  field, `HandoverPeer` a `link` field and `Handover` a `hints` field.
-- Incoming peers are no longer flagged reachable (`0x10`) in PEX.
-- **Breaking:** web seeds are reported to the engine at synthetic
-  addresses in `100::/64` (RFC 6666) instead of their server's address;
-  the engine never dials, retries or shares an address in that prefix.
-- **Breaking:** `Segment::Fetch` carries the file's length; web seed
-  redirects stay on the original host (at most five) and non-public
-  addresses are refused by default.
-- **Breaking:** `MetainfoError::NonUtf8Name`: names and path components
-  must be valid UTF-8 (`name.utf-8` / `path.utf-8` are used when valid).
-- The v2 reserved bit is set only for torrents with a v2 info-hash (and
-  `btmh` magnets), in handshakes and listener replies, as libtorrent does.
+- **Breaking:** `MagnetWithoutV1Hash` is `MagnetWithoutInfoHash`.
+- **Breaking:** `UnsupportedV2Only` is removed. v2-only torrents load.
+- **Breaking:** `AnnounceRequest` has a `crypto` field.
+- **Breaking:** `FileIo` is `name` + `adopt`. `write_block` takes `Bytes`.
+- **Breaking:** `PexPeer::flags` is `Option<u8>`. Connect and handover
+  events carry link and dial hints.
+- **Breaking:** web seeds use synthetic `100::/64` addresses.
+- **Breaking:** web-seed redirects stay on the original host. Non-public
+  addresses are refused unless allowed.
+- **Breaking:** names that are not UTF-8 are `NonUtf8Name`.
+- A v2-only session id is the v2 hash truncated to 20 bytes.
+- Outgoing peers try MSE first. `Disabled` restores plain handshakes.
+- The v2 reserved bit is set only for v2 and hybrid torrents.
+- A v2 magnet fetches piece layers instead of failing when they are missing.
+- Hybrid magnets wait up to `piece_layer_timeout`, then verify missing
+  files with SHA-1 and keep fetching layers.
+- A stalled v2 magnet raises `PieceLayersStalled`.
 
 #### Fixed
 
-- BEP 47 padding files may share a name (e.g. several `.pad/16384`), as
-  real hybrid torrents have; they were rejected as duplicate paths.
-- Two web seeds on the same host and port both run; a web seed no longer
-  hides a real peer at its server's address, and a dropped web seed is
-  no longer dialed as a BitTorrent peer on port 80 or 443.
-- A web seed `206` whose `Content-Range` does not match the request is
-  rejected before its bytes are delivered.
-- A web seed banned for bad data is not started again, and a URL that
-  can never be fetched (forbidden address, bad scheme, or a name that
-  resolves only to non-public addresses) never opens a connection.
-- `file tree` keys that differ only in invalid UTF-8 no longer collapse
-  into one path.
-- uTP: selective ACK masks of any length are accepted; libtorrent's 3- or
-  6-byte masks were dropped with their data, stalling uploads to
-  qBittorrent until the connection timed out.
-- v2: whole blocks of a padded last piece are served; libtorrent asked for
-  them forever and a v2 download from Dravity never finished.
-- libtorrent dropped plaintext connections to v1-only torrents because
-  Dravity always set the v2 reserved bit.
-- Simultaneous connections between two peers (both dialing over uTP) are
-  resolved as libtorrent does (the lower listen port's outgoing
-  connection stays), instead of each side possibly closing a different
-  one and leaving none.
+- BEP 47 padding files may share a name.
+- Two web seeds on one host both run, and a web seed is never dialed as a peer.
+- A `206` whose `Content-Range` does not match is rejected.
+- A banned or permanently unusable web seed is not retried.
+- uTP selective ACK masks of any length are accepted.
+- v2 padded last pieces are served as whole blocks.
+- Simultaneous connections keep the one the lower listen port opened.
 
 ### Phase 5 — Full terminal UI
 
-See [`docs/phase-5.md`](docs/phase-5.md) for design notes.
+Design: [`docs/phase-5.md`](docs/phase-5.md).
 
 #### Added
 
-- `dravity_engine::PeerInfo`, `TorrentState::peers`, `MetadataState::peers`:
-  a snapshot of each connected peer (address, direction, pieces, payload
-  totals, choke and interest flags).
-- `TorrentHandle::peers` (`PeerStatus`, `Transport`) and
-  `TorrentHandle::trackers` (`TrackerStatus`, `TrackerOutcome`): the last
-  announce outcome per tracker URL, in tier order.
-- `--tui` is a full client: add a magnet or a `.torrent` file while it
-  runs (`a`), remove a torrent or remove it and delete its files after a
-  confirm prompt (`d` / `D`), detail panes for files, peers and trackers
-  (`1` `2` `3`, add a peer with `a`), a per-torrent alert log, ratio and
-  ETA columns, a header with listen port, DHT, mapped port and totals,
-  sort (`o`), name filter (`/`), a key list (`?`), mouse row selection.
+- Peer and tracker snapshots on `TorrentHandle`.
+- `--tui` adds, removes, and shows files, peers, trackers, and alerts.
+  Sort, filter, help, and mouse row selection.
 
 #### Changed
 
-- The TUI refreshes every torrent at once under one 500 ms deadline; a
-  torrent that does not answer keeps its previous numbers instead of
-  stalling the frame.
-- `download --tui` keeps running once a second torrent was added from the
-  screen, until every torrent is finished (or `q`).
-- A magnet still fetching metadata shows no size or progress in the TUI
-  (it showed 100 %).
+- One 500 ms refresh for every torrent. Unanswered rows keep their last numbers.
+- `download --tui` stays up once a second torrent exists.
+- A magnet with no metadata shows no size.
 
 #### Fixed
 
-- Torrents added from a `.torrent` file now serve their metadata over
-  BEP 9, so magnet-link peers can start from a Dravity seed.
+- Torrents added from a file serve their metadata over BEP 9.
 
-### Toolchain and dependencies
+### Toolchain
 
-#### Changed
-
-- **MSRV raised from Rust 1.85 to 1.99** (latest stable; edition 2024 is
-  unchanged as the newest edition). CI's MSRV job runs 1.99 and uses
-  `actions/checkout@v7`.
-- Every dependency upgraded to its latest release, including majors:
-  ratatui 0.30, crossterm 0.29, sha1 0.11, criterion 0.8; fuzz: bytes 1.12,
-  serde 1.0.229.
-- Code adopts what the new MSRV allows: let-chains instead of nested
-  `if`/`if let`, `slice::as_chunks` for fixed-size records (compact peers,
-  hex, piece hashes, allowed fast set), `is_multiple_of`. No behavior
-  change.
-
-#### Removed
-
-- The `deny.toml` advisory exception for `paste` (ratatui 0.30 no longer
-  depends on it) and the criterion MSRV pin.
+- **MSRV is Rust 1.99** (edition 2024). It was 1.85.
+- Dependencies moved to current releases, including ratatui 0.30,
+  crossterm 0.29, sha1 0.11, and criterion 0.8.
+- The `paste` advisory exception and the criterion MSRV pin are gone.
 
 ### Phase 4 — Product surface
 
-See [`docs/phase-4.md`](docs/phase-4.md) for design notes.
+Design: [`docs/phase-4.md`](docs/phase-4.md).
 
 #### Added
 
-- File priorities: `dravity_engine::Priority`, per-piece priorities and
-  urgent pieces in the picker (`Event::SetPriorities`, `Event::SetUrgent`,
-  `Stats::wanted_left`); `AddTorrentOptions::with_file_priorities`,
-  `Session::set_file_priorities`, `Session::set_file_priority`.
-- `TorrentHandle::progress` (`TorrentProgress`, `FileProgress`).
-- Streaming: `TorrentHandle::open_file` returns a seekable `FileStream`
-  that waits for pieces and fetches a readahead window first.
-- `Session::list`, `pause`, `resume`, `remove` (optionally deleting the
-  files), `metainfo`; `AddTorrentOptions::paused`.
-- Session persistence: `SessionConfig::state_dir`, `Session::restore`
-  (`RestoreReport`), `dravity_session::persist`.
-- Watch folder: `Session::watch` (`WatchConfig`, `WatchHandle`).
-- `dravity-http`: JSON API over the session (torrents, files, priorities,
-  peers, pause/resume/delete), file streaming with `Range`, alerts as
-  server-sent events, Prometheus `/metrics`, optional bearer token.
-- CLI: `dravity serve` (restore, seed, `--watch`, `--http`, `--token` /
-  `DRAVITY_TOKEN`), `download --files` and `--file-priority`, `--tui`;
-  `info` numbers the files.
-- BEP 6 `suggest` messages steer piece selection.
-- Announces use the router's external port when NAT-PMP mapped a
-  different one (`dravity_portmap::Status::external_port`).
-- Fuzz targets `session_state`, `http_range`.
+- File priorities, streaming `FileStream`, pause, resume, and remove.
+- Session persistence, restore, and a watch folder.
+- `dravity-http`: JSON API, ranged streaming, server-sent alerts,
+  Prometheus `/metrics`, bearer token.
+- `dravity serve`, `--files`, `--file-priority`, `--tui`.
+- BEP 6 `suggest` affects picking. Announces use a mapped port when it differs.
 
 #### Changed
 
-- `TorrentStatus::Finished` / `Alert::Finished` mean every *wanted* piece
-  is verified. Trackers get `completed` once, only when every piece is in;
-  a partial download that does not seed announces `stopped`.
-- `TorrentHandle::stop` also removes the torrent from the session (and its
-  saved state); `Session::shutdown` keeps the saved state.
-- CLI networking options are shared by `download` and `serve`.
-- `/metrics` queries every torrent at once and stops after 2 seconds. A
-  torrent that does not answer is still listed, without live counters.
-- `HEAD` on a file's content returns the same status and headers as `GET`
-  and an empty body.
+- `Finished` means every wanted piece. Trackers get `completed` only when
+  the torrent is complete.
+- `TorrentHandle::stop` removes the torrent. `shutdown` keeps saved state.
+- `/metrics` stops after 2 seconds. `HEAD` matches `GET` with an empty body.
 
 ### Phase 3 — Good citizen
 
-See [`docs/phase-3.md`](docs/phase-3.md) for design notes.
+Design: [`docs/phase-3.md`](docs/phase-3.md).
 
 #### Added
 
-- Seeding: the engine serves blocks (`Effect::ReadBlock`,
-  `Event::BlockRead`), keeps finished torrents in the swarm
-  (`Config::seed`) and paces uploads (`upload_rate_limit`,
-  `--upload-limit`).
-- Choker: tit-for-tat by rate, anti-snubbing and a rotating optimistic
-  unchoke (`upload_slots`, `--upload-slots`).
-- BEP 6 fast extension: `have all`/`have none`, `reject`, allowed fast set
-  (`dravity_wire::allowed_fast_set`).
-- Per-IP bans for peers whose pieces fail the hash check
-  (`hash_fail_ban`, `Alert::PeerBanned`).
-- Incoming connections: `SessionConfig::listen` (`ListenConfig`), TCP and
-  uTP on IPv4 and IPv6, routed by info-hash; `Session::listen_port`. CLI
-  `--port` is now the listen port; `--no-listen`, `--seed`.
-- `dravity-utp`: uTP (BEP 29) with LEDBAT. The session dials over uTP when
-  TCP fails (`SessionConfig::prefer_utp`, `--prefer-utp`, `--no-utp`).
-- `dravity-portmap`: NAT-PMP and UPnP IGD port mapping, on by default
-  (`SessionConfig::port_mapping`, `Session::port_mapping`,
-  `--no-port-mapping`); mappings are removed on shutdown.
-- DHT `announce_peer` with the listen port after each lookup.
-- `dravity_storage` `read_block`.
-- Fuzz targets `utp_packet`, `portmap_parse`.
+- Seeding, upload rate limit, tit-for-tat, anti-snubbing, optimistic unchoke.
+- BEP 6, per-IP hash-failure bans, incoming TCP and uTP on IPv4 and IPv6.
+- `dravity-utp` and `dravity-portmap` (NAT-PMP and UPnP).
+- DHT `announce_peer`.
 
 #### Changed
 
-- Paths from metainfo are refused when they are invalid on the running
-  platform (Windows device names, `<>:"|?*`, trailing dots or spaces) or
-  have components over 255 bytes (`dravity_core::path::Platform`).
-- On Unix, content files are opened beneath the download directory with
-  `O_NOFOLLOW` at every level (`StorageError::UnsafePath`).
-- The handshake advertises the fast extension; the extension handshake
-  sends `p`, `reqq` and `yourip`.
-- `SessionConfig::announce_port` is only used when the session does not
-  listen.
+- Metainfo paths must be valid on this platform, including Windows device names.
+- Unix opens use `O_NOFOLLOW` at every directory.
+- The handshake advertises the fast extension. `announce_port` applies
+  only when the session does not listen.
 
 ### Phase 2 — Magnets and swarm
 
-See [`docs/phase-2.md`](docs/phase-2.md) for design notes.
+Design: [`docs/phase-2.md`](docs/phase-2.md).
 
 #### Added
 
-- Magnet links: `Session::add_magnet` and `dravity download 'magnet:…'`.
-  Metadata is fetched from peers (BEP 9/10), verified against the
-  info-hash and handed over to the download without reconnecting
-  (`dravity_engine::MetadataState`).
-- Metadata serving: torrents answer `ut_metadata` requests.
-- `dravity-dht`: mainline DHT (BEP 5) lookups and announces, wrapping
-  `mainline`; the session runs a DHT node by default (`SessionConfig::dht`,
-  `--no-dht`).
-- Peer exchange (BEP 11), disabled for private torrents (as is the DHT).
-- Endgame mode and block stealing from slow peers, with `cancel` for
-  duplicates.
-- AIMD per-peer request window capped by the peer's `reqq`.
-- Download rate limit (`Config::download_rate_limit`, `--download-limit`).
-- Fastresume: `dravity_storage::resume` (verified pieces + file stamps,
-  atomic save); `SessionConfig::resume_dir`, CLI `--resume-dir` /
-  `--no-resume` (default `<output>/.dravity`).
-- UDP tracker connection-id cache (BEP 15).
-- BEP 12 tier ordering: tiers shuffled and announced concurrently, trackers
-  within a tier tried in order, the answering one promoted.
-- Codecs: `dravity_wire::{MetadataMessage, PexMessage}`,
-  `dravity_core::compact`, `Metainfo::from_info_bytes`,
-  `dravity_bencode::Value::decode_prefix`.
-- Fuzz targets `wire_metadata`, `wire_pex`, `storage_resume`.
+- Magnet links, metadata fetch and serving, mainline DHT, PEX.
+- Endgame, block stealing, AIMD window, download rate limit, fastresume.
+- UDP connection-id cache and BEP 12 tiers.
 
 #### Changed
 
-- Default `max_requests_per_peer` is now 128 (the AIMD window's ceiling);
-  new peers start at `initial_requests_per_peer` = 4.
-- The handshake advertises the BEP 10 extension protocol.
-- `Event::PeerConnected` carries the peer's reserved bytes.
-- Peers may connect while the initial data check runs; they get a bitfield
-  and interest once it finishes.
+- New peers start at 4 requests and grow to at most 128.
+- The handshake advertises BEP 10.
+- Peers may connect during the initial check. Interest waits until it finishes.
 
 ## Phase 1 — MVP downloader
 
-`.torrent` downloads from HTTP/UDP trackers and TCP peers; see
-[`docs/phase-1.md`](docs/phase-1.md).
+`.torrent` downloads from HTTP and UDP trackers and TCP peers.
+See [`docs/phase-1.md`](docs/phase-1.md).
 
 ## Phase 0 — Foundations
 
-Bencode, metainfo, magnet and wire codecs with fuzz targets; see
-[`docs/phase-0.md`](docs/phase-0.md).
+Bencode, metainfo, magnets, and the wire codec, with fuzz targets.
+See [`docs/phase-0.md`](docs/phase-0.md).

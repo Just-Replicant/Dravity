@@ -30,6 +30,7 @@ dravity-http = { path = "crates/dravity-http", version = "0.1.0" }
 dravity-webseed = { path = "crates/dravity-webseed", version = "0.1.0" }
 dravity-mse = { path = "crates/dravity-mse", version = "0.1.0" }
 dravity-lsd = { path = "crates/dravity-lsd", version = "0.1.0" }
+dravity-i2p = { path = "crates/dravity-i2p", version = "0.1.0" }
 
 # External crates
 anyhow = "1"

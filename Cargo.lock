@@ -772,6 +772,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dravity-i2p"
+version = "0.1.0"
+dependencies = [
+ "fastrand",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "dravity-interop"
 version = "0.1.0"
 dependencies = [

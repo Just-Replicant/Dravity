@@ -6,23 +6,25 @@ dispatch effects. CLI and HTTP send commands and read alerts. Tokio is the
 default runtime. See [`docs/rust-torrent-plan.md`](docs/rust-torrent-plan.md)
 for the full architecture, comparison with existing clients, and roadmap.
 
-> **Status: Phase 6 (v2/hybrid torrents, web seeds, io_uring, encryption) complete.**
+> **Status: Phase 6 complete, plus the IronTide adoption work.**
 > Dravity downloads and seeds v1, v2 and hybrid `.torrent` files (BEP 52,
 > SHA-256 Merkle verification) and magnet links (`btih` and `btmh`,
 > metadata over BEP 9/10), finding peers through HTTP/UDP trackers (BEP 12
-> tiers), the mainline DHT and PEX, and downloading from HTTP(S) web seeds
-> (BEP 19). It accepts incoming peers over TCP and
-> uTP (BEP 29, LEDBAT) on IPv4 and IPv6, maps its port with NAT-PMP or UPnP,
-> chokes tit-for-tat, speaks the fast extension (BEP 6), bans peers that
-> send corrupt data and refuses hostile paths. Phase 4 adds file
-> priorities, streaming reads with seek, pause/resume/remove, a persisted
-> session with a watch folder, an HTTP API with Prometheus metrics
-> (`dravity-http`), `dravity serve` and a terminal UI. Phase 5 makes that
-> UI a full client: add magnets and `.torrent` files, remove, peers,
-> trackers, alerts, sort and filter. Phase 6 adds v2/hybrid torrents
-> (with BEP 52 hash requests for v2 magnets), web seeds, an optional
-> io_uring file backend and MSE/PE connection encryption. See [`docs/phase-1.md`](docs/phase-1.md) to
-> [`docs/phase-6.md`](docs/phase-6.md).
+> tiers), the DHT (the `mainline` crate by default, or Dravity's own node
+> with `--native-dht`), PEX and LSD, and downloading from HTTP(S) web seeds
+> (BEP 19). It accepts incoming peers over TCP and uTP (BEP 29, LEDBAT)
+> on IPv4 and IPv6, maps its port with PCP, NAT-PMP or UPnP (including
+> IPv6 PCP pinholes), chokes tit-for-tat, speaks the fast extension
+> (BEP 6) and later wire extensions (`upload_only`, `lt_donthave`,
+> `lt_tex`, BEP 55 holepunch), bans peers that send corrupt data
+> (session-wide, with smart banning) and refuses hostile paths. Live
+> settings (rate limits, queue, listen port) can change while the
+> session runs and are persisted. SOCKS4/5 and HTTP CONNECT proxies
+> carry peer, tracker, web-seed and (native) DHT traffic. See
+> [`docs/phase-1.md`](docs/phase-1.md) to [`docs/phase-6.md`](docs/phase-6.md)
+> for the original roadmap, [`docs/irontide-adoption.md`](docs/irontide-adoption.md)
+> for the work adopted after Phase 6, and
+> [`docs/bep-coverage.md`](docs/bep-coverage.md) for BEP status.
 
 ## Workspace
 
@@ -34,16 +36,71 @@ for the full architecture, comparison with existing clients, and roadmap.
 | [`dravity-engine`](crates/dravity-engine) | ✅ Phase 6 | Sans-IO `TorrentState::update(now, Event) -> Vec<Effect>`: rarest-first picker with piece priorities and urgent pieces, peer snapshots, AIMD request window, endgame + block stealing, rate limits, choker (tit-for-tat + optimistic unchoke), seeding, BEP 6, bans, PEX with peer flags and dial hints, metadata serving, data check, tracker/DHT scheduling; `MetadataState` for magnets (v1, v2 and hybrid metadata checks, v2 and hybrid piece layers over hash requests); serves hash requests |
 | [`dravity-storage`](crates/dravity-storage) | ✅ Phase 6 | `Storage` trait; filesystem backend (LRU FD cache, positional I/O, files opened without following symlinks) and memory backend; block reads; piece verification (SHA-1, SHA-256 Merkle, or both); fastresume data with file stamps; optional io_uring file I/O (`tokio-uring`, feature `uring`, Linux; long-lived ring files, owned buffers) |
 | [`dravity-tracker`](crates/dravity-tracker) | ✅ Phase 6 | HTTP (BEP 3/7/23) and UDP (BEP 15, cached connection ids) announce: sans-IO codecs + async client (rustls); MSE `supportcrypto` / `requirecrypto` |
-| [`dravity-dht`](crates/dravity-dht) | ✅ Phase 2 | Mainline DHT (BEP 5) peer lookups and announces, wrapping [`mainline`](https://crates.io/crates/mainline) |
-| [`dravity-session`](crates/dravity-session) | ✅ Phase 6 | The only I/O driver: per-torrent owner task on Tokio, peer tasks, TCP/uTP listener (IPv4 + IPv6), disk/hash offload, uploads, magnets, DHT, port mapping, fastresume, BEP 12 tiers, alerts; file priorities, streaming `FileStream`, pause/resume/remove, persisted state + restore, watch folder; peer and tracker reads; v2/hybrid torrents (both swarms of a hybrid, on the DHT, trackers and listener), web seeds as virtual peers, storage backend selection, MSE/PE encryption policies with PEX-informed dialing |
-| [`dravity-http`](crates/dravity-http) | ✅ Phase 4 | axum JSON API over the session: torrents, files, priorities, streaming with `Range`, server-sent alerts, Prometheus `/metrics`, bearer token |
+| [`dravity-dht`](crates/dravity-dht) | ✅ IronTide | DHT (BEP 5): `mainline` by default, or Dravity's own `NativeDht` (`DhtConfig::native`, `--native-dht`) with BEP 32/33/42/43/44/51, optional IPv6 dual-stack and SOCKS5 UDP relay. Public-network validation is documented in [`docs/native-dht-validation.md`](docs/native-dht-validation.md). |
+| [`dravity-session`](crates/dravity-session) | ✅ IronTide | The only I/O driver: per-torrent owner task on Tokio, peer tasks, TCP/uTP listener (IPv4 + IPv6, live rebind), disk/hash offload, uploads, magnets, DHT, port mapping, fastresume, BEP 12 tiers, alerts; file priorities, streaming `FileStream`, pause/resume/remove, persisted state + restore, watch folder; live settings (rate limits, queue, connection cap); IP filter, GeoIP, DSCP, SOCKS/HTTP proxies; peer and tracker reads; v2/hybrid torrents, web seeds, MSE/PE; pluggable `Network` transport; settings registry |
+| [`dravity-http`](crates/dravity-http) | ✅ Phase 4 | axum JSON API over the session: torrents, files, priorities, streaming with `Range`, server-sent alerts, Prometheus `/metrics`, bearer token. A non-loopback bind without a token is refused unless `--allow-insecure-http` / `HttpConfig::allow_insecure_unauthenticated` is set. |
 | [`dravity-cli`](crates/dravity-cli) | ✅ Phase 6 | `dravity download` / `info` / `create` / `serve` for files and magnet links, seeding, file selection, a full ratatui `--tui` client (add, remove, peers, trackers, alerts); renders alerts, never drives I/O |
 | [`dravity-utp`](crates/dravity-utp) | ✅ Phase 6 | uTP (BEP 29): packet codec, sans-IO connection with LEDBAT congestion control, Tokio socket and streams |
 | [`dravity-lsd`](crates/dravity-lsd) | ✅ irontide | Local Service Discovery (BEP 14): sans-IO `BT-SEARCH` codec and a multicast service; the session skips private torrents |
-| [`dravity-portmap`](crates/dravity-portmap) | ✅ Phase 4 | Router port mapping: NAT-PMP (RFC 6886) and UPnP IGD codecs, `PortMapper` that maps, renews and removes and reports the external port |
+| [`dravity-portmap`](crates/dravity-portmap) | ✅ IronTide | Router port mapping: PCP (RFC 6887, including IPv6 pinholes) first, then NAT-PMP (RFC 6886) and UPnP IGD. PCP mappings keep their nonce and assigned address and renew at half the lifetime the router granted. |
 | [`dravity-webseed`](crates/dravity-webseed) | ✅ Phase 6 | Web seeds (BEP 19): sans-IO plan of file URLs and HTTP ranges (padding as zeros), strict ranged HTTP(S) client (rustls) |
 | [`dravity-interop`](crates/dravity-interop) | ✅ Phase 6 | Opt-in tests against qBittorrent (libtorrent) and Transmission: v1, hybrid and v2 both ways, MSE, TCP and uTP |
 | [`dravity-mse`](crates/dravity-mse) | ✅ Phase 6 | Message Stream Encryption (MSE/PE): sans-IO initiator and responder (DH, RC4-drop1024, SHA-1 key derivation), async handshake and encrypted stream |
+| [`dravity-i2p`](crates/dravity-i2p) | ⚙️ partial | I2P SAM v3 client (transient sessions, naming lookup, streams). Tested against a fake SAM bridge; not yet wired into the session for BitTorrent peers. |
+| [`dravity`](crates/dravity) | ✅ IronTide | Facade crate: `prelude`, `ClientBuilder`, one `Error`. The intended public API when the library is consumed from outside this workspace. |
+
+## After Phase 6: IronTide adoption
+
+A review of the irontide engine produced a 31-item plan, reimplemented
+for Dravity's sans-IO design. The status of every item, and the design
+notes, are in [`docs/irontide-adoption.md`](docs/irontide-adoption.md).
+Highlights that are not in the Phase 6 write-up:
+
+- Session-wide rate limits, a torrent queue, live listen-port changes
+  and persisted live settings; concurrent settings writes are
+  serialized, and a live rebind of an occupied port fails instead of
+  silently picking another.
+- Tracker SSRF policy: private and loopback HTTP trackers need an
+  explicit opt-in or origin allowlist (`--allow-private-trackers`);
+  trusted-origin state is request-scoped.
+- Configurable torrent piece-length ceiling (32 MiB by default,
+  `--max-piece-length`) applied before torrent state is allocated.
+- Native DHT with BEP 32/33/42/43/44/51, opt-in via `--native-dht` and
+  `--dht-ipv6`. A shared UDP demultiplexer (`dravity_dht::shared`) is
+  ready; the session still binds DHT, uTP and UDP trackers on separate
+  sockets. See [`docs/native-dht-validation.md`](docs/native-dht-validation.md)
+  before making the native node the default.
+- The `dravity` facade, a settings registry that generates
+  [`docs/configuration.md`](docs/configuration.md), and a BEP coverage
+  table with a drift test.
+
+Still partial: I2P peer integration (the SAM client exists, the session
+does not use it), shared UDP demultiplexing on the listen port, and
+running the native DHT by default.
+
+## Consuming Dravity as a library
+
+All workspace crates set `publish = false`. Dravity is not on crates.io.
+That is a deliberate decision, not an omission:
+
+- The version is `0.1.0`; the public API is still evolving.
+- A few features remain incomplete or opt-in, as listed above.
+- The license is AGPL-3.0-or-later.
+
+The intended public surface is the [`dravity`](crates/dravity) facade
+(`prelude`, `ClientBuilder`, a single `Error`). Internal crates are not
+a supported API. To depend on Dravity today, use a git dependency:
+
+```toml
+dravity = { git = "https://github.com/Just-Replicant/Dravity", package = "dravity" }
+```
+
+`publish = true` will be considered once the facade is stable enough
+for a versioned release and the native DHT has passed the public-network
+checks in [`docs/native-dht-validation.md`](docs/native-dht-validation.md).
+Crate metadata (description, license, repository, Rust version) is
+already consistent across the workspace, so flipping the flag is a
+release decision rather than a cleanup.
 
 ## Phase 0 checklist
 
@@ -156,6 +213,10 @@ cargo run --release -p dravity-cli -- download example.torrent --no-web-seeds
 cargo run --release -p dravity-cli -- download example.torrent --web-seeds-allow-private
 # no DHT, at most 2 MiB/s
 cargo run --release -p dravity-cli -- download example.torrent --no-dht --download-limit 2M
+# Dravity's own DHT node (experimental until checked on the public DHT)
+cargo run --release -p dravity-cli -- download example.torrent --native-dht
+# …and a second IPv6 node (BEP 32); implies --native-dht
+cargo run --release -p dravity-cli -- download example.torrent --native-dht --dht-ipv6
 # keep seeding after the download (Ctrl-C to stop), uploads capped at 500 KiB/s
 cargo run --release -p dravity-cli -- download example.torrent --seed --upload-limit 500K
 # listen on another port, TCP only, without asking the router to forward it

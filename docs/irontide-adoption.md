@@ -11,8 +11,8 @@ sound version, with the difference explained), **open** (not started).
 
 | # | Item | Status | Commits | Notes |
 |---|------|--------|---------|-------|
-| 1 | SSRF guard for HTTP tracker announces | done | `fix(tracker): guard HTTP announces against SSRF` | [notes](#1-ssrf-guard) |
-| 2 | Session-wide smart ban | done | `feat(engine,session): session-wide smart ban` | [notes](#2-smart-ban) |
+| 1 | SSRF guard for HTTP tracker announces | done | `fix(tracker): guard HTTP announces against SSRF`; `fix(tracker): deny private origins and proxy DNS unless allowed` | [notes](#1-ssrf-guard) |
+| 2 | Session-wide smart ban | done | `feat(engine,session): session-wide smart ban`; reliable ban/filter propagation via a generation watch | [notes](#2-smart-ban) |
 | 3 | Global connection cap with one admit function and a loom model | done | `feat(core,session): session-wide connection cap` | [notes](#3-connection-cap) |
 | 4 | Session-wide hash pool | done | `perf(session): share one hash pool across torrents` | [notes](#4-hash-pool) |
 | 5 | Sans-IO purity tripwire tests | done | `test: sans-IO purity tripwires` | [notes](#5-purity-tripwires) |
@@ -26,12 +26,12 @@ sound version, with the difference explained), **open** (not started).
 | 13 | Torrent creation (v1/v2/hybrid, BEP 47 pads, auto piece size) and dravity create | done | `feat(core,storage,cli): torrent creation and dravity create` | [notes](#13-torrent-creation) |
 | 14 | Tracker scrape (BEP 48 HTTP, BEP 15 UDP) in TrackerStatus | done | `feat(tracker,session,cli): tracker scrape` | [notes](#14-tracker-scrape) |
 | 15 | Local Service Discovery (BEP 14), off for private torrents | done | `feat(lsd,session,cli): local service discovery` | [notes](#15-local-service-discovery) |
-| 16 | Live settings, session-wide rate limits and queueing | done | `feat(session,http,cli): live settings, session rate limits and queueing`; `feat(session): persist live settings across restarts`; `feat(session): rebind the listen port live` | [notes](#16-live-settings-rate-limits-and-queueing) |
+| 16 | Live settings, session-wide rate limits and queueing | done | `feat(session,http,cli): live settings…`; persist and live rebind; `fix(core): return the full token-bucket wait`; `fix(session): queue rate admissions and reprice live debt`; strict live rebind; serialized settings writes; parallel queue status | [notes](#16-live-settings-rate-limits-and-queueing) |
 | 17 | BEP 53 select-only magnets (so=) | done | `feat(core,session): BEP 53 select-only magnets` | [notes](#17-bep-53-select-only-magnets) |
 | 18 | Wire extensions: upload_only, lt_donthave, super-seeding, lt_tex | done | `feat(wire,engine,session,cli): upload_only, lt_donthave, super-seeding and tracker exchange` | [notes](#18-wire-extensions) |
 | 19 | BEP 40 canonical peer priority | done | `feat(core,engine): BEP 40 canonical peer priority at the connection cap` | [notes](#19-bep-40-peer-priority) |
-| 20 | IP filter (eMule .dat, P2P, CIDR) and --ip-filter | done | `feat(session,cli): IP filter lists` | [notes](#20-ip-filter) |
-| 21 | PCP (RFC 6887) before NAT-PMP and UPnP | done | `feat(portmap): PCP port mapping`; `feat(portmap,http): IPv6 PCP pinholes` | [notes](#21-pcp) |
+| 20 | IP filter (eMule .dat, P2P, CIDR) and --ip-filter | done | `feat(session,cli): IP filter lists`; filter and ban updates use a generation watch so a full command queue cannot drop them | [notes](#20-ip-filter) |
+| 21 | PCP (RFC 6887) before NAT-PMP and UPnP | done | `feat(portmap): PCP port mapping`; IPv6 pinholes; `fix(portmap): renew PCP maps with the granted lifetime and identity` | [notes](#21-pcp) |
 | 22 | Native DHT building blocks: KRPC codec, BEP 42 ids, UDP demux | partial | `feat(dht): KRPC codec, BEP 42 secure ids and a UDP datagram classifier`; stage 2 routing table and store; stage 3 `NativeDht` node | [notes](#22-native-dht-building-blocks) |
 | 23 | Proxy support: SOCKS4, SOCKS5, HTTP CONNECT | partial | `feat(session,tracker,webseed,cli): dial peers through SOCKS4/5 and HTTP CONNECT proxies` | [notes](#23-proxy-support) |
 | 24 | Peer extras: GeoIP country, DSCP marking, persistent web-seed stats | done | `feat(session,cli): GeoIP peer countries, DSCP marking and persistent web seed back-off` | [notes](#24-peer-extras) |
@@ -39,9 +39,9 @@ sound version, with the difference explained), **open** (not started).
 | 26 | BEP 52 conformance vector suite | done | `test(core): BEP 52 conformance vectors from an independent reference` | [notes](#26-bep-52-conformance-vectors) |
 | 27 | More loom models: shared rate bucket, live cap changes | done | `test(core,session): loom models for the shared rate bucket and live cap changes` | [notes](#27-more-loom-models) |
 | 28 | Pluggable network transport (Network, TransportListener, MemoryNetwork) | done | `feat(session): pluggable peer transport with an in-memory network` | [notes](#28-pluggable-network-transport) |
-| 29 | Settings single source of truth and docs/configuration.md | done | `feat(engine,session,http,cli): settings registry with a compile-time lock and generated configuration reference` | [notes](#29-settings-single-source-of-truth) |
+| 29 | Settings single source of truth and docs/configuration.md | done | settings registry; `--dht-ipv6`, `--max-piece-length` and `--allow-private-trackers` are in the generated configuration reference | [notes](#29-settings-single-source-of-truth) |
 | 30 | Facade crate dravity (prelude, ClientBuilder, one Error) | done | `feat(dravity): facade crate with prelude, ClientBuilder and one Error` | [notes](#30-facade-crate) |
-| 31 | BEP coverage table | done | `docs: BEP coverage table with a drift test` | [notes](#31-bep-coverage-table) |
+| 31 | BEP coverage table | done | BEP coverage table with a drift test; native BEP 33/43/44/51 and the wired native runtime are documented accurately | [notes](#31-bep-coverage-table) |
 
 ## Design notes
 
@@ -58,6 +58,17 @@ uses, so DNS rebinding cannot get around it. Host names that the
 torrent itself names as announce origins are trusted, so LAN trackers
 keep working. `ClientConfig::ssrf_mitigation = false` turns the guard
 off.
+
+
+**Remediation.** Untrusted torrents can no longer reach private-network
+paths such as `http://10.0.0.5/admin` unless the client opts in
+(`ClientConfig::allow_private_trackers` or
+`private_tracker_origins`, CLI `--allow-private-trackers`). Allowed
+private HTTP origins still need an announce-shaped path. Trust is
+request-scoped: a per-announce HTTP client and resolver carry the
+origin, so one allowed LAN tracker cannot make a later announce to a
+public host follow a redirect into the LAN. Proxy-side DNS is refused
+for untrusted names unless `allow_proxy_dns` is set.
 
 ### 2. Smart ban
 
@@ -88,6 +99,14 @@ the next attempt. Dravity attributes blame directly instead:
   The listener refuses banned addresses before the handshake.
   `Session::ban_ip`, `unban_ip` and `banned_ips` give applications the
   same control.
+
+
+**Remediation.** `BanIp` and `Refilter` commands are still sent as a
+fast path, but a full command queue can no longer drop them: `BanList`
+bumps a `watch` generation on every new ban and every filter
+replacement, and each torrent task applies the current snapshot
+(closing matching connections and feeding `Event::BanIp` to the engine)
+when that generation changes.
 
 ### 3. Connection cap
 
@@ -169,13 +188,18 @@ io_uring batching survives. Writes go through and drop the chunks they
 overlap. Each write bumps an epoch, and a read that raced a write does
 not insert what it read.
 
+Concurrent misses of the same aligned span are coalesced: one inner
+read fills the cache and every waiter, so a popular piece asked for by
+many peers at once is still read from disk once.
+
 **Why partial:** irontide pairs its ARC cache with a unified buffer pool
 that also backs in-flight writes. Dravity's writes already use
 reference-counted `Bytes` straight from the wire, and the hash-on-arrival
 hashers (item 6) hold only early blocks, so a shared write pool would add
 copies, not remove them. The read side, which is where seeding gains, is
-fully implemented. Segmented LRU replaces ARC because it gives the same
-scan resistance with simpler and cheaper bookkeeping.
+fully implemented (including miss coalescing). Segmented LRU replaces ARC
+because it gives the same scan resistance with simpler and cheaper
+bookkeeping.
 
 ### 8. Prescan
 
@@ -372,6 +396,16 @@ turns LSD on.
 - Live settings are now persisted: with a `state_dir`, every successful `apply_settings` writes `settings.bencode` (version 1, unlimited fields left out, written atomically), and `Session::restore` (which `dravity serve` calls) applies it before re-adding torrents, so queue limits hold for them; a damaged file is reported in `RestoreReport::failed`, not fatal. They are applied at `restore`, not in `Session::new`, so a library user who never restores is unaffected (tests: bencode round trip and refusal, and `live_settings_survive_a_restart`). The queued flag itself is not stored: queueing is recomputed from the limits at restore.
 - Tests: settings and queue-plan unit tests, `rate.rs` pacing tests, `tests/settings.rs` (all-or-nothing update, a 96 KiB download paced by a 32 KiB/s session limit, one-at-a-time queue then live lift and seed limit), the HTTP `settings_are_read_and_patched_all_at_once`, CLI flag tests and the TUI limit-prompt test.
 
+
+**Remediation.** The token bucket returns the complete wait (no
+two-second truncation); session admissions are FIFO and a live rate
+change reprices existing debt without charging the bytes again. A live
+listen-port change uses a strict bind: an occupied requested port is an
+error and the old listener is left alone. `apply_settings` and
+`set_listen_port` share a mutex so concurrent updates cannot write a
+stale snapshot. Queue status queries run in parallel (one shared
+one-second timeout) instead of one second per torrent.
+
 ### 17. BEP 53 select-only magnets
 
 - Parsing lives in `dravity-core/src/magnet.rs`: comma-separated decimal indices and `a-b` ranges (no signs, spaces, empty items or reversed ranges), stored as `RangeInclusive<usize>` so `so=0-18446744073709551615` costs one entry rather than an expansion. More than 1024 ranges are refused so selection checks stay cheap.
@@ -401,12 +435,23 @@ turns LSD on.
 - Port filtering from irontide is not added: blocklists in the wild are address-only, and the session already refuses port 0.
 - Tests: three parser unit tests (eMule levels, P2P, CIDR, IPv6, merging, malformed lines, reversed and mixed bounds, `0.0.0.0/0`), a doc test, `tests/ip_filter.rs` (a filtered peer is never dialed until the filter changes; the listener refuses filtered addresses; a live change closes an open connection) and a CLI test (unreadable file is an error; a loopback eMule range keeps the download from finishing).
 
+
+**Remediation.** Replacing the filter bumps the same generation watch
+as a session ban (item 2), so a full command queue cannot leave a
+running torrent connected to an address the new filter blocks.
+
 ### 21. PCP
 
 - `pcp.rs` is a self-written codec of the 60-byte MAP request/response (24-byte header plus 36-byte MAP body). Responses must be version 2 with opcode `0x81` and result 0; version 0 means a NAT-PMP-only gateway (`PcpError::NatPmpOnly`), other result codes are reported with RFC 6887 names. A response must carry the request's nonce, protocol and port to count. The module is in the crate's purity tripwire.
 - Mapper: `map_pcp` learns our address towards the gateway, sends one MAP per mapping with its own nonce (12 bytes from `RandomState` and the clock: unique and not guessable off-path, which is all RFC 6887 §11.1 asks), records the assigned port and public IPv4 address, and keeps the requests in `Active::Pcp` so renewals happen through the normal remap cycle and the delete on stop reuses the nonce with lifetime 0. Retransmissions follow the NAT-PMP schedule. Any PCP failure falls back to NAT-PMP, so old routers behave as before.
 - **IPv6 pinholes (follow-up, completes the item):** with `PortMapConfig::ipv6` (default on) the mapper also sends PCP MAP requests to the IPv6 default router (`default_gateway_v6`: Linux `/proc/net/ipv6_route` parsed by `parse_proc_net_ipv6_route`, the link-local router scoped by the interface index from `/sys/class/net/<if>/ifindex`; or `PortMapConfig::gateway_v6`). The client address is the source the kernel picks towards the router, or towards the internet when that is link-local, and requests are sent from a socket bound to it (RFC 6887 §8.3 wants them to match); the suggested external address is `::`. Pinholes run alongside the IPv4 method and never decide it: they have their own `Status::pinholes` / `Status::pinhole_error` (also in `GET /api/v1/session`), are renewed at half the lifetime even while IPv4 is retrying, and are closed with lifetime-0 requests that reuse each nonce on stop. No translation happens on IPv6, so announced ports are unchanged. Other OSes find no IPv6 router yet unless `gateway_v6` is set. Tests: the route parser (unit and doc test) and mapper tests against a fake PCP server on `[::1]` (two pinholes from the client address, IPv4 independent, deletes with the same nonce) and with `ipv6` off (nothing sent).
 - Tests: codec unit tests (layout, success, IPv6 external address, refusal, NAT-PMP-only, malformed and truncated input), a doc test, and mapper tests against a fake PCP gateway (map, report, delete with the same nonce, one nonce per mapping) and against a NAT-PMP-only gateway (PCP tried first, NAT-PMP used).
+
+
+**Remediation.** A successful mapping keeps its 12-byte nonce and the
+assigned external port and address. Renewals reuse that identity and
+are scheduled at half the lifetime the router granted, not a fresh
+mapping at a fixed interval.
 
 ### 22. Native DHT building blocks
 
@@ -429,7 +474,7 @@ turns LSD on.
   4. With `--proxy socks5://host:port --native-dht`, DHT traffic should go through the SOCKS5 UDP relay (item 23) and bootstrap host names should not appear in local DNS.
   5. If all of the above hold, set `DhtConfig::default` to `native: true` (and `ipv6: true` if dual-stack should be on by default) and drop the experimental wording on the flags.
 
-- **Partial, why (after stage 6):** `mainline` is still the default, because this box cannot reach the public DHT over UDP (see the live-validation steps above). Making `NativeDht` the only implementation also still wants a shared socket with uTP and UDP trackers via `demux`. BEP 42/43/44/51/33 and BEP 32 dual-stack are already in the native node.
+- **Partial, why (after stage 6, and this remediation):** `mainline` is still the default, because public-network validation needs a machine that can reach the public DHT over UDP (see `docs/native-dht-validation.md`). Offline protocol checks, hostile-input tests, IP-bound tokens, bootstrap through mixed live/dead routers, and OS cryptographic token secrets are in-tree. A shared UDP demultiplexer (`dravity_dht::shared::SharedUdp`) classifies DHT, uTP and tracker datagrams on one socket and is tested, but the session still binds those protocols on separate sockets. BEP 42/43/44/51/33 and BEP 32 dual-stack are already in the native node. Announce-token secrets use `getrandom`.
 
 ### 23. Proxy support
 
@@ -490,6 +535,12 @@ turns LSD on.
 - Drift tests: (1) `docs/configuration.md` must equal `configuration_markdown()` (`DRAVITY_BLESS=1 cargo test -p dravity-session --lib schema` rewrites it). (2) The live entries must be exactly the fields of `LiveSettings`, with an exhaustive destructure, so a new live setting has to be classified. (3) The `GET /api/v1/settings` JSON keys must equal the live registry names, which are the API names. (4) Every registered flag must appear in `dravity download --help`.
 - This turns item 16's settings into documented, checked data. It does not generate the CLI parser or the DTOs from the registry; the tests catch drift instead, which keeps clap's derive and serde's types idiomatic.
 
+
+**Remediation.** `--dht-ipv6` is listed on the `dht` field of the
+generated configuration reference, alongside `--max-piece-length` and
+`--allow-private-trackers`. Refresh the file with
+`DRAVITY_BLESS=1 cargo test -p dravity-session --lib schema`.
+
 ### 30. Facade crate
 
 - `crates/dravity` depends only on `dravity-session`, `dravity-core` and `dravity-storage` and forwards the `uring` feature. Users write `dravity::prelude::*` and `Client::builder()...build()?`. The internal crates stay reachable as `dravity::session`, `dravity::core` and `dravity::storage` for anything the facade does not wrap, so the facade never limits what can be done.
@@ -501,5 +552,11 @@ turns LSD on.
 ### 31. BEP coverage table
 
 - The table was built by listing every `BEP n` citation in the source (BEPs 3–55) and checking each against the implementation. Partial rows name their gap: BEP 19 is HTTP only, BEP 32 and 42 are complete in the native DHT (`--native-dht --dht-ipv6`) but not in the `mainline` runtime, and BEP 5 runs through `mainline` by default.
-- BEP 28 (tracker exchange, `lt_tex`) gets its own row, although the code calls it `lt_tex`. The not-supported list covers BEPs other clients often claim (17, 24, 33, 41, 43, 44, 51), so their absence is a stated decision rather than an oversight.
+- BEP 28 (tracker exchange, `lt_tex`) gets its own row, although the code calls it `lt_tex`. Native BEP 33, 43, 44 and 51 are in the main table as partial (native node only). The not-supported list covers BEPs other clients often claim (17, 24, 35, 36, 38, 39, 41, 46), so their absence is a stated decision rather than an oversight.
 - Drift test: `crates/dravity/tests/bep_coverage.rs` walks `crates/**/*.rs`, collects `BEP n` / `BEPn` citations, and requires a row for each. A new feature that cites a BEP must therefore update the doc. The test also checks its own citation parser.
+
+**Remediation.** The table now records that the native runtime is
+wired (`DhtConfig::native`), and lists native BEP 33, 43, 44 and 51 as
+partial (implemented in `NativeDht`, not in `mainline`). The default
+backend remains `mainline` until public-network validation
+(`docs/native-dht-validation.md`) passes.

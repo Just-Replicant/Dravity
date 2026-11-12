@@ -1,5 +1,8 @@
 //! Human-readable formatting for progress output.
 
+use std::time::Instant;
+
+use dravity_core::PeerId;
 use dravity_engine::{Stats, TorrentStatus};
 
 /// Formats a byte count with binary units (`1.5 MiB`).
@@ -77,6 +80,54 @@ pub(crate) fn eta(left: u64, rate: u64) -> String {
     } else {
         format!("{s}s")
     }
+}
+
+/// A compact duration (`42s`, `3m05s`, `1h02m`, `1d01h`, `>99d`).
+#[must_use]
+pub(crate) fn duration(secs: u64) -> String {
+    let (d, h, m, s) = (secs / 86_400, secs / 3600 % 24, secs / 60 % 60, secs % 60);
+    if d > 99 {
+        ">99d".to_owned()
+    } else if d > 0 {
+        format!("{d}d{h:02}h")
+    } else if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// How long ago `at` is relative to `now` (`just now`, `12s ago`).
+#[must_use]
+pub(crate) fn ago(at: Instant, now: Instant) -> String {
+    let secs = now.saturating_duration_since(at).as_secs();
+    if secs == 0 {
+        "just now".to_owned()
+    } else {
+        format!("{} ago", duration(secs))
+    }
+}
+
+/// A peer id as text: raw ASCII when every byte is printable, otherwise
+/// the Azureus-style prefix (if any) and a hex suffix.
+#[must_use]
+pub(crate) fn peer_id(id: PeerId) -> String {
+    let bytes = id.as_bytes();
+    if bytes.iter().all(|b| (0x20u8..=0x7e).contains(b)) {
+        // Every byte is printable ASCII (the usual Azureus form).
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let prefix = bytes
+        .iter()
+        .take_while(|b| (0x20u8..=0x7e).contains(b))
+        .count();
+    // A leading printable run (often `-DR0001-`) is shown as-is.
+    let (head, tail) = bytes.split_at(prefix);
+    let head = String::from_utf8_lossy(head);
+    let tail: String = tail.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{head}{tail}")
 }
 
 /// A short name for an engine state.
@@ -199,6 +250,31 @@ mod tests {
     }
 
     #[test]
+    fn duration_and_ago() {
+        assert_eq!(duration(0), "0s");
+        assert_eq!(duration(41), "41s");
+        assert_eq!(duration(185), "3m05s");
+        assert_eq!(duration(3720), "1h02m");
+        assert_eq!(duration(90_000), "1d01h");
+        assert_eq!(duration(u64::MAX), ">99d");
+        let now = Instant::now();
+        assert_eq!(ago(now, now), "just now");
+        let earlier = now.checked_sub(std::time::Duration::from_secs(12)).unwrap();
+        assert_eq!(ago(earlier, now), "12s ago");
+    }
+
+    #[test]
+    fn peer_id_is_ascii_or_hex() {
+        let printable = PeerId::with_prefix(b"-DR0001-", b"abcdefghijkl");
+        assert_eq!(peer_id(printable), "-DR0001-abcdefghijkl");
+        let mut raw = *b"-DR0001-abcdefghijkl";
+        raw[8] = 0;
+        raw[9] = 0xff;
+        let shown = peer_id(PeerId::new(raw));
+        assert_eq!(shown, "-DR0001-00ff636465666768696a6b6c");
+    }
+
+    #[test]
     fn rates() {
         assert_eq!(parse_rate("65536"), Ok(65536));
         assert_eq!(parse_rate("500K"), Ok(500 * 1024));
@@ -231,7 +307,7 @@ mod tests {
         config.dht = false;
         let mut state =
             dravity_engine::MetadataState::new(dravity_core::InfoHash::new([1; 20]), config);
-        let _ = state.update(std::time::Instant::now(), dravity_engine::Event::Start);
+        let _ = state.update(Instant::now(), dravity_engine::Event::Start);
         assert_eq!(state.status(), TorrentStatus::FetchingMetadata);
         assert_eq!(
             progress_line(&state.stats(), 0),

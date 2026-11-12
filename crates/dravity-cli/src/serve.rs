@@ -56,12 +56,14 @@ pub(crate) async fn run(config: SessionConfig, options: Options) -> Result<()> {
     };
 
     let (stop_http, stopped) = tokio::sync::oneshot::channel::<()>();
+    let mut http_bound = None;
     let server = match options.http {
         Some(addr) => {
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("binding the HTTP API to {addr}"))?;
             let bound = listener.local_addr().unwrap_or(addr);
+            http_bound = Some(bound);
             let mut config = HttpConfig::new(&options.download_dir).with_bind(bound);
             config.token.clone_from(&options.token);
             if options.allow_insecure_http {
@@ -84,7 +86,10 @@ pub(crate) async fn run(config: SessionConfig, options: Options) -> Result<()> {
     };
 
     let result = if options.tui {
-        tui::run(&session, options.download_dir.clone(), |_| false).await
+        tui::run(&session, options.download_dir.clone(), http_bound, |_| {
+            false
+        })
+        .await
     } else {
         tokio::signal::ctrl_c().await.context("waiting for Ctrl-C")
     };

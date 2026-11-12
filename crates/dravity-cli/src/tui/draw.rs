@@ -1,24 +1,35 @@
 //! Drawing: a pure function of the [`View`].
 
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap};
 
-use super::view::{Direction, Focus, Pane, Prompt, StatsRow, TrackerState, View};
+use super::add::AddField;
+use super::view::{
+    CacheRow, CapsField, Direction, Focus, Header, Pane, Prompt, StatsRow, TrackerState, View,
+};
 use crate::format;
+use dravity_session::{PortMapMethod, ScrapeOutcome};
 
 /// Alert lines shown under the detail pane.
 pub(crate) const ALERT_LINES: u16 = 4;
 
 /// The full key list `?` shows in place of the footer.
-const HELP: [&str; 7] = [
+const HELP: [&str; 12] = [
     "torrents: a add · 1/2/3 or enter detail · space/p pause or resume · d remove · D remove and delete files",
     "          o sort (added, name, progress, down rate) · / filter by name · tab files pane",
     "          L / U download / upload limit for all torrents (live; empty lifts it)",
+    "          Q queue caps (max active downloads and seeds) · C connection cap · P listen port",
+    "          b ban an IP · B ban list (u unban) · i load or replace the IP filter (empty clears it)",
     "detail:   1 files · 2 peers · 3 trackers · tab next pane · esc back · ↑↓/j k move",
-    "files:    s skip · l low · n normal · h high   peers: a add a peer (host:port)",
+    "files:    s skip · l low · n normal · h high · t stream while it downloads (HTTP Range URL)",
+    "peers:    a add a peer (host:port)",
+    "trackers: s scrape now (periodic scrape counts need --scrape-interval)",
+    "add:      tab fields · space start paused · after a .torrent, s/l/n/h file priorities, enter again to add",
     "peer flags: C we choke them · c they choke us · I we want · i they want · < incoming · U uTP · W web seed · E encrypted",
     "q quit · ctrl-c quit from anywhere · mouse: click a torrent or file row · any key closes this",
 ];
@@ -43,9 +54,9 @@ pub(crate) fn areas(area: Rect, view: &View) -> Areas {
         1
     };
     let [header, torrents, selected, detail, alerts, footer] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(2),
         Constraint::Fill(2),
-        Constraint::Length(3),
+        Constraint::Length(5),
         Constraint::Fill(3),
         Constraint::Length(ALERT_LINES + 2),
         Constraint::Length(footer),
@@ -82,7 +93,7 @@ pub(crate) fn table_row_at(area: Rect, selected: usize, column: u16, row: u16) -
 /// Draws the whole screen.
 pub(crate) fn draw(frame: &mut Frame<'_>, view: &View) {
     let a = areas(frame.area(), view);
-    frame.render_widget(Paragraph::new(header(view)).bold(), a.header);
+    frame.render_widget(Paragraph::new(header_lines(view)).bold(), a.header);
     draw_torrents(frame, view, a.torrents);
     draw_selected(frame, view, a.selected);
     match view.pane {
@@ -93,11 +104,42 @@ pub(crate) fn draw(frame: &mut Frame<'_>, view: &View) {
     draw_alerts(frame, view, a.alerts);
     draw_footer(frame, view, a.footer);
     match &view.prompt {
-        Some(Prompt::Add(text)) => popup(
+        Some(Prompt::Add(form)) => popup(frame, " Add a torrent ", add_lines(form, view)),
+        Some(Prompt::QueueCaps {
+            downloads,
+            seeds,
+            field,
+        }) => popup(
             frame,
-            " Add a magnet link or a .torrent file ",
+            " Queue caps (empty is unlimited) ",
+            queue_cap_lines(downloads, seeds, *field, view),
+        ),
+        Some(Prompt::Connections(text)) => popup(
+            frame,
+            " Connection cap (empty lifts it) ",
             vec![Line::from(format!("{text}▏")), message_line(view)],
         ),
+        Some(Prompt::ListenPort(text)) => popup(
+            frame,
+            " Listen port (0 picks a free port) ",
+            vec![Line::from(format!("{text}▏")), message_line(view)],
+        ),
+        Some(Prompt::Ban(text)) => popup(
+            frame,
+            " Ban an IP address ",
+            vec![Line::from(format!("{text}▏")), message_line(view)],
+        ),
+        Some(Prompt::Unban(text)) => popup(
+            frame,
+            " Unban an IP address ",
+            vec![Line::from(format!("{text}▏")), message_line(view)],
+        ),
+        Some(Prompt::IpFilter(text)) => popup(
+            frame,
+            " IP filter file (empty clears the filter) ",
+            vec![Line::from(format!("{text}▏")), message_line(view)],
+        ),
+        Some(Prompt::BanList) => popup(frame, " Ban list ", ban_list_lines(view)),
         Some(Prompt::AddPeer { text, .. }) => popup(
             frame,
             " Add a peer (host:port) ",
@@ -139,16 +181,24 @@ fn message_line(view: &View) -> Line<'static> {
     Line::from(view.message.clone()).dim()
 }
 
-fn header(view: &View) -> String {
+fn header_lines(view: &View) -> Vec<Line<'static>> {
+    vec![
+        Line::from(header_top(view)),
+        Line::from(header_limits(view)),
+    ]
+}
+
+fn header_top(view: &View) -> String {
     let n = view.torrents.len();
     let mut text = format!(" dravity — {n} torrent{}", if n == 1 { "" } else { "s" });
-    let h = view.header;
+    let h = &view.header;
     if let Some(port) = h.listen_port {
         text.push_str(&format!(" · port {port}"));
     }
     text.push_str(if h.dht { " · DHT on" } else { " · DHT off" });
-    if let Some(port) = h.mapped_port {
-        text.push_str(&format!(" · mapped {port}"));
+    if let Some(mapped) = mapping_text(h) {
+        text.push_str(" · ");
+        text.push_str(&mapped);
     }
     let (down, up) = view.totals();
     text.push_str(&format!(
@@ -157,6 +207,88 @@ fn header(view: &View) -> String {
         format::bytes(up)
     ));
     text
+}
+
+fn mapping_text(h: &Header) -> Option<String> {
+    if h.map_method.is_none()
+        && h.mapped_tcp.is_none()
+        && h.mapped_udp.is_none()
+        && h.external_ip.is_none()
+        && h.map_error.is_none()
+    {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Some(method) = h.map_method {
+        parts.push(map_method(method).to_owned());
+    }
+    if let Some(port) = h.mapped_tcp {
+        parts.push(format!("TCP {port}"));
+    }
+    if let Some(port) = h.mapped_udp {
+        parts.push(format!("UDP {port}"));
+    }
+    if let Some(ip) = h.external_ip {
+        parts.push(format!("ext {ip}"));
+    }
+    if let Some(err) = &h.map_error {
+        parts.push(format!("map failed: {err}"));
+    }
+    Some(format!("mapped {}", parts.join(" ")))
+}
+
+fn map_method(method: PortMapMethod) -> &'static str {
+    match method {
+        PortMapMethod::Pcp => "PCP",
+        PortMapMethod::NatPmp => "NAT-PMP",
+        PortMapMethod::Upnp => "UPnP",
+    }
+}
+
+fn header_limits(view: &View) -> String {
+    let h = &view.header;
+    let lim =
+        |v: Option<u64>| v.map_or_else(|| "—".to_owned(), |n| format!("{}/s", format::bytes(n)));
+    let cap = |v: Option<usize>| v.map_or_else(|| "—".to_owned(), |n| n.to_string());
+    let mut text = format!(
+        " ↓lim {} ↑lim {} · conn {}/{} · queue ↓{} ↑{}",
+        lim(h.download_limit),
+        lim(h.upload_limit),
+        h.connections,
+        cap(h.max_connections),
+        cap(h.max_active_downloads),
+        cap(h.max_active_seeds),
+    );
+    if let Some(id) = h.peer_id {
+        text.push_str(&format!(" · peer {}", format::peer_id(id)));
+    }
+    text.push_str(&format!(" · hash {}", h.hash_jobs));
+    if let Some(cache) = h.cache {
+        text.push_str(&format!(" · cache {}", cache_text(cache)));
+    }
+    text.push_str(&format!(
+        " · bans {} · filter {}",
+        h.banned, h.filter_ranges
+    ));
+    if h.scrape_interval {
+        text.push_str(" · scrape on");
+    }
+    text
+}
+
+fn cache_text(c: CacheRow) -> String {
+    let total = c.hits.saturating_add(c.misses);
+    let hit = c
+        .hits
+        .saturating_mul(100)
+        .checked_div(total)
+        .map_or_else(|| "—".to_owned(), |p| format!("{p}% hits"));
+    format!(
+        "{}/{} ({hit}, {} misses)",
+        format::bytes(c.bytes),
+        format::bytes(c.budget),
+        c.misses
+    )
 }
 
 fn percent(have: u64, total: u64) -> String {
@@ -258,11 +390,8 @@ fn draw_selected(frame: &mut Frame<'_>, view: &View, area: Rect) {
         return;
     };
     let Some(stats) = row.stats.filter(StatsRow::size_known) else {
-        let peers = row
-            .stats
-            .map(|s| format!(" · {} peers", s.peers))
-            .unwrap_or_default();
-        let text = format!("{} · {}{peers}", row.info_hash, row.state());
+        let extra = row.stats.as_ref().map(swarm_text).unwrap_or_default();
+        let text = format!("{} · {}{extra}", row.info_hash, row.state());
         frame.render_widget(Paragraph::new(text).block(block), area);
         return;
     };
@@ -284,10 +413,28 @@ fn draw_selected(frame: &mut Frame<'_>, view: &View, area: Rect) {
         stats.peers,
         if row.is_finished() { " · seeding" } else { "" },
     );
-    frame.render_widget(
-        Gauge::default().block(block).ratio(ratio).label(label),
-        area,
-    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [gauge, details] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(Gauge::default().ratio(ratio).label(label), gauge);
+    frame.render_widget(Paragraph::new(swarm_text(&stats)).dim(), details);
+}
+
+/// Piece, swarm and disk numbers the torrent table does not have room for.
+fn swarm_text(stats: &StatsRow) -> String {
+    format!(
+        " {}/{} pieces · {} connecting · {} known · {} unchoked · {} interested · disk r{} w{} · {} banned",
+        stats.pieces_have,
+        stats.piece_count,
+        stats.connecting,
+        stats.known_peers,
+        stats.unchoked,
+        stats.interested,
+        stats.pending_reads,
+        stats.pending_writes,
+        stats.banned,
+    )
 }
 
 /// The detail block, its title naming the panes with the current one
@@ -423,23 +570,52 @@ fn draw_trackers(frame: &mut Frame<'_>, view: &View, area: Rect) {
                 format!("{} — {error}", t.url),
             ),
         };
-        // A scrape fills in counts the announce did not report and adds
-        // the tracker's completed-download count.
-        let (seeds, leech, text) = match t.scrape {
-            Some(s) => (
-                if seeds == "-" {
+        // A scrape fills in counts the announce did not report, adds the
+        // tracker's completed-download count, and records failures.
+        let now = Instant::now();
+        let announced = t
+            .announced
+            .map(|at| format!("announced {}", format::ago(at, now)))
+            .unwrap_or_default();
+        let (seeds, leech, text) = match &t.scrape {
+            Some(ScrapeOutcome::Ok(s)) => {
+                let seeds = if seeds == "-" {
                     s.seeders.to_string()
                 } else {
                     seeds
-                },
-                if leech == "-" {
+                };
+                let leech = if leech == "-" {
                     s.leechers.to_string()
                 } else {
                     leech
-                },
-                format!("{text} · {} downloaded", s.downloaded),
-            ),
-            None => (seeds, leech, text),
+                };
+                let when = t
+                    .scraped
+                    .map(|at| format!(" · scraped {}", format::ago(at, now)))
+                    .unwrap_or_default();
+                (
+                    seeds,
+                    leech,
+                    format!("{text} · {} downloaded{when}", s.downloaded),
+                )
+            }
+            Some(ScrapeOutcome::Failed { error }) => {
+                let when = t
+                    .scraped
+                    .map(|at| format!(" ({})", format::ago(at, now)))
+                    .unwrap_or_default();
+                (
+                    seeds,
+                    leech,
+                    format!("{text} · scrape failed: {error}{when}"),
+                )
+            }
+            None | Some(_) => (seeds, leech, text),
+        };
+        let text = if announced.is_empty() {
+            text
+        } else {
+            format!("{text} · {announced}")
         };
         Row::new(vec![
             t.tier.to_string(),
@@ -490,26 +666,36 @@ fn draw_alerts(frame: &mut Frame<'_>, view: &View, area: Rect) {
 /// The keys for what has the focus.
 fn keys(view: &View) -> String {
     match (&view.prompt, view.focus, view.pane) {
-        (Some(Prompt::Add(_)), ..) => "enter add · esc cancel".to_owned(),
+        (Some(Prompt::Add(_)), ..) => {
+            "tab fields · space pause or cycle priority · enter add · esc cancel".to_owned()
+        }
         (Some(Prompt::AddPeer { .. }), ..) => "enter connect · esc cancel".to_owned(),
-        (Some(Prompt::Limit { .. }), ..) => "enter apply · esc cancel".to_owned(),
+        (Some(Prompt::Limit { .. } | Prompt::Connections(_) | Prompt::ListenPort(_) | Prompt::QueueCaps { .. }), ..) => {
+            "enter apply · esc cancel · tab next field".to_owned()
+        }
+        (Some(Prompt::Ban(_) | Prompt::Unban(_) | Prompt::IpFilter(_)), ..) => {
+            "enter apply · esc cancel".to_owned()
+        }
+        (Some(Prompt::BanList), ..) => {
+            "↑↓ select · u unban · b ban another · esc close".to_owned()
+        }
         (Some(Prompt::Confirm { .. }), ..) => "enter confirm · esc cancel".to_owned(),
         (Some(Prompt::Filter), ..) => {
             format!("filter: {}▏ · enter keep · esc clear", view.filter)
         }
         (None, Focus::Torrents, _) => {
-            "q quit · a add · enter detail · space pause/resume · d/D remove · o sort · / filter · ? keys"
+            "q quit · a add · enter detail · space pause/resume · d/D remove · o sort · / filter · Q/C/P caps · B bans · ? keys"
                 .to_owned()
         }
         (None, Focus::Detail, Pane::Files) => {
-            "esc back · ↑↓ file · s/l/n/h skip/low/normal/high · 1/2/3 pane · tab torrents · ? keys"
+            "esc back · ↑↓ file · s/l/n/h skip/low/normal/high · t stream · 1/2/3 pane · tab torrents · ? keys"
                 .to_owned()
         }
         (None, Focus::Detail, Pane::Peers) => {
             "esc back · ↑↓ peer · a add peer · 1/2/3 pane · tab trackers · ? keys".to_owned()
         }
         (None, Focus::Detail, Pane::Trackers) => {
-            "esc back · ↑↓ tracker · 1/2/3 pane · tab files · ? keys".to_owned()
+            "esc back · ↑↓ tracker · s scrape now · 1/2/3 pane · tab files · ? keys".to_owned()
         }
     }
 }
@@ -525,7 +711,17 @@ fn draw_footer(frame: &mut Frame<'_>, view: &View, area: Rect) {
     let in_popup = matches!(
         view.prompt,
         Some(
-            Prompt::Add(_) | Prompt::AddPeer { .. } | Prompt::Confirm { .. } | Prompt::Limit { .. }
+            Prompt::Add(_)
+                | Prompt::AddPeer { .. }
+                | Prompt::Confirm { .. }
+                | Prompt::Limit { .. }
+                | Prompt::QueueCaps { .. }
+                | Prompt::Connections(_)
+                | Prompt::ListenPort(_)
+                | Prompt::Ban(_)
+                | Prompt::Unban(_)
+                | Prompt::IpFilter(_)
+                | Prompt::BanList
         )
     );
     let text = if view.message.is_empty() || in_popup {
@@ -536,11 +732,146 @@ fn draw_footer(frame: &mut Frame<'_>, view: &View, area: Rect) {
     frame.render_widget(Paragraph::new(text).dim(), area);
 }
 
+fn cursor(text: &str, focused: bool) -> String {
+    if focused {
+        format!("{text}▏")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn add_lines(form: &super::add::AddForm, view: &View) -> Vec<Line<'static>> {
+    let mark = |field: AddField| form.field == field;
+    let paused = if form.paused { "yes" } else { "no" };
+    let dir = if form.download_dir.is_empty() && !mark(AddField::Dir) {
+        "(session default)".to_owned()
+    } else {
+        cursor(&form.download_dir, mark(AddField::Dir))
+    };
+    let mut lines = vec![
+        Line::from(format!(
+            "source:        {}",
+            cursor(&form.source, mark(AddField::Source))
+        )),
+        Line::from(format!("download dir:  {dir}")),
+        Line::from(format!(
+            "start paused:  {paused}{}",
+            if mark(AddField::Paused) {
+                "  (space toggles)"
+            } else {
+                ""
+            }
+        )),
+        Line::from(format!(
+            "extra peers:   {}",
+            cursor(&form.peers, mark(AddField::Peers))
+        )),
+    ];
+    if !form.files.is_empty() {
+        lines.push(Line::from(
+            "files:         s/l/n/h set priority · space cycles · enter adds",
+        ));
+        let selected = match form.field {
+            AddField::File(i) => i,
+            _ => usize::MAX,
+        };
+        // A window around the selection so a large torrent still fits.
+        let shown = 8;
+        let start = selected
+            .saturating_add(1)
+            .saturating_sub(shown)
+            .min(form.files.len().saturating_sub(shown));
+        for (i, f) in form.files.iter().enumerate().skip(start).take(shown) {
+            let pointer = if i == selected { ">" } else { " " };
+            lines.push(Line::from(format!(
+                " {pointer} {:<6} {:>10}  {}",
+                f.priority.as_str(),
+                format::bytes(f.length),
+                f.path
+            )));
+        }
+        if form.files.len() > shown {
+            lines.push(
+                Line::from(format!(
+                    "   ({} of {} files)",
+                    shown.min(form.files.len()),
+                    form.files.len()
+                ))
+                .dim(),
+            );
+        }
+    } else if form.inspected {
+        lines.push(
+            Line::from("files:         (none — a magnet's files appear once metadata arrives)")
+                .dim(),
+        );
+    } else {
+        lines.push(Line::from("files:         enter on a .torrent lists its files first").dim());
+    }
+    lines.push(message_line(view));
+    lines
+}
+
+fn queue_cap_lines(
+    downloads: &str,
+    seeds: &str,
+    field: CapsField,
+    view: &View,
+) -> Vec<Line<'static>> {
+    vec![
+        Line::from(format!(
+            "max active downloads: {}",
+            cursor(downloads, field == CapsField::Downloads)
+        )),
+        Line::from(format!(
+            "max active seeds:      {}",
+            cursor(seeds, field == CapsField::Seeds)
+        )),
+        Line::from("tab switches fields · empty lifts a cap · 0 queues everything").dim(),
+        message_line(view),
+    ]
+}
+
+fn ban_list_lines(view: &View) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(format!(
+        "{} banned · IP filter: {} range{}",
+        view.banned.len(),
+        view.header.filter_ranges,
+        if view.header.filter_ranges == 1 {
+            ""
+        } else {
+            "s"
+        }
+    ))];
+    if view.banned.is_empty() {
+        lines.push(Line::from("no banned addresses · b bans one · esc closes").dim());
+    } else {
+        let shown = 10;
+        let start = view
+            .selected_ban
+            .saturating_add(1)
+            .saturating_sub(shown)
+            .min(view.banned.len().saturating_sub(shown));
+        for (i, ip) in view.banned.iter().enumerate().skip(start).take(shown) {
+            let pointer = if i == view.selected_ban { ">" } else { " " };
+            lines.push(Line::from(format!(" {pointer} {ip}")));
+        }
+        lines.push(Line::from("↑↓ select · u unban · b ban another · esc close").dim());
+    }
+    if !view.message.is_empty() {
+        lines.push(message_line(view));
+    }
+    lines
+}
+
 /// A centered box over the screen.
 fn popup(frame: &mut Frame<'_>, title: &str, lines: Vec<Line<'_>>) {
     let area = frame.area();
-    let width = area.width.saturating_sub(4).min(80);
-    let height = 4.min(area.height);
+    let width = area.width.saturating_sub(4).min(88);
+    let needed = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let height = needed.min(area.height.saturating_sub(2)).max(4);
     let rect = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -581,10 +912,12 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{areas, render, table_row_at};
+    use crate::tui::add::AddForm;
     use crate::tui::view::tests::view;
     use crate::tui::view::{
         Action, Focus, Header, Pane, PeerRow, Prompt, TrackerRow, TrackerState, View,
     };
+    use dravity_session::{PortMapMethod, ScrapeOutcome};
 
     #[test]
     fn torrents_and_files_are_listed_with_progress_ratio_and_eta() {
@@ -592,15 +925,39 @@ mod tests {
         v.header = Header {
             listen_port: Some(6881),
             dht: true,
-            mapped_port: Some(40_000),
+            mapped_tcp: Some(40_000),
+            mapped_udp: Some(6881),
+            map_method: Some(PortMapMethod::Pcp),
+            external_ip: Some("203.0.113.1".parse().unwrap()),
+            download_limit: Some(2 << 20),
+            max_connections: Some(200),
+            connections: 12,
+            max_active_downloads: Some(3),
+            max_active_seeds: Some(5),
+            hash_jobs: 2,
+            banned: 1,
+            filter_ranges: 8,
+            ..Header::default()
         };
-        let screen = render(&v, 130, 30);
+        let screen = render(&v, 160, 30);
         assert!(
             screen.contains(
-                "dravity — 2 torrents · port 6881 · DHT on · mapped 40000 · ↓ 512.0 KiB/s ↑ 0 B/s"
+                "dravity — 2 torrents · port 6881 · DHT on · mapped PCP TCP 40000 UDP 6881 ext 203.0.113.1 · ↓ 512.0 KiB/s ↑ 0 B/s"
             ),
             "{screen}"
         );
+        assert!(
+            screen.contains("↓lim 2.0 MiB/s ↑lim — · conn 12/200 · queue ↓3 ↑5"),
+            "{screen}"
+        );
+        assert!(screen.contains("hash 2"), "{screen}");
+        assert!(screen.contains("bans 1 · filter 8"), "{screen}");
+        assert!(screen.contains("1/4 pieces"), "{screen}");
+        assert!(screen.contains("1 connecting"), "{screen}");
+        assert!(screen.contains("5 known"), "{screen}");
+        assert!(screen.contains("1 unchoked"), "{screen}");
+        assert!(screen.contains("2 interested"), "{screen}");
+        assert!(screen.contains("disk r2 w1"), "{screen}");
         assert!(screen.contains("debian.iso"), "{screen}");
         assert!(screen.contains("downloading"), "{screen}");
         assert!(screen.contains("25.0%"), "{screen}");
@@ -629,7 +986,8 @@ mod tests {
         stats.bytes_have = 0;
         let screen = render(&v, 130, 30);
         assert!(!screen.contains("100.0%"), "{screen}");
-        assert!(screen.contains("fetching metadata · 3 peers"), "{screen}");
+        assert!(screen.contains("fetching metadata"), "{screen}");
+        assert!(screen.contains("connecting"), "{screen}");
     }
 
     #[test]
@@ -647,20 +1005,18 @@ mod tests {
     #[test]
     fn a_magnet_in_the_add_buffer_is_visible_with_the_last_error() {
         let mut v = View {
-            prompt: Some(Prompt::Add("magnet:?xt=urn:btih:abc".to_owned())),
+            prompt: Some(Prompt::Add(AddForm::with_source("magnet:?xt=urn:btih:abc"))),
             message: "parsing the magnet link: bad hash".to_owned(),
             ..View::default()
         };
         let screen = render(&v, 110, 24);
-        assert!(
-            screen.contains("Add a magnet link or a .torrent file"),
-            "{screen}"
-        );
+        assert!(screen.contains("Add a torrent"), "{screen}");
         assert!(screen.contains("magnet:?xt=urn:btih:abc▏"), "{screen}");
         assert!(screen.contains("bad hash"), "{screen}");
-        assert!(screen.contains("enter add · esc cancel"), "{screen}");
+        assert!(screen.contains("enter add"), "{screen}");
+        assert!(screen.contains("start paused"), "{screen}");
         v.update(Action::Cancel);
-        assert!(!render(&v, 110, 24).contains("Add a magnet"));
+        assert!(!render(&v, 110, 24).contains("Add a torrent"));
     }
 
     #[test]
@@ -734,23 +1090,31 @@ mod tests {
                     leechers: Some(3),
                     peers: 15,
                 },
+                announced: Some(std::time::Instant::now()),
                 scrape: None,
+                scraped: None,
             },
             TrackerRow {
                 tier: 0,
                 url: "http://dead/announce".to_owned(),
                 state: TrackerState::Failed("connection refused".to_owned()),
-                scrape: None,
+                announced: None,
+                scrape: Some(ScrapeOutcome::Failed {
+                    error: "timed out".to_owned(),
+                }),
+                scraped: Some(std::time::Instant::now()),
             },
             TrackerRow {
                 tier: 1,
                 url: "udp://later:80".to_owned(),
                 state: TrackerState::Waiting,
-                scrape: Some(dravity_session::ScrapeStats {
+                announced: None,
+                scrape: Some(ScrapeOutcome::Ok(dravity_session::ScrapeStats {
                     seeders: 77,
                     leechers: 5,
                     downloaded: 901,
-                }),
+                })),
+                scraped: Some(std::time::Instant::now()),
             },
         ];
         let screen = render(&v, 120, 30);
@@ -761,6 +1125,9 @@ mod tests {
             screen.contains("http://dead/announce — connection refused"),
             "{screen}"
         );
+        assert!(screen.contains("scrape failed: timed out"), "{screen}");
+        assert!(screen.contains("announced just now"), "{screen}");
+        assert!(screen.contains("scraped just now"), "{screen}");
         assert!(screen.contains("waiting"), "{screen}");
         // A scrape fills in counts and the download total.
         assert!(screen.contains("77"), "{screen}");
@@ -825,7 +1192,38 @@ mod tests {
 
         let v = view();
         let a = areas(Rect::new(0, 0, 100, 30), &v);
-        assert_eq!(a.header.height, 1);
+        assert_eq!(a.header.height, 2);
         assert!(a.torrents.height >= 4 && a.detail.height >= a.torrents.height);
+    }
+
+    #[test]
+    fn a_queued_torrent_is_labelled_queued() {
+        let mut v = view();
+        v.torrents[1].queued = true;
+        v.torrents[1].running = false;
+        v.torrents[1].paused = false;
+        v.torrents[1].stats = None;
+        let screen = render(&v, 130, 30);
+        assert!(screen.contains("queued"), "{screen}");
+        assert!(screen.contains("Arch.iso"), "{screen}");
+        // The first torrent is still downloading, not stopped.
+        assert!(screen.contains("downloading"), "{screen}");
+    }
+
+    #[test]
+    fn the_ban_list_popup_lists_addresses_and_the_filter_size() {
+        let mut v = view();
+        v.header.filter_ranges = 12;
+        v.banned = vec!["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()];
+        v.selected_ban = 1;
+        v.prompt = Some(Prompt::BanList);
+        let screen = render(&v, 110, 30);
+        assert!(
+            screen.contains("2 banned · IP filter: 12 ranges"),
+            "{screen}"
+        );
+        assert!(screen.contains("192.0.2.1"), "{screen}");
+        assert!(screen.contains("> 192.0.2.2"), "{screen}");
+        assert!(screen.contains("u unban"), "{screen}");
     }
 }

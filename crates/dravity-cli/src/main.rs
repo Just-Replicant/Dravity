@@ -800,7 +800,7 @@ async fn download(
         let info_hash = torrent.info_hash();
         let mut finished = false;
         let mut several = false;
-        let ui_result = tui::run(&session, output.clone(), |view| {
+        let ui_result = tui::run(&session, output.clone(), None, |view| {
             finished |= view
                 .torrents
                 .iter()

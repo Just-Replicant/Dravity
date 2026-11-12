@@ -3,29 +3,74 @@
 //! tests fill one by hand and never open a terminal.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
-use std::time::Duration;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::{Duration, Instant};
 
-use dravity_core::InfoHash;
+use dravity_core::{InfoHash, PeerId};
 use dravity_engine::{Alert, Priority, Stats, TorrentStatus};
 use dravity_session::{
-    FileProgress, PeerStatus, ScrapeOutcome, ScrapeStats, TrackerOutcome, TrackerStatus, Transport,
+    FileProgress, PeerStatus, PortMapMethod, ScrapeOutcome, TrackerOutcome, TrackerStatus,
+    Transport,
 };
 
+use super::add::AddForm;
 use crate::format;
 
 /// Alerts kept per torrent; the oldest is dropped first.
 pub(crate) const ALERT_LOG: usize = 32;
 
-/// Session facts for the header line.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Session facts for the header lines.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Header {
     /// Port the session accepts peers on.
     pub(crate) listen_port: Option<u16>,
     /// The session runs a DHT node.
     pub(crate) dht: bool,
     /// The router's public TCP port, when port mapping got one.
-    pub(crate) mapped_port: Option<u16>,
+    pub(crate) mapped_tcp: Option<u16>,
+    /// The router's public UDP port, when port mapping got one.
+    pub(crate) mapped_udp: Option<u16>,
+    /// How the mappings were made (PCP, NAT-PMP, UPnP).
+    pub(crate) map_method: Option<PortMapMethod>,
+    /// The last port-mapping error, if mapping failed.
+    pub(crate) map_error: Option<String>,
+    /// The router's public address, when it told us.
+    pub(crate) external_ip: Option<Ipv4Addr>,
+    /// The session's peer id.
+    pub(crate) peer_id: Option<PeerId>,
+    /// Open peer connections in the session.
+    pub(crate) connections: usize,
+    /// Session-wide connection cap (`None` is unlimited).
+    pub(crate) max_connections: Option<usize>,
+    /// Piece-hash jobs running now.
+    pub(crate) hash_jobs: usize,
+    /// Read-cache occupancy and hit counts, when a cache is in use.
+    pub(crate) cache: Option<CacheRow>,
+    /// Session-wide download limit (bytes/s).
+    pub(crate) download_limit: Option<u64>,
+    /// Session-wide upload limit (bytes/s).
+    pub(crate) upload_limit: Option<u64>,
+    /// Queue cap on active downloads (`None` is unlimited).
+    pub(crate) max_active_downloads: Option<usize>,
+    /// Queue cap on active seeds (`None` is unlimited).
+    pub(crate) max_active_seeds: Option<usize>,
+    /// Addresses on the session ban list.
+    pub(crate) banned: usize,
+    /// Disjoint ranges in the IP filter.
+    pub(crate) filter_ranges: usize,
+    /// The session was started with `--scrape-interval` (periodic scrapes).
+    pub(crate) scrape_interval: bool,
+    /// HTTP API bind address, when the API is running (for stream URLs).
+    pub(crate) http: Option<SocketAddr>,
+}
+
+/// Read-cache numbers for the header.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CacheRow {
+    pub(crate) hits: u64,
+    pub(crate) misses: u64,
+    pub(crate) bytes: u64,
+    pub(crate) budget: u64,
 }
 
 /// One torrent as shown.
@@ -35,6 +80,8 @@ pub(crate) struct TorrentRow {
     pub(crate) name: String,
     pub(crate) paused: bool,
     pub(crate) running: bool,
+    /// Waiting for an active download or seed slot.
+    pub(crate) queued: bool,
     /// Live numbers, while running (the last ones that arrived).
     pub(crate) stats: Option<StatsRow>,
     /// Bytes per second.
@@ -44,10 +91,13 @@ pub(crate) struct TorrentRow {
 }
 
 impl TorrentRow {
-    /// A display state.
+    /// A display state. Queued is distinct from stopped: a queued torrent
+    /// is waiting for a slot, not paused or failed.
     pub(crate) fn state(&self) -> &'static str {
         if self.paused {
             "paused"
+        } else if self.queued {
+            "queued"
         } else if let Some(stats) = &self.stats {
             format::status(stats.status)
         } else if self.running {
@@ -93,6 +143,18 @@ pub(crate) struct StatsRow {
     pub(crate) downloaded: u64,
     pub(crate) uploaded: u64,
     pub(crate) peers: usize,
+    pub(crate) piece_count: u32,
+    pub(crate) pieces_have: u32,
+    /// Connection attempts in flight.
+    pub(crate) connecting: usize,
+    /// Known addresses not yet connected.
+    pub(crate) known_peers: usize,
+    pub(crate) unchoked: usize,
+    pub(crate) interested: usize,
+    pub(crate) pending_writes: usize,
+    pub(crate) pending_reads: usize,
+    /// Peers this torrent has banned for bad data.
+    pub(crate) banned: usize,
 }
 
 impl StatsRow {
@@ -112,6 +174,15 @@ impl From<&Stats> for StatsRow {
             downloaded: s.downloaded,
             uploaded: s.uploaded,
             peers: s.peers,
+            piece_count: s.piece_count,
+            pieces_have: s.pieces_have,
+            connecting: s.connecting,
+            known_peers: s.known_peers,
+            unchoked: s.unchoked,
+            interested: s.interested,
+            pending_writes: s.pending_writes,
+            pending_reads: s.pending_reads,
+            banned: s.banned,
         }
     }
 }
@@ -246,8 +317,12 @@ pub(crate) struct TrackerRow {
     pub(crate) tier: usize,
     pub(crate) url: String,
     pub(crate) state: TrackerState,
-    /// The last successful scrape.
-    pub(crate) scrape: Option<ScrapeStats>,
+    /// When the last announce was recorded.
+    pub(crate) announced: Option<Instant>,
+    /// The last scrape, success or failure.
+    pub(crate) scrape: Option<ScrapeOutcome>,
+    /// When the last scrape was recorded.
+    pub(crate) scraped: Option<Instant>,
 }
 
 impl From<&TrackerStatus> for TrackerRow {
@@ -268,15 +343,13 @@ impl From<&TrackerStatus> for TrackerRow {
             Some(TrackerOutcome::Failed { error }) => TrackerState::Failed(error.clone()),
             Some(_) => TrackerState::Failed("unknown outcome".to_owned()),
         };
-        let scrape = match &t.scrape {
-            Some(ScrapeOutcome::Ok(stats)) => Some(*stats),
-            _ => None,
-        };
         Self {
             tier: t.tier,
             url: t.url.clone(),
             state,
-            scrape,
+            announced: t.updated,
+            scrape: t.scrape.clone(),
+            scraped: t.scraped,
         }
     }
 }
@@ -353,8 +426,8 @@ impl Sort {
 /// An open input or question; it takes every key until it closes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Prompt {
-    /// A magnet link or a `.torrent` path.
-    Add(String),
+    /// Add a magnet or a `.torrent`, with extra options.
+    Add(AddForm),
     /// `host:port` of a peer for the selected torrent.
     AddPeer { info_hash: InfoHash, text: String },
     /// Editing [`View::filter`].
@@ -367,6 +440,32 @@ pub(crate) enum Prompt {
         name: String,
         delete_files: bool,
     },
+    /// Queue caps: max active downloads and seeds (empty lifts a cap).
+    QueueCaps {
+        downloads: String,
+        seeds: String,
+        field: CapsField,
+    },
+    /// Session connection cap (empty lifts it).
+    Connections(String),
+    /// Live listen-port change (`0` picks a free port).
+    ListenPort(String),
+    /// Ban an IP address.
+    Ban(String),
+    /// Lift a ban on an IP address.
+    Unban(String),
+    /// The session ban list (and IP-filter size).
+    BanList,
+    /// Path of an IP filter list to load (empty clears the filter).
+    IpFilter(String),
+}
+
+/// Which field of the queue-caps prompt is being edited.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CapsField {
+    #[default]
+    Downloads,
+    Seeds,
 }
 
 /// Which session-wide rate limit a prompt sets.
@@ -401,6 +500,32 @@ pub(crate) enum Action {
     OpenFilter,
     /// `L` / `U`: the session-wide download / upload limit prompt.
     OpenLimit(Direction),
+    /// `Q`: max active downloads and seeds.
+    OpenQueueCaps,
+    /// `C`: session connection cap.
+    OpenConnections,
+    /// `P`: change the listen port while running.
+    OpenListenPort,
+    /// `b`: ban an IP.
+    OpenBan,
+    /// Type an IP to unban.
+    OpenUnban,
+    /// `B`: show the ban list.
+    OpenBanList,
+    /// `i`: load or replace the IP filter.
+    OpenIpFilter,
+    /// `s` on the trackers pane: scrape now.
+    ForceScrape,
+    /// `t` on the files pane: stream the selected file.
+    StreamFile,
+    /// Tab inside a multi-field prompt.
+    NextField,
+    /// Shift+Tab inside a multi-field prompt.
+    PrevField,
+    /// Space on a toggle field (start paused, or cycle a file priority).
+    Toggle,
+    /// `u` on the ban list: unban the selected address.
+    UnbanSelected,
     Help,
     /// Any key while the key list is shown.
     DismissHelp,
@@ -423,8 +548,8 @@ pub(crate) enum Request {
         file: usize,
         priority: Priority,
     },
-    /// The add prompt's line; the prompt stays open until it succeeds.
-    Add(String),
+    /// The add form; the prompt stays open until the session accepts it.
+    Add(AddForm),
     /// The peer prompt's line; the prompt stays open until it succeeds.
     AddPeer {
         info_hash: InfoHash,
@@ -439,6 +564,23 @@ pub(crate) enum Request {
     SetLimit {
         direction: Direction,
         text: String,
+    },
+    /// Inspect a `.torrent` to fill the add form's file list; the prompt
+    /// stays open.
+    InspectAdd(AddForm),
+    SetQueueCaps {
+        downloads: String,
+        seeds: String,
+    },
+    SetConnections(String),
+    SetListenPort(String),
+    Ban(String),
+    Unban(String),
+    SetIpFilter(String),
+    Scrape(InfoHash),
+    Stream {
+        info_hash: InfoHash,
+        file: usize,
     },
 }
 
@@ -466,6 +608,10 @@ pub(crate) struct View {
     pub(crate) selected_tracker: usize,
     /// Recent alerts per torrent, oldest first.
     pub(crate) alerts: HashMap<InfoHash, VecDeque<String>>,
+    /// The session ban list, newest snapshot.
+    pub(crate) banned: Vec<IpAddr>,
+    /// Selection in the ban-list prompt.
+    pub(crate) selected_ban: usize,
     pub(crate) prompt: Option<Prompt>,
     /// The footer shows the full key list until the next key.
     pub(crate) help: bool,
@@ -578,8 +724,8 @@ impl View {
             Action::DismissHelp => self.help = false,
             Action::Help => self.help = true,
             Action::Back => self.focus = Focus::Torrents,
-            Action::Up => self.step(false),
-            Action::Down => self.step(true),
+            Action::Up => self.move_selection(false),
+            Action::Down => self.move_selection(true),
             Action::Tab => match (self.focus, self.pane) {
                 (Focus::Torrents, _) => {
                     self.focus = Focus::Detail;
@@ -607,6 +753,10 @@ impl View {
                 });
             }
             Action::SetPriority(priority) => {
+                if let Some(Prompt::Add(form)) = &mut self.prompt {
+                    form.set_file_priority(priority);
+                    return None;
+                }
                 if (self.focus, self.pane) != (Focus::Detail, Pane::Files) {
                     return None;
                 }
@@ -619,7 +769,7 @@ impl View {
                 });
             }
             Action::OpenAdd => {
-                self.prompt = Some(Prompt::Add(String::new()));
+                self.prompt = Some(Prompt::Add(AddForm::new()));
                 self.message.clear();
             }
             Action::OpenAddPeer => {
@@ -650,57 +800,234 @@ impl View {
                 });
                 self.message.clear();
             }
-            Action::Input(c) => match &mut self.prompt {
-                Some(
-                    Prompt::Add(text) | Prompt::AddPeer { text, .. } | Prompt::Limit { text, .. },
-                ) => text.push(c),
-                Some(Prompt::Filter) => self.filter.push(c),
-                Some(Prompt::Confirm { .. }) | None => {}
-            },
-            Action::Backspace => match &mut self.prompt {
-                Some(
-                    Prompt::Add(text) | Prompt::AddPeer { text, .. } | Prompt::Limit { text, .. },
-                ) => {
-                    text.pop();
+            Action::OpenQueueCaps => {
+                self.prompt = Some(Prompt::QueueCaps {
+                    downloads: cap_text(self.header.max_active_downloads),
+                    seeds: cap_text(self.header.max_active_seeds),
+                    field: CapsField::Downloads,
+                });
+                self.message.clear();
+            }
+            Action::OpenConnections => {
+                self.prompt = Some(Prompt::Connections(cap_text(self.header.max_connections)));
+                self.message.clear();
+            }
+            Action::OpenListenPort => {
+                self.prompt = Some(Prompt::ListenPort(
+                    self.header
+                        .listen_port
+                        .map(|p| p.to_string())
+                        .unwrap_or_default(),
+                ));
+                self.message.clear();
+            }
+            Action::OpenBan => {
+                self.prompt = Some(Prompt::Ban(String::new()));
+                self.message.clear();
+            }
+            Action::OpenUnban => {
+                self.prompt = Some(Prompt::Unban(String::new()));
+                self.message.clear();
+            }
+            Action::OpenBanList => {
+                self.selected_ban = self.selected_ban.min(self.banned.len().saturating_sub(1));
+                self.prompt = Some(Prompt::BanList);
+                self.message.clear();
+            }
+            Action::OpenIpFilter => {
+                self.prompt = Some(Prompt::IpFilter(String::new()));
+                self.message.clear();
+            }
+            Action::ForceScrape => {
+                let info_hash = self.selected_row()?.info_hash;
+                return Some(Request::Scrape(info_hash));
+            }
+            Action::StreamFile => {
+                if (self.focus, self.pane) != (Focus::Detail, Pane::Files) {
+                    return None;
                 }
-                Some(Prompt::Filter) => {
-                    self.filter.pop();
+                let info_hash = self.detail_of?;
+                let file = self.files.get(self.selected_file)?.index;
+                return Some(Request::Stream { info_hash, file });
+            }
+            Action::NextField => match &mut self.prompt {
+                Some(Prompt::Add(form)) => form.next_field(),
+                Some(Prompt::QueueCaps { field, .. }) => {
+                    *field = match field {
+                        CapsField::Downloads => CapsField::Seeds,
+                        CapsField::Seeds => CapsField::Downloads,
+                    };
                 }
-                Some(Prompt::Confirm { .. }) | None => {}
+                _ => {}
             },
+            Action::PrevField => match &mut self.prompt {
+                Some(Prompt::Add(form)) => form.prev_field(),
+                Some(Prompt::QueueCaps { field, .. }) => {
+                    *field = match field {
+                        CapsField::Downloads => CapsField::Seeds,
+                        CapsField::Seeds => CapsField::Downloads,
+                    };
+                }
+                _ => {}
+            },
+            Action::Toggle => {
+                if let Some(Prompt::Add(form)) = &mut self.prompt {
+                    form.toggle();
+                }
+            }
+            Action::UnbanSelected => {
+                let ip = *self.banned.get(self.selected_ban)?;
+                return Some(Request::Unban(ip.to_string()));
+            }
+            Action::Input(c) => self.input_char(c),
+            Action::Backspace => self.backspace(),
             Action::Cancel => {
                 if self.prompt.take() == Some(Prompt::Filter) {
                     self.filter.clear();
                 }
                 self.message.clear();
             }
-            Action::Submit => match self.prompt.clone()? {
-                Prompt::Add(text) => return Some(Request::Add(text)),
-                Prompt::AddPeer { info_hash, text } => {
-                    return Some(Request::AddPeer { info_hash, text });
-                }
-                Prompt::Filter => self.prompt = None,
-                Prompt::Limit { direction, text } => {
-                    return Some(Request::SetLimit { direction, text });
-                }
-                Prompt::Confirm {
-                    info_hash,
-                    name,
-                    delete_files,
-                } => {
-                    self.prompt = None;
-                    return Some(Request::Remove {
-                        info_hash,
-                        name,
-                        delete_files,
-                    });
-                }
-            },
+            Action::Submit => return self.submit(),
         }
         None
     }
+
+    fn move_selection(&mut self, down: bool) {
+        match &mut self.prompt {
+            Some(Prompt::BanList) => {
+                let last = self.banned.len().saturating_sub(1);
+                self.selected_ban = if down {
+                    self.selected_ban.saturating_add(1).min(last)
+                } else {
+                    self.selected_ban.saturating_sub(1)
+                };
+            }
+            Some(Prompt::Add(form)) => form.step_file(down),
+            _ => self.step(down),
+        }
+    }
+
+    fn input_char(&mut self, c: char) {
+        match &mut self.prompt {
+            Some(Prompt::Add(form)) => {
+                if let Some(text) = form.text_mut() {
+                    text.push(c);
+                }
+            }
+            Some(Prompt::AddPeer { text, .. } | Prompt::Limit { text, .. }) => text.push(c),
+            Some(Prompt::QueueCaps {
+                downloads,
+                seeds,
+                field,
+            }) => match field {
+                CapsField::Downloads => downloads.push(c),
+                CapsField::Seeds => seeds.push(c),
+            },
+            Some(
+                Prompt::Connections(text)
+                | Prompt::ListenPort(text)
+                | Prompt::Ban(text)
+                | Prompt::Unban(text)
+                | Prompt::IpFilter(text),
+            ) => text.push(c),
+            Some(Prompt::Filter) => self.filter.push(c),
+            Some(Prompt::Confirm { .. } | Prompt::BanList) | None => {}
+        }
+    }
+
+    fn backspace(&mut self) {
+        match &mut self.prompt {
+            Some(Prompt::Add(form)) => {
+                if let Some(text) = form.text_mut() {
+                    text.pop();
+                }
+            }
+            Some(Prompt::AddPeer { text, .. } | Prompt::Limit { text, .. }) => {
+                text.pop();
+            }
+            Some(Prompt::QueueCaps {
+                downloads,
+                seeds,
+                field,
+            }) => match field {
+                CapsField::Downloads => {
+                    downloads.pop();
+                }
+                CapsField::Seeds => {
+                    seeds.pop();
+                }
+            },
+            Some(
+                Prompt::Connections(text)
+                | Prompt::ListenPort(text)
+                | Prompt::Ban(text)
+                | Prompt::Unban(text)
+                | Prompt::IpFilter(text),
+            ) => {
+                text.pop();
+            }
+            Some(Prompt::Filter) => {
+                self.filter.pop();
+            }
+            Some(Prompt::Confirm { .. } | Prompt::BanList) | None => {}
+        }
+    }
+
+    fn submit(&mut self) -> Option<Request> {
+        match self.prompt.clone()? {
+            Prompt::Add(form) => {
+                if should_inspect(&form) {
+                    return Some(Request::InspectAdd(form));
+                }
+                Some(Request::Add(form))
+            }
+            Prompt::AddPeer { info_hash, text } => Some(Request::AddPeer { info_hash, text }),
+            Prompt::Filter => {
+                self.prompt = None;
+                None
+            }
+            Prompt::Limit { direction, text } => Some(Request::SetLimit { direction, text }),
+            Prompt::Confirm {
+                info_hash,
+                name,
+                delete_files,
+            } => {
+                self.prompt = None;
+                Some(Request::Remove {
+                    info_hash,
+                    name,
+                    delete_files,
+                })
+            }
+            Prompt::QueueCaps {
+                downloads, seeds, ..
+            } => Some(Request::SetQueueCaps { downloads, seeds }),
+            Prompt::Connections(text) => Some(Request::SetConnections(text)),
+            Prompt::ListenPort(text) => Some(Request::SetListenPort(text)),
+            Prompt::Ban(text) => Some(Request::Ban(text)),
+            Prompt::Unban(text) => Some(Request::Unban(text)),
+            Prompt::IpFilter(text) => Some(Request::SetIpFilter(text)),
+            Prompt::BanList => None,
+        }
+    }
 }
 
+/// Prefills a cap prompt: empty means unlimited.
+fn cap_text(value: Option<usize>) -> String {
+    value.map(|n| n.to_string()).unwrap_or_default()
+}
+
+/// Whether submitting the add form should first inspect a `.torrent` for
+/// its file list. Magnets and already-inspected forms go straight to add.
+fn should_inspect(form: &AddForm) -> bool {
+    if form.inspected {
+        return false;
+    }
+    let source = form.source.trim();
+    !source.is_empty() && !source.to_ascii_lowercase().starts_with("magnet:")
+}
+
+/// The log line for an alert, or `None` for alerts the log leaves out.
 /// The log line for an alert, or `None` for alerts the log leaves out.
 pub(crate) fn alert_text(alert: &Alert) -> Option<String> {
     Some(match alert {
@@ -708,6 +1035,10 @@ pub(crate) fn alert_text(alert: &Alert) -> Option<String> {
         Alert::MetadataReceived => "metadata received".to_owned(),
         Alert::Finished => "finished".to_owned(),
         Alert::HashFailed { piece } => format!("piece {piece} failed the hash check"),
+        Alert::PieceCompleted { piece } => format!("piece {piece} complete"),
+        Alert::UploadFailed { piece, message } => {
+            format!("upload read of piece {piece} failed: {message}")
+        }
         Alert::TrackerError { message } => format!("tracker: {message}"),
         Alert::PeerBanned { ip } => format!("banned {ip}"),
         Alert::PieceLayersStalled {
@@ -726,9 +1057,10 @@ pub(crate) fn alert_text(alert: &Alert) -> Option<String> {
 pub(crate) mod tests {
     use dravity_engine::{Alert, Priority, TorrentStatus};
 
+    use super::super::add::AddForm;
     use super::{
-        ALERT_LOG, Action, FileRow, Focus, Pane, PeerRow, Prompt, Request, Sort, StatsRow,
-        TorrentRow, View,
+        ALERT_LOG, Action, CapsField, FileRow, Focus, Pane, PeerRow, Prompt, Request, Sort,
+        StatsRow, TorrentRow, View, alert_text,
     };
 
     pub(crate) fn row(n: u8, name: &str, permille: u64, down_rate: u64) -> TorrentRow {
@@ -738,6 +1070,7 @@ pub(crate) mod tests {
             name: name.to_owned(),
             paused: false,
             running: true,
+            queued: false,
             stats: Some(StatsRow {
                 status: TorrentStatus::Downloading,
                 total_length: total,
@@ -746,6 +1079,15 @@ pub(crate) mod tests {
                 downloaded: total * permille / 1000,
                 uploaded: 0,
                 peers: 3,
+                piece_count: 4,
+                pieces_have: u32::try_from(permille * 4 / 1000).unwrap_or(0),
+                connecting: 1,
+                known_peers: 5,
+                unchoked: 1,
+                interested: 2,
+                pending_writes: 1,
+                pending_reads: 2,
+                banned: 0,
             }),
             down_rate,
             up_rate: 0,
@@ -786,10 +1128,13 @@ pub(crate) mod tests {
             v.update(Action::Input(c));
         }
         v.update(Action::Backspace);
-        assert_eq!(v.prompt, Some(Prompt::Add("magnet:?xt=".to_owned())));
+        assert_eq!(
+            v.prompt,
+            Some(Prompt::Add(AddForm::with_source("magnet:?xt=")))
+        );
         assert_eq!(
             v.update(Action::Submit),
-            Some(Request::Add("magnet:?xt=".to_owned()))
+            Some(Request::Add(AddForm::with_source("magnet:?xt=")))
         );
         assert!(
             v.prompt.is_some(),
@@ -964,7 +1309,14 @@ pub(crate) mod tests {
     fn the_alert_log_keeps_the_newest_and_skips_stats() {
         let mut v = view();
         let ih = v.torrents[0].info_hash;
-        assert!(!v.record_alert(ih, &Alert::PieceCompleted { piece: 1 }));
+        assert!(v.record_alert(ih, &Alert::PieceCompleted { piece: 1 }));
+        assert!(v.record_alert(
+            ih,
+            &Alert::UploadFailed {
+                piece: 2,
+                message: "disk error".to_owned(),
+            }
+        ));
         for piece in 0..40 {
             assert!(v.record_alert(ih, &Alert::HashFailed { piece }));
         }
@@ -972,6 +1324,165 @@ pub(crate) mod tests {
         assert_eq!(log.len(), ALERT_LOG);
         assert_eq!(log.back().unwrap(), "piece 39 failed the hash check");
         assert_eq!(log.front().unwrap(), "piece 8 failed the hash check");
+    }
+
+    #[test]
+    fn piece_complete_and_failed_upload_read_have_alert_text() {
+        assert_eq!(
+            alert_text(&Alert::PieceCompleted { piece: 7 }).as_deref(),
+            Some("piece 7 complete")
+        );
+        assert_eq!(
+            alert_text(&Alert::UploadFailed {
+                piece: 3,
+                message: "EIO".to_owned(),
+            })
+            .as_deref(),
+            Some("upload read of piece 3 failed: EIO")
+        );
+    }
+
+    #[test]
+    fn a_queued_torrent_is_not_drawn_as_stopped() {
+        let mut t = row(1, "q", 0, 0);
+        t.running = false;
+        t.paused = false;
+        t.stats = None;
+        t.queued = true;
+        assert_eq!(t.state(), "queued");
+        t.queued = false;
+        assert_eq!(t.state(), "stopped");
+        t.paused = true;
+        t.queued = true;
+        assert_eq!(t.state(), "paused", "a user pause wins over the queue");
+        t.paused = false;
+        t.running = true;
+        t.queued = true;
+        t.stats = Some(StatsRow {
+            status: TorrentStatus::Downloading,
+            total_length: 1,
+            bytes_have: 0,
+            wanted_left: 1,
+            downloaded: 0,
+            uploaded: 0,
+            peers: 0,
+            piece_count: 1,
+            pieces_have: 0,
+            connecting: 0,
+            known_peers: 0,
+            unchoked: 0,
+            interested: 0,
+            pending_writes: 0,
+            pending_reads: 0,
+            banned: 0,
+        });
+        assert_eq!(t.state(), "queued", "queued is shown even with live stats");
+    }
+
+    #[test]
+    fn a_torrent_path_is_inspected_before_it_is_added() {
+        let mut v = view();
+        v.update(Action::OpenAdd);
+        for c in "/tmp/film.torrent".chars() {
+            v.update(Action::Input(c));
+        }
+        let form = AddForm::with_source("/tmp/film.torrent");
+        assert_eq!(
+            v.update(Action::Submit),
+            Some(Request::InspectAdd(form.clone()))
+        );
+        // After inspection the form is submitted as Add.
+        let mut inspected = form;
+        inspected.inspected = true;
+        v.prompt = Some(Prompt::Add(inspected.clone()));
+        assert_eq!(v.update(Action::Submit), Some(Request::Add(inspected)));
+    }
+
+    #[test]
+    fn queue_caps_and_connection_prompts_submit_the_typed_values() {
+        let mut v = view();
+        v.header.max_active_downloads = Some(2);
+        v.header.max_active_seeds = Some(4);
+        v.header.max_connections = Some(50);
+        v.update(Action::OpenQueueCaps);
+        assert_eq!(
+            v.prompt,
+            Some(Prompt::QueueCaps {
+                downloads: "2".to_owned(),
+                seeds: "4".to_owned(),
+                field: CapsField::Downloads,
+            })
+        );
+        v.update(Action::Backspace);
+        v.update(Action::Input('3'));
+        v.update(Action::NextField);
+        v.update(Action::Input('x')); // will be validated later
+        assert_eq!(
+            v.update(Action::Submit),
+            Some(Request::SetQueueCaps {
+                downloads: "3".to_owned(),
+                seeds: "4x".to_owned(),
+            })
+        );
+        v.update(Action::Cancel);
+        v.update(Action::OpenConnections);
+        v.update(Action::Input('0'));
+        assert_eq!(
+            v.update(Action::Submit),
+            Some(Request::SetConnections("500".to_owned()))
+        );
+        // Prefill is "50", typed "0" appends → "500". Yes.
+        v.update(Action::Cancel);
+        v.update(Action::OpenListenPort);
+        assert!(matches!(v.prompt, Some(Prompt::ListenPort(_))));
+        v.prompt = Some(Prompt::ListenPort("6882".to_owned()));
+        assert_eq!(
+            v.update(Action::Submit),
+            Some(Request::SetListenPort("6882".to_owned()))
+        );
+    }
+
+    #[test]
+    fn ban_list_unban_and_stream_and_scrape_requests() {
+        let mut v = view();
+        let ih = v.torrents[0].info_hash;
+        v.banned = vec!["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()];
+        v.update(Action::OpenBanList);
+        assert_eq!(v.prompt, Some(Prompt::BanList));
+        v.update(Action::Down);
+        assert_eq!(v.selected_ban, 1);
+        assert_eq!(
+            v.update(Action::UnbanSelected),
+            Some(Request::Unban("10.0.0.2".to_owned()))
+        );
+        v.update(Action::OpenBan);
+        for c in "192.0.2.1".chars() {
+            v.update(Action::Input(c));
+        }
+        assert_eq!(
+            v.update(Action::Submit),
+            Some(Request::Ban("192.0.2.1".to_owned()))
+        );
+        v.update(Action::Cancel);
+        v.update(Action::OpenIpFilter);
+        for c in "/tmp/ipfilter.dat".chars() {
+            v.update(Action::Input(c));
+        }
+        assert_eq!(
+            v.update(Action::Submit),
+            Some(Request::SetIpFilter("/tmp/ipfilter.dat".to_owned()))
+        );
+        assert_eq!(v.update(Action::ForceScrape), Some(Request::Scrape(ih)));
+        v.update(Action::Pane(Pane::Files));
+        assert_eq!(
+            v.update(Action::StreamFile),
+            Some(Request::Stream {
+                info_hash: ih,
+                file: 0
+            })
+        );
+        v.update(Action::Back);
+        assert_eq!(v.update(Action::StreamFile), None, "files pane only");
     }
 
     #[test]

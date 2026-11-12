@@ -109,7 +109,7 @@ use dravity_core::{InfoHash, Magnet, Metainfo, PeerId};
 use dravity_dht::Dht;
 use dravity_engine::{Alert, Priority, Stats};
 use dravity_portmap::{Mapping, PortMapper};
-use dravity_storage::{BlockingIo, CacheStats, FileIo, FileStorage, ReadCache, Storage};
+use dravity_storage::{BlockingIo, FileIo, FileStorage, ReadCache, Storage};
 use dravity_tracker::TrackerClient;
 use dravity_webseed::WebSeedClient;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
@@ -124,7 +124,7 @@ pub use dravity_portmap::{
     Mapped as PortMapped, Method as PortMapMethod, PortMapConfig, Protocol as PortMapProtocol,
     Status as PortMapStatus,
 };
-pub use dravity_storage::{Durability, PreallocateMode};
+pub use dravity_storage::{CacheStats, Durability, PreallocateMode};
 pub use dravity_tracker::ScrapeStats;
 pub use dravity_webseed::WebSeedConfig;
 pub use error::SessionError;
